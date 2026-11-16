@@ -1453,6 +1453,45 @@ heavy!(
     }
 );
 
+h!(
+    /// `HasProp`, not a brand check: `c = a in b` for an index `a` of an
+    /// array `b` present in its dense part, the dispatch arm's first answer.
+    /// A hole or an index past the end is `s_has_prop`'s.
+    h_has_prop,
+    |cx| {
+        let (k, o) = (Value::from_bits(cx.get(cx.a())), Value::from_bits(cx.get(cx.b())));
+        if o.is_heap() {
+            if let HeapObj::Array(items) = cx.vm().heap.get(o.heap_index()) {
+                if let Some(i) = array_index(k) {
+                    if i < items.len() && !items[i].is_hole() {
+                        cx.put(cx.c(), Value::bool(true).bits());
+                        return go(cx, cx.after(1));
+                    }
+                }
+            }
+        }
+        again!(cx, s_has_prop)
+    }
+);
+
+slow!(s_has_prop, |cx| {
+    // A hole of an array, or an index past its dense end: absent when
+    // nothing else can supply it (`Vm::hole_index_absent`), as the arm
+    // answers. Anything else is the arm's.
+    let (k, o) = (Value::from_bits(cx.get(cx.a())), Value::from_bits(cx.get(cx.b())));
+    if o.is_heap() {
+        let vm = cx.vm();
+        let aidx = o.heap_index();
+        if let (HeapObj::Array(items), Some(i)) = (vm.heap.get(aidx), array_index(k)) {
+            if (i >= items.len() || items[i].is_hole()) && vm.hole_index_absent(aidx, i) {
+                cx.put(cx.c(), Value::bool(false).bits());
+                return go(cx, cx.after(1));
+            }
+        }
+    }
+    out(cx)
+});
+
 heavy!(
     /// `SetIndex`: `a[b] = c`, as the dispatch arm stores it: a numeric
     /// typed array's element, its leaf, and the general store, whose first
@@ -1718,6 +1757,119 @@ heavy!(
                 }
             }
             SetAct::None => finish_unit(cx, vm.set_prop(o, key, v, strict).map(|_| ())),
+        }
+    }
+);
+
+heavy!(
+    /// `SuperBase`: `c` = the home object's prototype, as the dispatch arm
+    /// reads it (`Vm::super_base`). `d` the home class, `a` 1 in a static
+    /// element's function.
+    h_super_base,
+    b_super_base,
+    |cx, go, out| {
+        let v = cx.vm().super_base(cx.d(), cx.a() != 0);
+        cx.put(cx.c(), v.bits());
+        go(cx, cx.after(1))
+    }
+);
+
+/// A `SuperGet` or `SuperSet` position's home class and name constant, as
+/// `decode` packs them into `k`.
+#[inline(always)]
+fn super_site(k: u64) -> (u32, u32) {
+    (k as u32, (k >> 32) as u32)
+}
+
+heavy!(
+    /// `SuperGet`: `c = super.<name>` by the site's super cache, as the
+    /// dispatch arm asks it (`ic_super_stamped`, then `ic_super_get`): a
+    /// data property's value, or a getter called with `this` (register 0)
+    /// as the arm calls it, a leaf without a frame and any other in a frame
+    /// the runner pushes. Anything else (a miss, the general lookup) is the
+    /// arm's. `d` the function, `k` the home class and the name
+    /// (`super_site`), `a` 1 in a static element's function.
+    h_super_get,
+    b_super_get,
+    |cx, go, out| {
+        let vm = cx.vm();
+        let ip = cx.ip();
+        let (home, name) = super_site(cx.k());
+        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+        let stamped = vm.ic_super_stamped(cx.d(), ip);
+        #[cfg(not(all(feature = "jit", not(feature = "safe-sandbox"))))]
+        let stamped = GetAct::None;
+        let act = match stamped {
+            GetAct::None => {
+                let key: &str = vm.func(cx.d() as usize).string_constants[name as usize].as_str();
+                vm.ic_super_get(cx.d(), ip, home, cx.a() != 0, key)
+            }
+            act => act,
+        };
+        let v = match act {
+            GetAct::Value(v) => v,
+            GetAct::Accessor { fid, closure, getter } => {
+                let this = Value::from_bits(cx.get(0));
+                // A strict getter takes `this` as it is, a sloppy one an
+                // object's without boxing.
+                let this_is_object = vm.is_object_value(this);
+                let this_ok = this_is_object || vm.func(fid as usize).is_strict;
+                let base = cx.frame_base();
+                match vm.leaf_call(fid, closure, this, this_ok, base, 0, 0) {
+                    Some(v) => v,
+                    None => {
+                        if !this_is_object {
+                            return out(cx);
+                        }
+                        let desc = vm.lean_call_desc(fid);
+                        return match vm.loop_enter(fid, closure, desc, Some(this), base, 0, 0, cx.c() as u16, ip + 1, getter) {
+                            Some(first) => go(cx, first),
+                            None => out(cx),
+                        };
+                    }
+                }
+            }
+            GetAct::None => return out(cx),
+        };
+        cx.put(cx.c(), v.bits());
+        go(cx, cx.after(1))
+    }
+);
+
+heavy!(
+    /// `SuperSet`: `super.<name> = b` through the setter the site's super
+    /// cache names (`ic_super_set_stamped`, then `ic_super_set`), called
+    /// with `this` (register 0) in a frame the runner pushes, as the
+    /// dispatch arm calls it. A write of data, which goes to the receiver,
+    /// is the arm's. `d` the function, `k` the home class and the name
+    /// (`super_site`), `c` 1 in a static element's function.
+    h_super_set,
+    b_super_set,
+    |cx, go, out| {
+        let vm = cx.vm();
+        let ip = cx.ip();
+        let (home, name) = super_site(cx.k());
+        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+        let stamped = vm.ic_super_set_stamped(cx.d(), ip);
+        #[cfg(not(all(feature = "jit", not(feature = "safe-sandbox"))))]
+        let stamped = SetAct::None;
+        let act = match stamped {
+            SetAct::None => {
+                let key: &str = vm.func(cx.d() as usize).string_constants[name as usize].as_str();
+                vm.ic_super_set(cx.d(), ip, home, cx.c() != 0, key)
+            }
+            act => act,
+        };
+        let SetAct::Setter { fid, closure, setter } = act else { return out(cx) };
+        let this = Value::from_bits(cx.get(0));
+        if !vm.is_object_value(this) {
+            return out(cx);
+        }
+        let desc = vm.lean_call_desc(fid);
+        let (base, val) = (cx.frame_base(), cx.b() as u16);
+        match vm.loop_enter(fid, closure, desc, Some(this), base, val, 1, super::ic::RET_DISCARD, ip + 1, setter) {
+            Some(first) => go(cx, first),
+            None => out(cx),
         }
     }
 );
@@ -2686,6 +2838,11 @@ fn decode(f: &FuncProto, code: &[Instr], ip: usize, func_id: u32, nglobals: usiz
         }
         Instr::GetIndex { dst, obj, key } => op(h_get_index, obj, key, dst, 0, 0),
         Instr::SetIndex { obj, key, val } => op(h_set_index, obj, key, val, 0, 0),
+        // A loop whose `in` probes the arm collapses (`try_in_probe_reduce`)
+        // is the arm's: entered here, the runner would run it in full.
+        Instr::HasProp { dst, key, obj, brand: false } if !super::enum_stream::in_probe_hook(f, ip) => {
+            op(h_has_prop, key, obj, dst, 0, 0)
+        }
         Instr::GetProp { dst, obj, name } if named(name, "length") => op(h_get_length, obj, 0, dst, func_id, 0),
         // A private name's read or write is the dispatch arm's (brand
         // checks): it fills no way of the cache these two ask.
@@ -2809,6 +2966,13 @@ fn decode(f: &FuncProto, code: &[Instr], ip: usize, func_id: u32, nglobals: usiz
         Instr::ToStr { dst, a } => op(h_to_str, a, 0, dst, 0, 0),
         Instr::StrAppendIndex { .. } => op(h_str_append_index, 0, 0, 0, 0, 0),
         Instr::GetIterator { dst, src } => op(h_get_iterator, src, 0, dst, 0, 0),
+        Instr::SuperBase { dst, home_class_id } => op(h_super_base, f.super_static as u16, 0, dst, home_class_id, 0),
+        Instr::SuperGet { dst, home_class_id, name } => {
+            op(h_super_get, f.super_static as u16, 0, dst, func_id, home_class_id as u64 | (name as u64) << 32)
+        }
+        Instr::SuperSet { home_class_id, name, val, .. } => {
+            op(h_super_set, 0, val, f.super_static as u16, func_id, home_class_id as u64 | (name as u64) << 32)
+        }
         _ => leave,
     }
 }
