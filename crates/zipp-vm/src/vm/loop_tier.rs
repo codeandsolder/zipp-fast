@@ -2503,30 +2503,26 @@ heavy!(
 
 heavy!(
     /// `FinalizeObject`: `c` = the object literal of the site's key plan
-    /// (`k`) over the `b` values from `a`, as the dispatch arm builds it; a
-    /// plan it would refuse is its to refuse (`d` the function).
+    /// over the values from `a`, as the dispatch arm builds it. `k` the
+    /// plan's address, `b` the count under the plan's index, `d` the
+    /// function: `decode` asked the arm's checks of the plan once, and a
+    /// plan they refuse is the arm's to refuse.
     h_finalize_object,
     b_finalize_object,
     |cx, go, out| {
         let vm = cx.vm();
-        let (val_base, count, plan_idx) = (cx.a(), cx.b() as usize, cx.k() as u16);
-        let Some(plan) = vm.func(cx.d() as usize).static_key_plans.get(plan_idx as usize) else {
-            return out(cx);
-        };
-        if !plan.runtime_valid()
-            || plan.len() > crate::bytecode::FINALIZE_STAGE_SLOTS
-            || plan.is_empty()
-            || plan.len() != count
-            || val_base as usize + count > u16::MAX as usize
-        {
-            return out(cx);
-        }
+        // SAFETY: an entry of the function's `static_key_plans`, which lives
+        // as long as the program (`'p`), and so the VM (`decode`).
+        let plan: &crate::bytecode::StaticKeyPlan = &*(cx.k() as *const crate::bytecode::StaticKeyPlan);
+        let (count, plan_idx) = ((cx.b() & 0xFFFF) as usize, (cx.b() >> 16) as u16);
+        // Positions are rebuilt when a function's body is replaced
+        // (`LoopFn::code`), so the plan is still the function's.
+        debug_assert!(std::ptr::eq(plan, &vm.func(cx.d() as usize).static_key_plans[plan_idx as usize]));
         let shape = vm.finalize_shape(cx.d(), plan_idx, plan);
-        let mut buf = [Value::UNDEFINED; crate::bytecode::FINALIZE_STAGE_SLOTS];
-        for (i, slot) in buf[..count].iter_mut().enumerate() {
-            *slot = Value::from_bits(cx.get(val_base + i as u32));
-        }
-        let v = Value::heap(vm.alloc_finalized_site(plan, &buf[..count], shape));
+        // The values straight from the window: the allocation moves no
+        // register file, and a recycled cell is never the window.
+        let vals = std::slice::from_raw_parts(cx.regs.add(cx.a() as usize) as *const Value, count);
+        let v = Value::heap(vm.alloc_finalized_site(plan, vals, shape));
         vm.realm_born(v.heap_index(), vm.obj_proto);
         cx.put(cx.c(), v.bits());
         after_alloc(cx, cx.after(1))
@@ -2989,12 +2985,32 @@ fn decode(f: &FuncProto, code: &[Instr], ip: usize, func_id: u32, nglobals: usiz
         } => op(h_iter_next, iter, idx, value_dst, done_dst as u32, 0),
         Instr::NewArray { dst, arg_base, argc } => op(h_new_array, arg_base, 0, dst, argc as u32, 0),
         Instr::NewObject { dst, hint } => op(h_new_object, 0, 0, dst, 0, hint as u64),
+        // The arm's checks of the plan, once: a plan they refuse is the
+        // arm's to refuse. The plan's address goes in `k`.
         Instr::FinalizeObject {
             dst,
             plan,
             val_base,
             count,
-        } => op(h_finalize_object, val_base, count, dst, func_id, plan as u64),
+        } => match f.static_key_plans.get(plan as usize) {
+            Some(p)
+                if p.runtime_valid()
+                    && !p.is_empty()
+                    && p.len() <= crate::bytecode::FINALIZE_STAGE_SLOTS
+                    && p.len() == count as usize
+                    && val_base as usize + count as usize <= u16::MAX as usize =>
+            {
+                Op {
+                    h: h_finalize_object,
+                    a: val_base as u32,
+                    b: count as u32 | (plan as u32) << 16,
+                    c: dst as u32,
+                    d: func_id,
+                    k: p as *const crate::bytecode::StaticKeyPlan as u64,
+                }
+            }
+            _ => leave,
+        },
         Instr::MakeClosure { dst, func_id: f } => op(h_make_closure, 0, 0, dst, f, 0),
         Instr::MakeArrow {
             dst,
