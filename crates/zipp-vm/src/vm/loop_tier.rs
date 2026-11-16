@@ -1677,12 +1677,10 @@ heavy!(
             None => GetAct::None,
         };
         let act = match first {
-            GetAct::None => {
-                if !o.is_heap() {
-                    return out(cx);
-                }
-                vm.loop_get_prop(cx.d(), ip, o, name)
-            }
+            // A primitive that is no string (a number's `constructor`, an
+            // undefined base's TypeError): the general read below.
+            GetAct::None if !o.is_heap() => GetAct::None,
+            GetAct::None => vm.loop_get_prop(cx.d(), ip, o, name),
             act => act,
         };
         let v = match act {
@@ -1706,7 +1704,26 @@ heavy!(
                     }
                 }
             }
-            GetAct::None => return out(cx),
+            GetAct::None => {
+                // What no cache answers (a class instance's `constructor`),
+                // by the arm's last steps: a constructor's own data, then
+                // the general read, which may run a getter or a trap, its
+                // error naming the function as the arm's does. It left the
+                // runner every time, and the loop struck out.
+                let key: &str = vm.func(cx.d() as usize).string_constants[name as usize].as_str();
+                let own = if o.is_heap() { vm.ctor_own_data_read(o, key) } else { None };
+                match own {
+                    Some(v) => v,
+                    None => {
+                        let r = vm.get_prop(o, key).map_err(|Thrown(msg)| {
+                            let f = vm.func(cx.d() as usize);
+                            let name: &str = if f.name.is_empty() { "<anonymous>" } else { &f.name };
+                            Thrown(format!("{msg} (in {name})"))
+                        });
+                        return finish(cx, r);
+                    }
+                }
+            }
         };
         cx.put(cx.c(), v.bits());
         go(cx, cx.after(1))
