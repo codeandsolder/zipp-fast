@@ -1478,6 +1478,48 @@ h!(
 );
 
 h!(
+    /// `BitNot`: `c = ~a` for a Number `a`, its ToInt32 inverted, as the
+    /// dispatch arm computes it. Anything else (a BigInt, a value whose
+    /// conversion runs code) is the arm's.
+    h_bit_not,
+    |cx| {
+        let v = Value::from_bits(cx.get(cx.a()));
+        let r = if v.is_int() {
+            !v.as_int()
+        } else if v.is_double() {
+            !super::helpers_num2::to_int32(v.as_f64())
+        } else {
+            return out(cx);
+        };
+        cx.put(cx.c(), int(r));
+        go(cx, cx.after(1))
+    }
+);
+
+heavy!(
+    /// `IsArray`: `c = Array.isArray(a)` while the callee `b` and its
+    /// receiver `d` are the intrinsic, as the dispatch arm answers it
+    /// (`Vm::value_is_array_throwing`). Another callee, which the arm calls,
+    /// and a revoked Proxy, a TypeError, are the arm's.
+    h_is_array,
+    b_is_array,
+    |cx, go, out| {
+        let vm = cx.vm();
+        let (callee, this_v) = (Value::from_bits(cx.get(cx.b())), Value::from_bits(cx.get(cx.d())));
+        if !vm.static_builtin_is_intrinsic("Array", native::ARR_IS_ARRAY, callee, this_v) {
+            return out(cx);
+        }
+        match vm.value_is_array_throwing(Value::from_bits(cx.get(cx.a()))) {
+            Ok(is) => {
+                cx.put(cx.c(), Value::bool(is).bits());
+                go(cx, cx.after(1))
+            }
+            Err(_) => out(cx),
+        }
+    }
+);
+
+h!(
     /// `ToPropKey` (`b[a] op= …`): `c` = the key `a` as a property key, for
     /// a base `b` that is neither null nor undefined, as the dispatch arm
     /// makes it (`Vm::coerce_index_key`): a key that is no heap value as it
@@ -2925,6 +2967,8 @@ fn decode(f: &FuncProto, code: &[Instr], ip: usize, func_id: u32, nglobals: usiz
             op(h_has_prop, key, obj, dst, 0, 0)
         }
         Instr::ToPropKey { dst, obj, src } => op(h_to_prop_key, src, obj, dst, 0, 0),
+        Instr::BitNot { dst, a } => op(h_bit_not, a, 0, dst, 0, 0),
+        Instr::IsArray { dst, a, callee, this_v } => op(h_is_array, a, callee, dst, this_v as u32, 0),
         Instr::New { dst, callee, arg_base, argc } => op(h_new, callee, arg_base, dst, argc as u32, 0),
         Instr::GetProp { dst, obj, name } if named(name, "length") => op(h_get_length, obj, 0, dst, func_id, 0),
         // A private name's read or write is the dispatch arm's (brand
