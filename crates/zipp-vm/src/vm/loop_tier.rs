@@ -47,6 +47,9 @@
 //! callee's first position, in its window, each function's positions built
 //! at its first use; a `Return` there pops the frame and goes on after the
 //! call. The frame the runner was entered in returns in the dispatch loop.
+//! A `new` of a plain constructor function, or of a base class with no
+//! field initializer, pushes its constructor's frame the same way, marked
+//! to hand back the instance (`Frame::construct_this`).
 //! Whatever leaves the runner in a frame it pushed stores its position in
 //! that frame, and the dispatch loop goes on from the top frame, as after
 //! any call (`LOOP_FRAMES`).
@@ -2166,6 +2169,59 @@ heavy!(
 );
 
 heavy!(
+    /// `New`: `c = new a(…)` (`b` the first argument's register, `d` the
+    /// count) by the dispatch arm's first ways: a constructor whose body
+    /// only stores, whose finished instance is made at once
+    /// (`Vm::new_stored`); a plain constructor function, and a base class
+    /// with a constructor of its own and no field initializer, whose
+    /// instance is made as the arm makes it and whose constructor's frame
+    /// the runner pushes, its return handing back the instance
+    /// (`Frame::construct_this`). Anything else (a class with fields or a
+    /// parent, a native, a bound function, a frame the lean push declines)
+    /// is the arm's.
+    h_new,
+    b_new,
+    |cx, go, out| {
+        let vm = cx.vm();
+        let cv = Value::from_bits(cx.get(cx.a()));
+        let (arg_base, argc) = (cx.b() as u16, cx.d() as u16);
+        let base = cx.frame_base();
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        if let Some(v) = vm.new_stored(cv, base, arg_base, argc) {
+            cx.put(cx.c(), v.bits());
+            return after_alloc(cx, cx.after(1));
+        }
+        let (fid, closure, obj, callee) = match vm.flat_new_instance(cv) {
+            Some((fid, closure, obj)) => (fid, closure, obj, cv),
+            None => {
+                let Some(target) = vm.flat_new_class_target(cv) else { return out(cx) };
+                if !vm.loop_class_fieldless(cv) {
+                    return out(cx);
+                }
+                // No field initializer: the making runs no code.
+                match vm.flat_new_class_make(cv, target) {
+                    Ok(made) => made,
+                    Err(_) => return out(cx),
+                }
+            }
+        };
+        let desc = vm.lean_call_desc(fid);
+        vm.pending_new_target = cv;
+        match vm.loop_enter(fid, closure, desc, Some(obj), base, arg_base, argc, cx.c() as u16, cx.ip() + 1, callee) {
+            Some(first) => {
+                let n = vm.frames.len();
+                vm.frames[n - 1].construct_this = true;
+                go(cx, first)
+            }
+            None => {
+                vm.pending_new_target = Value::UNDEFINED;
+                out(cx)
+            }
+        }
+    }
+);
+
+heavy!(
     /// `Return` from a frame this entry pushed: the value in `a` to the
     /// caller, and on at the position after its call (`Vm::loop_return`).
     /// The return of the frame the runner entered in is the dispatch
@@ -2843,6 +2899,7 @@ fn decode(f: &FuncProto, code: &[Instr], ip: usize, func_id: u32, nglobals: usiz
         Instr::HasProp { dst, key, obj, brand: false } if !super::enum_stream::in_probe_hook(f, ip) => {
             op(h_has_prop, key, obj, dst, 0, 0)
         }
+        Instr::New { dst, callee, arg_base, argc } => op(h_new, callee, arg_base, dst, argc as u32, 0),
         Instr::GetProp { dst, obj, name } if named(name, "length") => op(h_get_length, obj, 0, dst, func_id, 0),
         // A private name's read or write is the dispatch arm's (brand
         // checks): it fills no way of the cache these two ask.
@@ -3622,6 +3679,13 @@ impl<'p> Vm<'p> {
         }
         // SAFETY: `ip` is the position after the caller's call.
         unsafe { ops.add(ip) }
+    }
+
+    /// Whether the class `cv` has no field initializer to run on a new
+    /// instance (`h_new`).
+    #[inline]
+    fn loop_class_fieldless(&self, cv: Value) -> bool {
+        matches!(self.heap.get(cv.heap_index()), HeapObj::Class(c) if c.field_thunk.is_none())
     }
 
     /// [`Self::loop_return_now`] when the return is the runner's, else
