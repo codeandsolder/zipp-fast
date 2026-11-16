@@ -1477,6 +1477,35 @@ h!(
     }
 );
 
+h!(
+    /// `ToPropKey` (`b[a] op= …`): `c` = the key `a` as a property key, for
+    /// a base `b` that is neither null nor undefined, as the dispatch arm
+    /// makes it (`Vm::coerce_index_key`): a key that is no heap value as it
+    /// is. A string or a symbol is `s_to_prop_key`'s; an object key, whose
+    /// conversion runs code, and a nullish base, a TypeError, the arm's.
+    h_to_prop_key,
+    |cx| {
+        let (k, o) = (cx.get(cx.a()), Value::from_bits(cx.get(cx.b())));
+        if !Value::from_bits(k).is_heap() && !o.is_nullish() {
+            cx.put(cx.c(), k);
+            return go(cx, cx.after(1));
+        }
+        again!(cx, s_to_prop_key)
+    }
+);
+
+slow!(s_to_prop_key, |cx| {
+    let (k, o) = (Value::from_bits(cx.get(cx.a())), Value::from_bits(cx.get(cx.b())));
+    if k.is_heap()
+        && !o.is_nullish()
+        && matches!(cx.vm().heap.get(k.heap_index()), HeapObj::Symbol { .. } | HeapObj::Str(_) | HeapObj::Cons { .. })
+    {
+        cx.put(cx.c(), k.bits());
+        return go(cx, cx.after(1));
+    }
+    out(cx)
+});
+
 slow!(s_has_prop, |cx| {
     // A hole of an array, or an index past its dense end: absent when
     // nothing else can supply it (`Vm::hole_index_absent`), as the arm
@@ -2895,6 +2924,7 @@ fn decode(f: &FuncProto, code: &[Instr], ip: usize, func_id: u32, nglobals: usiz
         Instr::HasProp { dst, key, obj, brand: false } if !super::enum_stream::in_probe_hook(f, ip) => {
             op(h_has_prop, key, obj, dst, 0, 0)
         }
+        Instr::ToPropKey { dst, obj, src } => op(h_to_prop_key, src, obj, dst, 0, 0),
         Instr::New { dst, callee, arg_base, argc } => op(h_new, callee, arg_base, dst, argc as u32, 0),
         Instr::GetProp { dst, obj, name } if named(name, "length") => op(h_get_length, obj, 0, dst, func_id, 0),
         // A private name's read or write is the dispatch arm's (brand
