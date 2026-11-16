@@ -1519,6 +1519,27 @@ heavy!(
     }
 );
 
+heavy!(
+    /// `InstanceOfDyn`: `c = a instanceof b` by the operator's fast path
+    /// (`Vm::instanceof_fast`: a function or class whose @@hasInstance is
+    /// the intrinsic one and whose `prototype` is read without a getter, no
+    /// Proxy on `a`'s chain), which does nothing observable when it
+    /// declines. Anything else (a @@hasInstance of its own, a Proxy, a
+    /// TypeError) is the arm's.
+    h_instance_of,
+    b_instance_of,
+    |cx, go, out| {
+        let (v, c) = (Value::from_bits(cx.get(cx.a())), Value::from_bits(cx.get(cx.b())));
+        match cx.vm().instanceof_fast(c, v) {
+            Some(is) => {
+                cx.put(cx.c(), Value::bool(is).bits());
+                go(cx, cx.after(1))
+            }
+            None => out(cx),
+        }
+    }
+);
+
 h!(
     /// `ToPropKey` (`b[a] op= …`): `c` = the key `a` as a property key, for
     /// a base `b` that is neither null nor undefined, as the dispatch arm
@@ -2968,6 +2989,7 @@ fn decode(f: &FuncProto, code: &[Instr], ip: usize, func_id: u32, nglobals: usiz
         }
         Instr::ToPropKey { dst, obj, src } => op(h_to_prop_key, src, obj, dst, 0, 0),
         Instr::BitNot { dst, a } => op(h_bit_not, a, 0, dst, 0, 0),
+        Instr::InstanceOfDyn { dst, val, ctor } => op(h_instance_of, val, ctor, dst, 0, 0),
         Instr::IsArray { dst, a, callee, this_v } => op(h_is_array, a, callee, dst, this_v as u32, 0),
         Instr::New { dst, callee, arg_base, argc } => op(h_new, callee, arg_base, dst, argc as u32, 0),
         Instr::GetProp { dst, obj, name } if named(name, "length") => op(h_get_length, obj, 0, dst, func_id, 0),
