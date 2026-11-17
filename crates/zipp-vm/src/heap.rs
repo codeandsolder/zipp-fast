@@ -10714,6 +10714,14 @@ impl Heap {
     /// `set_gc_floor`: the boot allocations are pinned forever, so they are
     /// OLD from the floor on and the first minor never walks them).
     pub fn young_reset(&mut self) {
+        // The ready objects not yet taken are in the log too. Promoted here,
+        // and pinned under the floor, one handed out after it is an OLD
+        // object into which a literal stores its young values with no
+        // barrier (they are the cell's first contents): no minor then traced
+        // them, and a closure such a literal held was swept and its slot
+        // reused. None is handed out after this; the next take refills.
+        #[cfg(not(feature = "safe-sandbox"))]
+        self.ready_abandon();
         for &i in &self.young {
             self.gen[i as usize] = GEN_OLD;
         }
