@@ -520,6 +520,12 @@ impl<'s> Lexer<'s> {
         let plain_end = self.src.get(end).is_none_or(|&b| b < 0x80 && b != b'\\');
         if end > start && plain_end && !self.src[start].is_ascii_digit() {
             self.pos = end;
+            // Every byte in `start..end` passed the ASCII test above, and ASCII
+            // is UTF-8: validating it again was 2% of loading a bundle.
+            #[cfg(not(feature = "safe-sandbox"))]
+            // SAFETY: as above.
+            let s = unsafe { std::str::from_utf8_unchecked(&self.src[start..end]) };
+            #[cfg(feature = "safe-sandbox")]
             let s = std::str::from_utf8(&self.src[start..end]).expect("ASCII is UTF-8");
             return Ok((self.intern(s), false));
         }
@@ -642,6 +648,28 @@ impl<'s> Lexer<'s> {
     /// survives instead of being replaced.
     fn read_string(&mut self, quote: u8) -> LResult<TokenKind> {
         let start = self.pos;
+        // A literal with no escape and no line terminator is its source bytes:
+        // one copy, where the loop below pushed a UTF-16 unit a byte and then
+        // re-encoded them all (2% of loading a bundle). Not for an eval source
+        // with raw lone surrogates (`exact`), whose bytes the loop reads.
+        if self.exact.is_none() {
+            let body = start + 1;
+            let mut j = body;
+            while let Some(&b) = self.src.get(j) {
+                if b == quote || b == b'\\' || b == b'\n' || b == b'\r' {
+                    break;
+                }
+                j += 1;
+            }
+            if self.src.get(j) == Some(&quote) {
+                // Both ends are ASCII bytes of UTF-8 source, so the slice is
+                // UTF-8 too.
+                if let Ok(s) = std::str::from_utf8(&self.src[body..j]) {
+                    self.pos = j + 1;
+                    return Ok(TokenKind::Str(StrVal::Utf8(s.to_owned())));
+                }
+            }
+        }
         self.pos += 1;
         let mut units: Vec<u16> = Vec::new();
         loop {
