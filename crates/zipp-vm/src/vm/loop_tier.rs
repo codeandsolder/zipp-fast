@@ -47,6 +47,9 @@
 //! callee's first position, in its window, each function's positions built
 //! at its first use; a `Return` there pops the frame and goes on after the
 //! call. The frame the runner was entered in returns in the dispatch loop.
+//! A `new` of a plain constructor function, or of a base class with no
+//! field initializer, pushes its constructor's frame the same way, marked
+//! to hand back the instance (`Frame::construct_this`).
 //! Whatever leaves the runner in a frame it pushed stores its position in
 //! that frame, and the dispatch loop goes on from the top frame, as after
 //! any call (`LOOP_FRAMES`).
@@ -1453,6 +1456,160 @@ heavy!(
     }
 );
 
+h!(
+    /// `HasProp`, not a brand check: `c = a in b` for an index `a` of an
+    /// array `b` present in its dense part, the dispatch arm's first answer.
+    /// A hole or an index past the end is `s_has_prop`'s.
+    h_has_prop,
+    |cx| {
+        let (k, o) = (Value::from_bits(cx.get(cx.a())), Value::from_bits(cx.get(cx.b())));
+        if o.is_heap() {
+            if let HeapObj::Array(items) = cx.vm().heap.get(o.heap_index()) {
+                if let Some(i) = array_index(k) {
+                    if i < items.len() && !items[i].is_hole() {
+                        cx.put(cx.c(), Value::bool(true).bits());
+                        return go(cx, cx.after(1));
+                    }
+                }
+            }
+        }
+        again!(cx, s_has_prop)
+    }
+);
+
+h!(
+    /// `BitNot`: `c = ~a` for a Number `a`, its ToInt32 inverted, as the
+    /// dispatch arm computes it. Anything else (a BigInt, a value whose
+    /// conversion runs code) is the arm's.
+    h_bit_not,
+    |cx| {
+        let v = Value::from_bits(cx.get(cx.a()));
+        let r = if v.is_int() {
+            !v.as_int()
+        } else if v.is_double() {
+            !super::helpers_num2::to_int32(v.as_f64())
+        } else {
+            return out(cx);
+        };
+        cx.put(cx.c(), int(r));
+        go(cx, cx.after(1))
+    }
+);
+
+heavy!(
+    /// `IsArray`: `c = Array.isArray(a)` while the callee `b` and its
+    /// receiver `d` are the intrinsic, as the dispatch arm answers it
+    /// (`Vm::value_is_array_throwing`). Another callee, which the arm calls,
+    /// and a revoked Proxy, a TypeError, are the arm's.
+    h_is_array,
+    b_is_array,
+    |cx, go, out| {
+        let vm = cx.vm();
+        let (callee, this_v) = (Value::from_bits(cx.get(cx.b())), Value::from_bits(cx.get(cx.d())));
+        if !vm.static_builtin_is_intrinsic("Array", native::ARR_IS_ARRAY, callee, this_v) {
+            return out(cx);
+        }
+        match vm.value_is_array_throwing(Value::from_bits(cx.get(cx.a()))) {
+            Ok(is) => {
+                cx.put(cx.c(), Value::bool(is).bits());
+                go(cx, cx.after(1))
+            }
+            Err(_) => out(cx),
+        }
+    }
+);
+
+heavy!(
+    /// `ObjectKeys`: `c = Object.keys(a)` while the callee `b` and its
+    /// receiver `d` are the intrinsic, for an object that is no Proxy, by
+    /// the arm's enumeration (`object_enum_own`), which runs no code for
+    /// one. A primitive (its wrapper), a Proxy (its traps) and another
+    /// callee are the arm's.
+    h_object_keys,
+    b_object_keys,
+    |cx, go, out| {
+        let vm = cx.vm();
+        let (callee, this_v) = (Value::from_bits(cx.get(cx.b())), Value::from_bits(cx.get(cx.d())));
+        let o = Value::from_bits(cx.get(cx.a()));
+        if !o.is_heap()
+            || !vm.is_object_value(o)
+            || vm.proxy_parts(o.heap_index()).is_some()
+            || !vm.static_builtin_is_intrinsic("Object", native::OBJ_KEYS, callee, this_v)
+        {
+            return out(cx);
+        }
+        finish(cx, vm.object_enum_own(o, EnumWhat::Keys))
+    }
+);
+
+heavy!(
+    /// `InstanceOfDyn`: `c = a instanceof b` by the operator's fast path
+    /// (`Vm::instanceof_fast`: a function or class whose @@hasInstance is
+    /// the intrinsic one and whose `prototype` is read without a getter, no
+    /// Proxy on `a`'s chain), which does nothing observable when it
+    /// declines. Anything else (a @@hasInstance of its own, a Proxy, a
+    /// TypeError) is the arm's.
+    h_instance_of,
+    b_instance_of,
+    |cx, go, out| {
+        let (v, c) = (Value::from_bits(cx.get(cx.a())), Value::from_bits(cx.get(cx.b())));
+        match cx.vm().instanceof_fast(c, v) {
+            Some(is) => {
+                cx.put(cx.c(), Value::bool(is).bits());
+                go(cx, cx.after(1))
+            }
+            None => out(cx),
+        }
+    }
+);
+
+h!(
+    /// `ToPropKey` (`b[a] op= …`): `c` = the key `a` as a property key, for
+    /// a base `b` that is neither null nor undefined, as the dispatch arm
+    /// makes it (`Vm::coerce_index_key`): a key that is no heap value as it
+    /// is. A string or a symbol is `s_to_prop_key`'s; an object key, whose
+    /// conversion runs code, and a nullish base, a TypeError, the arm's.
+    h_to_prop_key,
+    |cx| {
+        let (k, o) = (cx.get(cx.a()), Value::from_bits(cx.get(cx.b())));
+        if !Value::from_bits(k).is_heap() && !o.is_nullish() {
+            cx.put(cx.c(), k);
+            return go(cx, cx.after(1));
+        }
+        again!(cx, s_to_prop_key)
+    }
+);
+
+slow!(s_to_prop_key, |cx| {
+    let (k, o) = (Value::from_bits(cx.get(cx.a())), Value::from_bits(cx.get(cx.b())));
+    if k.is_heap()
+        && !o.is_nullish()
+        && matches!(cx.vm().heap.get(k.heap_index()), HeapObj::Symbol { .. } | HeapObj::Str(_) | HeapObj::Cons { .. })
+    {
+        cx.put(cx.c(), k.bits());
+        return go(cx, cx.after(1));
+    }
+    out(cx)
+});
+
+slow!(s_has_prop, |cx| {
+    // A hole of an array, or an index past its dense end: absent when
+    // nothing else can supply it (`Vm::hole_index_absent`), as the arm
+    // answers. Anything else is the arm's.
+    let (k, o) = (Value::from_bits(cx.get(cx.a())), Value::from_bits(cx.get(cx.b())));
+    if o.is_heap() {
+        let vm = cx.vm();
+        let aidx = o.heap_index();
+        if let (HeapObj::Array(items), Some(i)) = (vm.heap.get(aidx), array_index(k)) {
+            if (i >= items.len() || items[i].is_hole()) && vm.hole_index_absent(aidx, i) {
+                cx.put(cx.c(), Value::bool(false).bits());
+                return go(cx, cx.after(1));
+            }
+        }
+    }
+    out(cx)
+});
+
 heavy!(
     /// `SetIndex`: `a[b] = c`, as the dispatch arm stores it: a numeric
     /// typed array's element, its leaf, and the general store, whose first
@@ -1543,12 +1700,10 @@ heavy!(
             None => GetAct::None,
         };
         let act = match first {
-            GetAct::None => {
-                if !o.is_heap() {
-                    return out(cx);
-                }
-                vm.loop_get_prop(cx.d(), ip, o, name)
-            }
+            // A primitive that is no string (a number's `constructor`, an
+            // undefined base's TypeError): the general read below.
+            GetAct::None if !o.is_heap() => GetAct::None,
+            GetAct::None => vm.loop_get_prop(cx.d(), ip, o, name),
             act => act,
         };
         let v = match act {
@@ -1572,7 +1727,26 @@ heavy!(
                     }
                 }
             }
-            GetAct::None => return out(cx),
+            GetAct::None => {
+                // What no cache answers (a class instance's `constructor`),
+                // by the arm's last steps: a constructor's own data, then
+                // the general read, which may run a getter or a trap, its
+                // error naming the function as the arm's does. It left the
+                // runner every time, and the loop struck out.
+                let key: &str = vm.func(cx.d() as usize).string_constants[name as usize].as_str();
+                let own = if o.is_heap() { vm.ctor_own_data_read(o, key) } else { None };
+                match own {
+                    Some(v) => v,
+                    None => {
+                        let r = vm.get_prop(o, key).map_err(|Thrown(msg)| {
+                            let f = vm.func(cx.d() as usize);
+                            let name: &str = if f.name.is_empty() { "<anonymous>" } else { &f.name };
+                            Thrown(format!("{msg} (in {name})"))
+                        });
+                        return finish(cx, r);
+                    }
+                }
+            }
         };
         cx.put(cx.c(), v.bits());
         go(cx, cx.after(1))
@@ -1718,6 +1892,119 @@ heavy!(
                 }
             }
             SetAct::None => finish_unit(cx, vm.set_prop(o, key, v, strict).map(|_| ())),
+        }
+    }
+);
+
+heavy!(
+    /// `SuperBase`: `c` = the home object's prototype, as the dispatch arm
+    /// reads it (`Vm::super_base`). `d` the home class, `a` 1 in a static
+    /// element's function.
+    h_super_base,
+    b_super_base,
+    |cx, go, out| {
+        let v = cx.vm().super_base(cx.d(), cx.a() != 0);
+        cx.put(cx.c(), v.bits());
+        go(cx, cx.after(1))
+    }
+);
+
+/// A `SuperGet` or `SuperSet` position's home class and name constant, as
+/// `decode` packs them into `k`.
+#[inline(always)]
+fn super_site(k: u64) -> (u32, u32) {
+    (k as u32, (k >> 32) as u32)
+}
+
+heavy!(
+    /// `SuperGet`: `c = super.<name>` by the site's super cache, as the
+    /// dispatch arm asks it (`ic_super_stamped`, then `ic_super_get`): a
+    /// data property's value, or a getter called with `this` (register 0)
+    /// as the arm calls it, a leaf without a frame and any other in a frame
+    /// the runner pushes. Anything else (a miss, the general lookup) is the
+    /// arm's. `d` the function, `k` the home class and the name
+    /// (`super_site`), `a` 1 in a static element's function.
+    h_super_get,
+    b_super_get,
+    |cx, go, out| {
+        let vm = cx.vm();
+        let ip = cx.ip();
+        let (home, name) = super_site(cx.k());
+        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+        let stamped = vm.ic_super_stamped(cx.d(), ip);
+        #[cfg(not(all(feature = "jit", not(feature = "safe-sandbox"))))]
+        let stamped = GetAct::None;
+        let act = match stamped {
+            GetAct::None => {
+                let key: &str = vm.func(cx.d() as usize).string_constants[name as usize].as_str();
+                vm.ic_super_get(cx.d(), ip, home, cx.a() != 0, key)
+            }
+            act => act,
+        };
+        let v = match act {
+            GetAct::Value(v) => v,
+            GetAct::Accessor { fid, closure, getter } => {
+                let this = Value::from_bits(cx.get(0));
+                // A strict getter takes `this` as it is, a sloppy one an
+                // object's without boxing.
+                let this_is_object = vm.is_object_value(this);
+                let this_ok = this_is_object || vm.func(fid as usize).is_strict;
+                let base = cx.frame_base();
+                match vm.leaf_call(fid, closure, this, this_ok, base, 0, 0) {
+                    Some(v) => v,
+                    None => {
+                        if !this_is_object {
+                            return out(cx);
+                        }
+                        let desc = vm.lean_call_desc(fid);
+                        return match vm.loop_enter(fid, closure, desc, Some(this), base, 0, 0, cx.c() as u16, ip + 1, getter) {
+                            Some(first) => go(cx, first),
+                            None => out(cx),
+                        };
+                    }
+                }
+            }
+            GetAct::None => return out(cx),
+        };
+        cx.put(cx.c(), v.bits());
+        go(cx, cx.after(1))
+    }
+);
+
+heavy!(
+    /// `SuperSet`: `super.<name> = b` through the setter the site's super
+    /// cache names (`ic_super_set_stamped`, then `ic_super_set`), called
+    /// with `this` (register 0) in a frame the runner pushes, as the
+    /// dispatch arm calls it. A write of data, which goes to the receiver,
+    /// is the arm's. `d` the function, `k` the home class and the name
+    /// (`super_site`), `c` 1 in a static element's function.
+    h_super_set,
+    b_super_set,
+    |cx, go, out| {
+        let vm = cx.vm();
+        let ip = cx.ip();
+        let (home, name) = super_site(cx.k());
+        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+        let stamped = vm.ic_super_set_stamped(cx.d(), ip);
+        #[cfg(not(all(feature = "jit", not(feature = "safe-sandbox"))))]
+        let stamped = SetAct::None;
+        let act = match stamped {
+            SetAct::None => {
+                let key: &str = vm.func(cx.d() as usize).string_constants[name as usize].as_str();
+                vm.ic_super_set(cx.d(), ip, home, cx.c() != 0, key)
+            }
+            act => act,
+        };
+        let SetAct::Setter { fid, closure, setter } = act else { return out(cx) };
+        let this = Value::from_bits(cx.get(0));
+        if !vm.is_object_value(this) {
+            return out(cx);
+        }
+        let desc = vm.lean_call_desc(fid);
+        let (base, val) = (cx.frame_base(), cx.b() as u16);
+        match vm.loop_enter(fid, closure, desc, Some(this), base, val, 1, super::ic::RET_DISCARD, ip + 1, setter) {
+            Some(first) => go(cx, first),
+            None => out(cx),
         }
     }
 );
@@ -2014,6 +2301,59 @@ heavy!(
 );
 
 heavy!(
+    /// `New`: `c = new a(…)` (`b` the first argument's register, `d` the
+    /// count) by the dispatch arm's first ways: a constructor whose body
+    /// only stores, whose finished instance is made at once
+    /// (`Vm::new_stored`); a plain constructor function, and a base class
+    /// with a constructor of its own and no field initializer, whose
+    /// instance is made as the arm makes it and whose constructor's frame
+    /// the runner pushes, its return handing back the instance
+    /// (`Frame::construct_this`). Anything else (a class with fields or a
+    /// parent, a native, a bound function, a frame the lean push declines)
+    /// is the arm's.
+    h_new,
+    b_new,
+    |cx, go, out| {
+        let vm = cx.vm();
+        let cv = Value::from_bits(cx.get(cx.a()));
+        let (arg_base, argc) = (cx.b() as u16, cx.d() as u16);
+        let base = cx.frame_base();
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        if let Some(v) = vm.new_stored(cv, base, arg_base, argc) {
+            cx.put(cx.c(), v.bits());
+            return after_alloc(cx, cx.after(1));
+        }
+        let (fid, closure, obj, callee) = match vm.flat_new_instance(cv) {
+            Some((fid, closure, obj)) => (fid, closure, obj, cv),
+            None => {
+                let Some(target) = vm.flat_new_class_target(cv) else { return out(cx) };
+                if !vm.loop_class_fieldless(cv) {
+                    return out(cx);
+                }
+                // No field initializer: the making runs no code.
+                match vm.flat_new_class_make(cv, target) {
+                    Ok(made) => made,
+                    Err(_) => return out(cx),
+                }
+            }
+        };
+        let desc = vm.lean_call_desc(fid);
+        vm.pending_new_target = cv;
+        match vm.loop_enter(fid, closure, desc, Some(obj), base, arg_base, argc, cx.c() as u16, cx.ip() + 1, callee) {
+            Some(first) => {
+                let n = vm.frames.len();
+                vm.frames[n - 1].construct_this = true;
+                go(cx, first)
+            }
+            None => {
+                vm.pending_new_target = Value::UNDEFINED;
+                out(cx)
+            }
+        }
+    }
+);
+
+heavy!(
     /// `Return` from a frame this entry pushed: the value in `a` to the
     /// caller, and on at the position after its call (`Vm::loop_return`).
     /// The return of the frame the runner entered in is the dispatch
@@ -2295,30 +2635,26 @@ heavy!(
 
 heavy!(
     /// `FinalizeObject`: `c` = the object literal of the site's key plan
-    /// (`k`) over the `b` values from `a`, as the dispatch arm builds it; a
-    /// plan it would refuse is its to refuse (`d` the function).
+    /// over the values from `a`, as the dispatch arm builds it. `k` the
+    /// plan's address, `b` the count under the plan's index, `d` the
+    /// function: `decode` asked the arm's checks of the plan once, and a
+    /// plan they refuse is the arm's to refuse.
     h_finalize_object,
     b_finalize_object,
     |cx, go, out| {
         let vm = cx.vm();
-        let (val_base, count, plan_idx) = (cx.a(), cx.b() as usize, cx.k() as u16);
-        let Some(plan) = vm.func(cx.d() as usize).static_key_plans.get(plan_idx as usize) else {
-            return out(cx);
-        };
-        if !plan.runtime_valid()
-            || plan.len() > crate::bytecode::FINALIZE_STAGE_SLOTS
-            || plan.is_empty()
-            || plan.len() != count
-            || val_base as usize + count > u16::MAX as usize
-        {
-            return out(cx);
-        }
+        // SAFETY: an entry of the function's `static_key_plans`, which lives
+        // as long as the program (`'p`), and so the VM (`decode`).
+        let plan: &crate::bytecode::StaticKeyPlan = &*(cx.k() as *const crate::bytecode::StaticKeyPlan);
+        let (count, plan_idx) = ((cx.b() & 0xFFFF) as usize, (cx.b() >> 16) as u16);
+        // Positions are rebuilt when a function's body is replaced
+        // (`LoopFn::code`), so the plan is still the function's.
+        debug_assert!(std::ptr::eq(plan, &vm.func(cx.d() as usize).static_key_plans[plan_idx as usize]));
         let shape = vm.finalize_shape(cx.d(), plan_idx, plan);
-        let mut buf = [Value::UNDEFINED; crate::bytecode::FINALIZE_STAGE_SLOTS];
-        for (i, slot) in buf[..count].iter_mut().enumerate() {
-            *slot = Value::from_bits(cx.get(val_base + i as u32));
-        }
-        let v = Value::heap(vm.alloc_finalized_site(plan, &buf[..count], shape));
+        // The values straight from the window: the allocation moves no
+        // register file, and a recycled cell is never the window.
+        let vals = std::slice::from_raw_parts(cx.regs.add(cx.a() as usize) as *const Value, count);
+        let v = Value::heap(vm.alloc_finalized_site(plan, vals, shape));
         vm.realm_born(v.heap_index(), vm.obj_proto);
         cx.put(cx.c(), v.bits());
         after_alloc(cx, cx.after(1))
@@ -2686,6 +3022,21 @@ fn decode(f: &FuncProto, code: &[Instr], ip: usize, func_id: u32, nglobals: usiz
         }
         Instr::GetIndex { dst, obj, key } => op(h_get_index, obj, key, dst, 0, 0),
         Instr::SetIndex { obj, key, val } => op(h_set_index, obj, key, val, 0, 0),
+        // A loop whose `in` probes the arm collapses (`try_in_probe_reduce`)
+        // is the arm's: entered here, the runner would run it in full.
+        Instr::HasProp { dst, key, obj, brand: false } if !super::enum_stream::in_probe_hook(f, ip) => {
+            op(h_has_prop, key, obj, dst, 0, 0)
+        }
+        Instr::ToPropKey { dst, obj, src } => op(h_to_prop_key, src, obj, dst, 0, 0),
+        Instr::BitNot { dst, a } => op(h_bit_not, a, 0, dst, 0, 0),
+        Instr::InstanceOfDyn { dst, val, ctor } => op(h_instance_of, val, ctor, dst, 0, 0),
+        // A keys-length loop the arm collapses (`try_object_keys_len_reduce`)
+        // is the arm's, as `HasProp`'s probes are.
+        Instr::ObjectKeys { dst, obj, callee, this_v } if !super::enum_stream::object_keys_len_hook(f, ip) => {
+            op(h_object_keys, obj, callee, dst, this_v as u32, 0)
+        }
+        Instr::IsArray { dst, a, callee, this_v } => op(h_is_array, a, callee, dst, this_v as u32, 0),
+        Instr::New { dst, callee, arg_base, argc } => op(h_new, callee, arg_base, dst, argc as u32, 0),
         Instr::GetProp { dst, obj, name } if named(name, "length") => op(h_get_length, obj, 0, dst, func_id, 0),
         // A private name's read or write is the dispatch arm's (brand
         // checks): it fills no way of the cache these two ask.
@@ -2775,12 +3126,32 @@ fn decode(f: &FuncProto, code: &[Instr], ip: usize, func_id: u32, nglobals: usiz
         } => op(h_iter_next, iter, idx, value_dst, done_dst as u32, 0),
         Instr::NewArray { dst, arg_base, argc } => op(h_new_array, arg_base, 0, dst, argc as u32, 0),
         Instr::NewObject { dst, hint } => op(h_new_object, 0, 0, dst, 0, hint as u64),
+        // The arm's checks of the plan, once: a plan they refuse is the
+        // arm's to refuse. The plan's address goes in `k`.
         Instr::FinalizeObject {
             dst,
             plan,
             val_base,
             count,
-        } => op(h_finalize_object, val_base, count, dst, func_id, plan as u64),
+        } => match f.static_key_plans.get(plan as usize) {
+            Some(p)
+                if p.runtime_valid()
+                    && !p.is_empty()
+                    && p.len() <= crate::bytecode::FINALIZE_STAGE_SLOTS
+                    && p.len() == count as usize
+                    && val_base as usize + count as usize <= u16::MAX as usize =>
+            {
+                Op {
+                    h: h_finalize_object,
+                    a: val_base as u32,
+                    b: count as u32 | (plan as u32) << 16,
+                    c: dst as u32,
+                    d: func_id,
+                    k: p as *const crate::bytecode::StaticKeyPlan as u64,
+                }
+            }
+            _ => leave,
+        },
         Instr::MakeClosure { dst, func_id: f } => op(h_make_closure, 0, 0, dst, f, 0),
         Instr::MakeArrow {
             dst,
@@ -2809,6 +3180,13 @@ fn decode(f: &FuncProto, code: &[Instr], ip: usize, func_id: u32, nglobals: usiz
         Instr::ToStr { dst, a } => op(h_to_str, a, 0, dst, 0, 0),
         Instr::StrAppendIndex { .. } => op(h_str_append_index, 0, 0, 0, 0, 0),
         Instr::GetIterator { dst, src } => op(h_get_iterator, src, 0, dst, 0, 0),
+        Instr::SuperBase { dst, home_class_id } => op(h_super_base, f.super_static as u16, 0, dst, home_class_id, 0),
+        Instr::SuperGet { dst, home_class_id, name } => {
+            op(h_super_get, f.super_static as u16, 0, dst, func_id, home_class_id as u64 | (name as u64) << 32)
+        }
+        Instr::SuperSet { home_class_id, name, val, .. } => {
+            op(h_super_set, 0, val, f.super_static as u16, func_id, home_class_id as u64 | (name as u64) << 32)
+        }
         _ => leave,
     }
 }
@@ -3458,6 +3836,13 @@ impl<'p> Vm<'p> {
         }
         // SAFETY: `ip` is the position after the caller's call.
         unsafe { ops.add(ip) }
+    }
+
+    /// Whether the class `cv` has no field initializer to run on a new
+    /// instance (`h_new`).
+    #[inline]
+    fn loop_class_fieldless(&self, cv: Value) -> bool {
+        matches!(self.heap.get(cv.heap_index()), HeapObj::Class(c) if c.field_thunk.is_none())
     }
 
     /// [`Self::loop_return_now`] when the return is the runner's, else

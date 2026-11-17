@@ -204,6 +204,28 @@ mod tests {
         assert!(Lexer::new("\"a\nb\"").next_token(false).is_err());
     }
 
+    /// A literal with no escape is its source bytes (the lexer's copy, not
+    /// the unit-by-unit loop): raw non-ASCII and U+2028 are content, the other
+    /// quote is content, and the token after it starts where it should.
+    #[test]
+    fn plain_string_literals_are_their_bytes() {
+        let toks = lex_all("'caf\u{e9} \u{4e2d}\u{1F600}' \"it's\" '' 'a\u{2028}b' x");
+        let strs: Vec<String> = toks
+            .iter()
+            .filter_map(|t| match t {
+                TokenKind::Str(v) => Some(v.to_lossy_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(strs, ["caf\u{e9} \u{4e2d}\u{1F600}", "it's", "", "a\u{2028}b"]);
+        assert!(matches!(toks.last(), Some(TokenKind::Ident { name, .. }) if &**name == "x"), "{toks:?}");
+        // An escape after plain bytes still takes the general reader.
+        match &lex_all("'plain\\u0041'")[0] {
+            TokenKind::Str(v) => assert_eq!(v.to_lossy_string(), "plainA"),
+            other => panic!("got {other:?}"),
+        }
+    }
+
     #[test]
     fn slash_is_division_or_regex_only_the_parser_knows() {
         // Same bytes, both readings, decided by the caller.

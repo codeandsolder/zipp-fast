@@ -316,12 +316,71 @@ enum Mapped {
     Multi(&'static [u16; 3]),
 }
 
+/// For each 256-code-point page `p` of the Basic Multilingual Plane, how many
+/// runs of `table` start at or before the page's first code point (entry 256:
+/// at or before U+10000). The runs that can cover a code point `u` of page `p`
+/// are then the last one starting at or before the page and those starting in
+/// it, `table[pages[p] - 1..pages[p + 1]]`: none to a few for most pages, where
+/// the whole table is 186 runs (lower) or 303 (upper).
+///
+/// Native builds only: WebAssembly, built for its download size, searches
+/// the whole table and carries no index (`Pages` is `()` there).
+#[cfg(not(target_arch = "wasm32"))]
+const fn case_pages(table: &[(u32, i32)]) -> [u16; 257] {
+    let mut out = [0u16; 257];
+    let (mut p, mut i) = (0usize, 0usize);
+    while p <= 256 {
+        let first = (p as u32) << 8;
+        while i < table.len() && table[i].0 & RUN_START <= first {
+            i += 1;
+        }
+        out[p] = i as u16;
+        p += 1;
+    }
+    out
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+type Pages = [u16; 257];
+#[cfg(target_arch = "wasm32")]
+type Pages = ();
+
+#[cfg(not(target_arch = "wasm32"))]
+static CASE_LOWER_PAGES: Pages = case_pages(&CASE_LOWER);
+#[cfg(not(target_arch = "wasm32"))]
+static CASE_UPPER_PAGES: Pages = case_pages(&CASE_UPPER);
+#[cfg(target_arch = "wasm32")]
+static CASE_LOWER_PAGES: Pages = ();
+#[cfg(target_arch = "wasm32")]
+static CASE_UPPER_PAGES: Pages = ();
+
+/// The runs of `table` (paged by `pages`, see [`case_pages`]) that can cover `u`:
+/// on WebAssembly, the whole table.
+#[inline(always)]
+#[cfg(target_arch = "wasm32")]
+fn candidate_runs<'t>(_u: u32, table: &'t [(u32, i32)], _pages: &Pages) -> &'t [(u32, i32)] {
+    table
+}
+
+/// The runs of `table` (paged by `pages`, see [`case_pages`]) that can cover `u`.
+#[cfg(not(target_arch = "wasm32"))]
+#[inline(always)]
+fn candidate_runs<'t>(u: u32, table: &'t [(u32, i32)], pages: &Pages) -> &'t [(u32, i32)] {
+    let (lo, hi) = match pages.get((u >> 8) as usize..) {
+        Some([lo, hi, ..]) => (usize::from(*lo), usize::from(*hi)),
+        // Past the BMP: the last run at or before U+10000, and every later one.
+        _ => (usize::from(pages[256]), table.len()),
+    };
+    table.get(lo.saturating_sub(1)..hi).unwrap_or(table)
+}
+
 /// The run of `table` covering `u`, if one does, and what it maps `u` to.
 /// Written out, a branchless binary search over the runs' first code points
 /// (the standard library's form), so that Lite, built for size, does not
-/// leave each step a call.
+/// leave each step a call; over the runs `pages` leaves for `u`'s page.
 #[inline(always)]
-fn lookup(u: u32, table: &[(u32, i32)]) -> Mapped {
+fn lookup(u: u32, table: &[(u32, i32)], pages: &Pages) -> Mapped {
+    let table = candidate_runs(u, table, pages);
     let (mut base, mut size) = (0usize, table.len());
     while size > 1 {
         let half = size / 2;
@@ -367,8 +426,8 @@ fn row_chars(row: &[u16; 3]) -> impl Iterator<Item = char> + '_ {
 }
 
 #[inline(always)]
-fn map_char(c: char, table: &[(u32, i32)]) -> CaseMapping {
-    match lookup(c as u32, table) {
+fn map_char(c: char, table: &[(u32, i32)], pages: &Pages) -> CaseMapping {
+    match lookup(c as u32, table, pages) {
         Mapped::Same => CaseMapping::one(c),
         Mapped::One(m) => CaseMapping::one(m),
         Mapped::Multi(row) => {
@@ -388,8 +447,8 @@ fn map_char(c: char, table: &[(u32, i32)]) -> CaseMapping {
 
 /// Appends the default mapping of `c`, which is not ASCII, to `out`.
 #[inline(always)]
-fn push_mapped(out: &mut String, c: char, table: &[(u32, i32)]) {
-    match lookup(c as u32, table) {
+fn push_mapped(out: &mut String, c: char, table: &[(u32, i32)], pages: &Pages) {
+    match lookup(c as u32, table, pages) {
         Mapped::Same => out.push(c),
         Mapped::One(m) => out.push(m),
         Mapped::Multi(row) => {
@@ -406,7 +465,7 @@ pub(crate) fn to_lower(c: char) -> CaseMapping {
     if c.is_ascii() {
         return CaseMapping::one(c.to_ascii_lowercase());
     }
-    map_char(c, &CASE_LOWER)
+    map_char(c, &CASE_LOWER, &CASE_LOWER_PAGES)
 }
 
 /// `c.to_uppercase()`, without the standard library's tables.
@@ -415,7 +474,7 @@ pub(crate) fn to_upper(c: char) -> CaseMapping {
     if c.is_ascii() {
         return CaseMapping::one(c.to_ascii_uppercase());
     }
-    map_char(c, &CASE_UPPER)
+    map_char(c, &CASE_UPPER, &CASE_UPPER_PAGES)
 }
 
 /// The UTF-8 length of `c`'s default upper (`upper`) or lower mapping. The
@@ -424,7 +483,8 @@ pub(crate) fn mapped_len(c: char, upper: bool) -> usize {
     if c.is_ascii() {
         return 1;
     }
-    match lookup(c as u32, if upper { &CASE_UPPER } else { &CASE_LOWER }) {
+    let (table, pages) = if upper { (&CASE_UPPER[..], &CASE_UPPER_PAGES) } else { (&CASE_LOWER[..], &CASE_LOWER_PAGES) };
+    match lookup(c as u32, table, pages) {
         Mapped::Same => c.len_utf8(),
         Mapped::One(m) => m.len_utf8(),
         Mapped::Multi(row) => row_chars(row).map(char::len_utf8).sum(),
@@ -438,7 +498,7 @@ pub(crate) fn str_to_uppercase(s: &str) -> String {
         if c.is_ascii() {
             out.push(c.to_ascii_uppercase());
         } else {
-            push_mapped(&mut out, c, &CASE_UPPER);
+            push_mapped(&mut out, c, &CASE_UPPER, &CASE_UPPER_PAGES);
         }
     }
     out
@@ -456,7 +516,7 @@ pub(crate) fn str_to_lowercase(s: &str) -> String {
         } else if c == '\u{3A3}' {
             out.push(lower_sigma(s, i));
         } else {
-            push_mapped(&mut out, c, &CASE_LOWER);
+            push_mapped(&mut out, c, &CASE_LOWER, &CASE_LOWER_PAGES);
         }
     }
     out

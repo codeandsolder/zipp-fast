@@ -43,6 +43,21 @@ impl<'p> Vm<'p> {
         Some((m.attr_at(p), m.val_at(p)))
     }
 
+    /// Whether index `i` of the array at `arr_idx`, a hole or past its dense
+    /// end, is absent from it and from its prototype chain: no side table
+    /// holds it, the array has its ordinary prototype and is no arguments
+    /// object, and nothing on `Array.prototype`'s chain has an index (the
+    /// protector a hole read takes, `get_index`). The `in` operator's
+    /// shortcut, in the dispatch arm and the loop runner.
+    #[inline(always)]
+    pub(crate) fn hole_index_absent(&self, arr_idx: u32, i: usize) -> bool {
+        crate::codegen::hole_undef_enabled()
+            && !self.array_proto_has_index
+            && !self.proto_of.contains_key(&arr_idx)
+            && (self.arguments_objs.is_empty() || !self.arguments_objs.contains_key(&arr_idx))
+            && self.array_index_override(arr_idx, i).is_none()
+    }
+
     /// Can anything outside the dense `Vec` shadow, hide, or constrain an ELEMENT
     /// (or `length`) of the array at `idx`? The precise form of the
     /// `arr_props.contains_key(&idx)` test that the dense fast paths grew up on.

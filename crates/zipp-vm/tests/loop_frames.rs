@@ -10,8 +10,8 @@
 //! runner pushed, caught in the loop's function and above it; recursion past
 //! the frame limit; closures, an arrow's captured `this`, a sloppy function's
 //! and a strict one's; `for…of` over arrays with a call in the body, over a
-//! hole and over an array the loop grows; generators, async functions and
-//! constructors, which are not the runner's frames; a callee replaced while
+//! hole and over an array the loop grows; generators and async functions,
+//! which are not the runner's frames, and constructors; a callee replaced while
 //! the loop runs and one that is not a function; mutual recursion with loops
 //! at each level; results that are not numbers; a collection while frames
 //! the runner pushed are live. In the interpreter with the runner entering
@@ -103,7 +103,7 @@ function forOf(n) {
 }
 out.push(forOf(500));
 
-// 10. Generators, async functions and constructors called from a hot loop are not the runner's frames.
+// 10. Generators and async functions called from a hot loop are not the runner's frames; constructors are.
 function* gen(i) { yield i; yield i + 1; }
 function ctor(i) { this.i = i; }
 async function later(i) { return i; }

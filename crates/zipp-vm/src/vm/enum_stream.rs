@@ -511,6 +511,14 @@ fn periodic_in_key(
     Some((next, key, modulus, scale, offset))
 }
 
+/// Whether instruction `ip` of `proto` is the `HasProp` that hooks an
+/// in-probe loop's reduction (`try_in_probe_reduce`): the loop runner leaves
+/// it to the dispatch arm, which may collapse the whole loop there.
+#[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+pub(crate) fn in_probe_hook(proto: &crate::bytecode::FuncProto, ip: usize) -> bool {
+    matches!(proto.code.get(ip), Some(Instr::HasProp { brand: false, .. })) && recognize_in_probe_reduce(proto, ip).is_some()
+}
+
 /// Recognize an arbitrary non-empty sequence of
 /// `if (periodicIntegerKey in source) counter++` probes inside one compiler
 /// induction loop. The first `HasProp` is the dispatch hook; accepting only it
@@ -995,6 +1003,15 @@ fn recognize_forin_sum(proto: &crate::bytecode::FuncProto, ip: usize) -> Option<
         limit_global,
         exit: start + 26,
     })
+}
+
+/// Whether instruction `ip` of `proto` is the `ObjectKeys` that hooks a
+/// keys-length loop's reduction (`try_object_keys_len_reduce`): the loop
+/// runner leaves it to the dispatch arm, which may collapse the whole loop
+/// there.
+#[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+pub(crate) fn object_keys_len_hook(proto: &crate::bytecode::FuncProto, ip: usize) -> bool {
+    recognize_object_keys_len(proto, ip).is_some()
 }
 
 fn recognize_object_keys_len(

@@ -2566,13 +2566,7 @@ impl<'p> Vm<'p> {
                                     // hole read takes (`get_index`), under the
                                     // same protector. It walked the full
                                     // HasProperty, key text and all.
-                                    if crate::codegen::hole_undef_enabled()
-                                        && !self.array_proto_has_index
-                                        && !self.proto_of.contains_key(&aidx)
-                                        && (self.arguments_objs.is_empty()
-                                            || !self.arguments_objs.contains_key(&aidx))
-                                        && self.array_index_override(aidx, i).is_none()
-                                    {
+                                    if self.hole_index_absent(aidx, i) {
                                         self.set(base, dst, Value::bool(false));
                                         ip += 1;
                                         continue;

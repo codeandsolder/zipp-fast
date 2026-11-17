@@ -66,7 +66,13 @@ jobs:
   # browser modules one after another; as two, 15.
   python:
     name: Python native tests (${{ matrix.group }})
-    runs-on: ubuntu-latest
+    # Pinned: the parser group checks ZIPP's Python front end, which parses
+    # Python 3.13, against the runner's own CPython. ubuntu-latest moved to an
+    # image whose CPython is 3.14, which accepts syntax 3.13 does not
+    # (`except A, B:` without parentheses, PEP 758; template strings,
+    # PEP 750), so the check failed on CPython's new grammar, not on ZIPP.
+    # Ubuntu 24.04's CPython is 3.12, what the check ran against before.
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     strategy:
       fail-fast: false

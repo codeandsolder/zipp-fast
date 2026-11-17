@@ -20,7 +20,20 @@ impl SourceIndex {
         let mut wide = Vec::new();
         let mut extra = 0u32;
         let mut i = 0usize;
+        // Eight bytes with no line terminator and nothing beyond ASCII are
+        // skipped as one word: a bundle is nearly all of that, and a byte at a
+        // time cost ten instructions a byte (3% of loading a 2 MB bundle).
+        const ONES: u64 = 0x0101_0101_0101_0101;
+        const HIGH: u64 = 0x8080_8080_8080_8080;
+        let has_zero = |x: u64| x.wrapping_sub(ONES) & !x & HIGH;
         while i < bytes.len() {
+            if let Some(word) = bytes.get(i..i + 8) {
+                let w = u64::from_le_bytes(word.try_into().expect("eight bytes"));
+                if (has_zero(w ^ (ONES * u64::from(b'\n'))) | has_zero(w ^ (ONES * u64::from(b'\r'))) | (w & HIGH)) == 0 {
+                    i += 8;
+                    continue;
+                }
+            }
             let b = bytes[i];
             if b < 0x80 {
                 // LineTerminator: LF, CR, and CR LF as one.
@@ -181,5 +194,34 @@ mod tests {
         assert_eq!(at("i"), (5, 1));
         // é is one UTF-16 unit, the emoji two: x is the fourth unit.
         assert_eq!(at("x"), (6, 4));
+    }
+
+    /// The index skips eight plain bytes at a time: a line terminator or a
+    /// non-ASCII character at every offset from a word boundary, in runs long
+    /// enough to be skipped, must place every character as a byte-at-a-time
+    /// count does.
+    #[test]
+    fn word_skips_place_every_character() {
+        let pieces = ["\n", "\r\n", "\r", "\u{2028}", "\u{e9}", "\u{1F600}", "\u{4e2d}"];
+        for piece in pieces {
+            for lead in 0..17 {
+                for tail in [0, 3, 8, 13] {
+                    let src = format!("{}{piece}{}{piece}{}", "a".repeat(lead), "b".repeat(9 + tail), "c".repeat(tail));
+                    let idx = SourceIndex::new(&src);
+                    let (mut line, mut col) = (1u32, 1u32);
+                    let mut chars = src.char_indices().peekable();
+                    while let Some((off, ch)) = chars.next() {
+                        assert_eq!(idx.line_col(off as u32), (line, col), "{src:?} at {off}");
+                        let crlf = ch == '\r' && chars.peek().is_some_and(|&(_, n)| n == '\n');
+                        if matches!(ch, '\n' | '\r' | '\u{2028}' | '\u{2029}') && !crlf {
+                            line += 1;
+                            col = 1;
+                        } else {
+                            col += ch.len_utf16() as u32;
+                        }
+                    }
+                }
+            }
+        }
     }
 }
