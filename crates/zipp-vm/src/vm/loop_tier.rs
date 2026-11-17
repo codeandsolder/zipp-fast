@@ -1520,6 +1520,29 @@ heavy!(
 );
 
 heavy!(
+    /// `ObjectKeys`: `c = Object.keys(a)` while the callee `b` and its
+    /// receiver `d` are the intrinsic, for an object that is no Proxy, by
+    /// the arm's enumeration (`object_enum_own`), which runs no code for
+    /// one. A primitive (its wrapper), a Proxy (its traps) and another
+    /// callee are the arm's.
+    h_object_keys,
+    b_object_keys,
+    |cx, go, out| {
+        let vm = cx.vm();
+        let (callee, this_v) = (Value::from_bits(cx.get(cx.b())), Value::from_bits(cx.get(cx.d())));
+        let o = Value::from_bits(cx.get(cx.a()));
+        if !o.is_heap()
+            || !vm.is_object_value(o)
+            || vm.proxy_parts(o.heap_index()).is_some()
+            || !vm.static_builtin_is_intrinsic("Object", native::OBJ_KEYS, callee, this_v)
+        {
+            return out(cx);
+        }
+        finish(cx, vm.object_enum_own(o, EnumWhat::Keys))
+    }
+);
+
+heavy!(
     /// `InstanceOfDyn`: `c = a instanceof b` by the operator's fast path
     /// (`Vm::instanceof_fast`: a function or class whose @@hasInstance is
     /// the intrinsic one and whose `prototype` is read without a getter, no
@@ -3007,6 +3030,11 @@ fn decode(f: &FuncProto, code: &[Instr], ip: usize, func_id: u32, nglobals: usiz
         Instr::ToPropKey { dst, obj, src } => op(h_to_prop_key, src, obj, dst, 0, 0),
         Instr::BitNot { dst, a } => op(h_bit_not, a, 0, dst, 0, 0),
         Instr::InstanceOfDyn { dst, val, ctor } => op(h_instance_of, val, ctor, dst, 0, 0),
+        // A keys-length loop the arm collapses (`try_object_keys_len_reduce`)
+        // is the arm's, as `HasProp`'s probes are.
+        Instr::ObjectKeys { dst, obj, callee, this_v } if !super::enum_stream::object_keys_len_hook(f, ip) => {
+            op(h_object_keys, obj, callee, dst, this_v as u32, 0)
+        }
         Instr::IsArray { dst, a, callee, this_v } => op(h_is_array, a, callee, dst, this_v as u32, 0),
         Instr::New { dst, callee, arg_base, argc } => op(h_new, callee, arg_base, dst, argc as u32, 0),
         Instr::GetProp { dst, obj, name } if named(name, "length") => op(h_get_length, obj, 0, dst, func_id, 0),

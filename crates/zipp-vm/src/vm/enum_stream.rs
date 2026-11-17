@@ -1005,6 +1005,15 @@ fn recognize_forin_sum(proto: &crate::bytecode::FuncProto, ip: usize) -> Option<
     })
 }
 
+/// Whether instruction `ip` of `proto` is the `ObjectKeys` that hooks a
+/// keys-length loop's reduction (`try_object_keys_len_reduce`): the loop
+/// runner leaves it to the dispatch arm, which may collapse the whole loop
+/// there.
+#[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+pub(crate) fn object_keys_len_hook(proto: &crate::bytecode::FuncProto, ip: usize) -> bool {
+    recognize_object_keys_len(proto, ip).is_some()
+}
+
 fn recognize_object_keys_len(
     proto: &crate::bytecode::FuncProto,
     ip: usize,
