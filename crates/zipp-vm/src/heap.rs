@@ -140,6 +140,15 @@ pub(crate) const FID_MIRROR_NONE: u32 = u32::MAX;
 #[cfg(feature = "jit")]
 pub(crate) const FID_MIRROR_CTOR: u32 = FID_MIRROR_CLASS - 1;
 
+/// The fid-mirror word of a non-empty flat string (`HeapObj::Str` with
+/// `units > 0`, paired with `shape == DICT`): lets inline JIT `typeof` and
+/// `to_bool` resolve non-empty strings straight from `hot_mirror`, and lets GC
+/// tracing skip pushing edge-free flat strings onto the mark stack. Ropes
+/// (`HeapObj::Cons`) and empty strings retain `HotMirror::CLEAR` so `Cons`
+/// children are always traced and `to_bool("")` stays `false`.
+#[cfg(feature = "jit")]
+pub(crate) const FID_MIRROR_STR: u32 = FID_MIRROR_CTOR - 1;
+
 /// The fid-mirror bit of a class instance's map: the word is the bit and its
 /// class's heap index (`object_mirror_fid`), so Tier C's class-method lane
 /// can check a receiver's class without loading its map. No function id has
@@ -6710,13 +6719,14 @@ mod gc_courier {
 
 /// B212: one const+int concat memo entry (see `Heap::concat_memo`).
 #[cfg(not(feature = "safe-sandbox"))]
+#[repr(C)]
 #[derive(Clone, Copy)]
-struct ConcatMemoEntry {
-    left_idx: u32,
-    left_ver: u32,
-    int: i32,
-    res_idx: u32,
-    res_ver: u32,
+pub(crate) struct ConcatMemoEntry {
+    pub(crate) left_idx: u32,
+    pub(crate) left_ver: u32,
+    pub(crate) int: i32,
+    pub(crate) res_idx: u32,
+    pub(crate) res_ver: u32,
 }
 
 /// B253: one weak `frozen-left + pinned-ASCII-suffix` concat memo entry.
@@ -6924,6 +6934,13 @@ impl HotMirror {
         fid: FID_MIRROR_NONE,
         vals: 0,
     };
+
+    /// A non-empty string record: `DICT` shape, `FID_MIRROR_STR` sentinel.
+    pub(crate) const STR: HotMirror = HotMirror {
+        shape: crate::shape::DICT,
+        fid: FID_MIRROR_STR,
+        vals: 0,
+    };
 }
 
 #[cfg(feature = "jit")]
@@ -6944,9 +6961,19 @@ fn clear_hot_mirror() -> HotMirrorHint {
     Some(HotMirror::CLEAR)
 }
 
+#[cfg(feature = "jit")]
+#[inline(always)]
+fn str_hot_mirror() -> HotMirrorHint {
+    Some(HotMirror::STR)
+}
+
 #[cfg(not(feature = "jit"))]
 #[inline(always)]
 fn clear_hot_mirror() -> HotMirrorHint {}
+
+#[cfg(not(feature = "jit"))]
+#[inline(always)]
+fn str_hot_mirror() -> HotMirrorHint {}
 
 #[cfg(not(feature = "jit"))]
 #[inline(always)]
@@ -7660,6 +7687,10 @@ pub struct Heap {
     /// anything: a collected result's version mismatch is a plain miss.
     #[cfg(not(feature = "safe-sandbox"))]
     concat_memo: Vec<ConcatMemoEntry>,
+    /// Raw base of `concat_memo` for the inline `emit_concat_memo_fast` probe
+    /// (0 when disabled or when oracle telemetry needs exact hit/miss counts).
+    #[cfg(all(not(feature = "safe-sandbox"), feature = "jit", target_arch = "x86_64"))]
+    pub(crate) concat_memo_raw: u64,
     /// B212 oracle telemetry: [hits, misses]. Printed at heap drop.
     #[cfg(not(feature = "safe-sandbox"))]
     concat_memo_stats: [u64; 2],
@@ -8464,6 +8495,8 @@ impl Heap {
             courier_stats: [0; 6],
             #[cfg(not(feature = "safe-sandbox"))]
             concat_memo: vec![ConcatMemoEntry::EMPTY; CONCAT_MEMO_SLOTS],
+            #[cfg(all(not(feature = "safe-sandbox"), feature = "jit", target_arch = "x86_64"))]
+            concat_memo_raw: 0,
             #[cfg(not(feature = "safe-sandbox"))]
             concat_memo_stats: [0; 2],
             #[cfg(all(not(feature = "safe-sandbox"), feature = "jit", target_arch = "x86_64"))]
@@ -8519,7 +8552,12 @@ impl Heap {
             shell_cell_stats: [0; 2],
             thin_stats: [0; 6],
             #[cfg(feature = "jit")]
-            hot_mirror: vec![HotMirror::CLEAR; versions.len()],
+            hot_mirror: {
+                // Pre-interned slots are non-empty ASCII strings except `INTERN_EMPTY`.
+                let mut hm = vec![HotMirror::STR; versions.len()];
+                hm[INTERN_EMPTY as usize] = HotMirror::CLEAR;
+                hm
+            },
             cell_vals_mirror: vec![Value::UNDEFINED.bits(); versions.len()],
             atoms: Vec::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -8690,6 +8728,22 @@ impl Heap {
             self.versions_raw = self.versions.as_ptr() as u64;
             self.gen_raw = self.gen.as_ptr() as u64;
         }
+        #[cfg(all(not(feature = "safe-sandbox"), feature = "jit", target_arch = "x86_64"))]
+        {
+            self.concat_memo_raw = if concat_memo_enabled() && !self.oracle {
+                self.concat_memo.as_ptr() as u64
+            } else {
+                0
+            };
+        }
+    }
+
+    /// True iff slot `idx` holds a non-empty flat `HeapObj::Str` (zero outgoing
+    /// GC edges, never in `closure_home` / `closure_new_target`).
+    #[cfg(feature = "jit")]
+    #[inline(always)]
+    pub(crate) fn is_flat_str_mirror(&self, idx: usize) -> bool {
+        self.hot_mirror[idx].fid == FID_MIRROR_STR
     }
 
     /// Re-cache `gen_raw` after a `gen` growth (`push` / `reserve_exact` may
@@ -9542,16 +9596,25 @@ impl Heap {
                     HotMirror::CLEAR,
                     "free_slot leaves a recycled slot's mirror cleared"
                 );
+                #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                let arr_entry = [items.as_ptr() as u64, items.len() as u64];
                 self.reuse_slot_begin();
                 self.reuse_slot_write_array(idx, items);
                 self.reuse_slot_stamp(idx);
+                #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                {
+                    self.arr_mirror[idx as usize] = arr_entry;
+                }
                 if self.oracle {
                     self.thin_stats[2] += 1;
                 }
                 return idx;
             }
         }
-        self.alloc(HeapObj::Array(items))
+        let idx = self.alloc(HeapObj::Array(items));
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        self.repair_arr_mirror(idx);
+        idx
     }
 
     /// B257: allocate a capture-free function value with its mirror
@@ -9754,6 +9817,7 @@ impl Heap {
             // B201: a Cell's mirror is written by `alloc_cell` (the enum
             // carries no payload to copy from).
             HeapObj::Cell => HotMirror::CLEAR,
+            HeapObj::Str(s) if s.units() > 0 => HotMirror::STR,
             // Python attribute storage: its layout and values (see the JIT
             // contract in `vm::py_table::layout`).
             #[cfg(feature = "python")]
@@ -9819,6 +9883,7 @@ impl Heap {
             HeapObj::Object(_) | HeapObj::Func(_) | HeapObj::Closure { .. } => no_hot_mirror(),
             #[cfg(feature = "python")]
             HeapObj::PyAttrs { .. } => no_hot_mirror(),
+            HeapObj::Str(s) if s.units() > 0 => str_hot_mirror(),
             _ => clear_hot_mirror(),
         };
         self.alloc_settled(obj, hot)
@@ -11374,6 +11439,26 @@ impl Heap {
         // still moved each one's 80 bytes out of its slot and called the
         // enum's drop glue on the copy, a third of what it cost to sweep the
         // three million promises of a `Promise.all` benchmark.
+        if matches!(&self.objs[idx as usize], HeapObj::Cell) {
+            // `Cell` is payload-free (hot_mirror is already CLEAR); only its
+            // value mirror needs resetting before retiring the slot.
+            self.cell_vals_mirror[idx as usize] = Value::UNDEFINED.bits();
+            if self.payload_accounting.get() {
+                let payload = self.resident_payload_charged[idx as usize].replace(0);
+                self.resident_payload_current
+                    .set(self.resident_payload_current.get().saturating_sub(payload));
+            }
+            std::mem::forget(std::mem::replace(
+                &mut self.objs[idx as usize],
+                HeapObj::Date(f64::NAN),
+            ));
+            self.version_retire(idx);
+            if self.nursery {
+                self.gen[idx as usize] = GEN_OLD;
+            }
+            self.free.push(idx);
+            return;
+        }
         if matches!(
             &self.objs[idx as usize],
             HeapObj::Promise {
@@ -11381,6 +11466,12 @@ impl Heap {
                 ..
             } | HeapObj::BoundResolver { .. }
                 | HeapObj::CombinatorResolver { .. }
+                | HeapObj::Func(_)
+                | HeapObj::Cons { .. }
+                | HeapObj::Native(_)
+                | HeapObj::Date(_)
+                | HeapObj::BigInt(_)
+                | HeapObj::Boxed { .. }
         ) {
             #[cfg(feature = "jit")]
             {
@@ -12309,8 +12400,14 @@ impl Heap {
                     HotMirror::CLEAR,
                     "free_slot leaves a recycled slot's mirror cleared"
                 );
+                #[cfg(feature = "jit")]
+                let non_empty = js.units() > 0;
                 self.reuse_slot_begin();
                 self.reuse_slot_write(idx, HeapObj::Str(js));
+                #[cfg(feature = "jit")]
+                if non_empty {
+                    self.hot_mirror[idx as usize] = HotMirror::STR;
+                }
                 self.reuse_slot_stamp(idx);
                 return idx;
             }

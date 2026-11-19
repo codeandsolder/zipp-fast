@@ -135,6 +135,9 @@ pub(crate) const JIT_HTMLDDA_IDX_OFFSET: usize = core::mem::offset_of!(Vm<'stati
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_HTMLDDA_SCALAR_ENABLED_OFFSET: usize =
     core::mem::offset_of!(Vm<'static>, htmldda_scalar_enabled);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_TYPEOF_SPECIAL_MAX_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, typeof_special_max);
 
 /// VM-relative bases pinned by Tier-C whole-function entry code. These are
 /// explicit mirrors rather than offsets into `Vec`: Rust does not expose a
@@ -283,6 +286,21 @@ pub(crate) const JIT_ARRAY_SNAPSHOT_EPOCH_OFFSET: usize = core::mem::offset_of!(
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_GEN_RAW_OFFSET: usize =
     core::mem::offset_of!(Vm<'static>, heap) + core::mem::offset_of!(crate::heap::Heap, gen_raw);
+/// VM-relative offset of `Heap::concat_memo_raw` (inline string+int memo probe).
+#[cfg(all(not(feature = "safe-sandbox"), feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_CONCAT_MEMO_RAW_OFFSET: usize = core::mem::offset_of!(Vm<'static>, heap)
+    + core::mem::offset_of!(crate::heap::Heap, concat_memo_raw);
+#[cfg(all(not(feature = "safe-sandbox"), feature = "jit", target_arch = "x86_64"))]
+const _: () = {
+    use crate::heap::ConcatMemoEntry as E;
+    assert!(core::mem::size_of::<E>() == 20);
+    assert!(core::mem::offset_of!(E, left_idx) == 0);
+    assert!(core::mem::offset_of!(E, left_ver) == 4);
+    assert!(core::mem::offset_of!(E, int) == 8);
+    assert!(core::mem::offset_of!(E, res_idx) == 12);
+    assert!(core::mem::offset_of!(E, res_ver) == 16);
+    assert!(JIT_CONCAT_MEMO_RAW_OFFSET % core::mem::align_of::<u64>() == 0);
+};
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 const _: () = assert!(JIT_GEN_RAW_OFFSET % core::mem::align_of::<u64>() == 0);
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -303,6 +321,8 @@ pub(crate) const JIT_REGS_LEN_OFFSET: usize = core::mem::offset_of!(Vm<'static>,
     + core::mem::offset_of!(crate::vm::RegisterFile, logical_len);
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_REGS_HW_OFFSET: usize = core::mem::offset_of!(Vm<'static>, regs_hw);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_REGS_END_OFFSET: usize = core::mem::offset_of!(Vm<'static>, regs_end_raw);
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 const _: () = {
     use crate::vm::RegisterFile as R;

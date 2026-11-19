@@ -591,14 +591,7 @@ pub(crate) fn compile_region_mem(
     // each inlined Call site reads it and falls back to the helper on 0. rbx is
     // callee-saved (survives the call); rcx/rdx/r8 are volatile scratch here.
     if do_leaf || do_method {
-        dynasm!(ops
-            ; mov rcx, rdi                            // vm
-            ; mov rdx, rbx                            // caller window base
-            ; mov r8, QWORD max_scratch_top as i64    // highest scratch slot used
-            ; mov rax, QWORD heap.regs_fits as i64
-            ; call rax
-            ; mov [rsp + leaf_flag_off], rax          // 1 = inline ok, 0 = helper
-        );
+        emit_regs_fits_check(&mut ops, max_scratch_top, leaf_flag_off, heap.regs_fits);
     }
 
     // ── loop-invariant `g.length` hoist ── compute it ONCE here (reusing the
@@ -925,6 +918,7 @@ pub(crate) fn compile_region_mem(
                         ; jmp => epilogue
                     );
                 } else {
+                    emit_concat_memo_fast(&mut ops, dst, a, b, done_a);
                     dynasm!(ops
                         ; mov rcx, rdi                        // vm
                         ; mov rdx, [rbx + dreg(a)]
@@ -1224,15 +1218,7 @@ pub(crate) fn compile_region_mem(
                 emit_typeof_is(&mut ops, dst, a, code, neg, heap.typeof_is);
             }
             Instr::TypeOfSame { dst, a, b, neg } => {
-                dynasm!(ops
-                    ; mov rcx, rdi
-                    ; mov rdx, [rbx + dreg(a)]
-                    ; mov r8, [rbx + dreg(b)]
-                    ; mov r9d, neg as i32
-                    ; mov rax, QWORD heap.typeof_same as i64
-                    ; call rax
-                    ; mov [rbx + dreg(dst)], rax
-                );
+                emit_typeof_same(&mut ops, dst, a, b, neg, heap.typeof_same);
             }
             Instr::TypeOf { dst, a } => {
                 // `typeof v` → its canonical result string (`jit_typeof`):
@@ -4705,6 +4691,8 @@ pub(crate) fn compile_region_mem(
                 // array, which may reallocate) — so when the region also has
                 // GetProp/SetProp (the r13 users), re-derive r13 after the
                 // call. It never runs user code, so the IC table (r14) is safe.
+                let done_sc = ops.new_dynamic_label();
+                emit_concat_memo_fast(&mut ops, dst, a, b, done_sc);
                 dynasm!(ops
                     ; mov rcx, rdi                        // vm
                     ; mov rdx, [rbx + dreg(a)]            // a bits
@@ -4726,6 +4714,7 @@ pub(crate) fn compile_region_mem(
                     emit_cross_refetch_ta(&mut ops, snap, plan, cache);
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
+                dynasm!(ops ; => done_sc);
             }
             Instr::AddRightPair {
                 dst,
@@ -5979,7 +5968,7 @@ pub(crate) struct Cross3Invoke {
     pub fid: u32,
     pub callee_regs: u16,
     pub argc: u16,
-    pub uninit_mask: u64,
+    pub uninit_mask: [u64; 2],
     pub mask_gen: u32,
     pub this_src: Cross3This,
     pub arg_base: u16,
@@ -6038,7 +6027,6 @@ fn emit_cross3_invoke(
         .map(|_| crate::vm::activationrootstats::nested_counter_addr());
     let array_epoch_cache =
         ta_refetch.and_then(|(_, plan, _)| cross_array_epoch_cache_off(iv.c3, plan));
-    let zeroed = ops.new_dynamic_label();
     let noroot = ops.new_dynamic_label();
     let inline_noroot = ops.new_dynamic_label();
     let inline_entered = ops.new_dynamic_label();
@@ -6051,7 +6039,9 @@ fn emit_cross3_invoke(
     // missed on every read. `ZIPP_NO_CROSS3_GROW=1` leaves the lane again.
     let grow = (inline_regs && crate::codegen::cross3_grow_enabled()).then(|| ops.new_dynamic_label());
     let entered = ops.new_dynamic_label();
+    let entered_fast = ops.new_dynamic_label();
     let hw_miss = grow.unwrap_or(fb);
+    let skip_act_inline = iv.act_free && inline_regs;
     let act = JIT_ACTIVATION_OFFSET as i32;
     let depth = JIT_CALL_DEPTH_OFFSET as i32;
     let c3 = iv.c3;
@@ -6072,7 +6062,8 @@ fn emit_cross3_invoke(
         // same-mask recompile re-sets it); the mask generation proves the
         // baked zeroing mask still matches the live callee.
         ; mov r11, [rdi + JIT_CROSS_TABLE_RAW_OFFSET as i32]
-        ; mov r11, [r11 + (iv.fid as i32) * 16]
+        ; lea rcx, [r11 + (iv.fid as i32) * 16]
+        ; mov r11, [rcx]
         ; test r11, r11
         ; jz => fb
     );
@@ -6084,8 +6075,7 @@ fn emit_cross3_invoke(
         );
     }
     dynasm!(ops
-        ; mov r11, [rdi + JIT_CROSS_TABLE_RAW_OFFSET as i32]
-        ; cmp DWORD [r11 + (iv.fid as i32) * 16 + 8], iv.mask_gen as i32
+        ; cmp DWORD [rcx + 8], iv.mask_gen as i32
         ; jne => fb
         ; cmp DWORD [rdi + JIT_GLOBAL_ROUTE_EPOCH_OFFSET as i32], 0
         ; jne => fb
@@ -6093,15 +6083,19 @@ fn emit_cross3_invoke(
         ; jne => fb
         ; cmp BYTE [rdi + JIT_GC_STRESS_OFFSET as i32], 0
         ; jne => fb
-        // Save the prior activation (three qwords). The inline and helper
-        // entry paths share the same restore record.
-        ; mov r11, [rdi + act]
-        ; mov [rsp + c3], r11
-        ; mov r11, [rdi + act + 8]
-        ; mov [rsp + c3 + 8], r11
-        ; mov r11, [rdi + act + 16]
-        ; mov [rsp + c3 + 16], r11
     );
+    if !skip_act_inline {
+        dynasm!(ops
+            // Save the prior activation (three qwords). The inline and helper
+            // entry paths share the same restore record.
+            ; mov r11, [rdi + act]
+            ; mov [rsp + c3], r11
+            ; mov r11, [rdi + act + 8]
+            ; mov [rsp + c3 + 8], r11
+            ; mov r11, [rdi + act + 16]
+            ; mov [rsp + c3 + 16], r11
+        );
+    }
     if inline_regs {
         let regs_ptr = JIT_REGS_PTR_OFFSET as i32;
         let regs_len = JIT_REGS_LEN_OFFSET as i32;
@@ -6119,15 +6113,13 @@ fn emit_cross3_invoke(
             ; add r8, iv.callee_regs as i32
             ; cmp r8, [rdi + JIT_REGS_HW_OFFSET as i32]
             ; ja => hw_miss
+            ; mov r9, rdx
         );
         if iv.act_free {
             // The callee never reads the activation (`activation_free`), so
-            // the caller's stays installed: no install, and no root-stack
-            // duplicate of a frame-free prior, which remains the installed,
-            // rooted activation. The callee value lives in a caller register,
-            // rooted by the suspended caller's window. The exit's restore
-            // rewrites the unchanged prior; its duplicate bit is set only by
-            // the grow helper, which installs and roots as before.
+            // the caller's stays installed: no save, no install, no restore,
+            // and no root-stack duplicate of a frame-free prior. The `grow`
+            // cold stub saves/installs/sets bit 0 so exit restores it there.
             dynasm!(ops
                 ; mov [rsp + c3 + 24], rdx
                 ; mov [rdi + regs_len], r8
@@ -6191,6 +6183,12 @@ fn emit_cross3_invoke(
                 ; lock inc QWORD [rax]
             );
         }
+        dynasm!(ops
+            // Inline path: `r9` holds the aligned window base, `r10d` still
+            // holds callee idx, and bit 0 (fresh-zeroed) is known to be 0.
+            ; xor eax, eax
+            ; jmp => entered_fast
+        );
     } else {
         dynasm!(ops
             // Pre-B243 helper entry: window open plus root-stack-aware
@@ -6208,13 +6206,13 @@ fn emit_cross3_invoke(
     }
     dynasm!(ops
         ; => entered
-        // Re-derive the callee idx from the stashed bits (the helper call, or
-        // optional stats counter maintenance, may have consumed rax).
-        ; mov rax, [rsp + c3 + 48]
-        ; mov r10d, eax
-        // -- window fill: this, args, then the may-read-before-write mask --
-        ; mov r9, [rsp + c3 + 24]
+        // Re-derive the callee idx and window base after helper/grow entry.
+        // Bit 0 of `rax` carries the fresh-zeroed flag into `entered_fast`.
+        ; mov r10d, DWORD [rsp + c3 + 48]
+        ; mov rax, [rsp + c3 + 24]
+        ; mov r9, rax
         ; and r9, -4
+        ; => entered_fast
     );
     match iv.this_src {
         Cross3This::ArrowMirror => {
@@ -6250,26 +6248,36 @@ fn emit_cross3_invoke(
             ; mov [r9 + (1 + i) * 8], r11
         );
     }
-    dynasm!(ops
-        ; test BYTE [rsp + c3 + 24], 1
-        ; jnz => zeroed
-        ; mov r11, QWORD Value::UNDEFINED.bits() as i64
-    );
     {
         // Registers [0 ..= argc] were just written; zero only the remaining
-        // may-read-before-write set (baked; `epoch` guards its staleness).
-        let mut m = iv.uninit_mask;
-        while m != 0 {
-            let r = m.trailing_zeros() as i32;
-            m &= m - 1;
-            if r <= iv.argc as i32 {
-                continue;
+        // may-read-before-write set (up to 128 regs, baked; `mask_gen` guards
+        // staleness). Skip the test+load completely when no slots need zeroing.
+        let arg_mask = if iv.argc + 1 >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << (iv.argc + 1)) - 1
+        };
+        let mask0 = iv.uninit_mask[0] & !arg_mask;
+        let mask1 = iv.uninit_mask[1];
+        if mask0 != 0 || mask1 != 0 {
+            let zeroed = ops.new_dynamic_label();
+            dynasm!(ops
+                ; test al, 1
+                ; jnz => zeroed
+                ; mov r11, QWORD Value::UNDEFINED.bits() as i64
+            );
+            for (word_idx, mut m) in [mask0, mask1].into_iter().enumerate() {
+                let base_reg = (word_idx as i32) * 64;
+                while m != 0 {
+                    let r = base_reg + m.trailing_zeros() as i32;
+                    m &= m - 1;
+                    dynasm!(ops ; mov [r9 + r * 8], r11);
+                }
             }
-            dynasm!(ops ; mov [r9 + r * 8], r11);
+            dynasm!(ops ; => zeroed);
         }
     }
     dynasm!(ops
-        ; => zeroed
         // -- depth++, direct native call --
         ; inc DWORD [rdi + depth]
         ; mov DWORD [rsp + c3 + 40], crate::codegen::NO_BAIL as i32
@@ -6293,7 +6301,20 @@ fn emit_cross3_invoke(
     }
     dynasm!(ops
         ; call rax
-        ; mov [rsp + c3 + 32], rax
+        // Single 8-byte load of base|flags (avoids narrow-load store-forward
+        // stalls and the second reload of `[rsp + c3 + 24]`). `rax` stays live
+        // across the inline clean return path without spilling to stack.
+        ; mov rdx, [rsp + c3 + 24]
+    );
+    if skip_act_inline {
+        // Inline `act_free` never modified `act` and left bits 0..=1 clear;
+        // only the rare `grow` stub sets bit 0 (and possibly bit 1).
+        dynasm!(ops
+            ; test dl, 3
+            ; jz => noroot
+        );
+    }
+    dynasm!(ops
         // -- restore the caller activation inline; pop the root-stack
         // duplicate when enter reported one --
         ; mov r11, [rsp + c3]
@@ -6302,7 +6323,7 @@ fn emit_cross3_invoke(
         ; mov [rdi + act + 8], r11
         ; mov r11, [rsp + c3 + 16]
         ; mov [rdi + act + 16], r11
-        ; test BYTE [rsp + c3 + 24], 2
+        ; test dl, 2
         ; jz => noroot
     );
     if inline_regs {
@@ -6311,9 +6332,12 @@ fn emit_cross3_invoke(
         );
     } else {
         dynasm!(ops
+            ; mov [rsp + c3 + 32], rax
             ; mov rcx, rdi
             ; mov rax, QWORD heap.cross3_unroot as i64
             ; call rax
+            ; mov rax, [rsp + c3 + 32]
+            ; mov rdx, [rsp + c3 + 24]
         );
     }
     dynasm!(ops
@@ -6323,7 +6347,6 @@ fn emit_cross3_invoke(
         ; jne => slow
         // -- clean native return --
         ; dec DWORD [rdi + depth]
-        ; mov rdx, [rsp + c3 + 24]
         ; and rdx, -4
     );
     if inline_regs {
@@ -6336,18 +6359,18 @@ fn emit_cross3_invoke(
             ; sub rdx, r11
             ; shr rdx, 3
             ; mov [rdi + regs_len], rdx
+            ; mov [rbx + dreg(iv.dst)], rax
         );
     } else {
         dynasm!(ops
+            ; mov [rsp + c3 + 32], rax
             ; mov rcx, rdi
             ; mov rax, QWORD heap.window_close as i64
             ; call rax
+            ; mov rax, [rsp + c3 + 32]
+            ; mov [rbx + dreg(iv.dst)], rax
         );
     }
-    dynasm!(ops
-        ; mov rax, [rsp + c3 + 32]
-        ; mov [rbx + dreg(iv.dst)], rax
-    );
     if refetch_pinned {
         emit_refetch_pinned(ops, heap.versions_base, Some(heap.ic_base));
     }
@@ -6388,8 +6411,18 @@ fn emit_cross3_invoke(
         // the inline entry's encoding, so the inline exit above closes it:
         // the length restored from the base, and a root-stack duplicate the
         // helper pushed popped by the same depth word.
+        dynasm!(ops ; => grow);
+        if skip_act_inline {
+            dynasm!(ops
+                ; mov r11, [rdi + act]
+                ; mov [rsp + c3], r11
+                ; mov r11, [rdi + act + 8]
+                ; mov [rsp + c3 + 8], r11
+                ; mov r11, [rdi + act + 16]
+                ; mov [rsp + c3 + 16], r11
+            );
+        }
         dynasm!(ops
-            ; => grow
             ; mov rcx, rdi
             ; lea rdx, [rbx + dreg(iv.caller_regs)]
             ; mov r8d, iv.callee_regs as i32

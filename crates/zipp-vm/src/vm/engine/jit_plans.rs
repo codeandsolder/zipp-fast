@@ -2152,7 +2152,10 @@ impl<'p> Vm<'p> {
             || callee.arguments_reg.is_some()
             || (crate::codegen::handler_callee_skip_enabled()
                 && crate::codegen::proto_has_handler_ops(callee)
-                && !self.jit.cross_lazy_ff(fid))
+                && !(self.jit.cross_lazy_ff(fid)
+                    || (fid == caller_fid
+                        && whole_body
+                        && crate::codegen::lazy_frame_free(callee))))
             || usize::from(callee.param_count) != usize::from(argc)
             || argc > 6
         {
@@ -2197,19 +2200,29 @@ impl<'p> Vm<'p> {
         // nothing. The masks are this proto's own analysis, the same calls the
         // compile makes before `set_cross_entry`; raytracer's 87-register
         // `trace` reached its own recursion through the helper only.
-        let self_wide_empty = fid == caller_fid
+        let self_wide_mask = if fid == caller_fid
             && reg_count > 64
             && crate::codegen::crosscall2_enabled()
             && crate::codegen::crosscall_wide_mask_enabled()
             && crate::codegen::cross3_wide_enabled()
             && crate::codegen::cross_uninit_mask(callee) == u64::MAX
-            && crate::codegen::cross_uninit_wide_mask(callee).is_some_and(|m| {
-                m.len() == (reg_count as usize).div_ceil(64) && m.iter().all(|&w| w == 0)
-            });
+        {
+            crate::codegen::cross_uninit_wide_mask(callee).and_then(|m| {
+                if m.len() == (reg_count as usize).div_ceil(64)
+                    && m.iter().skip(2).all(|&w| w == 0)
+                {
+                    Some([m.first().copied().unwrap_or(0), m.get(1).copied().unwrap_or(0)])
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
         let self_arm = fid == caller_fid
             && whole_body
             && crate::codegen::cross3_self_enabled()
-            && (reg_count <= 64 || self_wide_empty)
+            && (reg_count <= 64 || self_wide_mask.is_some())
             && crate::codegen::markdown_inline_plan(callee).is_none()
             && (crate::codegen::cross3_self_global_enabled() || callee.name_global.is_none_or(|own| {
                 !callee
@@ -2218,20 +2231,22 @@ impl<'p> Vm<'p> {
                     .any(|i| matches!(i, Instr::LoadGlobal { idx, .. } if *idx == own))
             }));
         let parked = self.jit.cross_parked_mask(fid);
-        let mut self_wide = false;
+        let mut self_wide: Option<[u64; 2]> = None;
         let (uninit_mask, json_walk, markdown_inline, mask_gen) = match self.jit.cross_entry_lane(fid)
         {
             Some((_entry, mask, json, markdown)) => {
                 (mask, json, markdown, self.jit.cross_mask_gen(fid))
             }
-            None if self_arm && self_wide_empty => {
+            None if self_arm && self_wide_mask.is_some() => {
                 // The install records the inline mask as MAX (a wide body's
                 // always is) and, with no live entry before it, does not bump
                 // for the wide words: the generation it leaves is this one.
-                self_wide = true;
+                self_wide = self_wide_mask;
                 if crate::jitlog_enabled() {
+                    let wm = self_wide_mask.unwrap_or([0, 0]);
                     eprintln!(
-                        "[cross] fn{caller_fid}@{call_ip} CROSS3 wide self arm (regs={reg_count}, empty wide mask)"
+                        "[cross] fn{caller_fid}@{call_ip} CROSS3 wide self arm (regs={reg_count}, mask={:#x}:{:#x})",
+                        wm[1], wm[0]
                     );
                 }
                 (0, None, None, self.jit.cross_mask_gen_after_set(fid, u64::MAX))
@@ -2265,25 +2280,39 @@ impl<'p> Vm<'p> {
                 return None;
             }
         };
-        // B228: a wide callee (> 64 registers) always reports the inline mask
-        // as MAX. An exact all-zero wide mask needs no emitted fill, so zero
-        // describes it without constraining the window size.
-        let wide_empty = uninit_mask == u64::MAX
-            && crate::codegen::cross3_wide_enabled()
-            && self.jit.cross_wide_uninit_mask(fid).is_some_and(|m| {
-                m.len() == (reg_count as usize).div_ceil(64) && m.iter().all(|&w| w == 0)
-            });
-        let uninit_mask = if wide_empty { 0 } else { uninit_mask };
+        // B228+: a wide callee (> 64 registers) always reports the inline mask
+        // as MAX. Whenever its wide mask has no marked bits past register 127
+        // (including an all-zero wide mask for any window size), the 2-word
+        // inline mask `[w0, w1]` describes the exact fill set.
+        let wide_mask = if let Some(wm) = self_wide {
+            Some(wm)
+        } else if uninit_mask == u64::MAX && crate::codegen::cross3_wide_enabled() {
+            self.jit.cross_wide_uninit_mask(fid).and_then(|m| {
+                if m.len() == (reg_count as usize).div_ceil(64)
+                    && m.iter().skip(2).all(|&w| w == 0)
+                {
+                    Some([m.first().copied().unwrap_or(0), m.get(1).copied().unwrap_or(0)])
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+        let uninit_mask_words = if let Some(wm) = wide_mask {
+            wm
+        } else {
+            [uninit_mask, 0]
+        };
         if json_walk.is_some()
             || markdown_inline.is_some()
-            || uninit_mask == u64::MAX
-            || (reg_count > 64 && !wide_empty && !self_wide)
+            || (wide_mask.is_none() && (uninit_mask == u64::MAX || reg_count > 64))
         {
             if crate::jitlog_enabled() {
                 eprintln!(
                     "[cross] fn{caller_fid}@{call_ip} CROSS3 decline: plans={} mask_max={} regs={}",
                     json_walk.is_some() || markdown_inline.is_some(),
-                    uninit_mask == u64::MAX,
+                    wide_mask.is_none() && uninit_mask == u64::MAX,
                     reg_count
                 );
             }
@@ -2297,7 +2326,7 @@ impl<'p> Vm<'p> {
             arrow_this: callee.lexical_this,
             sloppy_this,
             mask_gen,
-            uninit_mask,
+            uninit_mask: uninit_mask_words,
             act_free: crate::codegen::cross3_act_free_enabled() && crate::codegen::activation_free(callee),
         })
     }
@@ -2663,19 +2692,55 @@ impl<'p> Vm<'p> {
                     if argc > 6 {
                         continue;
                     }
-                    let Some(recv) = self.regs.get(base + obj as usize).copied() else {
+                    // Exemplar receiver: live register first, then recorded
+                    // `mi_recv` hits at this site, then dense elements of an
+                    // `arr[idx]` receiver source (e.g. `survivors[i].apply()`
+                    // whose temporary `obj` reg is stale at compile time).
+                    // Every CROSS3M arm guards `shape` + `fid` at runtime.
+                    let mut cand_recv: Option<Value> = self
+                        .regs
+                        .get(base + obj as usize)
+                        .copied()
+                        .filter(|v| v.is_heap() && self.ic_obj_ok(v.heap_index()) && matches!(self.heap.get(v.heap_index()), crate::heap::HeapObj::Object(m) if m.shape() != crate::shape::DICT));
+                    if cand_recv.is_none() {
+                        if let Some(rset) = self
+                            .mi_recv
+                            .get(&(((func_id as u64) << 32) | ip as u64))
+                        {
+                            cand_recv = rset.iter().copied().map(Value::from_bits).find(|v| {
+                                v.is_heap()
+                                    && (v.heap_index() as usize) < self.heap.len()
+                                    && self.ic_obj_ok(v.heap_index())
+                                    && matches!(self.heap.get(v.heap_index()), crate::heap::HeapObj::Object(m) if m.shape() != crate::shape::DICT)
+                            });
+                        }
+                    }
+                    if cand_recv.is_none() {
+                        if let Some(arr_reg) =
+                            Self::mi_last_getindex_array(&caller.code, 0, ip, obj)
+                        {
+                            if let Some(&av) = self.regs.get(base + arr_reg as usize) {
+                                if av.is_heap() {
+                                    if let crate::heap::HeapObj::Array(items) =
+                                        self.heap.get(av.heap_index())
+                                    {
+                                        cand_recv = items.iter().copied().take(16).find(|v| {
+                                            v.is_heap()
+                                                && self.ic_obj_ok(v.heap_index())
+                                                && matches!(self.heap.get(v.heap_index()), crate::heap::HeapObj::Object(m) if m.shape() != crate::shape::DICT)
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let Some(recv) = cand_recv else {
                         continue;
                     };
-                    if !recv.is_heap() || !self.ic_obj_ok(recv.heap_index()) {
-                        continue;
-                    }
                     let crate::heap::HeapObj::Object(map) = self.heap.get(recv.heap_index()) else {
                         continue;
                     };
                     let sh = map.shape();
-                    if sh == crate::shape::DICT {
-                        continue;
-                    }
                     let Some(key) = caller.string_constants.get(name as usize) else {
                         continue;
                     };
@@ -2740,7 +2805,7 @@ impl<'p> Vm<'p> {
                         argc,
                         arrow_this: callee.lexical_this,
                         mask_gen: self.jit.cross_mask_gen(fid),
-                        uninit_mask,
+                        uninit_mask: [uninit_mask, 0],
                     };
                     if crate::jitlog_enabled() {
                         eprintln!(

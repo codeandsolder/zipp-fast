@@ -592,6 +592,7 @@ impl<'p> Vm<'p> {
         // Record the pinned capacity: growth sites must not exceed it (else the
         // Vec would realloc). Use the ACTUAL capacity Rust gave us (≥ requested).
         self.reg_capacity = self.regs.capacity();
+        self.regs_end_raw = self.regs.as_ptr().wrapping_add(self.reg_capacity) as usize;
     }
 
     /// Allocate a string on the heap and return its boxed Value.

@@ -1852,6 +1852,11 @@ impl Vm<'_> {
                     let i = v.heap_index() as usize;
                     if i < n && !marks[i] {
                         marks[i] = true;
+                        #[cfg(feature = "jit")]
+                        if !self.heap.is_flat_str_mirror(i) {
+                            stack.push(v.heap_index());
+                        }
+                        #[cfg(not(feature = "jit"))]
                         stack.push(v.heap_index());
                     }
                 }
@@ -2108,11 +2113,15 @@ impl Vm<'_> {
         // Trace them only when that function is itself reachable. Rooting every
         // value from `mark_roots` makes a dead object-literal method cycle
         // immortal: home -> method (own property), method -> home (this table).
-        if let Some(&home) = self.closure_home.get(&idx) {
-            m_val!(home);
+        if !self.closure_home.is_empty() {
+            if let Some(&home) = self.closure_home.get(&idx) {
+                m_val!(home);
+            }
         }
-        if let Some(&new_target) = self.closure_new_target.get(&idx) {
-            m_val!(new_target);
+        if !self.closure_new_target.is_empty() {
+            if let Some(&new_target) = self.closure_new_target.get(&idx) {
+                m_val!(new_target);
+            }
         }
     }
 }

@@ -728,6 +728,8 @@ impl<'p> Vm<'p> {
             is_htmldda: Default::default(),
             htmldda_idx: u32::MAX,
             htmldda_scalar_enabled: crate::env_var_os("ZIPP_NO_HTMLDDA_SCALAR").is_none(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            typeof_special_max: u32::MAX,
             proxy_ctor: 0,
             temporal_ns: 0,
             duration_ctor: 0,
@@ -826,6 +828,8 @@ impl<'p> Vm<'p> {
             ta_species_memo: [(u32::MAX, u32::MAX, u32::MAX, 0, 0); 12],
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             reg_capacity: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            regs_end_raw: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             regs_hw: 0,
             // 0 until set_gc_floor() runs after setup; until then nothing is

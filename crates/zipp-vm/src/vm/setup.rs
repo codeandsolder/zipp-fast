@@ -2850,6 +2850,18 @@ impl<'p> Vm<'p> {
         } else {
             u32::MAX
         };
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        {
+            self.typeof_special_max = if self.htmldda_scalar_enabled && self.is_htmldda.len() <= 1 {
+                let mut m = self.fn_proto.max(self.symbol_ctor).max(self.bigint_ctor);
+                if self.htmldda_idx != u32::MAX {
+                    m = m.max(self.htmldda_idx);
+                }
+                m
+            } else {
+                u32::MAX
+            };
+        }
         // `$262.agent`: the full multi-agent surface (vm/agents.rs). getReport
         // must exist (returning null on empty) even before any worker agent
         // starts — atomicsHelper.js binds it unconditionally at load. The

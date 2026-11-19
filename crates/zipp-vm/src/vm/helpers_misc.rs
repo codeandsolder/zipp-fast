@@ -758,17 +758,17 @@ pub(crate) extern "win64" fn jit_coll_lookup(
         }
         return jit_weak_coll(vm as *mut Vm as *mut core::ffi::c_void, recv_bits, key_bits, 0, id);
     }
-    let (name, kind) = match op {
-        0 => ("get", 4),
-        1 => ("has", 4),
-        2 => ("has", 3),
+    let (nid, name, kind) = match op {
+        0 => (0usize, "get", 4),
+        1 => (2, "has", 4),
+        2 => (2, "has", 3),
         _ => return crate::codegen::SELF_CALL_DEOPT,
     };
     // Kind+name dispatch is insufficient: own shadows, custom prototypes and
     // writable Map/Set prototype slots are observable. Re-read the complete
     // main-realm intrinsic proof on every call and fail closed to ordinary
     // Get+Call before performing the lookup.
-    if !vm.collection_method_is_intrinsic(idx, name, kind) {
+    if !vm.collection_method_is_intrinsic_id(idx, nid, name, kind) {
         return crate::codegen::SELF_CALL_DEOPT;
     }
     coll_lookup_proven(vm, idx, key_bits, op)
@@ -858,17 +858,7 @@ pub(crate) extern "win64" fn jit_coll_mutate_direct(
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[inline]
 fn coll_lookup_proven(vm: &mut Vm, idx: u32, key_bits: u64, op: u64) -> u64 {
-    let found = vm.coll_find(idx, Value::from_bits(key_bits));
-    match op {
-        0 => match found {
-            Some(i) => match vm.heap.get(idx) {
-                crate::heap::HeapObj::Map { vals, .. } => vals[i].bits(),
-                _ => Value::UNDEFINED.bits(),
-            },
-            None => Value::UNDEFINED.bits(),
-        },
-        _ => Value::bool(found.is_some()).bits(),
-    }
+    vm.coll_lookup_proven_fast(idx, Value::from_bits(key_bits), op)
 }
 
 /// Win64 helper for guarded `Map.prototype.set` / `clear` in Tier C.
@@ -923,7 +913,14 @@ pub(crate) extern "win64" fn jit_coll_mutate(
         return jit_weak_coll(vm as *mut Vm as *mut core::ffi::c_void, recv_bits, key_bits, val_bits, id);
     }
     let (name, kind) = coll_mutate_name(op);
-    if !vm.collection_method_is_intrinsic(idx, name, kind) {
+    let nid = match op {
+        0 => 1usize, // set
+        1 => 5,      // clear
+        2 => 3,      // add
+        3 | 4 => 4,  // delete
+        _ => return crate::codegen::SELF_CALL_DEOPT,
+    };
+    if !vm.collection_method_is_intrinsic_id(idx, nid, name, kind) {
         return crate::codegen::SELF_CALL_DEOPT;
     }
     coll_mutate_proven(vm, idx, key_bits, val_bits, op)
@@ -4791,6 +4788,12 @@ pub(crate) extern "win64" fn jit_concat(
     // snapshots after this helper, as it must after any allocation or user
     // coercion `add_values` can run.
     vm.maybe_gc();
+    #[cfg(not(feature = "safe-sandbox"))]
+    if b.is_int() && a.is_heap() {
+        if let Some(idx) = vm.heap.concat_memo_get(a.heap_index(), b.as_int()) {
+            return Value::heap(idx).bits();
+        }
+    }
     match vm.add_values(a, b) {
         Ok(v) => v.bits(),
         // `add_values` can run user coercion code (an object operand's
@@ -9481,6 +9484,15 @@ pub(crate) extern "win64" fn jit_iter_next(
     }
     // SAFETY: `regs` is this activation's window, inside `vm.regs`' buffer.
     let base = unsafe { (regs as *const u64).offset_from(vm.regs.as_ptr() as *const u64) } as usize;
+    // A frame-free body (`lazy_frame_free`) owns no frame on `vm.frames`: only
+    // the dense-array fast path above runs natively; any non-dense iterable
+    // bails before touching user code so `jit_cross3_finish` materializes the
+    // frame and its deferred `finally` handlers first.
+    if vm.frames.last().is_none_or(|f| f.base != base) {
+        vm.osr_deopt_exempt = true;
+        iterstats::deopt();
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
     // A generator is the exception: the interpreter steps one as a frame of its
     // own loop (`gen_enter_inline`), and from here each step copies its window
     // in and out, which cost a loop more than compiling it saved (11% of

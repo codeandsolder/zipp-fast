@@ -28,6 +28,13 @@ env_off_switch! {
     fn typeof_small_bigint_enabled() = "ZIPP_NO_TYPEOF_SMALL_BIGINT"
 }
 
+env_off_switch! {
+    /// `ZIPP_NO_INLINE_REGS_FITS=1`: restore the Win64 `jit_regs_fits` helper
+    /// call in Tier-C / region prologues instead of the inline
+    /// `JIT_REGS_END_OFFSET` subtraction check.
+    fn inline_regs_fits_enabled() = "ZIPP_NO_INLINE_REGS_FITS"
+}
+
 /// A baked literal's allocation without a call: take the next ready object of
 /// its slab class (`Heap::ready`) and fill it, as `ObjMap::ready_fill` does.
 /// There is no safe point, so no value moves and nothing needs refetching.
@@ -289,11 +296,13 @@ pub(crate) fn emit_typeof_is(
     let answer = |name: &str| -> i64 {
         crate::value::Value::bool((lit == Some(name)) != neg).bits() as i64
     };
-    let (res_number, res_boolean, res_undefined, res_object, res_bigint) = (
+    let (res_number, res_string, res_boolean, res_undefined, res_object, res_function, res_bigint) = (
         answer("number"),
+        answer("string"),
         answer("boolean"),
         answer("undefined"),
         answer("object"),
+        answer("function"),
         answer("bigint"),
     );
     // A small (immediate) BigInt's top 17 bits: the Null tag and the
@@ -304,10 +313,16 @@ pub(crate) fn emit_typeof_is(
         _ => -1,
     };
     let is_number = ops.new_dynamic_label();
+    let is_string = ops.new_dynamic_label();
+    let is_string_check = ops.new_dynamic_label();
     let is_boolean = ops.new_dynamic_label();
     let is_undefined = ops.new_dynamic_label();
+    let is_object = ops.new_dynamic_label();
+    let is_function = ops.new_dynamic_label();
     let not_null = ops.new_dynamic_label();
-    let heap = ops.new_dynamic_label();
+    let heap_val = ops.new_dynamic_label();
+    let heap_non_dict = ops.new_dynamic_label();
+    let helper_call = ops.new_dynamic_label();
     let store = ops.new_dynamic_label();
     dynasm!(ops
         ; mov rax, [rbx + dreg(a)]
@@ -316,7 +331,7 @@ pub(crate) fn emit_typeof_is(
         ; sub edx, TAG_LO as i32                 // 0 Int, 1 Bool, 2 Null, 3 Undefined, 4 Heap
         ; cmp edx, (TAG_HI - TAG_LO) as i32
         ; ja => is_number                        // outside the tag range: a double
-        ; je => heap                             // == 4: heap value → helper
+        ; je => heap_val                         // == 4: heap value → hot_mirror fast path
         ; test edx, edx
         ; jz => is_number                        // Int
         ; cmp edx, 1
@@ -329,17 +344,55 @@ pub(crate) fn emit_typeof_is(
         ; mov r8, QWORD crate::value::Value::NULL.bits() as i64
         ; cmp rax, r8
         ; jne => not_null
-        ; mov rax, QWORD res_object
-        ; jmp => store
+        ; jmp => is_object
         ; => not_null
         ; mov r8, rax
         ; shr r8, 47
         ; cmp r8d, small_bigint_top
-        ; jne => heap
+        ; jne => helper_call
         ; mov rax, QWORD res_bigint
+        ; jmp => store
+        // Heap fast path via `HotMirror`: plain/class non-ctor Objects,
+        // non-empty Strings (`FID_MIRROR_STR`), and JS Funcs/Closures answer
+        // inline without touching `Heap::objs` or making a Win64 FFI call.
+        ; => heap_val
+        ; mov r10d, eax                          // zero-extended heap index
+        ; mov r11, [rdi + crate::vm::host_api::JIT_HOT_MIRROR_RAW_OFFSET as i32]
+        ; lea r11, [r11 + r10 * 8]
+        ; mov edx, DWORD [r11 + r10 * 8]         // hot.shape
+        ; mov ecx, DWORD [r11 + r10 * 8 + crate::vm::host_api::JIT_HOT_FID_OFF as i32] // hot.fid
+        ; test edx, edx
+        ; jnz => heap_non_dict
+        // shape == DICT: FID_MIRROR_STR => string; fid < FID_MIRROR_STR => Func/Closure.
+        ; cmp ecx, crate::heap::FID_MIRROR_STR as i32
+        ; ja => helper_call
+        ; je => is_string_check
+        // Func/Closure: guard setup specials + ZIPP_NO_HTMLDDA_SCALAR ablation.
+        ; cmp r10d, DWORD [rdi + crate::vm::host_api::JIT_TYPEOF_SPECIAL_MAX_OFFSET as i32]
+        ; jbe => helper_call
+        ; jmp => is_function
+        ; => is_string_check
+        ; cmp DWORD [rdi + crate::vm::host_api::JIT_TYPEOF_SPECIAL_MAX_OFFSET as i32], -1
+        ; je => helper_call
+        ; jmp => is_string
+        ; => heap_non_dict
+        // shape != DICT: must be JS object (sign bit clear, excludes PyAttrs)
+        // with plain/class fid (sign bit set, excludes FID_MIRROR_CTOR) and
+        // index above special setup slots (fn_proto/symbol_ctor/bigint_ctor/htmldda).
+        ; test edx, edx
+        ; js => helper_call
+        ; test ecx, ecx
+        ; jns => helper_call
+        ; cmp r10d, DWORD [rdi + crate::vm::host_api::JIT_TYPEOF_SPECIAL_MAX_OFFSET as i32]
+        ; jbe => helper_call
+        ; => is_object
+        ; mov rax, QWORD res_object
         ; jmp => store
         ; => is_number
         ; mov rax, QWORD res_number
+        ; jmp => store
+        ; => is_string
+        ; mov rax, QWORD res_string
         ; jmp => store
         ; => is_boolean
         ; mov rax, QWORD res_boolean
@@ -347,7 +400,10 @@ pub(crate) fn emit_typeof_is(
         ; => is_undefined
         ; mov rax, QWORD res_undefined
         ; jmp => store
-        ; => heap
+        ; => is_function
+        ; mov rax, QWORD res_function
+        ; jmp => store
+        ; => helper_call
         ; mov rcx, rdi                            // vm
         ; mov rdx, rax                            // value bits
         ; mov r8d, code_neg as i32                // code | neg<<8
@@ -356,6 +412,204 @@ pub(crate) fn emit_typeof_is(
         ; => store
         ; mov [rbx + dreg(dst)], rax              // Bool Value bits
     );
+}
+
+/// Emit inline `typeof` type-code classification of the NaN-boxed Value in
+/// `rax` into `out_reg` (`0..=7`, matching `Vm::type_code`), jumping to `slow`
+/// for exotic/unsettled heap occupants. Preserves `r8`, `r9` unless `out_reg`
+/// is one of them; clobbers `rax, rcx, rdx, r10, r11`.
+fn emit_classify_typeof_code(
+    ops: &mut dynasmrt::x64::Assembler,
+    out_is_r9: bool,
+    small_bigint_top: i32,
+    slow: dynasmrt::DynamicLabel,
+) {
+    let is_num = ops.new_dynamic_label();
+    let is_str = ops.new_dynamic_label();
+    let is_str_check = ops.new_dynamic_label();
+    let is_bool = ops.new_dynamic_label();
+    let is_undef = ops.new_dynamic_label();
+    let is_obj = ops.new_dynamic_label();
+    let is_fn = ops.new_dynamic_label();
+    let not_null = ops.new_dynamic_label();
+    let heap_val = ops.new_dynamic_label();
+    let heap_non_dict = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    let set_code = |ops: &mut dynasmrt::x64::Assembler, c: i32| {
+        if out_is_r9 {
+            dynasm!(ops ; mov r9d, c);
+        } else {
+            dynasm!(ops ; mov eax, c);
+        }
+    };
+    dynasm!(ops
+        ; mov rdx, rax
+        ; shr rdx, 48
+        ; sub edx, TAG_LO as i32
+        ; cmp edx, (TAG_HI - TAG_LO) as i32
+        ; ja => is_num
+        ; je => heap_val
+        ; test edx, edx
+        ; jz => is_num
+        ; cmp edx, 1
+        ; je => is_bool
+        ; cmp edx, 3
+        ; je => is_undef
+        ; mov r10, QWORD crate::value::Value::NULL.bits() as i64
+        ; cmp rax, r10
+        ; jne => not_null
+        ; jmp => is_obj
+        ; => not_null
+        ; mov r10, rax
+        ; shr r10, 47
+        ; cmp r10d, small_bigint_top
+        ; jne => slow
+    );
+    set_code(ops, 7); // BIGINT
+    dynasm!(ops
+        ; jmp => done
+        ; => heap_val
+        ; mov r10d, eax
+        ; mov r11, [rdi + crate::vm::host_api::JIT_HOT_MIRROR_RAW_OFFSET as i32]
+        ; lea r11, [r11 + r10 * 8]
+        ; mov edx, DWORD [r11 + r10 * 8]
+        ; mov ecx, DWORD [r11 + r10 * 8 + crate::vm::host_api::JIT_HOT_FID_OFF as i32]
+        ; test edx, edx
+        ; jnz => heap_non_dict
+        ; cmp ecx, crate::heap::FID_MIRROR_STR as i32
+        ; ja => slow
+        ; je => is_str_check
+        ; cmp r10d, DWORD [rdi + crate::vm::host_api::JIT_TYPEOF_SPECIAL_MAX_OFFSET as i32]
+        ; jbe => slow
+        ; jmp => is_fn
+        ; => is_str_check
+        ; cmp DWORD [rdi + crate::vm::host_api::JIT_TYPEOF_SPECIAL_MAX_OFFSET as i32], -1
+        ; je => slow
+        ; jmp => is_str
+        ; => heap_non_dict
+        ; test edx, edx
+        ; js => slow
+        ; test ecx, ecx
+        ; jns => slow
+        ; cmp r10d, DWORD [rdi + crate::vm::host_api::JIT_TYPEOF_SPECIAL_MAX_OFFSET as i32]
+        ; jbe => slow
+        ; => is_obj
+    );
+    set_code(ops, 4); // OBJECT
+    dynasm!(ops ; jmp => done ; => is_num);
+    set_code(ops, 0); // NUMBER
+    dynasm!(ops ; jmp => done ; => is_str);
+    set_code(ops, 1); // STRING
+    dynasm!(ops ; jmp => done ; => is_bool);
+    set_code(ops, 2); // BOOLEAN
+    dynasm!(ops ; jmp => done ; => is_undef);
+    set_code(ops, 3); // UNDEFINED
+    dynasm!(ops ; jmp => done ; => is_fn);
+    set_code(ops, 5); // FUNCTION
+    dynasm!(ops ; => done);
+}
+
+/// `TypeOfSame { dst, a, b, neg }` — `dst = ((typeof a === typeof b) != neg)` —
+/// shared by Tier C and MEM regions. Resolves identical-bits, primitives,
+/// settled plain/class objects, non-empty strings, and JS functions/closures
+/// inline via `HotMirror`; exotic heap values fall back to `jit_typeof_same`.
+pub(crate) fn emit_typeof_same(
+    ops: &mut dynasmrt::x64::Assembler,
+    dst: u16,
+    a: u16,
+    b: u16,
+    neg: bool,
+    helper: usize,
+) {
+    if !typeof_is_inline_enabled() {
+        dynasm!(ops
+            ; mov rcx, rdi
+            ; mov rdx, [rbx + dreg(a)]
+            ; mov r8, [rbx + dreg(b)]
+            ; mov r9d, neg as i32
+            ; mov rax, QWORD helper as i64
+            ; call rax
+            ; mov [rbx + dreg(dst)], rax
+        );
+        return;
+    }
+    let small_bigint_top = match crate::value::Value::small_bigint(0) {
+        Some(v) if typeof_small_bigint_enabled() => (v.bits() >> 47) as i32,
+        _ => -1,
+    };
+    let res_same = crate::value::Value::bool(!neg).bits() as i64;
+    let res_diff = crate::value::Value::bool(neg).bits() as i64;
+    let same = ops.new_dynamic_label();
+    let slow = ops.new_dynamic_label();
+    let store = ops.new_dynamic_label();
+    dynasm!(ops
+        ; mov rax, [rbx + dreg(a)]
+        ; mov r8, [rbx + dreg(b)]
+        ; cmp rax, r8
+        ; je => same
+    );
+    emit_classify_typeof_code(ops, true, small_bigint_top, slow);
+    dynasm!(ops ; mov rax, r8);
+    emit_classify_typeof_code(ops, false, small_bigint_top, slow);
+    dynasm!(ops
+        ; cmp r9d, eax
+        ; je => same
+        ; mov rax, QWORD res_diff
+        ; jmp => store
+        ; => same
+        ; mov rax, QWORD res_same
+        ; jmp => store
+        ; => slow
+        ; mov rcx, rdi
+        ; mov rdx, [rbx + dreg(a)]
+        ; mov r8, [rbx + dreg(b)]
+        ; mov r9d, neg as i32
+        ; mov rax, QWORD helper as i64
+        ; call rax
+        ; => store
+        ; mov [rbx + dreg(dst)], rax
+    );
+}
+
+/// Emit the leaf/method-inline register headroom check into `[rsp + leaf_flag_off]`:
+/// `1` if `base_ptr + max_scratch_top * 8 <= regs_end_raw`, else `0`.
+/// Avoids a Win64 FFI call to `jit_regs_fits` on every Tier-C / region entry.
+pub(crate) fn emit_regs_fits_check(
+    ops: &mut dynasmrt::x64::Assembler,
+    max_scratch_top: u64,
+    leaf_flag_off: i32,
+    helper: usize,
+) {
+    if !inline_regs_fits_enabled() {
+        dynasm!(ops
+            ; mov rcx, rdi
+            ; mov rdx, rbx
+            ; mov r8, QWORD max_scratch_top as i64
+            ; mov rax, QWORD helper as i64
+            ; call rax
+            ; mov [rsp + leaf_flag_off], rax
+        );
+        return;
+    }
+    let needed_bytes = max_scratch_top.saturating_mul(8);
+    if needed_bytes <= i32::MAX as u64 {
+        dynasm!(ops
+            ; lea r8, [rbx + needed_bytes as i32]
+            ; cmp r8, [rdi + crate::vm::host_api::JIT_REGS_END_OFFSET as i32]
+            ; setbe al
+            ; movzx eax, al
+            ; mov [rsp + leaf_flag_off], rax
+        );
+    } else {
+        dynasm!(ops
+            ; mov r8, QWORD needed_bytes as i64
+            ; add r8, rbx
+            ; cmp r8, [rdi + crate::vm::host_api::JIT_REGS_END_OFFSET as i32]
+            ; setbe al
+            ; movzx eax, al
+            ; mov [rsp + leaf_flag_off], rax
+        );
+    }
 }
 
 env_off_switch! {
@@ -2315,6 +2569,87 @@ pub(crate) fn emit_route_guard(ops: &mut dynasmrt::x64::Assembler, bail: dynasmr
         ; cmp BYTE [rdi + off], 0
         ; jne => bail
     );
+}
+
+/// Inline probe of `Heap::concat_memo` (`string + int`) before calling
+/// `jit_concat`. Soundness matches `Heap::concat_memo_get` check-for-check:
+/// skips when GC is requested/stressed or `concat_memo_raw == 0` (disabled or
+/// oracle telemetry active), verifies `a` is `TAG_HEAP` and `b` is `TAG_INT`,
+/// bounds-checks both `left_idx` and `res_idx` against `hot_mirror_len`, and
+/// checks `left_idx`, `int`, `left_ver`, and `res_ver`. On hit, writes the
+/// memoized string `Value` to `dst` and jumps to `done`, skipping the Win64
+/// FFI call and pinned refetch. Clobbers rax, rcx, rdx, r8, r9, r10, r11.
+#[cfg(not(feature = "safe-sandbox"))]
+pub(crate) fn emit_concat_memo_fast(
+    ops: &mut dynasmrt::x64::Assembler,
+    dst: u16,
+    a: u16,
+    b: u16,
+    done: dynasmrt::DynamicLabel,
+) {
+    use crate::vm::host_api::{
+        JIT_CONCAT_MEMO_RAW_OFFSET, JIT_GC_REQUESTED_OFFSET, JIT_GC_STRESS_OFFSET,
+        JIT_HOT_MIRROR_LEN_OFFSET, JIT_VERSIONS_RAW_OFFSET,
+    };
+    let miss = ops.new_dynamic_label();
+    dynasm!(ops
+        ; cmp BYTE [rdi + JIT_GC_REQUESTED_OFFSET as i32], 0
+        ; jne => miss
+        ; cmp BYTE [rdi + JIT_GC_STRESS_OFFSET as i32], 0
+        ; jne => miss
+        ; mov r11, [rdi + JIT_CONCAT_MEMO_RAW_OFFSET as i32]
+        ; test r11, r11
+        ; jz => miss
+        ; mov rax, [rbx + dreg(a)]
+        ; mov r10, rax
+        ; shr r10, 48
+        ; cmp r10d, 0x7FFD                        // Value TAG_HEAP >> 48
+        ; jne => miss
+        ; mov rcx, [rbx + dreg(b)]
+        ; mov r10, rcx
+        ; shr r10, 48
+        ; cmp r10d, 0x7FF9                        // Value TAG_INT >> 48
+        ; jne => miss
+        ; mov eax, eax                            // li (zero-extended)
+        ; cmp eax, [rdi + JIT_HOT_MIRROR_LEN_OFFSET as i32]
+        ; jae => miss
+        ; imul r10d, ecx, DWORD -1640531535       // 0x9E37_79B1u32 as i32
+        ; xor r10d, eax
+        ; and r10d, 2047                          // CONCAT_MEMO_SLOTS - 1
+        ; lea r10, [r10 + r10 * 4]                // * 5
+        ; shl r10, 2                              // * 20 (size_of::<ConcatMemoEntry>())
+        ; add r11, r10
+        ; cmp [r11], eax                          // e.left_idx == li
+        ; jne => miss
+        ; cmp [r11 + 8], ecx                      // e.int == n
+        ; jne => miss
+        ; mov r8, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
+        ; mov edx, [r11 + 4]                      // e.left_ver
+        ; cmp edx, [r8 + rax * 4]                 // == versions[li]
+        ; jne => miss
+        ; mov r9d, [r11 + 12]                     // e.res_idx (zero-extended)
+        ; cmp r9d, [rdi + JIT_HOT_MIRROR_LEN_OFFSET as i32]
+        ; jae => miss
+        ; mov edx, [r11 + 16]                     // e.res_ver
+        ; cmp edx, [r8 + r9 * 4]                  // == versions[res_idx]
+        ; jne => miss
+        ; mov r10, QWORD HEAP_TAG as i64
+        ; or r9, r10
+        ; mov [rbx + dreg(dst)], r9
+        ; jmp => done
+        ; => miss
+    );
+}
+
+#[cfg(feature = "safe-sandbox")]
+#[inline]
+pub(crate) fn emit_concat_memo_fast(
+    _ops: &mut dynasmrt::x64::Assembler,
+    _dst: u16,
+    _a: u16,
+    _b: u16,
+    _done: dynasmrt::DynamicLabel,
+) {
 }
 
 thread_local! {

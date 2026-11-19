@@ -55,7 +55,11 @@ pub(crate) const INDEX_THRESHOLD: usize = 48;
 ///   of `strict_eq`.
 #[inline]
 pub(crate) fn svz_repr(heap: &Heap, v: Value) -> u64 {
-    if v.is_number() {
+    if v.is_int() {
+        let n = v.as_int();
+        return if n == 0 { 0 } else { (n as f64).to_bits() };
+    }
+    if v.is_double() {
         let n = v.as_f64();
         return if n.is_nan() {
             f64::NAN.to_bits() // one canonical NaN
@@ -68,7 +72,10 @@ pub(crate) fn svz_repr(heap: &Heap, v: Value) -> u64 {
     if v.is_heap() {
         let i = v.heap_index();
         match heap.get(i) {
-            HeapObj::Str(_) | HeapObj::Cons { .. } => {
+            HeapObj::Str(s) => {
+                return fnv1a(s.as_bytes());
+            }
+            HeapObj::Cons { .. } => {
                 return fnv1a(&heap.str_wtf8_cow(i).unwrap());
             }
             HeapObj::BigInt(x) => {
@@ -723,7 +730,13 @@ pub(crate) fn strict_eq_position(heap: &Heap, items: &[Value], target: Value, re
 
 /// JS `SameValueZero` (the Map/Set key equality) — `Vm::same_value_zero`
 /// delegates here.
+#[inline]
 pub(crate) fn svz_eq(heap: &Heap, a: Value, b: Value) -> bool {
+    // Under SameValueZero, identical raw NaN-boxed bits are ALWAYS equal
+    // (including ints, doubles, NaN === NaN, objects, symbols, same-slot strings).
+    if a.bits() == b.bits() {
+        return true;
+    }
     if a.is_number() && b.is_number() {
         let (na, nb) = (a.as_f64(), b.as_f64());
         return na == nb || (na.is_nan() && nb.is_nan());
@@ -837,6 +850,11 @@ impl<'p> Vm<'p> {
             HeapObj::Set(items) | HeapObj::WeakSet(items) => items,
             _ => return None,
         };
+        // Tiny collections (e.g. small route maps) are faster to scan directly
+        // than probing `collection_index` — and `keys` is always authoritative.
+        if keys.len() <= 8 {
+            return svz_position(heap, keys, key);
+        }
         if let Some(ix) = self.collection_index.get(&idx) {
             return ix.find(heap, keys, key);
         }
@@ -850,6 +868,42 @@ impl<'p> Vm<'p> {
         let found = ix.find(heap, keys, key);
         self.collection_index.insert(idx, ix);
         found
+    }
+
+    /// Fused Map.get / Map.has / Set.has lookup for proven JIT collection lanes:
+    /// reads `keys` and `vals` in a single `heap.get(idx)` without re-fetching
+    /// `HeapObj::Map` after `coll_find`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub(crate) fn coll_lookup_proven_fast(&mut self, idx: u32, key: Value, op: u64) -> u64 {
+        if key.is_heap() {
+            self.heap.flatten(key.heap_index());
+        }
+        let heap = &self.heap;
+        let (keys, vals): (&[Value], Option<&[Value]>) = match heap.get(idx) {
+            HeapObj::Map { keys, vals } => (keys.as_slice(), Some(vals.as_slice())),
+            HeapObj::Set(items) => (items.as_slice(), None),
+            _ => return if op == 0 { Value::UNDEFINED.bits() } else { Value::FALSE.bits() },
+        };
+        let found = if keys.len() <= 8 {
+            svz_position(heap, keys, key)
+        } else if let Some(ix) = self.collection_index.get(&idx) {
+            ix.find(heap, keys, key)
+        } else if keys.len() < INDEX_THRESHOLD {
+            svz_position(heap, keys, key)
+        } else {
+            let ix = CollIndex::build(heap, keys);
+            let f = ix.find(heap, keys, key);
+            self.collection_index.insert(idx, ix);
+            f
+        };
+        match op {
+            0 => match (found, vals) {
+                (Some(i), Some(vs)) => vs[i].bits(),
+                _ => Value::UNDEFINED.bits(),
+            },
+            _ => Value::bool(found.is_some()).bits(),
+        }
     }
 
     /// Give the `Map` `idx` its index now when it has at least 8 slots and

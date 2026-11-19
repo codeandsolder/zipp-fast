@@ -1813,10 +1813,24 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
             Instr::PushHandler { .. } | Instr::PopHandler => (u0(), None),
             Instr::EndFinally { kind_reg, val_reg } => (u2(kind_reg, val_reg), None),
             Instr::IterCloseFinally { iter, kind_reg } => (u2(iter, kind_reg), None),
-            // IterNext writes three registers, which does not fit the
-            // single-def mask model; a decline only costs the zero-fill
-            // fallback (and handler-op functions get no cross entry anyway).
-            Instr::IterNext { .. } => return None,
+            // IterNext always writes `done_dst`, and writes `value_dst`/`idx`
+            // only on non-exhausted steps; reporting exact uses and `done_dst`
+            // as the single guaranteed def is conservatively sound for the
+            // must-defined fixpoint (matching the contract in `uninit_mask_over`).
+            Instr::IterNext {
+                done_dst,
+                iter,
+                idx,
+                next,
+                ..
+            } => (
+                if next == crate::bytecode::NO_REG {
+                    u2(iter, idx)
+                } else {
+                    u3(iter, idx, next)
+                },
+                Some(done_dst),
+            ),
             Instr::LooseEq { dst, a, b } => (u2(a, b), Some(dst)),
             Instr::MathOp {
                 dst,
@@ -3084,13 +3098,9 @@ pub(crate) fn lazy_frame_free(proto: &crate::bytecode::FuncProto) -> bool {
             Instr::JumpFinally { .. } if !lazy_jump_enabled() => return false,
             Instr::TailCall { .. }
             | Instr::IterDelegate { .. }
-            | Instr::IterNext { .. }
-            | Instr::IterPrime { .. }
             | Instr::IterClose { .. }
             | Instr::IterCloseQuiet { .. }
-            | Instr::IterCloseFinally { .. }
             | Instr::IterToArray { .. }
-            | Instr::GetIterator { .. }
             | Instr::GetIteratorObj { .. }
             | Instr::GetAsyncIterator { .. } => return false,
             _ => {}
@@ -3943,14 +3953,7 @@ pub(crate) fn compile_proto_mem(
     // inlined Call site reads the flag and falls back to the helper on 0. rbx is
     // callee-saved; rcx/rdx/r8 are volatile scratch here.
     if do_leaf || method_needs_headroom {
-        dynasm!(ops
-            ; mov rcx, rdi                            // vm
-            ; mov rdx, rbx                            // caller window base
-            ; mov r8, QWORD max_scratch_top as i64    // highest scratch slot used
-            ; mov rax, QWORD heap.regs_fits as i64
-            ; call rax
-            ; mov [rsp + leaf_flag_off], rax          // 1 = inline ok, 0 = helper
-        );
+        emit_regs_fits_check(&mut ops, max_scratch_top, leaf_flag_off, heap.regs_fits);
     }
 
     // The k-th GetProp/SetProp uses inline-cache site `ic_site` (advanced in the
@@ -6415,8 +6418,9 @@ pub(crate) fn compile_proto_mem(
                 store_xmm(&mut ops, dst);
                 dynasm!(ops ; jmp => done_a);
                 emit_arith_fb_stub(&mut ops, fb, first, f64_path);
+                dynasm!(ops ; => slow);
+                emit_concat_memo_fast(&mut ops, dst, a, b, done_a);
                 dynasm!(ops
-                    ; => slow
                     ; mov rcx, rdi                        // vm
                     ; mov rdx, [rbx + dreg(a)]
                     ; mov r8, [rbx + dreg(b)]
@@ -6622,15 +6626,7 @@ pub(crate) fn compile_proto_mem(
                 emit_typeof_is(&mut ops, dst, a, code, neg, heap.typeof_is);
             }
             Instr::TypeOfSame { dst, a, b, neg } => {
-                dynasm!(ops
-                    ; mov rcx, rdi
-                    ; mov rdx, [rbx + dreg(a)]
-                    ; mov r8, [rbx + dreg(b)]
-                    ; mov r9d, neg as i32
-                    ; mov rax, QWORD heap.typeof_same as i64
-                    ; call rax
-                    ; mov [rbx + dreg(dst)], rax
-                );
+                emit_typeof_same(&mut ops, dst, a, b, neg, heap.typeof_same);
             }
             Instr::IsArray {
                 dst,
@@ -9241,17 +9237,43 @@ fn ta_cache_regs(proto: &FuncProto, metered: bool) -> Vec<u16> {
     if metered || !tierc_ta_cache_enabled() {
         return Vec::new();
     }
-    let mut counts: Vec<(u16, u32)> = Vec::new();
-    for instr in &proto.code {
-        if let Instr::GetIndex { obj, .. } | Instr::SetIndex { obj, .. } = *instr {
-            match counts.iter_mut().find(|(r, _)| *r == obj) {
-                Some((_, n)) => *n += 1,
-                None => counts.push((obj, 1)),
+    // Collect backward-jump intervals `[target, jump_ip]` so we only allocate
+    // a per-call stack TypedArray cache slot when a register can actually be
+    // read more than once in a single invocation (either >= 2 static sites or
+    // inside a loop). A single non-loop read starts at epoch 0 and can never
+    // hit.
+    let mut loops: Vec<(usize, usize)> = Vec::new();
+    for (ip, instr) in proto.code.iter().enumerate() {
+        let target = match *instr {
+            Instr::Jump { target }
+            | Instr::JumpIfFalse { target, .. }
+            | Instr::JumpIfTrue { target, .. }
+            | Instr::JumpIfNotLt { target, .. }
+            | Instr::JumpIfNotLe { target, .. } => Some(target as usize),
+            _ => None,
+        };
+        if let Some(t) = target {
+            if t <= ip {
+                loops.push((t, ip));
             }
         }
     }
+    let mut counts: Vec<(u16, u32, bool)> = Vec::new();
+    for (ip, instr) in proto.code.iter().enumerate() {
+        if let Instr::GetIndex { obj, .. } | Instr::SetIndex { obj, .. } = *instr {
+            let in_loop = loops.iter().any(|&(s, e)| s <= ip && ip <= e);
+            match counts.iter_mut().find(|(r, _, _)| *r == obj) {
+                Some((_, n, lp)) => {
+                    *n += 1;
+                    *lp |= in_loop;
+                }
+                None => counts.push((obj, 1, in_loop)),
+            }
+        }
+    }
+    counts.retain(|&(_, n, lp)| n >= 2 || lp);
     crate::cold_sort::sort_by(&mut counts, |a, b| b.1.cmp(&a.1));
-    counts.into_iter().take(4).map(|(r, _)| r).collect()
+    counts.into_iter().take(4).map(|(r, _, _)| r).collect()
 }
 
 /// `dst = obj[key]` through the typed array `obj`'s register held when this
@@ -9862,7 +9884,8 @@ fn fc_effect(instr: &Instr) -> FcEffect {
         | Instr::LoadGlobal { dst, .. }
         | Instr::MathOp { dst, .. }
         | Instr::TypeOf { dst, .. }
-        | Instr::TypeOfIs { dst, .. } => FcEffect::Write(dst),
+        | Instr::TypeOfIs { dst, .. }
+        | Instr::TypeOfSame { dst, .. } => FcEffect::Write(dst),
         Instr::SetProp { .. }
         | Instr::SetIndex { .. }
         | Instr::StoreGlobal { .. }

@@ -2128,24 +2128,45 @@ impl<'p> Vm<'p> {
         }
     }
 
+    #[inline]
+    pub(crate) fn collection_method_is_intrinsic_id(
+        &mut self,
+        idx: u32,
+        nid: usize,
+        name: &str,
+        kind: u8,
+    ) -> bool {
+        if crate::vm::coll_proof_cache_enabled() && self.realm_global_objs.is_empty() {
+            let cslot = ((idx as usize).wrapping_mul(31) ^ nid) & (COLL_PROOF_SLOTS - 1);
+            let (ci, cv, cn, ck) = self.coll_proof_cache[cslot];
+            if ci == idx && cv == self.heap.version_of(idx) && cn == nid as u8 && ck == kind {
+                let mproto = if kind == 4 {
+                    self.map_proto
+                } else {
+                    self.set_proto
+                };
+                if let Some((ver, pslot, fn_bits)) =
+                    self.coll_intrinsic_memo[(kind == 4) as usize][nid]
+                {
+                    if self.heap.version_of(mproto) == ver {
+                        if let HeapObj::Object(map) = self.heap.get(mproto) {
+                            if map.val_get_ref(pslot as usize).map(|v| v.bits()) == Some(fn_bits) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.collection_method_is_intrinsic_slow(idx, Some(nid), name, kind)
+    }
+
     pub(crate) fn collection_method_is_intrinsic(
         &mut self,
         idx: u32,
         name: &str,
         kind: u8,
     ) -> bool {
-        // B215: the RECEIVER half of this proof, cached per (idx, method)
-        // under the receiver's heap version. Every install that could change
-        // the answer bumps `versions[idx]`: an own-shadow ADD (the named-prop
-        // store bumps on add), defineProperty (bumps unconditionally),
-        // setPrototypeOf (bumps by documented design), and slot reuse (free
-        // bumps). A shadow DELETE only widens validity, and this cache holds
-        // proven-true entries only, so its missing bump is harmless. The
-        // PROTOTYPE half deliberately stays live below - an in-place value
-        // overwrite need not bump an ObjMap version (see
-        // `string_regexp_method_is_intrinsic`), so the B183 memo's
-        // version+bits pair remains the authority there. Root realm only:
-        // the multi-realm dance keeps the full proof.
         let early_nid = match name {
             "get" => Some(0usize),
             "set" => Some(1),
@@ -2156,31 +2177,19 @@ impl<'p> Vm<'p> {
             _ => None,
         };
         if let Some(nid) = early_nid {
-            if crate::vm::coll_proof_cache_enabled() && self.realm_global_objs.is_empty() {
-                let cslot = ((idx as usize).wrapping_mul(31) ^ nid) & (COLL_PROOF_SLOTS - 1);
-                let (ci, cv, cn, ck) = self.coll_proof_cache[cslot];
-                if ci == idx && cv == self.heap.version_of(idx) && cn == nid as u8 && ck == kind {
-                    let mproto = if kind == 4 {
-                        self.map_proto
-                    } else {
-                        self.set_proto
-                    };
-                    if let Some((ver, pslot, fn_bits)) =
-                        self.coll_intrinsic_memo[(kind == 4) as usize][nid]
-                    {
-                        if self.heap.version_of(mproto) == ver {
-                            if let HeapObj::Object(map) = self.heap.get(mproto) {
-                                if map.val_get_ref(pslot as usize).map(|v| v.bits())
-                                    == Some(fn_bits)
-                                {
-                                    return true;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            return self.collection_method_is_intrinsic_id(idx, nid, name, kind);
         }
+        self.collection_method_is_intrinsic_slow(idx, None, name, kind)
+    }
+
+    #[cold]
+    fn collection_method_is_intrinsic_slow(
+        &mut self,
+        idx: u32,
+        early_nid: Option<usize>,
+        name: &str,
+        kind: u8,
+    ) -> bool {
         let proto = match (self.heap.get(idx), kind) {
             (HeapObj::Set(_), 3) => self.set_proto,
             (HeapObj::Map { .. }, 4) => self.map_proto,

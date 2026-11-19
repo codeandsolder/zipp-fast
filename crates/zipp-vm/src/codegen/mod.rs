@@ -1270,7 +1270,7 @@ pub struct Cross3MethodPlan {
     pub argc: u16,
     pub arrow_this: bool,
     pub mask_gen: u32,
-    pub uninit_mask: u64,
+    pub uninit_mask: [u64; 2],
 }
 
 /// B199: one live cross-entry record — `entry` (0 = none) and the mask
@@ -1354,7 +1354,7 @@ pub struct SameProtoCross3Plan {
     /// live `CrossEntryRec::mask_gen` equals `mask_gen`; the entry itself
     /// is loaded from the live table per call (B199), never baked.
     pub mask_gen: u32,
-    pub uninit_mask: u64,
+    pub uninit_mask: [u64; 2],
     /// The callee's body never reads the running activation
     /// ([`activation_free`]): a site whose callee value sits in a caller
     /// register (rooted by the suspended caller's window) may skip the

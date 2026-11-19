@@ -834,7 +834,6 @@ impl DenseClosureHomes {
             .is_some_and(|present| present & mask != 0)
     }
 
-    #[cfg(test)]
     #[inline]
     fn len(&self) -> usize {
         self.len
@@ -980,13 +979,17 @@ impl ClosureHomeTable {
         self.get(key).is_some()
     }
 
-    #[cfg(test)]
     #[inline]
     fn len(&self) -> usize {
         match self {
             Self::Dense(table) => table.len(),
             Self::Map(table) => table.len(),
         }
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     fn retain<F: FnMut(&u32, &mut Value) -> bool>(&mut self, keep: F) {
@@ -3542,6 +3545,13 @@ pub struct Vm<'p> {
     htmldda_idx: u32,
     /// VM-construction-latched same-binary ablation for `htmldda_idx`.
     htmldda_scalar_enabled: bool,
+    /// Upper bound of special non-plain-object setup indices (`fn_proto`,
+    /// `symbol_ctor`, `bigint_ctor`, and the singleton `htmldda_idx`), or
+    /// `u32::MAX` when the scalar HTMLDDA lane is disabled. Any heap object
+    /// with `idx > typeof_special_max`, non-DICT JS shape, and plain/class fid
+    /// mirror word is guaranteed `typeof === "object"` without an FFI call.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    typeof_special_max: u32,
     /// The `Proxy` constructor object (no `.prototype`). 0 until setup.
     proxy_ctor: u32,
     /// The `Temporal` namespace object + `Temporal.Duration`/`PlainDate` ctors/protos.
@@ -3783,6 +3793,13 @@ pub struct Vm<'p> {
     /// it). Exceeding it throws RangeError — a tighter bound than MAX_FRAMES.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     reg_capacity: usize,
+    /// One-past-the-end byte address of the pinned register buffer
+    /// (`regs.as_ptr().add(reg_capacity) as usize`), 0 until `reserve_jit_regs`
+    /// runs. Lets Tier-C / region prologues perform the leaf-inline headroom
+    /// check (`regs_end - base >= needed * 8`) inline instead of calling
+    /// `jit_regs_fits`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    regs_end_raw: usize,
     /// High-water mark: the largest `regs.len()` ever reached (and thus
     /// initialized). A native self-call window at or below this can be exposed
     /// with `set_len` instead of a zero-filling `resize` — its slots already hold
