@@ -1055,7 +1055,7 @@ fn lex_number(source: &str, base_offset: u32, start: usize) -> Result<(TokenKind
     }
 
     if is_float {
-        let f = clean.parse::<f64>().map_err(|_| {
+        let f = zipp_numparse::parse_f64(&clean).ok_or_else(|| {
             ParseError::new(source, base_offset + start as u32, "invalid float literal")
         })?;
         return Ok((TokenKind::FloatLit(f), pos));
@@ -1078,7 +1078,7 @@ fn lex_number(source: &str, base_offset: u32, start: usize) -> Result<(TokenKind
     if let Ok(v) = clean.parse::<i64>() {
         Ok((TokenKind::IntLit(v), pos))
     } else {
-        let f = clean.parse::<f64>().map_err(|_| {
+        let f = zipp_numparse::parse_f64(&clean).ok_or_else(|| {
             ParseError::new(source, base_offset + start as u32, "invalid numeric literal")
         })?;
         Ok((TokenKind::FloatLit(f), pos))

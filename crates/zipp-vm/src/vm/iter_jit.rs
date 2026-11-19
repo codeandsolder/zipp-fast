@@ -40,7 +40,7 @@ pub(crate) extern "win64" fn jit_get_iterator(vm: *mut core::ffi::c_void, v_bits
     if vm.is_null() {
         return crate::codegen::SELF_CALL_DEOPT;
     }
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    crate::vm::helpers_misc::catch_effectful_jit_u64(|| {
         let vm = unsafe { &*(vm as *const Vm) };
         let v = Value::from_bits(v_bits);
         if !v.is_heap() || v.heap_index() as usize >= vm.heap.len() {
@@ -78,8 +78,7 @@ pub(crate) extern "win64" fn jit_get_iterator(vm: *mut core::ffi::c_void, v_bits
             return crate::codegen::SELF_CALL_DEOPT;
         }
         v_bits
-    }))
-    .unwrap_or(crate::codegen::SELF_CALL_DEOPT)
+    })
 }
 
 /// `IterPrime { dst, iter }` — built-in fast iterables perform no observable
@@ -90,7 +89,7 @@ pub(crate) extern "win64" fn jit_iter_prime(vm: *mut core::ffi::c_void, it_bits:
     if vm.is_null() {
         return crate::codegen::SELF_CALL_DEOPT;
     }
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    crate::vm::helpers_misc::catch_effectful_jit_u64(|| {
         let vm = unsafe { &*(vm as *const Vm) };
         let it = Value::from_bits(it_bits);
         if it.is_heap() {
@@ -109,8 +108,7 @@ pub(crate) extern "win64" fn jit_iter_prime(vm: *mut core::ffi::c_void, it_bits:
             }
         }
         Value::UNDEFINED.bits()
-    }))
-    .unwrap_or(crate::codegen::SELF_CALL_DEOPT)
+    })
 }
 
 /// `EndFinally { kind_reg, val_reg }` — only the NORMAL completion resumes
@@ -251,7 +249,7 @@ pub(crate) extern "win64" fn jit_object_keys(
     if vm.is_null() {
         return crate::codegen::SELF_CALL_DEOPT;
     }
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    crate::vm::helpers_misc::catch_effectful_jit_u64(|| {
         let vm = unsafe { &mut *(vm as *mut Vm) };
         if !vm.static_builtin_is_intrinsic(
             "Object",
@@ -276,8 +274,5 @@ pub(crate) extern "win64" fn jit_object_keys(
             Ok(v) => v.bits(),
             Err(t) => vm.jit_thrown_to_sentinel(t),
         }
-    })) {
-        Ok(bits) => bits,
-        Err(_) => std::process::abort(),
-    }
+    })
 }

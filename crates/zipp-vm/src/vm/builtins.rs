@@ -449,24 +449,41 @@ impl<'p> Vm<'p> {
             return false;
         }
         let idx = recv.heap_index();
-        if !matches!(
-            self.heap.get(idx),
-            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Native(_) | HeapObj::Bound { .. }
-        ) {
-            return false;
-        }
-        if self
-            .fn_props
-            .get(&idx)
-            .is_some_and(|m| m.pos(name).is_some())
+        let callable_via_mirror = {
+            #[cfg(feature = "jit")]
+            {
+                self.heap.hot_mirror_of(idx).fid < crate::heap::FID_MIRROR_STR
+            }
+            #[cfg(not(feature = "jit"))]
+            {
+                false
+            }
+        };
+        if !callable_via_mirror
+            && !matches!(
+                self.heap.get(idx),
+                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Native(_) | HeapObj::Bound { .. }
+            )
         {
             return false;
         }
-        if self
-            .proto_of
-            .get(&idx)
-            .is_some_and(|&p| p != Value::heap(self.fn_proto))
+        let skip_fn_props = match name {
+            "call" => self.fn_props_has_call == 0,
+            "apply" => self.fn_props_has_apply == 0,
+            "bind" => self.fn_props_has_bind == 0,
+            _ => false,
+        };
+        if !skip_fn_props
+            && !self.fn_props.is_empty()
+            && self
+                .fn_props
+                .get(&idx)
+                .is_some_and(|m| m.pos(name).is_some())
         {
+            return false;
+        }
+        let raw_proto = self.proto_of.raw_bits(idx);
+        if raw_proto != 0 && raw_proto != Value::heap(self.fn_proto).bits() {
             return false;
         }
         let want = match name {
@@ -474,18 +491,90 @@ impl<'p> Vm<'p> {
             "bind" => FN_BIND,
             _ => FN_CALL,
         };
-        // `own_pos`: %Function.prototype%'s shape answers `call`/`bind`
-        // from the (shape, key) memo, not a hash of the name per call.
+        // Fast path: reuse `ci_pristine`'s cached `%Function.prototype%` slot
+        // index and pristine native `Value` bits when its version matches,
+        // avoiding both `own_pos` hash lookup and the second `Heap::objs` load.
         match self.heap.get(self.fn_proto) {
-            HeapObj::Object(m) => self.own_pos(m, name).is_some_and(|slot| {
-                !m.attr_at(slot).accessor
-                    && m.val_at(slot).is_heap()
-                    && matches!(
-                        self.heap.get(m.val_at(slot).heap_index()),
-                        HeapObj::Native(id) if *id == want
-                    )
-            }),
+            HeapObj::Object(m) => {
+                #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                if self.ci_pristine.ver == self.heap.version_of(self.fn_proto) {
+                    let (slot, want_bits) = match want {
+                        FN_CALL => (self.ci_pristine.call_slot, self.ci_pristine.call_bits),
+                        FN_APPLY => (self.ci_pristine.apply_slot, self.ci_pristine.apply_bits),
+                        FN_BIND => (self.ci_pristine.bind_slot, self.ci_pristine.bind_bits),
+                        _ => (u32::MAX, 0),
+                    };
+                    if slot != u32::MAX && want_bits != 0 {
+                        return m.val_at(slot as usize).bits() == want_bits;
+                    }
+                }
+                let slot = self.own_pos(m, name);
+                slot.is_some_and(|slot| {
+                    !m.attr_at(slot).accessor
+                        && m.val_at(slot).is_heap()
+                        && matches!(
+                            self.heap.get(m.val_at(slot).heap_index()),
+                            HeapObj::Native(id) if *id == want
+                        )
+                })
+            }
             _ => false,
+        }
+    }
+
+    /// Populate `ci_pristine` for the current `%Function.prototype%` version so
+    /// `fn_call_apply_pristine` and `try_fn_call_apply_inline` resolve `"call"`,
+    /// `"apply"`, and `"bind"` in O(1) without per-call hash or `Heap::objs` lookups.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub(crate) fn refresh_ci_pristine(&mut self) {
+        use crate::vm::native::{FN_APPLY, FN_BIND, FN_CALL};
+        if self.fn_proto == 0 {
+            return;
+        }
+        let fp_ver = self.heap.version_of(self.fn_proto);
+        if self.ci_pristine.ver != fp_ver {
+            self.ci_pristine = match self.heap.get(self.fn_proto) {
+                HeapObj::Object(m) => {
+                    let probe = |name: &str, want: u16| -> (u32, u64) {
+                        let Some(s) = m.pos(name) else {
+                            return (u32::MAX, 0);
+                        };
+                        let bits = if !m.attr_at(s).accessor {
+                            let v = m.val_at(s);
+                            if v.is_heap()
+                                && matches!(
+                                    self.heap.get(v.heap_index()),
+                                    HeapObj::Native(id) if *id == want
+                                )
+                            {
+                                v.bits()
+                            } else {
+                                0
+                            }
+                        } else {
+                            0
+                        };
+                        (s as u32, bits)
+                    };
+                    let (call_slot, call_bits) = probe("call", FN_CALL);
+                    let (apply_slot, apply_bits) = probe("apply", FN_APPLY);
+                    let (bind_slot, bind_bits) = probe("bind", FN_BIND);
+                    crate::vm::CiPristine {
+                        ver: fp_ver,
+                        call_slot,
+                        apply_slot,
+                        bind_slot,
+                        call_bits,
+                        apply_bits,
+                        bind_bits,
+                    }
+                }
+                _ => crate::vm::CiPristine {
+                    ver: fp_ver,
+                    ..crate::vm::CiPristine::EMPTY
+                },
+            };
         }
     }
 
@@ -540,6 +629,8 @@ impl<'p> Vm<'p> {
         arg_base: u16,
         argc: u16,
     ) -> Option<Value> {
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        self.refresh_ci_pristine();
         if !bind_fast_enabled()
             || !recv.is_heap()
             || !self.realm_global_objs.is_empty()

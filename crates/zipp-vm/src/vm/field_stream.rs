@@ -1438,20 +1438,13 @@ pub(crate) extern "win64" fn jit_field_read_loop(
     regs: *mut u64,
     packed: u64,
 ) -> u64 {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+    crate::vm::helpers_misc::catch_effectful_jit_u64(|| unsafe {
         let vm = &mut *(vm as *mut Vm);
         let func_id = (packed >> 32) as usize;
         let start = ((packed >> 16) & 0xffff) as usize;
         let end = (packed & 0xffff) as usize;
         vm.field_read_loop(regs, func_id, start, end) as u64
-    }));
-    match result {
-        Ok(served) => served,
-        // Reducers return `false` themselves only while still a pure prefix.
-        // An unwind can happen after a register/global commit, so replaying the
-        // unchanged region would duplicate observable effects.
-        Err(_) => std::process::abort(),
-    }
+    })
 }
 
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -1460,19 +1453,13 @@ pub(crate) extern "win64" fn jit_field_write_loop(
     regs: *mut u64,
     packed: u64,
 ) -> u64 {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+    crate::vm::helpers_misc::catch_effectful_jit_u64(|| unsafe {
         let vm = &mut *(vm as *mut Vm);
         let func_id = (packed >> 32) as usize;
         let start = ((packed >> 16) & 0xffff) as usize;
         let end = (packed & 0xffff) as usize;
         vm.field_write_loop(regs, func_id, start, end) as u64
-    }));
-    match result {
-        Ok(served) => served,
-        // Writes may already have published one or more object slots. Never
-        // turn an invariant panic into the ordinary pre-effect decline value.
-        Err(_) => std::process::abort(),
-    }
+    })
 }
 
 #[cfg(all(test, feature = "jit", target_arch = "x86_64"))]

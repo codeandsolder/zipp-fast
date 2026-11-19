@@ -116,6 +116,10 @@ impl<'p> Vm<'p> {
         }
         let top = self.frames.len() - 1;
         self.frames[top].ip = bail as usize;
+        #[cfg(not(target_arch = "wasm32"))]
+        if crate::vm::dispatch::interp_stats::enabled() {
+            crate::vm::dispatch::interp_stats::bump_region(fid, u32::MAX, bail);
+        }
         if let Some(tv) = self.pending_throw {
             // `run_loop`'s own unwind for a throw out of its frame.
             if self.unwind_to_handler(tv, stop) {
@@ -279,6 +283,16 @@ impl<'p> Vm<'p> {
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     fn jit_get_prop_complete(&mut self, func_id: u32, o: Value, key: &str) -> u64 {
         if crate::vm::is_private_key(key) || self.jit_complete_declines() {
+            return crate::codegen::SELF_CALL_DEOPT;
+        }
+        if (key == "arguments" || key == "caller")
+            && o.is_heap()
+            && matches!(
+                self.heap.get(o.heap_index()),
+                HeapObj::Func(_) | HeapObj::Closure { .. }
+            )
+            && self.jit_tierc_activation.frame_free
+        {
             return crate::codegen::SELF_CALL_DEOPT;
         }
         // The interpreter's lanes for these, ahead of the member walk.

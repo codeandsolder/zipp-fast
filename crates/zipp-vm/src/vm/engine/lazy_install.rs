@@ -13,14 +13,7 @@ use crate::bytecode::FuncProto;
 
 impl<'p> Vm<'p> {
     /// Give this VM the session that compiles its program's deferred bodies.
-    /// Such a program runs in the interpreter alone: the native tiers' plans
-    /// read a callee's code before its first call, which a stub's does not
-    /// answer for.
     pub(crate) fn set_lazy_session(&mut self, session: crate::compile::LazySession<'p>) {
-        #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
-        {
-            self.jit_enabled = false;
-        }
         self.lazy = Some(Box::new(session));
     }
 
@@ -254,6 +247,7 @@ impl<'p> Vm<'p> {
             if let Some(m) = self.mi_cache.get_mut(f) {
                 *m = i32::MIN;
             }
+            self.jit.forget_stub(fid);
         }
         #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
         self.lite_forget(fid);

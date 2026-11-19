@@ -7523,6 +7523,10 @@ pub struct Heap {
     /// no per-object check while the value stands: one compare for a chain
     /// of any depth. Never 0, which entries hold for "not stamped".
     pub(crate) chain_epoch: u32,
+    /// Non-zero once any `HeapObj::TypedArray` has been allocated in this heap;
+    /// lets compiled `GetIndex`/`SetIndex` skip the typed-array receiver cache
+    /// and `jit_get_index_ta_fill` completely on typed-array-free programs.
+    pub(crate) has_typed_array: u8,
     /// One-code-point strings handed out by [`Heap::cp_str`], direct-mapped by
     /// code point: (code point, slot, the slot's version when cached). A slot
     /// freed or reused since has another version, so a stale entry is seen
@@ -8608,6 +8612,7 @@ impl Heap {
             versions,
             spare: 0,
             chain_epoch: 1,
+            has_typed_array: 0,
             cp_strs: Vec::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             array_snapshot_epoch: 0,
@@ -8744,6 +8749,31 @@ impl Heap {
     #[inline(always)]
     pub(crate) fn is_flat_str_mirror(&self, idx: usize) -> bool {
         self.hot_mirror[idx].fid == FID_MIRROR_STR
+    }
+
+    /// True iff slot `idx` holds a settled dense `HeapObj::Array` with a live
+    /// `arr_mirror` entry (no element overlay, no mapped `arguments`, no
+    /// virtual length).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline(always)]
+    pub(crate) fn arr_mirror_live(&self, idx: u32) -> bool {
+        self.arr_mirror[idx as usize][0] != 0
+    }
+
+    /// Read dense present element `i` directly through `arr_mirror` when live
+    /// (zero `Heap::objs` deref, zero side-table checks).
+    #[cfg(all(feature = "jit", target_arch = "x86_64", not(feature = "safe-sandbox")))]
+    #[inline(always)]
+    pub(crate) fn arr_mirror_get_fast(&self, idx: u32, i: usize) -> Option<Value> {
+        let [ptr, len] = self.arr_mirror[idx as usize];
+        if ptr == 0 || i >= len as usize {
+            return None;
+        }
+        // SAFETY: a live `arr_mirror` entry is `[items.as_ptr(), items.len()]`
+        // for a live dense `HeapObj::Array` (cleared by every mutating
+        // chokepoint, `bump_version`, `replace`, and `free_slot`).
+        let v = unsafe { *(ptr as *const Value).add(i) };
+        (!v.is_hole()).then_some(v)
     }
 
     /// Re-cache `gen_raw` after a `gen` growth (`push` / `reserve_exact` may
@@ -9884,6 +9914,10 @@ impl Heap {
             #[cfg(feature = "python")]
             HeapObj::PyAttrs { .. } => no_hot_mirror(),
             HeapObj::Str(s) if s.units() > 0 => str_hot_mirror(),
+            HeapObj::TypedArray { .. } => {
+                self.has_typed_array = 1;
+                clear_hot_mirror()
+            }
             _ => clear_hot_mirror(),
         };
         self.alloc_settled(obj, hot)
@@ -12823,6 +12857,14 @@ impl Heap {
         let mut out = Vec::with_capacity(len);
         self.write_wtf8(idx, &mut out);
         self.objs[idx as usize] = HeapObj::Str(JsStr::from_wtf8(out));
+        #[cfg(feature = "jit")]
+        {
+            self.hot_mirror[idx as usize] = if len > 0 {
+                HotMirror::STR
+            } else {
+                HotMirror::CLEAR
+            };
+        }
     }
 
     /// Resolve a callable (plain function or closure) to its function id and

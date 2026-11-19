@@ -23,7 +23,7 @@ env_off_switch!(
 /// The split lets cross-call completions always refresh TypedArrays/DataViews/
 /// strings while guarding only dense Arrays with the B244 mutation epoch.
 fn emit_refetch_ta_partition(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     snapshot_helper: usize,
     plan: &TaPinPlan,
     arrays: bool,
@@ -55,7 +55,7 @@ fn emit_refetch_ta_partition(
 /// proof before another direct access.  Keep each pin's original stack index:
 /// `TaPinPlan::access` addresses these slots by plan position.
 fn emit_refetch_ta_methods(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     snapshot_helper: usize,
     plan: &TaPinPlan,
 ) {
@@ -99,7 +99,7 @@ fn cross_array_epoch_cache_off(c3_off: i32, plan: &TaPinPlan) -> Option<i32> {
 /// method of the same name) continues here.
 #[allow(clippy::too_many_arguments)]
 fn emit_region_general_method(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     ip: usize,
     bail: dynasmrt::DynamicLabel,
     epilogue: dynasmrt::DynamicLabel,
@@ -130,7 +130,7 @@ fn emit_region_general_method(
 }
 
 pub(crate) fn emit_cross_refetch_ta(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     snapshot_helper: usize,
     plan: &TaPinPlan,
     epoch_cache_off: Option<i32>,
@@ -192,12 +192,14 @@ env_off_switch! {
 /// loop pays no branch when the prefix is enabled.
 #[inline]
 fn field_write_stream_enabled() -> bool {
-    crate::env_var_os("ZIPP_NO_FIELD_WRITE_STREAM").is_none()
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::env_var_os("ZIPP_NO_FIELD_WRITE_STREAM").is_none())
 }
 
 #[inline]
 fn field_mixed_stream_enabled() -> bool {
-    crate::env_var_os("ZIPP_NO_FIELD_MIXED_STREAM").is_none()
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::env_var_os("ZIPP_NO_FIELD_MIXED_STREAM").is_none())
 }
 
 /// The helper's own bytecode screen (`vm::field_stream`), as an admission
@@ -294,7 +296,7 @@ pub(crate) fn compile_region_mem(
     if (scalar_matchall.is_some() || scalar_exec.is_some()) && meter.is_some() {
         return None;
     }
-    let mut ops = dynasmrt::x64::Assembler::new().ok()?;
+    let mut ops = crate::codegen::new_x64_asm();
     let (s, e) = (start as usize, end as usize);
     // A Python loop (see `codegen::py`).
     let py = py_ext || has_py_ops(&proto.code[s..=e]);
@@ -321,7 +323,11 @@ pub(crate) fn compile_region_mem(
         }
     };
 
-    if crate::env_var_os("ZIPP_JITDUMP").is_some() {
+    let jitdump = {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| crate::env_var_os("ZIPP_JITDUMP").is_some())
+    };
+    if jitdump {
         for ip in s..=e {
             eprintln!("[dump] {ip}: {:?}", proto.code[ip]);
         }
@@ -1507,7 +1513,10 @@ pub(crate) fn compile_region_mem(
                 // ⇒ no refetch, and re-execution on deopt is always sound.
                 // `ZIPP_NO_TONUM_STR=1` restores the plain bail (the pre-change
                 // shape) so the string arm can be A/B'd on ONE binary.
-                let tonum_str = crate::env_var_os("ZIPP_NO_TONUM_STR").is_none();
+                let tonum_str = {
+                    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                    *ON.get_or_init(|| crate::env_var_os("ZIPP_NO_TONUM_STR").is_none())
+                };
                 let is_num = ops.new_dynamic_label();
                 let tn_done = ops.new_dynamic_label();
                 dynasm!(ops
@@ -3642,7 +3651,16 @@ pub(crate) fn compile_region_mem(
                     });
                     if let Some(site) = class_lane {
                         let lookup_miss = ops.new_dynamic_label();
+                        let have_callee = ops.new_dynamic_label();
                         let cl_bail = ops.new_dynamic_label();
+                        if let Some(plane) = site.proto_read {
+                            let guard_miss = ops.new_dynamic_label();
+                            super::proto_mem::emit_proto_read_guard(&mut ops, obj, &plane, guard_miss);
+                            dynasm!(ops
+                                ; jmp => have_callee
+                                ; => guard_miss
+                            );
+                        }
                         dynasm!(ops
                             ; mov rcx, rdi                        // vm
                             ; mov rdx, [rbx + dreg(obj)]          // receiver bits
@@ -3652,6 +3670,7 @@ pub(crate) fn compile_region_mem(
                             ; mov r10, QWORD SELF_CALL_DEOPT as i64
                             ; cmp rax, r10
                             ; je => lookup_miss
+                            ; => have_callee
                             ; mov [rsp + c3_off + 48], rax        // the arms' callee
                         );
                         for c3plan in site.cross3.iter() {
@@ -5570,7 +5589,7 @@ pub(crate) fn compile_region_mem(
         Vec::new()
     };
     deferred_bails.flush(&mut ops);
-    let buf = ops.finalize().ok()?;
+    let buf = crate::codegen::finalize_code(ops)?;
     let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
     if !op_offsets.is_empty() {
         super::proto_mem::write_op_offsets(heap.func_id, entry_ptr as u64, &proto.code, &op_offsets);
@@ -5804,7 +5823,7 @@ pub(crate) enum Cross3Callee {
 /// the completion contract.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_cross3_call(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     plan: crate::codegen::SameProtoCross3Plan,
     callee: Cross3Callee,
     // A method call's receiver register (the strict callee's `this`);
@@ -5841,6 +5860,26 @@ pub(crate) fn emit_cross3_call(
         ; cmp DWORD [r11 + r10 * 8 + JIT_HOT_FID_OFF as i32], plan.fid as i32
         ; jne => fb
     );
+    // If this is a sloppy method call (`CallWithThis` / `CallMethod` / getter),
+    // prove the receiver is a shaped `HeapObj::Object` (`mir.shape != DICT`) so
+    // `this` passes verbatim without `ToObject` boxing (uses r11/rcx only,
+    // preserving rax = callee bits and r10d = callee heap index).
+    if plan.sloppy_obj_this {
+        if let Some(r) = this_reg {
+            dynasm!(ops
+                ; mov r11, [rbx + dreg(r)]
+                ; mov rcx, r11
+                ; shr rcx, 48
+                ; cmp ecx, TAG_HEAP_HI as i32
+                ; jne => fb
+                ; mov ecx, r11d
+                ; mov r11, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
+                ; lea r11, [r11 + rcx * 8]
+                ; cmp DWORD [r11 + rcx * 8], 0
+                ; je => fb
+            );
+        }
+    }
     let this_src = if plan.arrow_this {
         Cross3This::ArrowMirror
     } else if let Some(r) = this_reg {
@@ -5856,6 +5895,7 @@ pub(crate) fn emit_cross3_call(
             fid: plan.fid,
             callee_regs: plan.callee_regs,
             argc: plan.argc,
+            param_count: plan.param_count,
             mask_gen: plan.mask_gen,
             uninit_mask: plan.uninit_mask,
             this_src,
@@ -5892,7 +5932,7 @@ pub(crate) fn emit_cross3_call(
 /// unchanged method-IC helper block as a pure prefix.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_cross3_method_call(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     plan: crate::codegen::Cross3MethodPlan,
     obj: u16,
     arg_base: u16,
@@ -5945,6 +5985,7 @@ pub(crate) fn emit_cross3_method_call(
             fid: plan.fid,
             callee_regs: plan.callee_regs,
             argc: plan.argc,
+            param_count: plan.argc,
             mask_gen: plan.mask_gen,
             uninit_mask: plan.uninit_mask,
             this_src,
@@ -5968,6 +6009,7 @@ pub(crate) struct Cross3Invoke {
     pub fid: u32,
     pub callee_regs: u16,
     pub argc: u16,
+    pub param_count: u16,
     pub uninit_mask: [u64; 2],
     pub mask_gen: u32,
     pub this_src: Cross3This,
@@ -5999,7 +6041,7 @@ pub(crate) struct Cross3Invoke {
 /// label exactly like the helper route.
 #[allow(clippy::too_many_arguments)]
 fn emit_cross3_invoke(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     iv: Cross3Invoke,
     heap: &crate::codegen::HeapHelpers,
     bail: dynasmrt::DynamicLabel,
@@ -6062,7 +6104,7 @@ fn emit_cross3_invoke(
         // same-mask recompile re-sets it); the mask generation proves the
         // baked zeroing mask still matches the live callee.
         ; mov r11, [rdi + JIT_CROSS_TABLE_RAW_OFFSET as i32]
-        ; lea rcx, [r11 + (iv.fid as i32) * 16]
+        ; lea rcx, [r11 + (iv.fid as i32) * 32]
         ; mov r11, [rcx]
         ; test r11, r11
         ; jz => fb
@@ -6242,22 +6284,32 @@ fn emit_cross3_invoke(
             );
         }
     }
-    for i in 0..iv.argc as i32 {
+    let copy_n = iv.argc.min(iv.param_count);
+    for i in 0..copy_n as i32 {
         dynasm!(ops
             ; mov r11, [rbx + dreg(iv.arg_base) + i * 8]
             ; mov [r9 + (1 + i) * 8], r11
         );
     }
     {
-        // Registers [0 ..= argc] were just written; zero only the remaining
-        // may-read-before-write set (up to 128 regs, baked; `mask_gen` guards
-        // staleness). Skip the test+load completely when no slots need zeroing.
-        let arg_mask = if iv.argc + 1 >= 64 {
+        // Registers [0 ..= copy_n] were just written; missing formal params
+        // `(copy_n .. param_count)` MUST be filled with `undefined` (since
+        // `cross_uninit_mask` assumes all formals are supplied), plus the
+        // remaining may-read-before-write set (up to 128 regs, baked;
+        // `mask_gen` guards staleness). Skip completely when no slots need
+        // zeroing.
+        let arg_mask = if copy_n + 1 >= 64 {
             u64::MAX
         } else {
-            (1u64 << (iv.argc + 1)) - 1
+            (1u64 << (copy_n + 1)) - 1
         };
-        let mask0 = iv.uninit_mask[0] & !arg_mask;
+        let mut missing_params_mask = 0u64;
+        for p in copy_n..iv.param_count {
+            if 1 + p < 64 {
+                missing_params_mask |= 1u64 << (1 + p);
+            }
+        }
+        let mask0 = (iv.uninit_mask[0] & !arg_mask) | missing_params_mask;
         let mask1 = iv.uninit_mask[1];
         if mask0 != 0 || mask1 != 0 {
             let zeroed = ops.new_dynamic_label();
@@ -6292,7 +6344,7 @@ fn emit_cross3_invoke(
             // enter helper changes only window/activation state. Re-reading the
             // live table frees the scratch tail for B244's epoch cache.
             ; mov rax, [rdi + JIT_CROSS_TABLE_RAW_OFFSET as i32]
-            ; mov rax, [rax + (iv.fid as i32) * 16]
+            ; mov rax, [rax + (iv.fid as i32) * 32]
         );
     } else {
         dynasm!(ops

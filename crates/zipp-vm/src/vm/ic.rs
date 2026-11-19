@@ -88,8 +88,13 @@ const IC_MISS_LIMIT: u8 = 16;
 /// polymorphic phases beside it 2-4%), class-features 0.971, the rest of the
 /// 51 bench rows and the bundled applications neutral.
 const IC_PROBATION: u8 = 64;
-/// Maximum proto-chain hops a `Proto*`/`Super*` entry can guard.
+/// Maximum proto-chain hops a `Proto*`/`Super*` entry can guard inline.
 const IC_MAX_HOPS: usize = 6;
+/// Maximum proto-chain hops a stamped `ProtoDeep` entry can guard via
+/// `Heap::chain_epoch` (covers deep ES5 transpiled hierarchies such as Babel's
+/// 10-level Parser chain while keeping `size_of::<IcEntry>() <= 72`).
+#[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+const IC_DEEP_MAX_HOPS: usize = 24;
 
 env_off_switch! {
     /// `ZIPP_NO_CLASS_MISS=1`: a class instance's absent key fills no way.
@@ -97,6 +102,9 @@ env_off_switch! {
 }
 
 /// `Vm::own_slot_cache`'s size, a power of two.
+#[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+pub(crate) const OWN_SLOT_CACHE_SLOTS: usize = 16384;
+#[cfg(not(all(feature = "jit", not(feature = "safe-sandbox"))))]
 pub(crate) const OWN_SLOT_CACHE_SLOTS: usize = 4096;
 
 /// One answer of [`Vm::own_pos`]: in an object of shape `shape`, the key of
@@ -286,6 +294,20 @@ pub(crate) enum IcEntry {
         first: u8,
         hops: IcHops,
         slot: u32,
+    },
+    /// Deep stamped inherited data property (> `IC_MAX_HOPS` hops, up to
+    /// `IC_DEEP_MAX_HOPS`): every hop on the chain was marked with
+    /// `Heap::guard_version` before `epoch` was sampled, so matching
+    /// `Heap::chain_epoch == epoch` plus the receiver's `first` link proves
+    /// the entire chain and holder slot valid in O(1).
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    ProtoDeep {
+        recv_shape: u32,
+        first: u8,
+        first_hop: u32,
+        holder: u32,
+        slot: u32,
+        epoch: u32,
     },
     /// An accessor on the proto_of chain at `hops[last].slot`. `recv_shape`
     /// is the receiver's hidden class at fill, as for `ProtoData`: a live
@@ -560,9 +582,12 @@ fn hops_guarded(hops: &IcHops) -> bool {
 /// read's takes either.
 #[derive(Default)]
 pub(crate) struct SiteCell {
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    site: std::cell::UnsafeCell<Option<Box<SiteIc>>>,
+    #[cfg(not(all(feature = "jit", not(feature = "safe-sandbox"))))]
     pub(crate) site: Option<Box<SiteIc>>,
-    own_shape: u32,
-    own_slot: u32,
+    own_shape: std::cell::Cell<u32>,
+    own_slot: std::cell::Cell<u32>,
 }
 
 impl SiteCell {
@@ -574,12 +599,27 @@ impl SiteCell {
     /// slot first (`dict_hint`).
     const DICT_HINT: u32 = u32::MAX;
 
+    #[inline(always)]
+    pub(crate) fn site_ref(&self) -> Option<&SiteIc> {
+        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+        {
+            // SAFETY: `site` is mutated only under `&mut Vm` (`IcTable::site_slot_mut_at`)
+            // when no shared `&SiteIc` borrow is live.
+            unsafe { (*self.site.get()).as_deref() }
+        }
+        #[cfg(not(all(feature = "jit", not(feature = "safe-sandbox"))))]
+        {
+            self.site.as_deref()
+        }
+    }
+
     /// The slot a dictionary-mode receiver last held the key at, if the
     /// cell remembers one.
     #[inline(always)]
     #[cfg_attr(feature = "safe-sandbox", allow(dead_code))]
     fn dict_hint(&self) -> Option<usize> {
-        (self.own_shape == Self::DICT_HINT).then_some((self.own_slot & !Self::WRITE_PROVEN) as usize)
+        (self.own_shape.get() == Self::DICT_HINT)
+            .then_some((self.own_slot.get() & !Self::WRITE_PROVEN) as usize)
     }
 
     /// The slot of the key in a receiver of `shape`, if the cell knows it.
@@ -587,7 +627,7 @@ impl SiteCell {
     #[inline(always)]
     #[cfg_attr(feature = "safe-sandbox", allow(dead_code))]
     fn own_read(&self, shape: u32) -> Option<u32> {
-        (self.own_shape == shape).then_some(self.own_slot & !Self::WRITE_PROVEN)
+        (self.own_shape.get() == shape).then_some(self.own_slot.get() & !Self::WRITE_PROVEN)
     }
 
     /// Whether the instruction has found its key as an own data property of
@@ -596,15 +636,137 @@ impl SiteCell {
     #[inline(always)]
     #[cfg_attr(not(all(feature = "jit", not(feature = "safe-sandbox"))), allow(dead_code))]
     fn knows_own(&self) -> bool {
-        self.own_shape != crate::shape::DICT
+        self.own_shape.get() != crate::shape::DICT
     }
 
     /// The slot a write of the key may store to in a receiver of `shape`.
     #[inline(always)]
     #[cfg_attr(feature = "safe-sandbox", allow(dead_code))]
     fn own_write(&self, shape: u32) -> Option<u32> {
-        (self.own_shape == shape && self.own_slot & Self::WRITE_PROVEN != 0)
-            .then_some(self.own_slot & !Self::WRITE_PROVEN)
+        let slot = self.own_slot.get();
+        (self.own_shape.get() == shape && slot & Self::WRITE_PROVEN != 0)
+            .then_some(slot & !Self::WRITE_PROVEN)
+    }
+
+    /// Update the cell's `(own_shape, own_slot)` in place via interior mutability.
+    #[inline(always)]
+    fn set_own(&self, shape: u32, slot: u32, write_proven: bool) {
+        if shape == crate::shape::DICT || slot >= Self::WRITE_PROVEN {
+            return;
+        }
+        self.own_shape.set(shape);
+        self.own_slot
+            .set(slot | if write_proven { Self::WRITE_PROVEN } else { 0 });
+    }
+}
+
+/// Owned per-function table of [`SiteCell`] entries.
+///
+/// Under `jit && !safe-sandbox`, the backing slice is owned via a raw pointer
+/// and never forms `&mut [SiteCell]` or `&mut SiteCell` after allocation:
+/// `own_shape`/`own_slot` use `Cell<u32>` and `site` uses `UnsafeCell` (mutated
+/// only through `&mut IcTable` via `site_slot_mut_at`). That keeps a frame's
+/// hoisted `*const SiteCell` pointer sound across IC fills and recursive calls.
+#[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+pub(crate) struct IcTable {
+    ptr: std::ptr::NonNull<SiteCell>,
+    len: usize,
+}
+
+#[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+impl IcTable {
+    fn new(len: usize) -> Self {
+        let mut v = Vec::new();
+        v.resize_with(len, SiteCell::default);
+        let raw = Box::into_raw(v.into_boxed_slice()) as *mut SiteCell;
+        // SAFETY: `Box::into_raw` on a boxed slice is always non-null (even for len == 0).
+        Self {
+            ptr: unsafe { std::ptr::NonNull::new_unchecked(raw) },
+            len,
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline(always)]
+    pub(crate) fn as_ptr(&self) -> *const SiteCell {
+        self.ptr.as_ptr()
+    }
+
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub(crate) fn as_slice(&self) -> &[SiteCell] {
+        // SAFETY: `ptr..ptr+len` is owned by `self` and never mutably aliased as `[SiteCell]`.
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+
+    #[inline(always)]
+    pub(crate) fn get(&self, ip: usize) -> Option<&SiteCell> {
+        if ip < self.len {
+            // SAFETY: `ip < self.len`, and no `&mut SiteCell` ever exists.
+            Some(unsafe { &*self.ptr.as_ptr().add(ip) })
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    fn site_slot_mut_at(&mut self, ip: usize) -> Option<&mut Option<Box<SiteIc>>> {
+        if ip < self.len {
+            // SAFETY: `&mut self` (called under `&mut Vm`) guarantees exclusive
+            // access to `site` with no live `&SiteIc` borrows, without forming
+            // `&mut SiteCell` or `&mut [SiteCell]`.
+            Some(unsafe { &mut *(*self.ptr.as_ptr().add(ip)).site.get() })
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+impl Drop for IcTable {
+    fn drop(&mut self) {
+        // SAFETY: matches `Box::into_raw(v.into_boxed_slice())` in `IcTable::new`.
+        unsafe {
+            let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(self.ptr.as_ptr(), self.len));
+        }
+    }
+}
+
+#[cfg(not(all(feature = "jit", not(feature = "safe-sandbox"))))]
+pub(crate) struct IcTable(Box<[SiteCell]>);
+
+#[cfg(not(all(feature = "jit", not(feature = "safe-sandbox"))))]
+impl IcTable {
+    fn new(len: usize) -> Self {
+        let mut v = Vec::new();
+        v.resize_with(len, SiteCell::default);
+        Self(v.into_boxed_slice())
+    }
+
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub(crate) fn as_slice(&self) -> &[SiteCell] {
+        &self.0
+    }
+
+    #[inline(always)]
+    pub(crate) fn get(&self, ip: usize) -> Option<&SiteCell> {
+        self.0.get(ip)
+    }
+
+    #[inline(always)]
+    fn site_slot_mut_at(&mut self, ip: usize) -> Option<&mut Option<Box<SiteIc>>> {
+        self.0.get_mut(ip).map(|c| &mut c.site)
     }
 }
 
@@ -692,6 +854,16 @@ pub(crate) enum Walked {
         first: u8,
         hops: IcHops,
         slot: u32,
+    },
+    /// Inherited data property beyond `IC_MAX_HOPS` (up to `IC_DEEP_MAX_HOPS`),
+    /// stamped via `Heap::guard_version` on every hop before sampling `epoch`.
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    ChainDeepData {
+        first: u8,
+        first_hop: u32,
+        holder: u32,
+        slot: u32,
+        epoch: u32,
     },
     ChainAcc {
         first: u8,
@@ -844,7 +1016,7 @@ impl<'p> Vm<'p> {
         if !self.ic_func_eligible(func_id) {
             return None;
         }
-        self.site_ics.get(f)?.as_ref()?.get(ip)?.site.as_deref()
+        self.site_ics.get(f)?.as_ref()?.get(ip)?.site_ref()
     }
 
     /// The table cell of `(func_id, ip)`, if its function has a table.
@@ -852,6 +1024,25 @@ impl<'p> Vm<'p> {
     #[cfg_attr(feature = "safe-sandbox", allow(dead_code))]
     fn ic_cell(&self, func_id: u32, ip: usize) -> Option<&SiteCell> {
         self.site_ics.get(func_id as usize)?.as_ref()?.get(ip)
+    }
+
+    /// Raw pointer to `func_id`'s [`SiteCell`] table when `func_id` is
+    /// IC-eligible and its table has already been allocated with length
+    /// `code_len`, else null.
+    ///
+    /// Hoisted once per frame in `dispatch_body`: eliminates `ic_func_eligible`
+    /// and the double `site_ics[func_id][ip]` bounds-checked pointer chase on
+    /// every `GetProp` / `SetProp` / `CallMethod` / `Call`.
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    #[inline(always)]
+    pub(crate) fn ic_func_cells_raw(&self, func_id: u32, code_len: usize) -> *const SiteCell {
+        if !self.ic_func_eligible(func_id) {
+            return core::ptr::null();
+        }
+        match self.site_ics.get(func_id as usize).and_then(Option::as_ref) {
+            Some(table) if table.len() == code_len => table.as_ptr(),
+            _ => core::ptr::null(),
+        }
     }
 
     /// The accessor lane (`codegen::AccLane`) of the `GetProp` (`set` false)
@@ -963,13 +1154,15 @@ impl<'p> Vm<'p> {
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn ic_cell_own_pair(&self, func_id: u32, ip: usize) -> Option<(u32, u32, bool)> {
         let cell = self.ic_cell(func_id, ip)?;
-        if cell.own_shape == crate::shape::DICT || cell.own_shape == SiteCell::DICT_HINT {
+        let shape = cell.own_shape.get();
+        if shape == crate::shape::DICT || shape == SiteCell::DICT_HINT {
             return None;
         }
+        let slot = cell.own_slot.get();
         Some((
-            cell.own_shape,
-            cell.own_slot & !SiteCell::WRITE_PROVEN,
-            cell.own_slot & SiteCell::WRITE_PROVEN != 0,
+            shape,
+            slot & !SiteCell::WRITE_PROVEN,
+            slot & SiteCell::WRITE_PROVEN != 0,
         ))
     }
 
@@ -1027,6 +1220,52 @@ impl<'p> Vm<'p> {
             .collect()
     }
 
+    /// True when the `GetProp` / `SetProp` at `(func_id, ip)` has already
+    /// observed multiple distinct guardable own-data shapes (or misses alongside
+    /// own-data hits) and NO prototype/accessor/class ways — meaning a first-time
+    /// Tier-C compile should emit the 32-shape direct probe immediately instead
+    /// of compiling an 8-way identity probe and paying a `direct-miss site gate`
+    /// eviction. Monomorphic single-shape sites return `false`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn ic_site_is_rotating_own(&self, func_id: u32, ip: usize, is_set: bool) -> bool {
+        let Some(cell) = self.ic_cell(func_id, ip) else {
+            return false;
+        };
+        let cell_shape = cell.own_shape.get();
+        if cell_shape == crate::shape::DICT || cell_shape == SiteCell::DICT_HINT {
+            return false;
+        }
+        if is_set && (cell.own_slot.get() & SiteCell::WRITE_PROVEN) == 0 {
+            return false;
+        }
+        let Some(site) = cell.site_ref() else {
+            return false;
+        };
+        if site.n == 0 {
+            return false;
+        }
+        let mut first_shape = crate::shape::DICT;
+        let mut distinct_shapes = 0u32;
+        for e in &site.entries[..site.n as usize] {
+            match *e {
+                IcEntry::OwnData { shape, .. } if shape != crate::shape::DICT => {
+                    if distinct_shapes == 0 {
+                        first_shape = shape;
+                        distinct_shapes = 1;
+                    } else if shape != first_shape {
+                        distinct_shapes = 2;
+                    }
+                }
+                IcEntry::AddData { .. } if is_set => {}
+                _ => return false,
+            }
+        }
+        if distinct_shapes == 0 {
+            return false;
+        }
+        distinct_shapes >= 2 || cell_shape != first_shape || site.misses >= 4
+    }
+
     /// The class getter the `GetProp` at `(func_id, ip)`'s cache found first
     /// (way 0 an `IcEntry::ClassGetter` of a plain user function), with the
     /// guards of `ic_class_method_read`'s lane: Tier O inlines its body.
@@ -1066,18 +1305,12 @@ impl<'p> Vm<'p> {
     /// with `write_proven`). A table that does not exist yet is not made for
     /// it: the instruction's first fill makes one.
     #[inline]
-    fn ic_cell_own(&mut self, func_id: u32, ip: usize, shape: u32, slot: usize, write_proven: bool) {
+    fn ic_cell_own(&self, func_id: u32, ip: usize, shape: u32, slot: usize, write_proven: bool) {
         if shape == crate::shape::DICT || slot >= SiteCell::WRITE_PROVEN as usize {
             return;
         }
-        if let Some(cell) = self
-            .site_ics
-            .get_mut(func_id as usize)
-            .and_then(Option::as_mut)
-            .and_then(|table| table.get_mut(ip))
-        {
-            cell.own_shape = shape;
-            cell.own_slot = slot as u32 | if write_proven { SiteCell::WRITE_PROVEN } else { 0 };
+        if let Some(cell) = self.ic_cell(func_id, ip) {
+            cell.set_own(shape, slot as u32, write_proven);
         }
     }
 
@@ -1086,19 +1319,15 @@ impl<'p> Vm<'p> {
     /// dict_hint`), unless the cell knows a shaped receiver's pair, which
     /// the inline hits read. As `ic_cell_own`, never made for it.
     #[inline]
-    fn ic_cell_dict(&mut self, func_id: u32, ip: usize, slot: usize) {
+    fn ic_cell_dict(&self, func_id: u32, ip: usize, slot: usize) {
         if slot >= SiteCell::WRITE_PROVEN as usize {
             return;
         }
-        if let Some(cell) = self
-            .site_ics
-            .get_mut(func_id as usize)
-            .and_then(Option::as_mut)
-            .and_then(|table| table.get_mut(ip))
-        {
-            if cell.own_shape == crate::shape::DICT || cell.own_shape == SiteCell::DICT_HINT {
-                cell.own_shape = SiteCell::DICT_HINT;
-                cell.own_slot = slot as u32;
+        if let Some(cell) = self.ic_cell(func_id, ip) {
+            let cur = cell.own_shape.get();
+            if cur == crate::shape::DICT || cur == SiteCell::DICT_HINT {
+                cell.own_shape.set(SiteCell::DICT_HINT);
+                cell.own_slot.set(slot as u32);
             }
         }
     }
@@ -1115,26 +1344,36 @@ impl<'p> Vm<'p> {
     /// visit; every [`IC_PROBATION`]th visit it may fill once more (and the
     /// fill's eviction, if the site is full, disables it again). The visits
     /// are counted in the eviction cursor, so that fill takes way 0.
-    #[cold]
-    #[inline(never)]
+    #[inline]
     fn ic_still_disabled(&mut self, func_id: u32, ip: usize) -> bool {
+        // `ZIPP_NO_IC_PROBATION=1` leaves a disabled site disabled, as before.
+        if !crate::WASM_STATIC_SWITCHES {
+            use std::sync::atomic::Ordering;
+            static OFF: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
+            let off = match OFF.load(Ordering::Relaxed) {
+                0 => false,
+                1 => true,
+                _ => {
+                    let v = crate::env_var_os("ZIPP_NO_IC_PROBATION").is_some() as u8;
+                    OFF.store(v, Ordering::Relaxed);
+                    v == 1
+                }
+            };
+            if off {
+                return true;
+            }
+        }
         let Some(site) = self
             .site_ics
             .get_mut(func_id as usize)
             .and_then(Option::as_mut)
-            .and_then(|table| table.get_mut(ip))
-            .and_then(|cell| cell.site.as_deref_mut())
+            .and_then(|table| table.site_slot_mut_at(ip))
+            .and_then(Option::as_deref_mut)
         else {
             return true;
         };
-        // `ZIPP_NO_IC_PROBATION=1` leaves a disabled site disabled, as before:
-        // the two sides of a one-binary A/B.
-        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *OFF.get_or_init(|| crate::env_var_os("ZIPP_NO_IC_PROBATION").is_some()) {
-            return true;
-        }
         site.rot = site.rot.wrapping_add(1);
-        if site.rot % IC_PROBATION != 0 {
+        if site.rot & (IC_PROBATION - 1) != 0 {
             return true;
         }
         site.misses = IC_MISS_LIMIT - 1;
@@ -1161,7 +1400,7 @@ impl<'p> Vm<'p> {
             let site_new = ip < code_len
                 && self.site_ics[f]
                     .as_ref()
-                    .is_none_or(|table| table[ip].site.is_none());
+                    .is_none_or(|table| table.get(ip).is_none_or(|c| c.site_ref().is_none()));
             let mut need = 0usize;
             if table_new {
                 need = need.saturating_add(code_len.saturating_mul(std::mem::size_of::<SiteCell>()));
@@ -1177,13 +1416,9 @@ impl<'p> Vm<'p> {
                 self.dynamic_ic_bytes = total;
             }
         }
-        let slots = self.site_ics[f].get_or_insert_with(|| {
-            let mut v = Vec::new();
-            v.resize_with(code_len, SiteCell::default);
-            v.into_boxed_slice()
-        });
-        let slot = slots.get_mut(ip)?;
-        Some(slot.site.get_or_insert_with(|| {
+        let slots = self.site_ics[f].get_or_insert_with(|| IcTable::new(code_len));
+        let slot = slots.site_slot_mut_at(ip)?;
+        Some(slot.get_or_insert_with(|| {
             Box::new(SiteIc {
                 misses: 0,
                 n: 0,
@@ -1302,59 +1537,122 @@ impl<'p> Vm<'p> {
         // Plain-object proto_of chain, recording (idx, version) per hop.
         self.ic_walk_chain(idx, key)
     }
+}
 
-    /// `m.pos(key)`, answered from `own_slot_cache` when `m` has a shape and
-    /// `key` is at most 16 bytes.
-    ///
-    /// A site that sees many layouts — Babel's `node.type`, `path.node`, the
-    /// AST walkers of every bundled compiler — misses its shape-keyed ways on
-    /// most reads, and each miss hashed the key and compared it against the
-    /// object's heap-allocated key string (a quarter of a miss-heavy profile,
-    /// and the set path asked twice). An object's shape fixes its key
-    /// sequence, and shapes are never reissued, so one (shape, key) answer —
-    /// a slot, or absent — holds for every object of that shape for the
-    /// VM's life. Keys are compared by their bytes, not by address.
+/// `m.pos(key)`, answered from `own_slot_cache` when `m` has a shape and
+/// `key` is at most 16 bytes.
+///
+/// A site that sees many layouts — Babel's `node.type`, `path.node`, the
+/// AST walkers of every bundled compiler — misses its shape-keyed ways on
+/// most reads, and each miss hashed the key and compared it against the
+/// object's heap-allocated key string (a quarter of a miss-heavy profile,
+/// and the set path asked twice). An object's shape fixes its key
+/// sequence, and shapes are never reissued, so one (shape, key) answer —
+/// a slot, or absent — holds for every object of that shape for the
+/// VM's life. Keys are compared by their bytes, not by address.
+#[inline]
+pub(crate) fn own_pos_in(cache: &[std::cell::Cell<OwnSlot>], m: &ObjMap, key: &str) -> Option<usize> {
+    let sh = m.shape();
+    let b = key.as_bytes();
+    if sh == crate::shape::DICT || b.len() > 16 {
+        return m.pos(key);
+    }
+    let (w0, w1) = key_words(b);
+    let cell = &cache[own_slot_index(sh, w0, b.len())];
+    let e = cell.get();
+    if e.shape == sh && e.len == b.len() as u32 && e.w0 == w0 && e.w1 == w1 {
+        let r = (e.slot != u32::MAX).then_some((e.slot & !OwnSlot::FLAGS) as usize);
+        debug_assert_eq!(r, m.pos(key), "own_slot_cache: a stale answer for {key:?}");
+        return r;
+    }
+    let r = m.pos(key);
+    cell.set(OwnSlot {
+        shape: sh,
+        len: b.len() as u32,
+        slot: r.map_or(u32::MAX, |s| {
+            let a = m.attr_at(s);
+            s as u32
+                | if a.accessor {
+                    OwnSlot::ACCESSOR
+                } else if !a.writable {
+                    OwnSlot::READONLY
+                } else {
+                    0
+                }
+        }),
+        w0,
+        w1,
+    });
+    r
+}
+
+/// Outcome of a single read-only probe into `Vm::own_slot_cache`.
+#[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OwnSlotProbe {
+    Data(u32),
+    Miss,
+    Unknown,
+}
+
+/// `Vm::ic_walk` -> `Vm::own_pos` helper continues below.
+impl<'p> Vm<'p> {
     #[inline]
     pub(crate) fn own_pos(&self, m: &ObjMap, key: &str) -> Option<usize> {
-        let sh = m.shape();
+        own_pos_in(&self.own_slot_cache, m, key)
+    }
+
+    /// Single-lookup read-only probe of `(sh, key)` in `own_slot_cache`:
+    /// distinguishes own DATA property (`Data(slot)`), proved own absence
+    /// (`Miss`), and cache miss / accessor (`Unknown`).
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    #[inline(always)]
+    pub(crate) fn own_slot_probe(&self, sh: u32, key: &str) -> OwnSlotProbe {
         let b = key.as_bytes();
         if sh == crate::shape::DICT || b.len() > 16 {
-            return m.pos(key);
+            return OwnSlotProbe::Unknown;
         }
         let (w0, w1) = key_words(b);
-        let cell = &self.own_slot_cache[own_slot_index(sh, w0, b.len())];
-        let e = cell.get();
+        let e = self.own_slot_cache[own_slot_index(sh, w0, b.len())].get();
         if e.shape == sh && e.len == b.len() as u32 && e.w0 == w0 && e.w1 == w1 {
-            let r = (e.slot != u32::MAX).then_some((e.slot & !OwnSlot::FLAGS) as usize);
-            debug_assert_eq!(r, m.pos(key), "own_slot_cache: a stale answer for {key:?}");
-            return r;
+            if e.slot == u32::MAX {
+                OwnSlotProbe::Miss
+            } else if e.slot & OwnSlot::ACCESSOR == 0 {
+                OwnSlotProbe::Data(e.slot & !OwnSlot::FLAGS)
+            } else {
+                OwnSlotProbe::Unknown
+            }
+        } else {
+            OwnSlotProbe::Unknown
         }
-        let r = m.pos(key);
-        cell.set(OwnSlot {
-            shape: sh,
-            len: b.len() as u32,
-            slot: r.map_or(u32::MAX, |s| {
-                let a = m.attr_at(s);
-                s as u32
-                    | if a.accessor {
-                        OwnSlot::ACCESSOR
-                    } else if !a.writable {
-                        OwnSlot::READONLY
-                    } else {
-                        0
-                    }
-            }),
-            w0,
-            w1,
-        });
-        r
+    }
+
+    /// Whether `%Object.prototype%` is a plain unchained root object that does
+    /// not have `key` as an own property (so an absent own property on any
+    /// default-prototype plain object resolves directly to `undefined`).
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    #[inline]
+    pub(crate) fn obj_proto_lacks_key(&self, key: &str) -> bool {
+        let op = self.obj_proto;
+        if op == 0 {
+            return true;
+        }
+        if !self.ic_obj_ok(op) || self.proto_of.get_copied(op).is_some_and(|p| p.is_heap()) {
+            return false;
+        }
+        match self.heap.get(op) {
+            HeapObj::Object(m) if !m.is_ctor && m.class.is_none() => {
+                own_pos_in(&self.own_slot_cache, m, key).is_none()
+            }
+            _ => false,
+        }
     }
 
     /// The slot of an own writable DATA property `key` of every object of
     /// `shape`, when the (shape, key) memo already holds the answer.
     #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
     #[inline(always)]
-    fn own_writable_slot_cached(&self, sh: u32, key: &str) -> Option<u32> {
+    pub(crate) fn own_writable_slot_cached(&self, sh: u32, key: &str) -> Option<u32> {
         let b = key.as_bytes();
         if sh == crate::shape::DICT || b.len() > 16 {
             return None;
@@ -1376,13 +1674,17 @@ impl<'p> Vm<'p> {
         if !recv.is_heap()
             || is_private_key(key)
             || !self.deferred_ns_state.is_empty()
-            || !self.interp_own_resolve_vm_is_interpreter()
             || !ic_mega_enabled()
         {
             return false;
         }
-        // As for the read: only where a write has stored an own field before.
-        if !self.ic_cell(func_id, ip).is_some_and(SiteCell::knows_own) {
+        // As for the read: only where a write has stored an own field before,
+        // and either in an interpreter-only VM or once the site's 8 training
+        // ways are already full (megamorphic).
+        let Some(cell) = self.ic_cell(func_id, ip) else {
+            return false;
+        };
+        if !cell.knows_own() || !self.interp_own_resolve_site_ok(cell.site_ref()) {
             return false;
         }
         let idx = recv.heap_index();
@@ -1393,13 +1695,13 @@ impl<'p> Vm<'p> {
         let Some(slot) = self.own_writable_slot_cached(mir.shape, key) else {
             return false;
         };
+        cell.set_own(mir.shape, slot, true);
         if val.is_heap() {
             self.heap.write_barrier_val(idx, val);
         }
         // SAFETY: as for the read in `ic_get_prop_mega`; the barrier above
         // allocates nothing and moves no column.
         unsafe { *(mir.vals as *mut Value).add(slot as usize) = val };
-        self.ic_cell_own(func_id, ip, mir.shape, slot as usize, true);
         true
     }
 
@@ -1408,7 +1710,7 @@ impl<'p> Vm<'p> {
     /// accessor, an absent key and a memo miss alike.
     #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
     #[inline(always)]
-    fn own_data_slot_cached(&self, sh: u32, key: &str) -> Option<u32> {
+    pub(crate) fn own_data_slot_cached(&self, sh: u32, key: &str) -> Option<u32> {
         let b = key.as_bytes();
         if sh == crate::shape::DICT || b.len() > 16 {
             return None;
@@ -1423,14 +1725,10 @@ impl<'p> Vm<'p> {
             .then_some(e.slot & !OwnSlot::FLAGS)
     }
 
-    /// A read of `recv.key` that missed the inline hits, in a pure-
-    /// interpreter VM: an own data property answered from the receiver's
-    /// mirror and the (shape, key) memo alone, as `ic_get_prop`'s own
-    /// resolve would answer it after its site probe, the receiver's heap
-    /// slot and map, the namespace test and the ways. A field read through
-    /// more layouts than the inline hits keep (`node.flags` over a
-    /// compiler's AST) took that whole call on most reads. `None` for
-    /// anything else, which goes on to the call.
+    /// A read of `recv.key` that missed the inline hits: an own data property
+    /// answered from the receiver's mirror and the (shape, key) memo alone,
+    /// in an interpreter-only VM or once a JIT VM's site has filled all 8
+    /// training ways (`interp_own_resolve_site_ok`).
     #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
     #[inline(never)]
     pub(crate) fn ic_get_prop_mega(&mut self, func_id: u32, ip: usize, recv: Value, key: &str) -> Option<Value> {
@@ -1438,16 +1736,14 @@ impl<'p> Vm<'p> {
         if !recv.is_heap()
             || is_private_key(key)
             || !self.deferred_ns_state.is_empty()
-            || !self.interp_own_resolve_vm_is_interpreter()
             || !ic_mega_enabled()
         {
             return None;
         }
         // Only an instruction that has read an own data property before (its
-        // cell holds a layout): an inherited method's, an accessor's or a
-        // miss's site would probe the memo for nothing before the full call
-        // asks it again.
-        if !self.ic_cell(func_id, ip).is_some_and(SiteCell::knows_own) {
+        // cell holds a layout) and is either pure-interpreted or megamorphic.
+        let cell = self.ic_cell(func_id, ip)?;
+        if !cell.knows_own() || !self.interp_own_resolve_site_ok(cell.site_ref()) {
             return None;
         }
         let mir = self.heap.hot_mirror_of(recv.heap_index());
@@ -1458,7 +1754,7 @@ impl<'p> Vm<'p> {
         // SAFETY: the mirror's shape proves `vals` is the map's live value
         // column, and the memo's answer for that shape that it holds `slot`.
         let v = unsafe { *(mir.vals as *const Value).add(slot as usize) };
-        self.ic_cell_own(func_id, ip, mir.shape, slot as usize, false);
+        cell.set_own(mir.shape, slot, false);
         Some(v)
     }
 
@@ -1533,6 +1829,45 @@ impl<'p> Vm<'p> {
                 }
             };
             if hops.1 as usize >= IC_MAX_HOPS {
+                #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+                {
+                    let first_hop = hops.0[0].0;
+                    let mut cur_next = next;
+                    let mut depth = IC_MAX_HOPS;
+                    while depth < IC_DEEP_MAX_HOPS {
+                        if !self.ic_obj_ok(cur_next) {
+                            return Walked::No;
+                        }
+                        let m2 = match self.heap.get(cur_next) {
+                            HeapObj::Object(m2) if !m2.is_ctor && m2.class.is_none() => m2,
+                            _ => return Walked::No,
+                        };
+                        self.heap.guard_version(cur_next);
+                        if let Some(i) = self.own_pos(m2, key) {
+                            if !m2.attr_at(i).accessor && self.heap.chain_epoch != 0 {
+                                return Walked::ChainDeepData {
+                                    first,
+                                    first_hop,
+                                    holder: cur_next,
+                                    slot: i as u32,
+                                    epoch: self.heap.chain_epoch,
+                                };
+                            }
+                            return Walked::No;
+                        }
+                        cur_next = match self.proto_of.get_copied(cur_next) {
+                            Some(p) if p.is_heap() => p.heap_index(),
+                            Some(_) => return Walked::No,
+                            None => {
+                                if self.obj_proto == 0 || cur_next == self.obj_proto {
+                                    return Walked::No;
+                                }
+                                self.obj_proto
+                            }
+                        };
+                        depth += 1;
+                    }
+                }
                 return Walked::No; // too deep to guard
             }
             if !self.ic_obj_ok(next) {
@@ -1677,6 +2012,64 @@ impl<'p> Vm<'p> {
         self.ic_holder_val(hops.0[n - 1].0, slot)
     }
 
+    /// Validate a deep stamped prototype entry (`IcEntry::ProtoDeep`) in O(1):
+    /// `Heap::chain_epoch == epoch` proves every guarded prototype along the
+    /// chain is unchanged, and the receiver's `first` link still points to
+    /// `first_hop`. Returns the holder's `ObjMap`.
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    #[inline(always)]
+    fn ic_proto_deep_ok(
+        &self,
+        idx: u32,
+        first: u8,
+        first_hop: u32,
+        holder: u32,
+        epoch: u32,
+    ) -> Option<&ObjMap> {
+        if epoch == 0 || self.heap.chain_epoch != epoch {
+            return None;
+        }
+        let link = self.proto_of.raw_bits(idx);
+        match first {
+            FIRST_HEAP if link == Value::heap(first_hop).bits() => {}
+            FIRST_DEFAULT if link == 0 && first_hop == self.obj_proto => {}
+            _ => return None,
+        }
+        match self.heap.get(holder) {
+            HeapObj::Object(hm) => Some(hm),
+            _ => None,
+        }
+    }
+
+    /// Stamped mirror-guarded read for `IcEntry::ProtoDeep`.
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    #[inline(always)]
+    fn ic_proto_deep_stamped(
+        &self,
+        idx: u32,
+        fid: u32,
+        first: u8,
+        first_hop: u32,
+        holder: u32,
+        slot: u32,
+        epoch: u32,
+    ) -> Option<Value> {
+        #[cfg(target_arch = "x86_64")]
+        if fid != crate::heap::FID_MIRROR_NONE {
+            return None;
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = fid;
+            if !matches!(self.heap.get(idx), HeapObj::Object(m) if m.class.is_none()) {
+                return None;
+            }
+        }
+        let hm = self.ic_proto_deep_ok(idx, first, first_hop, holder, epoch)?;
+        let s = slot as usize;
+        (s < hm.vals_len() && !hm.attr_at(s).accessor).then(|| hm.val_at(s))
+    }
+
     /// Whether object `idx`'s own [[Prototype]] link is still what a chain
     /// entry (`first`, `hops`) found it to be: `ic_chain_ok`'s first check,
     /// on the link as stored. The one part of a chain no version guards.
@@ -1776,6 +2169,16 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// True when a site may take the megamorphic own-data/proto shortcuts
+    /// without losing JIT training feedback: either the VM is interpreter-only,
+    /// OR this site has already filled all [`IC_WAYS`] training ways (or hit
+    /// [`IC_MISS_LIMIT`]).
+    #[inline(always)]
+    fn interp_own_resolve_site_ok(&self, site: Option<&SiteIc>) -> bool {
+        self.interp_own_resolve_vm_is_interpreter()
+            || site.is_some_and(|s| (s.n as usize) >= IC_WAYS || s.misses >= IC_MISS_LIMIT)
+    }
+
     /// The way-0 own-data hit of [`Self::ic_get_prop`], for the general
     /// profile's dispatch loop to take inline. `ic_get_prop` is large and stays
     /// a call there; on an interpreted property-read loop the call and its
@@ -1830,7 +2233,7 @@ impl<'p> Vm<'p> {
             // of this shape, which has that many slots).
             return Some(unsafe { *(mir.vals as *const Value).add(slot as usize) });
         }
-        let site = cell.site.as_deref()?;
+        let site = cell.site_ref()?;
         if site.n == 0 {
             return None;
         }
@@ -1841,7 +2244,10 @@ impl<'p> Vm<'p> {
                 // of this shape, which has that many slots).
                 Some(unsafe { *(mir.vals as *const Value).add(slot as usize) })
             }
-            IcEntry::ProtoData { .. } | IcEntry::Private { .. } | IcEntry::PrivateMethod { .. } => {
+            IcEntry::ProtoData { .. }
+            | IcEntry::ProtoDeep { .. }
+            | IcEntry::Private { .. }
+            | IcEntry::PrivateMethod { .. } => {
                 self.ic_get_way0_tail(recv.heap_index(), site, mir.shape, mir.fid)
             }
             _ => None,
@@ -1862,7 +2268,24 @@ impl<'p> Vm<'p> {
     /// pays for the question.
     #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
     #[inline(always)]
-    pub(crate) fn ic_get_prop_way0(&mut self, func_id: u32, ip: usize, recv: Value, name: u32) -> GetAct {
+    pub(crate) fn ic_get_prop_way0(&self, func_id: u32, ip: usize, recv: Value, name: u32) -> GetAct {
+        if !recv.is_heap() || !self.ic_func_eligible(func_id) {
+            return GetAct::None;
+        }
+        let Some(cell) = self.ic_cell(func_id, ip) else {
+            return GetAct::None;
+        };
+        self.ic_get_prop_way0_cell(cell, func_id, recv, name)
+    }
+
+    /// [`Self::ic_get_prop_way0`] with the site's [`SiteCell`] already hoisted
+    /// from the frame's [`IcTable`]. Skips `ic_func_eligible` and the double
+    /// `site_ics[func_id][ip]` indirection, and hands `cell` + `mir` straight
+    /// to [`Self::ic_get_memo_tail_cell`] on a megamorphic miss so the memo
+    /// path updates `cell` in place without re-indexing `site_ics`.
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    #[inline(always)]
+    pub(crate) fn ic_get_prop_way0_cell(&self, cell: &SiteCell, func_id: u32, recv: Value, name: u32) -> GetAct {
         if !recv.is_heap() {
             return GetAct::None;
         }
@@ -1870,19 +2293,15 @@ impl<'p> Vm<'p> {
         if mir.shape == crate::shape::DICT
             || !crate::heap::fid_mirror_plain(mir.fid)
             || !self.deferred_ns_state.is_empty()
-            || !self.ic_func_eligible(func_id)
         {
             return GetAct::None;
         }
-        let Some(cell) = self.ic_cell(func_id, ip) else {
-            return GetAct::None;
-        };
         if let Some(slot) = cell.own_read(mir.shape) {
             // SAFETY: as in `ic_get_prop_own_hit`.
             return GetAct::Value(unsafe { *(mir.vals as *const Value).add(slot as usize) });
         }
         let knows_own = cell.knows_own();
-        let act = match cell.site.as_deref() {
+        let act = match cell.site_ref() {
             Some(site) if site.n != 0 => match site.entries[0] {
                 IcEntry::OwnData { shape, slot } if shape == mir.shape => {
                     // SAFETY: as in `ic_get_prop_own_hit`.
@@ -1897,8 +2316,7 @@ impl<'p> Vm<'p> {
                     ref hops,
                     slot,
                 } if recv_shape == mir.shape
-                    && site.stamp0.get() == self.heap.chain_epoch
-                    && self.interp_own_resolve_vm_is_interpreter() =>
+                    && site.stamp0.get() == self.heap.chain_epoch =>
                 {
                     match self.ic_proto_stamped(recv.heap_index(), mir.fid, first, hops, slot) {
                         Some(v) => return GetAct::Value(v),
@@ -1908,7 +2326,31 @@ impl<'p> Vm<'p> {
                         },
                     }
                 }
-                IcEntry::ProtoData { .. } | IcEntry::Private { .. } | IcEntry::PrivateMethod { .. } => {
+                IcEntry::ProtoDeep {
+                    recv_shape,
+                    first,
+                    first_hop,
+                    holder,
+                    slot,
+                    epoch,
+                } if recv_shape == mir.shape && epoch == self.heap.chain_epoch => {
+                    match self.ic_proto_deep_stamped(
+                        recv.heap_index(),
+                        mir.fid,
+                        first,
+                        first_hop,
+                        holder,
+                        slot,
+                        epoch,
+                    ) {
+                        Some(v) => return GetAct::Value(v),
+                        None => GetAct::None,
+                    }
+                }
+                IcEntry::ProtoData { .. }
+                | IcEntry::ProtoDeep { .. }
+                | IcEntry::Private { .. }
+                | IcEntry::PrivateMethod { .. } => {
                     match self.ic_get_way0_tail(recv.heap_index(), site, mir.shape, mir.fid) {
                         Some(v) => GetAct::Value(v),
                         None => GetAct::None,
@@ -1925,22 +2367,60 @@ impl<'p> Vm<'p> {
             _ => GetAct::None,
         };
         if knows_own && matches!(act, GetAct::None) {
-            return self.ic_get_memo_tail(func_id, ip, recv, name);
+            return self.ic_get_memo_tail_cell(cell, func_id, mir, name);
         }
         act
     }
 
-    /// [`Self::ic_get_prop_way0`]'s question to the (shape, key) memo. Out of
-    /// line: the loop keeps its one call, and `name`'s text, the first load
-    /// of a read that gets here, is read only if one does.
+    /// Fused megamorphic `(shape, key)` memo read for [`Self::ic_get_prop_way0_cell`]:
+    /// reuses the caller's already-validated `cell` and `mir` and updates `cell`
+    /// in place via `Cell::set`, avoiding the double out-of-line call, duplicate
+    /// mirror load, and `ic_cell_own`'s `site_ics` re-lookup.
     #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
     #[inline(never)]
-    fn ic_get_memo_tail(&mut self, func_id: u32, ip: usize, recv: Value, name: u32) -> GetAct {
-        let key: &'p str = self.func(func_id as usize).string_constants[name as usize].as_str();
-        match self.ic_get_prop_mega(func_id, ip, recv, key) {
-            Some(v) => GetAct::Value(v),
-            None => GetAct::None,
+    fn ic_get_memo_tail_cell(
+        &self,
+        cell: &SiteCell,
+        func_id: u32,
+        mir: crate::heap::HotMirror,
+        name: u32,
+    ) -> GetAct {
+        if !ic_mega_enabled() {
+            return GetAct::None;
         }
+        let site_opt = cell.site_ref();
+        if !self.interp_own_resolve_site_ok(site_opt) {
+            // Under JIT, keep recording first-time shapes into `site.entries`
+            // until all IC_WAYS are full, but serve any shape ALREADY in ways
+            // 1..site.n directly through `mir.vals` and update `cell` so
+            // polymorphic 2..7-shape sites do not fall through to `ic_get_prop`
+            // and `own_pos_in` on every single read.
+            if let Some(site) = site_opt {
+                for e in &site.entries[1..site.n as usize] {
+                    if let IcEntry::OwnData { shape, slot } = *e {
+                        if shape == mir.shape {
+                            // SAFETY: `shape` proves `vals` is live and holds `slot`.
+                            let v = unsafe { *(mir.vals as *const Value).add(slot as usize) };
+                            cell.set_own(mir.shape, slot, false);
+                            return GetAct::Value(v);
+                        }
+                    }
+                }
+            }
+            return GetAct::None;
+        }
+        let key: &'p str = self.func(func_id as usize).string_constants[name as usize].as_str();
+        if is_private_key(key) {
+            return GetAct::None;
+        }
+        let Some(slot) = self.own_data_slot_cached(mir.shape, key) else {
+            return GetAct::None;
+        };
+        // SAFETY: the mirror's shape proves `vals` is the map's live value
+        // column, and the memo's answer for that shape that it holds `slot`.
+        let v = unsafe { *(mir.vals as *const Value).add(slot as usize) };
+        cell.set_own(mir.shape, slot, false);
+        GetAct::Value(v)
     }
 
     /// [`Self::ic_get_prop_way0`]'s accessor and class-member ways, out of
@@ -1999,7 +2479,7 @@ impl<'p> Vm<'p> {
                 let HeapObj::Object(m) = self.heap.get(idx) else {
                     return GetAct::None;
                 };
-                if m.class.is_some() || !self.interp_own_resolve_vm_is_interpreter() {
+                if m.class.is_some() {
                     return GetAct::None;
                 }
                 // The chain by the way's stamp when it has one (`SiteIc`),
@@ -2071,9 +2551,6 @@ impl<'p> Vm<'p> {
                 ref hops,
                 slot,
             } if recv_shape == shape => {
-                if !self.interp_own_resolve_vm_is_interpreter() {
-                    return None;
-                }
                 if site.stamp0.get() == self.heap.chain_epoch {
                     if let Some(v) = self.ic_proto_stamped(idx, fid, first, hops, slot) {
                         return Some(v);
@@ -2082,6 +2559,17 @@ impl<'p> Vm<'p> {
                 let v = self.ic_proto_hit_tail(idx, first, hops, slot)?;
                 self.ic_stamp_way(site, 0, hops);
                 Some(v)
+            }
+            #[cfg(feature = "jit")]
+            IcEntry::ProtoDeep {
+                recv_shape,
+                first,
+                first_hop,
+                holder,
+                slot,
+                epoch,
+            } if recv_shape == shape => {
+                self.ic_proto_deep_stamped(idx, fid, first, first_hop, holder, slot, epoch)
             }
             IcEntry::Private { head, brand, id, pos } => self.ic_private_get_tail(idx, head, brand, id, pos),
             IcEntry::PrivateMethod {
@@ -2143,7 +2631,7 @@ impl<'p> Vm<'p> {
     #[inline]
     pub(crate) fn ic_private_way0(&self, func_id: u32, ip: usize, ctx: Value) -> Option<(u64, u32, u32)> {
         let Some(IcEntry::Private { head, brand, id, pos }) =
-            self.ic_cell(func_id, ip).and_then(|c| c.site.as_deref()).map(|s| s.entries[0])
+            self.ic_cell(func_id, ip).and_then(SiteCell::site_ref).map(|s| s.entries[0])
         else {
             return None;
         };
@@ -2156,7 +2644,7 @@ impl<'p> Vm<'p> {
     /// makes the brand sound by its declaration's evaluation count).
     #[cfg(all(feature = "jit", target_arch = "x86_64", not(feature = "safe-sandbox")))]
     pub(crate) fn ic_private_field_way0_plan(&self, func_id: u32, ip: usize) -> Option<(u64, u32, u32)> {
-        let site = self.ic_cell(func_id, ip)?.site.as_deref()?;
+        let site = self.ic_cell(func_id, ip)?.site_ref()?;
         if site.n == 0 {
             return None;
         }
@@ -2181,7 +2669,7 @@ impl<'p> Vm<'p> {
             method,
             epoch,
             pos,
-        }) = self.ic_cell(func_id, ip).and_then(|c| c.site.as_deref()).map(|s| s.entries[0])
+        }) = self.ic_cell(func_id, ip).and_then(SiteCell::site_ref).map(|s| s.entries[0])
         else {
             return None;
         };
@@ -2203,7 +2691,7 @@ impl<'p> Vm<'p> {
     fn ic_private_set_tail(&mut self, func_id: u32, ip: usize, idx: u32, val: Value) -> bool {
         let Some(IcEntry::Private { head, brand, id, pos }) = self
             .ic_cell(func_id, ip)
-            .and_then(|c| c.site.as_deref())
+            .and_then(SiteCell::site_ref)
             .map(|s| s.entries[0])
         else {
             return false;
@@ -2353,9 +2841,6 @@ impl<'p> Vm<'p> {
     #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
     #[inline]
     fn ic_proto_hit_tail(&self, idx: u32, first: u8, hops: &IcHops, slot: u32) -> Option<Value> {
-        if !self.interp_own_resolve_vm_is_interpreter() {
-            return None;
-        }
         let HeapObj::Object(m) = self.heap.get(idx) else {
             return None;
         };
@@ -2426,7 +2911,7 @@ impl<'p> Vm<'p> {
             // SAFETY: as in `ic_get_prop_own_hit`.
             return Some(unsafe { *(mir.vals as *const Value).add(slot as usize) });
         }
-        let site = cell.site.as_deref()?;
+        let site = cell.site_ref()?;
         if site.n == 0 {
             return None;
         }
@@ -2456,7 +2941,7 @@ impl<'p> Vm<'p> {
         {
             return None;
         }
-        let site = self.ic_cell(func_id, ip)?.site.as_deref()?;
+        let site = self.ic_cell(func_id, ip)?.site_ref()?;
         if site.n == 0 {
             return None;
         }
@@ -2468,9 +2953,30 @@ impl<'p> Vm<'p> {
                 slot,
             } if recv_shape == mir.shape
                 && site.stamp0.get() == self.heap.chain_epoch
-                && self.interp_own_resolve_vm_is_interpreter() =>
+                && self.interp_own_resolve_site_ok(Some(site)) =>
             {
                 self.ic_proto_stamped(recv.heap_index(), mir.fid, first, hops, slot)
+            }
+            IcEntry::ProtoDeep {
+                recv_shape,
+                first,
+                first_hop,
+                holder,
+                slot,
+                epoch,
+            } if recv_shape == mir.shape
+                && epoch == self.heap.chain_epoch
+                && self.interp_own_resolve_site_ok(Some(site)) =>
+            {
+                self.ic_proto_deep_stamped(
+                    recv.heap_index(),
+                    mir.fid,
+                    first,
+                    first_hop,
+                    holder,
+                    slot,
+                    epoch,
+                )
             }
             _ => None,
         }
@@ -2482,8 +2988,14 @@ impl<'p> Vm<'p> {
     #[cfg(all(feature = "jit", not(any(feature = "safe-sandbox", feature = "meter-only"))))]
     pub(crate) fn ic_way0_is_proto(&self, func_id: u32, ip: usize) -> bool {
         self.ic_cell(func_id, ip)
-            .and_then(|c| c.site.as_deref())
-            .is_some_and(|s| s.n > 0 && matches!(s.entries[0], IcEntry::ProtoData { .. }))
+            .and_then(SiteCell::site_ref)
+            .is_some_and(|s| {
+                s.n > 0
+                    && matches!(
+                        s.entries[0],
+                        IcEntry::ProtoData { .. } | IcEntry::ProtoDeep { .. }
+                    )
+            })
     }
 
     /// [`Self::ic_way0_is_proto`] without stamped ways to read.
@@ -2519,7 +3031,7 @@ impl<'p> Vm<'p> {
                 return Some(m.val_at(slot as usize));
             }
         }
-        let site = cell.site.as_deref()?;
+        let site = cell.site_ref()?;
         if site.n == 0 {
             return None;
         }
@@ -2551,7 +3063,7 @@ impl<'p> Vm<'p> {
         if let Some(slot) = cell.own_read(sh) {
             return Some(m.val_at(slot as usize));
         }
-        let site = cell.site.as_deref()?;
+        let site = cell.site_ref()?;
         if site.n == 0 {
             return None;
         }
@@ -2571,7 +3083,7 @@ impl<'p> Vm<'p> {
     #[inline(never)]
     fn ic_dict_hint_hit(&self, func_id: u32, ip: usize, recv: Value, key: &str) -> Option<Value> {
         let s = self.ic_cell(func_id, ip)?.dict_hint()?;
-        if is_private_key(key) || !self.interp_own_resolve_vm_is_interpreter() {
+        if is_private_key(key) {
             return None;
         }
         let (_, m) = self.ic_recv_map(recv)?;
@@ -2619,7 +3131,7 @@ impl<'p> Vm<'p> {
                 return Some(v);
             }
         }
-        let site = cell.site.as_deref()?;
+        let site = cell.site_ref()?;
         if site.n == 0 {
             return None;
         }
@@ -2640,12 +3152,16 @@ impl<'p> Vm<'p> {
         };
         let (idx, m) = self.ic_recv_map(recv)?;
         let sh = m.shape();
-        if sh == crate::shape::DICT || m.class.is_some() || !self.interp_own_resolve_vm_is_interpreter() {
+        if sh == crate::shape::DICT || m.class.is_some() {
             return None;
         }
         if recv_shape != sh {
             // Another layout reading the same inherited name (`node.type`
             // through dozens of AST node shapes, a field most nodes lack).
+            // Safe under JIT too: `ic_proto_hit_other_shape` only hits when
+            // `key` is absent from `m` (an own property returns `None` and
+            // still falls through to `ic_get_prop`), and no JIT planner reads
+            // `ProtoData` ways past way 0 on `GetProp`.
             return self.ic_proto_hit_other_shape(idx, m, first, &hops, slot, key);
         }
         let hm = self.ic_chain_ok(idx, first, &hops)?;
@@ -2824,9 +3340,30 @@ impl<'p> Vm<'p> {
                                 if slot != u32::MAX
                                     && recv_shape == sh
                                     && m.class.is_none()
-                                    && self.interp_own_resolve_vm_is_interpreter()
                                 {
                                     if let Some(hm) = self.ic_chain_ok(idx, first, &hops) {
+                                        let s = slot as usize;
+                                        if hm.key_get(s) == Some(key)
+                                            && !hm.attr_at(s).accessor
+                                        {
+                                            return GetAct::Value(hm.val_at(s));
+                                        }
+                                    }
+                                }
+                            }
+                            #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+                            IcEntry::ProtoDeep {
+                                recv_shape,
+                                first,
+                                first_hop,
+                                holder,
+                                slot,
+                                epoch,
+                            } => {
+                                if recv_shape == sh && m.class.is_none() {
+                                    if let Some(hm) =
+                                        self.ic_proto_deep_ok(idx, first, first_hop, holder, epoch)
+                                    {
                                         let s = slot as usize;
                                         if hm.key_get(s) == Some(key)
                                             && !hm.attr_at(s).accessor
@@ -2847,7 +3384,6 @@ impl<'p> Vm<'p> {
                             } => {
                                 if recv_shape == sh
                                     && m.class.is_none()
-                                    && self.interp_own_resolve_vm_is_interpreter()
                                     && self.ic_chain_ok(idx, first, &hops).is_some()
                                 {
                                     match self.ic_chain_acc_get(hops, slot) {
@@ -2865,7 +3401,6 @@ impl<'p> Vm<'p> {
                     // property). The search hashed or scanned the receiver's
                     // keys on every read of such a receiver.
                     if sh == crate::shape::DICT
-                        && self.interp_own_resolve_vm_is_interpreter()
                         && !is_private_key(key)
                     {
                         if let Some(s) = self.ic_cell(func_id, ip).and_then(SiteCell::dict_hint) {
@@ -2891,7 +3426,7 @@ impl<'p> Vm<'p> {
                     // old scan/walk/install path so every observed shape remains
                     // training feedback for native property plans.
                     if let Some(slot) = own {
-                        if self.interp_own_resolve_vm_is_interpreter() {
+                        if sh == crate::shape::DICT || self.interp_own_resolve_site_ok(Some(site)) {
                             if m.attr_at(slot).accessor {
                                 return self.ic_acc_get_from(m, slot);
                             }
@@ -2918,11 +3453,47 @@ impl<'p> Vm<'p> {
                             return GetAct::Value(v);
                         }
                     }
+                    let mut own_matched: Option<(u32, usize, GetAct)> = None;
+                    let mut shape_recorded = false;
                     for e in &site.entries[..site.n as usize] {
-                        match self.ic_validate_get(e, idx, m, own, key) {
-                            GetAct::None => {}
-                            act => return act,
+                        if let IcEntry::OwnData { shape: es, .. } = *e {
+                            if es == sh {
+                                shape_recorded = true;
+                            }
                         }
+                        if own_matched.is_none() {
+                            match self.ic_validate_get(e, idx, m, own, key) {
+                                GetAct::None => {}
+                                act => {
+                                    if let IcEntry::OwnData { slot, .. } = *e {
+                                        own_matched = Some((sh, slot as usize, act));
+                                    } else {
+                                        return act;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some((recv_sh, slot, act)) = own_matched {
+                        let need_record = recv_sh != crate::shape::DICT
+                            && !is_private_key(key)
+                            && !shape_recorded
+                            && (site.n as usize) < IC_WAYS;
+                        if need_record {
+                            self.ic_install(
+                                func_id,
+                                ip,
+                                IcEntry::OwnData {
+                                    shape: recv_sh,
+                                    slot: slot as u32,
+                                },
+                            );
+                        }
+                        if recv_sh != crate::shape::DICT && !is_private_key(key) {
+                            self.ic_cell_own(func_id, ip, recv_sh, slot, false);
+                            self.heap.refresh_mirror(idx);
+                        }
+                        return act;
                     }
                 }
             }
@@ -2992,6 +3563,9 @@ impl<'p> Vm<'p> {
                     },
                 );
                 self.ic_cell_own(func_id, ip, shape, slot, false);
+                if shape != crate::shape::DICT {
+                    self.heap.refresh_mirror(recv.heap_index());
+                }
                 GetAct::Value(v)
             }
             Walked::OwnAcc { slot } => {
@@ -3073,6 +3647,33 @@ impl<'p> Vm<'p> {
                 // The stamped hit reads the holder through its mirror.
                 self.heap.refresh_mirror(hops.0[hops.1 as usize - 1].0);
                 let hm = match self.heap.get(hops.0[hops.1 as usize - 1].0) {
+                    HeapObj::Object(hm) => hm,
+                    _ => return GetAct::None,
+                };
+                GetAct::Value(hm.val_at(slot as usize))
+            }
+            #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+            Walked::ChainDeepData {
+                first,
+                first_hop,
+                holder,
+                slot,
+                epoch,
+            } => {
+                let recv_shape = self.ic_recv_shape(recv);
+                self.ic_install(
+                    func_id,
+                    ip,
+                    IcEntry::ProtoDeep {
+                        recv_shape,
+                        first,
+                        first_hop,
+                        holder,
+                        slot,
+                        epoch,
+                    },
+                );
+                let hm = match self.heap.get(holder) {
                     HeapObj::Object(hm) => hm,
                     _ => return GetAct::None,
                 };
@@ -3225,6 +3826,28 @@ impl<'p> Vm<'p> {
                     GetAct::None
                 }
             }
+            #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+            IcEntry::ProtoDeep {
+                first,
+                first_hop,
+                holder,
+                slot,
+                epoch,
+                ..
+            } => {
+                if own.is_some() || m.class.is_some() {
+                    return GetAct::None;
+                }
+                let Some(hm) = self.ic_proto_deep_ok(idx, first, first_hop, holder, epoch) else {
+                    return GetAct::None;
+                };
+                let s = slot as usize;
+                if hm.key_get(s) == Some(key) && !hm.attr_at(s).accessor {
+                    GetAct::Value(hm.val_at(s))
+                } else {
+                    GetAct::None
+                }
+            }
             IcEntry::ProtoAcc {
                 first, hops, slot, ..
             } => {
@@ -3338,7 +3961,7 @@ impl<'p> Vm<'p> {
         let slot = match cell.own_write(mir.shape) {
             Some(slot) => slot,
             None => {
-                let Some(site) = cell.site.as_deref() else {
+                let Some(site) = cell.site_ref() else {
                     return false;
                 };
                 if site.n == 0 {
@@ -3370,6 +3993,29 @@ impl<'p> Vm<'p> {
     #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
     #[inline(always)]
     pub(crate) fn ic_set_prop_way0(&mut self, func_id: u32, ip: usize, recv: Value, val: Value, name: u32) -> SetAct {
+        if !recv.is_heap() || !self.ic_func_eligible(func_id) {
+            return SetAct::None;
+        }
+        let Some(cell) = self.ic_cell(func_id, ip) else {
+            return SetAct::None;
+        };
+        let cell_ptr: *const SiteCell = cell;
+        self.ic_set_prop_way0_cell(cell_ptr, func_id, ip, recv, val, name)
+    }
+
+    /// [`Self::ic_set_prop_way0`] with the site's [`SiteCell`] pointer already
+    /// hoisted from the frame's [`IcTable`].
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    #[inline(always)]
+    pub(crate) fn ic_set_prop_way0_cell(
+        &mut self,
+        cell_ptr: *const SiteCell,
+        func_id: u32,
+        ip: usize,
+        recv: Value,
+        val: Value,
+        name: u32,
+    ) -> SetAct {
         if !recv.is_heap() {
             return SetAct::None;
         }
@@ -3378,17 +4024,16 @@ impl<'p> Vm<'p> {
         if mir.shape == crate::shape::DICT
             || !crate::heap::fid_mirror_plain(mir.fid)
             || !self.deferred_ns_state.is_empty()
-            || !self.ic_func_eligible(func_id)
         {
             return SetAct::None;
         }
-        let Some(cell) = self.ic_cell(func_id, ip) else {
-            return SetAct::None;
-        };
+        // SAFETY: `cell_ptr` points into `func_id`'s live `IcTable`, whose
+        // slice never has `&mut [SiteCell]` or `&mut SiteCell` formed.
+        let cell = unsafe { &*cell_ptr };
         let slot = match cell.own_write(mir.shape) {
             Some(slot) => slot,
             None => {
-                let Some(site) = cell.site.as_deref() else {
+                let Some(site) = cell.site_ref() else {
                     return SetAct::None;
                 };
                 if site.n == 0 {
@@ -3396,6 +4041,12 @@ impl<'p> Vm<'p> {
                 }
                 match site.entries[0] {
                     IcEntry::OwnData { shape: cached, slot } if cached == mir.shape => slot,
+                    IcEntry::OwnData { .. } => {
+                        match self.ic_set_own_tail_cell(cell, site, func_id, mir.shape, name) {
+                            Some(slot) => slot,
+                            None => return SetAct::None,
+                        }
+                    }
                     IcEntry::Private { .. } => {
                         return if self.ic_private_set_tail(func_id, ip, idx, val) {
                             SetAct::Done
@@ -3425,6 +4076,44 @@ impl<'p> Vm<'p> {
         // SAFETY: as in `ic_set_prop_own_hit`.
         unsafe { *(mir.vals as *mut Value).add(slot as usize) = val };
         SetAct::Done
+    }
+
+    /// Out-of-line polymorphic own-data write tail for [`Self::ic_set_prop_way0_cell`]:
+    /// serves shapes already recorded in ways `1..site.n` (even under JIT before
+    /// all 8 training ways fill) or via the megamorphic `(shape, key)` writable
+    /// slot cache once `interp_own_resolve_site_ok` holds, updating `cell` in
+    /// place so repeated writes hit inline on the next op.
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    #[inline(never)]
+    fn ic_set_own_tail_cell(
+        &self,
+        cell: &SiteCell,
+        site: &SiteIc,
+        func_id: u32,
+        shape: u32,
+        name: u32,
+    ) -> Option<u32> {
+        if !ic_mega_enabled() {
+            return None;
+        }
+        if !self.interp_own_resolve_site_ok(Some(site)) {
+            for e in &site.entries[1..site.n as usize] {
+                if let IcEntry::OwnData { shape: s, slot } = *e {
+                    if s == shape {
+                        cell.set_own(shape, slot, true);
+                        return Some(slot);
+                    }
+                }
+            }
+            return None;
+        }
+        let key: &'p str = self.func(func_id as usize).string_constants[name as usize].as_str();
+        if is_private_key(key) {
+            return None;
+        }
+        let slot = self.own_writable_slot_cached(shape, key)?;
+        cell.set_own(shape, slot, true);
+        Some(slot)
     }
 
     /// [`Self::ic_set_prop_way0`]'s appends and setters, under the guards
@@ -3564,7 +4253,7 @@ impl<'p> Vm<'p> {
         let slot = match (sh != crate::shape::DICT).then(|| cell.own_write(sh)).flatten() {
             Some(slot) => slot,
             None => {
-                let Some(site) = cell.site.as_deref() else {
+                let Some(site) = cell.site_ref() else {
                     return false;
                 };
                 if site.n == 0 {
@@ -3629,6 +4318,7 @@ impl<'p> Vm<'p> {
         }
         let mut plan: Option<SetPlan> = None;
         let mut own_rec: Option<(u32, u32)> = None;
+        let mut own_install = false;
         let mut disabled = false;
         if let Some(site) = self.ic_site(func_id, ip) {
             disabled = site.misses >= IC_MISS_LIMIT;
@@ -3710,7 +4400,7 @@ impl<'p> Vm<'p> {
                         // every write. JIT-enabled VMs keep the scan and the
                         // fills, which are their native plans' feedback.
                         if let Some(s) = own {
-                            if self.interp_own_resolve_vm_is_interpreter()
+                            if self.interp_own_resolve_site_ok(Some(site))
                                 && !is_private_key(key)
                                 && m.shape_guardable()
                                 && !m.attr_at(s).accessor
@@ -3722,18 +4412,31 @@ impl<'p> Vm<'p> {
                             }
                         }
                         if plan.is_none() {
+                            let mut shape_recorded = false;
                             for e in &site.entries[..site.n as usize] {
-                                if let Some(p) = self.ic_validate_set(e, idx, m, own) {
-                                    // A later way's own-data write: the cell's
-                                    // pair takes this layout's next one inline.
-                                    if let (SetPlan::WriteOwn { slot, .. }, true) =
-                                        (&p, m.shape_guardable() && !is_private_key(key))
-                                    {
-                                        own_rec = Some((shape, *slot));
+                                if let IcEntry::OwnData { shape: es, .. } = *e {
+                                    if es == shape {
+                                        shape_recorded = true;
                                     }
-                                    plan = Some(p);
-                                    break;
                                 }
+                                if plan.is_none() {
+                                    if let Some(p) = self.ic_validate_set(e, idx, m, own) {
+                                        // A later way's own-data write: the cell's
+                                        // pair takes this layout's next one inline.
+                                        if let (SetPlan::WriteOwn { slot, .. }, true) =
+                                            (&p, m.shape_guardable() && !is_private_key(key))
+                                        {
+                                            own_rec = Some((shape, *slot));
+                                        }
+                                        plan = Some(p);
+                                    }
+                                }
+                            }
+                            if own_rec.is_some()
+                                && !shape_recorded
+                                && (site.n as usize) < IC_WAYS
+                            {
+                                own_install = true;
                             }
                         }
                     }
@@ -3741,6 +4444,9 @@ impl<'p> Vm<'p> {
             }
         }
         if let Some((sh, slot)) = own_rec {
+            if own_install {
+                self.ic_install(func_id, ip, IcEntry::OwnData { shape: sh, slot });
+            }
             self.ic_cell_own(func_id, ip, sh, slot as usize, true);
             // Settle the receiver's mirror for the inline hits, as the read
             // side's own resolve does.
@@ -3910,6 +4616,11 @@ impl<'p> Vm<'p> {
                         }
                     }
                 }
+                self.ic_note_miss(func_id, ip);
+                SetAct::None
+            }
+            #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+            Walked::ChainDeepData { .. } => {
                 self.ic_note_miss(func_id, ip);
                 SetAct::None
             }
@@ -4521,7 +5232,25 @@ impl<'p> Vm<'p> {
     #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
     #[inline(always)]
     pub(crate) fn ic_call_method_mirror(&self, func_id: u32, ip: usize, recv: Value) -> Option<(u32, u32, Value)> {
-        if !recv.is_heap() {
+        if !recv.is_heap() || !self.ic_func_eligible(func_id) {
+            return None;
+        }
+        let cell = self.ic_cell(func_id, ip)?;
+        self.ic_call_method_mirror_cell(cell, recv)
+    }
+
+    /// [`Self::ic_call_method_mirror`] with the site's [`SiteCell`] hoisted
+    /// from the frame's [`IcTable`].
+    ///
+    /// Keeps the inline arm tiny (avoiding dispatch-loop icache bloat) while
+    /// skipping `ic_func_eligible` + `site_ics` lookup, returning `ClassMethod`
+    /// way 0 directly without `ic_plain_fn`, and delegating other ways to
+    /// [`Self::ic_call_method_mirror_ways_site`] so `ic_plain_fn` runs only
+    /// once instead of twice.
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    #[inline(always)]
+    pub(crate) fn ic_call_method_mirror_cell(&self, cell: &SiteCell, recv: Value) -> Option<(u32, u32, Value)> {
+        if !recv.is_heap() || !self.deferred_ns_state.is_empty() {
             return None;
         }
         let idx = recv.heap_index();
@@ -4529,7 +5258,11 @@ impl<'p> Vm<'p> {
         if mir.shape == crate::shape::DICT || !crate::heap::fid_mirror_plain(mir.fid) {
             return None;
         }
-        let bits = self.ic_call_method_mirror_ways(func_id, ip, idx, mir);
+        let site = cell.site_ref()?;
+        if site.n == 0 {
+            return None;
+        }
+        let bits = self.ic_call_method_mirror_ways_site(site, idx, mir);
         if bits == Value::UNDEFINED.bits() {
             return None;
         }
@@ -4537,32 +5270,20 @@ impl<'p> Vm<'p> {
         self.ic_plain_fn(callee).map(|(fid, closure)| (fid, closure, callee))
     }
 
-    /// [`Self::ic_call_method_mirror`]'s site and ways, out of line: the
-    /// dispatch loop keeps one call. It answers with the plain user function's
-    /// bits alone (`undefined`'s for none), which come back in a register:
-    /// as `Option<(u32, u32, Value)>` the answer came back through memory,
-    /// stored in pieces and read back as one 16-byte load, a failed
-    /// store-forward that held a fifth of a polymorphic `o.area()` loop's
-    /// cycles. The caller re-derives `(fid, closure)` with `ic_plain_fn`,
-    /// which is what a class-method way stored them from at its fill.
+    /// Out-of-line multi-way / unstamped-way-0 tail of
+    /// [`Self::ic_call_method_mirror_cell`]. Returns the resolved value bits
+    /// (or `Value::UNDEFINED.bits()`); the caller validates `ic_plain_fn` once.
     #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
     #[inline(never)]
-    fn ic_call_method_mirror_ways(&self, func_id: u32, ip: usize, idx: u32, mir: crate::heap::HotMirror) -> u64 {
+    fn ic_call_method_mirror_ways_site(&self, site: &SiteIc, idx: u32, mir: crate::heap::HotMirror) -> u64 {
         const NONE: u64 = Value::UNDEFINED.bits();
-        if !self.deferred_ns_state.is_empty() || !self.ic_func_eligible(func_id) {
-            return NONE;
-        }
-        let Some(site) = self.ic_cell(func_id, ip).and_then(|c| c.site.as_deref()) else {
-            return NONE;
-        };
         let sh = mir.shape;
         for (way, e) in site.entries[..site.n as usize].iter().enumerate() {
             match *e {
                 IcEntry::OwnData { shape, slot } if shape == sh => {
                     // SAFETY: the matching shape proves `vals` is the map's
                     // live value column and that it holds `slot`.
-                    let v = unsafe { *(mir.vals as *const Value).add(slot as usize) };
-                    return if self.ic_plain_fn(v).is_some() { v.bits() } else { NONE };
+                    return unsafe { *(mir.vals as *const Value).add(slot as usize) }.bits();
                 }
                 IcEntry::ClassMethod {
                     class,
@@ -4585,23 +5306,28 @@ impl<'p> Vm<'p> {
                     hops,
                     slot,
                 } if recv_shape == sh && slot != u32::MAX && mir.fid == crate::heap::FID_MIRROR_NONE => {
-                    // The way's stamp first (`ic_proto_stamped`): the hops'
-                    // versions and the holder's slot and map were most of an
-                    // inherited method's lookup.
                     if site.stamp(way) == self.heap.chain_epoch {
                         if let Some(v) = self.ic_proto_stamped(idx, mir.fid, first, &hops, slot) {
-                            if self.ic_plain_fn(v).is_some() {
-                                return v.bits();
-                            }
-                            continue;
+                            return v.bits();
                         }
                     }
                     if let Some(hm) = self.ic_chain_ok(idx, first, &hops) {
                         self.ic_stamp_way(site, way, &hops);
-                        let v = hm.val_at(slot as usize);
-                        if self.ic_plain_fn(v).is_some() {
-                            return v.bits();
-                        }
+                        return hm.val_at(slot as usize).bits();
+                    }
+                }
+                IcEntry::ProtoDeep {
+                    recv_shape,
+                    first,
+                    first_hop,
+                    holder,
+                    slot,
+                    epoch,
+                } if recv_shape == sh && mir.fid == crate::heap::FID_MIRROR_NONE => {
+                    if let Some(v) = self.ic_proto_deep_stamped(
+                        idx, mir.fid, first, first_hop, holder, slot, epoch,
+                    ) {
+                        return v.bits();
                     }
                 }
                 _ => {}
@@ -4680,6 +5406,26 @@ impl<'p> Vm<'p> {
                                         }
                                     }
                                 }
+                                #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+                                IcEntry::ProtoDeep {
+                                    recv_shape,
+                                    first,
+                                    first_hop,
+                                    holder,
+                                    slot,
+                                    epoch,
+                                } if recv_shape == sh && m.class.is_none() => {
+                                    if let Some(hm) =
+                                        self.ic_proto_deep_ok(idx, first, first_hop, holder, epoch)
+                                    {
+                                        let s = slot as usize;
+                                        debug_assert!(hm.key_get(s) == Some(key) && !hm.attr_at(s).accessor);
+                                        let v = hm.val_at(s);
+                                        if let Some((fid, closure)) = self.ic_plain_fn(v) {
+                                            return Some((fid, closure, v));
+                                        }
+                                    }
+                                }
                                 _ => {}
                             }
                         }
@@ -4744,6 +5490,22 @@ impl<'p> Vm<'p> {
                                     first,
                                     hops,
                                     slot,
+                                }),
+                                #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+                                IcEntry::ProtoDeep {
+                                    first,
+                                    first_hop,
+                                    holder,
+                                    slot,
+                                    epoch,
+                                    ..
+                                } => Some(IcEntry::ProtoDeep {
+                                    recv_shape: sh,
+                                    first,
+                                    first_hop,
+                                    holder,
+                                    slot,
+                                    epoch,
                                 }),
                                 _ => None,
                             };
@@ -4850,6 +5612,43 @@ impl<'p> Vm<'p> {
                         );
                         // The stamped hit reads the holder through its mirror.
                         self.heap.refresh_mirror(hops.0[hops.1 as usize - 1].0);
+                        Some((fid, closure, v))
+                    }
+                    None => {
+                        self.ic_note_miss(func_id, ip);
+                        None
+                    }
+                }
+            }
+            #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+            Walked::ChainDeepData {
+                first,
+                first_hop,
+                holder,
+                slot,
+                epoch,
+            } => {
+                let hm = match self.heap.get(holder) {
+                    HeapObj::Object(hm) => hm,
+                    _ => return None,
+                };
+                let v = hm.val_at(slot as usize);
+                match self.ic_plain_fn(v) {
+                    Some((fid, closure)) => {
+                        self.mi_record_recv(func_id, ip, recv);
+                        let recv_shape = self.ic_recv_shape(recv);
+                        self.ic_install(
+                            func_id,
+                            ip,
+                            IcEntry::ProtoDeep {
+                                recv_shape,
+                                first,
+                                first_hop,
+                                holder,
+                                slot,
+                                epoch,
+                            },
+                        );
                         Some((fid, closure, v))
                     }
                     None => {
@@ -5029,6 +5828,28 @@ impl<'p> Vm<'p> {
                     None
                 }
             }
+            #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+            IcEntry::ProtoDeep {
+                first,
+                first_hop,
+                holder,
+                slot,
+                epoch,
+                ..
+            } => {
+                if own.is_some() || m.class.is_some() {
+                    return None;
+                }
+                let hm = self.ic_proto_deep_ok(idx, first, first_hop, holder, epoch)?;
+                let s = slot as usize;
+                if hm.key_get(s) == Some(key) && !hm.attr_at(s).accessor {
+                    let v = hm.val_at(s);
+                    let (fid, closure) = self.ic_plain_fn(v)?;
+                    Some((fid, closure, v))
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
     }
@@ -5081,21 +5902,59 @@ impl<'p> Vm<'p> {
         })
     }
 
-    /// The function ids of the class methods a `CallMethod` site's cache
-    /// holds, when every way is one (`ic_site_only_class_methods`); the
-    /// emitted class-method lane bakes an arm per id and revalidates it per
-    /// call. Read-only, as `ic_call_mono`.
+    /// The function ids of the class or inherited prototype methods a
+    /// `CallMethod` site's cache holds, when every way is one
+    /// (`ic_site_only_class_or_proto_methods`); the emitted lane bakes an arm
+    /// per id and revalidates it per call. Read-only, as `ic_call_mono`.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-    pub(crate) fn ic_class_method_fids(&self, func_id: u32, ip: usize) -> Vec<u32> {
+    pub(crate) fn ic_method_lane_fids(&self, func_id: u32, ip: usize) -> Vec<u32> {
         let Some(site) = self.ic_site(func_id, ip) else {
             return Vec::new();
         };
         let mut fids = Vec::new();
         for e in &site.entries[..site.n as usize] {
-            match e {
+            match *e {
                 IcEntry::ClassMethod { fid, .. } => {
-                    if !fids.contains(fid) {
-                        fids.push(*fid);
+                    if !fids.contains(&fid) {
+                        fids.push(fid);
+                    }
+                }
+                IcEntry::ProtoData { hops, slot, .. } if slot != u32::MAX && hops.1 > 0 => {
+                    let n = hops.1 as usize;
+                    if hops.0[..n].iter().any(|&(h, v)| self.heap.version_of(h) != v) {
+                        continue;
+                    }
+                    let holder = hops.0[n - 1].0;
+                    if let HeapObj::Object(hm) = self.heap.get(holder) {
+                        let s = slot as usize;
+                        if s < hm.vals_len() && !hm.attr_at(s).accessor {
+                            if let Some((fid, _)) = self.ic_plain_fn(hm.val_at(s)) {
+                                if !fids.contains(&fid) {
+                                    fids.push(fid);
+                                }
+                            }
+                        }
+                    }
+                }
+                #[cfg(not(feature = "safe-sandbox"))]
+                IcEntry::ProtoDeep {
+                    holder,
+                    slot,
+                    epoch,
+                    ..
+                } => {
+                    if epoch == 0 || self.heap.chain_epoch != epoch {
+                        continue;
+                    }
+                    if let HeapObj::Object(hm) = self.heap.get(holder) {
+                        let s = slot as usize;
+                        if s < hm.vals_len() && !hm.attr_at(s).accessor {
+                            if let Some((fid, _)) = self.ic_plain_fn(hm.val_at(s)) {
+                                if !fids.contains(&fid) {
+                                    fids.push(fid);
+                                }
+                            }
+                        }
                     }
                 }
                 _ => return Vec::new(),
@@ -5170,15 +6029,153 @@ impl<'p> Vm<'p> {
     // ── plain Call sites ──
 
     /// Whether the site's cache holds at least one way and every way is a
-    /// class method (a profitability signal: nothing is trusted from it).
+    /// class method or a non-miss inherited prototype method (a profitability
+    /// signal: nothing is trusted from it).
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-    pub(crate) fn ic_site_only_class_methods(&self, func_id: u32, ip: usize) -> bool {
+    pub(crate) fn ic_site_only_class_or_proto_methods(&self, func_id: u32, ip: usize) -> bool {
         self.ic_site(func_id, ip).is_some_and(|site| {
             site.n > 0
-                && site.entries[..site.n as usize]
-                    .iter()
-                    .all(|e| matches!(e, IcEntry::ClassMethod { .. }))
+                && site.entries[..site.n as usize].iter().all(|e| match *e {
+                    IcEntry::ClassMethod { .. } => true,
+                    IcEntry::ProtoData { slot, .. } => slot != u32::MAX,
+                    #[cfg(not(feature = "safe-sandbox"))]
+                    IcEntry::ProtoDeep { .. } => true,
+                    _ => false,
+                })
         })
+    }
+
+    /// Inline stamped prototype-method read guard for way 0 (plus up to 3
+    /// additional receiver shapes sharing the exact same guarded prototype
+    /// chain and holder slot) of a `CallMethod` site. Supports both `ProtoData`
+    /// (<= 6 hops) and `ProtoDeep` (7..=24 hops) and both shaped and dictionary-
+    /// mode prototype holders (every hop is `VERSION_GUARD`-marked, so
+    /// `holder_slot_addr` remains live and unmoved while `chain_epoch` stands
+    /// still). Read-only.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn ic_proto_method_read(
+        &self,
+        func_id: u32,
+        ip: usize,
+    ) -> Option<crate::codegen::ProtoReadLane> {
+        #[cfg(feature = "safe-sandbox")]
+        {
+            let _ = (func_id, ip);
+            None
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            if !self.deferred_ns_state.is_empty() || self.heap.chain_epoch == 0 {
+                return None;
+            }
+            let site = self.ic_site(func_id, ip)?;
+            if site.n == 0 {
+                return None;
+            }
+            let (recv_shape, first_hop, holder, slot) = match site.entries[0] {
+                IcEntry::ProtoData {
+                    recv_shape,
+                    first: FIRST_HEAP,
+                    hops,
+                    slot,
+                } => {
+                    if recv_shape == crate::shape::DICT
+                        || slot == u32::MAX
+                        || (slot as usize) >= (i32::MAX as usize) / 8
+                        || hops.1 == 0
+                        || !hops_guarded(&hops)
+                    {
+                        return None;
+                    }
+                    let n = hops.1 as usize;
+                    if hops.0[..n].iter().any(|&(h, v)| self.heap.version_of(h) != v) {
+                        return None;
+                    }
+                    (recv_shape, hops.0[0].0, hops.0[n - 1].0, slot)
+                }
+                IcEntry::ProtoDeep {
+                    recv_shape,
+                    first: FIRST_HEAP,
+                    first_hop,
+                    holder,
+                    slot,
+                    epoch,
+                } => {
+                    if recv_shape == crate::shape::DICT
+                        || (slot as usize) >= (i32::MAX as usize) / 8
+                        || epoch == 0
+                        || self.heap.chain_epoch != epoch
+                    {
+                        return None;
+                    }
+                    (recv_shape, first_hop, holder, slot)
+                }
+                _ => return None,
+            };
+            let holder_slot_addr = match self.heap.get(holder) {
+                HeapObj::Object(hm)
+                    if (slot as usize) < hm.vals_len() && !hm.attr_at(slot as usize).accessor =>
+                {
+                    hm.vals_ptr_raw() as u64 + (slot as u64) * 8
+                }
+                _ => return None,
+            };
+            let mut recv_shapes = [recv_shape, 0, 0, 0];
+            let mut n_shapes = 1usize;
+            for e in &site.entries[1..site.n as usize] {
+                if n_shapes >= 4 {
+                    break;
+                }
+                let sh2_opt = match *e {
+                    IcEntry::ProtoData {
+                        recv_shape: sh2,
+                        first: FIRST_HEAP,
+                        hops: hops2,
+                        slot: slot2,
+                    } if sh2 != crate::shape::DICT
+                        && slot2 == slot
+                        && hops2.1 > 0
+                        && hops2.0[0].0 == first_hop
+                        && hops2.0[hops2.1 as usize - 1].0 == holder
+                        && hops_guarded(&hops2)
+                        && hops2.0[..hops2.1 as usize]
+                            .iter()
+                            .all(|&(h, v)| self.heap.version_of(h) == v) =>
+                    {
+                        Some(sh2)
+                    }
+                    IcEntry::ProtoDeep {
+                        recv_shape: sh2,
+                        first: FIRST_HEAP,
+                        first_hop: fh2,
+                        holder: h2,
+                        slot: slot2,
+                        epoch: ep2,
+                    } if sh2 != crate::shape::DICT
+                        && slot2 == slot
+                        && fh2 == first_hop
+                        && h2 == holder
+                        && ep2 == self.heap.chain_epoch =>
+                    {
+                        Some(sh2)
+                    }
+                    _ => None,
+                };
+                if let Some(sh2) = sh2_opt {
+                    if !recv_shapes[..n_shapes].contains(&sh2) {
+                        recv_shapes[n_shapes] = sh2;
+                        n_shapes += 1;
+                    }
+                }
+            }
+            Some(crate::codegen::ProtoReadLane {
+                recv_shapes,
+                n_shapes: n_shapes as u8,
+                first_bits: Value::heap(first_hop).bits(),
+                chain_epoch: self.heap.chain_epoch,
+                holder_slot_addr,
+            })
+        }
     }
 
     /// Read-only probe of a `Call` site's inline cache for the Q4 leaf-inline
@@ -5681,6 +6678,48 @@ impl<'p> Vm<'p> {
     /// other ways, the fill) is `ic_call_ways`. The whole was too large to
     /// inline, and every call of the main loop paid the call to it and its
     /// result through memory: a twentieth of a call-heavy loop.
+    /// [`Self::ic_call`] with the site's [`SiteCell`] pointer hoisted from the
+    /// frame's [`IcTable`]: skips `ic_func_eligible` and the double `site_ics`
+    /// indirection on every monomorphic `Call`.
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    #[inline(always)]
+    pub(crate) fn ic_call_cell(
+        &mut self,
+        cell_ptr: *const SiteCell,
+        func_id: u32,
+        ip: usize,
+        callee: Value,
+    ) -> Option<CallIcHit> {
+        if !callee.is_heap() {
+            return None;
+        }
+        // SAFETY: `cell_ptr` points into `func_id`'s live `IcTable`.
+        let cell = unsafe { &*cell_ptr };
+        if let Some(site) = cell.site_ref() {
+            if site.n > 0 {
+                if let IcEntry::Callee {
+                    bits,
+                    ver,
+                    fid,
+                    closure,
+                    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                    desc,
+                } = site.entries[0]
+                {
+                    if callee.bits() == bits && self.heap.version_of(callee.heap_index()) == ver {
+                        return Some(CallIcHit {
+                            fid,
+                            closure,
+                            #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                            desc,
+                        });
+                    }
+                }
+            }
+        }
+        self.ic_call_ways(func_id, ip, callee)
+    }
+
     #[inline(always)]
     pub(crate) fn ic_call(&mut self, func_id: u32, ip: usize, callee: Value) -> Option<CallIcHit> {
         if !callee.is_heap() {
@@ -5908,7 +6947,7 @@ impl<'p> Vm<'p> {
     #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
     #[inline(always)]
     fn ic_super_stamped_site(&self, func_id: u32, ip: usize) -> Option<&SiteIc> {
-        let site = self.ic_cell(func_id, ip)?.site.as_deref()?;
+        let site = self.ic_cell(func_id, ip)?.site_ref()?;
         (site.n != 0
             && site.stamp0.get() == self.heap.chain_epoch
             && site.class_stamp.get() == self.mi_class_epoch.wrapping_add(1)

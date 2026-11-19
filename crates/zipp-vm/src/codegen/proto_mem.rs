@@ -16,6 +16,9 @@ use super::*;
 /// exact instruction back to the interpreter to perform completion routing.
 /// The difference sweep is linear even for hostile deeply-nested source.
 fn tierc_protected_return_map(code: &[Instr]) -> Vec<bool> {
+    if !code.iter().any(|i| matches!(i, Instr::PushFinally { .. })) {
+        return Vec::new();
+    }
     let mut depth_delta = vec![0i32; code.len() + 1];
     for (push_ip, instr) in code.iter().enumerate() {
         let Instr::PushFinally { target, .. } = *instr else {
@@ -782,7 +785,7 @@ fn tierc_global_xorshift_at(
 /// commit (the captured-cell helper has already committed its copy).
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 fn emit_tierc_xorshift_registers(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     steps: &[TiercUpvalXorShiftStep],
 ) {
     dynasm!(ops ; mov r11d, eax);
@@ -859,6 +862,25 @@ env_off_switch! {
 
 /// Tier C eligibility: is every op of `proto` in the v1 whole-function mem-path
 /// subset? Stricter than `region_can_compile` (no GetProp/SetProp/StrConcat/
+/// Ops that Tier C admits in medium/large unmetered functions by emitting an
+/// unconditional bail to the interpreter at `ip` (exact replay). Returns
+/// `Some(true)` for ultra-cold ops (`JSON.stringify` / `JSON.parse`, typically
+/// error-message builders), `Some(false)` for conditional-branch ops, and
+/// `None` for everything else.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn tierc_cold_bail_op(instr: &Instr) -> Option<bool> {
+    match *instr {
+        Instr::JsonStringify { .. } | Instr::JsonParse { .. } => Some(true),
+        Instr::CallWithThisSpread { .. }
+        | Instr::ArrayFrom { .. }
+        | Instr::DeleteIndex { .. }
+        | Instr::Pow { .. } => Some(false),
+        _ => None,
+    }
+}
+
+/// Eligibility check for Tier C (whole-function memory-path JIT). Accepts
 /// MathOp/Bitwise/Cell/etc. yet — those are later increments). Rejects
 /// generators/async, rest/`arguments` (materialized by call setup, not emitted
 /// code), and any op the emitter below doesn't implement.
@@ -914,7 +936,10 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
     // three functions were also using `UpvalSet`, `join` and `push` — which the
     // first-only report had never shown. Behaviour is unchanged when the flag is
     // off.
-    let dump = crate::env_var_os("ZIPP_JITDUMP").is_some();
+    let dump = {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| crate::env_var_os("ZIPP_JITDUMP").is_some())
+    };
     let mut ok = true;
     macro_rules! reject {
         ($($arg:tt)*) => {{
@@ -930,6 +955,9 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
     // A Python body (see `codegen::py`): the fused instructions and the
     // Python body ops are admitted here, and nowhere in a JavaScript body.
     let py = has_py_ops(&proto.code);
+    let mut seen_branch = false;
+    let mut cold_bail_ops = 0usize;
+    let mut back_loops: Option<Vec<(usize, usize)>> = None;
     for (ip, instr) in proto.code.iter().enumerate() {
         // Tier C turns register operands into unchecked native displacements
         // and branch targets into label-table indices. Compiler-produced
@@ -939,6 +967,15 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
             reject!("[tierC-reject] malformed operands at ip {ip}: {instr:?}");
             continue;
         }
+        if matches!(
+            *instr,
+            Instr::JumpIfFalse { .. }
+                | Instr::JumpIfTrue { .. }
+                | Instr::JumpIfNotLt { .. }
+                | Instr::JumpIfNotLe { .. }
+        ) {
+            seen_branch = true;
+        }
         if py && (py_op_edges(instr).is_some() || py_body_op(instr)) {
             continue;
         }
@@ -946,8 +983,10 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
             Instr::LoadInt { .. }
             | Instr::LoadBool { .. }
             | Instr::LoadNull { .. }
+            | Instr::LoadCallee { .. }
             | Instr::Move { .. }
             | Instr::LoadGlobal { .. }
+            | Instr::LoadGlobalOrUndefined { .. }
             | Instr::StoreGlobal { .. }
             | Instr::StoreGlobalStrict { .. }
             | Instr::StoreGlobalResolved { .. }
@@ -993,6 +1032,8 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
             // silent: the whole function is blacklisted and INTERPRETED for the
             // rest of the run, so one `h ^= h << 13` costs the entire body.
             | Instr::Bitwise { .. }
+            | Instr::BitNot { .. }
+            | Instr::ToNum { .. }
             | Instr::Not { .. }
             // `undefined` as a constant — a single store of the canonical bits,
             // the exact shape of the `LoadNull` arm right above. It was in
@@ -1199,20 +1240,13 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
                     reject!("[tierC-reject] GlobalFn String (disabled)");
                 }
             }
-            Instr::LooseEq { a, b, .. } => {
-                // Profitability guard: admit only the compiler's adjacent
-                // `LoadNull/Undefined; LooseEq` lowering (for `x == null`).
-                // The helper rechecks the LIVE operands, so even an unusual
-                // internal edge that skips the prefix still deopts safely.
-                let null_prefix = ip.checked_sub(1).is_some_and(|previous| {
-                    matches!(
-                        proto.code[previous],
-                        Instr::LoadNull { dst } | Instr::LoadUndefined { dst }
-                            if dst == a || dst == b
-                    )
-                });
-                if !crate::vm::tierc_loose_null_eq_enabled() || !null_prefix {
-                    reject!("[tierC-reject] op LooseEq (not adjacent nullish comparison)");
+            Instr::LooseEq { .. } | Instr::LooseNe { .. } => {
+                // Full pure Abstract Equality / Inequality: inline for two Int32s
+                // and nullish comparisons (incl. [[IsHTMLDDA]]), helper for
+                // primitive-vs-primitive and object-vs-object identity, and clean
+                // exact-ip bail for object-vs-non-nullish-primitive (ToPrimitive).
+                if !crate::vm::tierc_loose_null_eq_enabled() {
+                    reject!("[tierC-reject] LooseEq (not adjacent nullish comparison)");
                 }
             }
             Instr::DeleteProp { .. } => {
@@ -1281,11 +1315,55 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
                 if !crate::codegen::static_fn_jit_enabled() {
                     reject!("[tierC-reject] op StaticFn (disabled)");
                 }
-                // `Promise.resolve(x)` and the `Number.is*` tests: a loop of
-                // them runs as a region, whose own arm is faster than this
-                // helper (a whole-body compile made such a loop 40% slower).
+                // `Promise.resolve(x)` and the `Number.is*` tests: a LOOP of
+                // them runs faster in an OSR region (whose own inline arm
+                // avoids `jit_static_fn_ic`). Outside any backward-jump loop,
+                // keep the enclosing function in Tier C instead of blacklisting
+                // 150-op AST printers/validators over one `Number.isNaN`.
                 if crate::codegen::static_fn_region_inline(op, argc) {
-                    reject!("[tierC-reject] op StaticFn {op:?} (the region's)");
+                    let loops = back_loops.get_or_insert_with(|| {
+                        let mut v = Vec::new();
+                        for (j, ins) in proto.code.iter().enumerate() {
+                            let target = match *ins {
+                                Instr::Jump { target }
+                                | Instr::JumpIfFalse { target, .. }
+                                | Instr::JumpIfTrue { target, .. }
+                                | Instr::JumpIfNotLt { target, .. }
+                                | Instr::JumpIfNotLe { target, .. } => Some(target as usize),
+                                _ => None,
+                            };
+                            if let Some(t) = target {
+                                if t <= j {
+                                    v.push((t, j));
+                                }
+                            }
+                        }
+                        v
+                    });
+                    if loops.iter().any(|&(s, e)| s <= ip && ip <= e) {
+                        reject!("[tierC-reject] op StaticFn {op:?} (the region's)");
+                    }
+                }
+            }
+            // Rare / error-path ops (`JSON.stringify`, `...spread`, `delete o[k]`,
+            // `Array.from`, `**`) inside medium/large conditional bodies emit
+            // an unconditional bail at `ip` instead of blacklisting the entire
+            // function (e.g. Babel's `print` and `validate2`, Prettier's 4878-op
+            // printer). Metered compiles still decline cleanly in `compile_proto_mem`.
+            ref cold if !py && tierc_cold_bail_op(cold).is_some() => {
+                let ultra_cold = tierc_cold_bail_op(cold).unwrap_or(false);
+                let min_ops = if ultra_cold || matches!(cold, Instr::ArrayFrom { .. }) {
+                    24
+                } else {
+                    48
+                };
+                cold_bail_ops += 1;
+                if proto.code.len() < min_ops
+                    || proto.code.len() > 2048
+                    || cold_bail_ops > 8
+                    || (!ultra_cold && !seen_branch)
+                {
+                    reject!("[tierC-reject] cold op {cold:?}");
                 }
             }
             // `v instanceof c`: the operator's helper, with the call protocol.
@@ -1504,6 +1582,7 @@ pub(crate) fn activation_free(proto: &FuncProto) -> bool {
                 | Instr::LoadNull { .. }
                 | Instr::LoadBool { .. }
                 | Instr::LoadGlobal { .. }
+                | Instr::LoadGlobalOrUndefined { .. }
                 | Instr::Move { .. }
                 | Instr::StoreGlobal { .. }
                 | Instr::StoreGlobalStrict { .. }
@@ -1514,8 +1593,10 @@ pub(crate) fn activation_free(proto: &FuncProto) -> bool {
                 | Instr::Div { .. }
                 | Instr::Mod { .. }
                 | Instr::Neg { .. }
+                | Instr::ToNum { .. }
                 | Instr::Not { .. }
                 | Instr::Bitwise { .. }
+                | Instr::BitNot { .. }
                 | Instr::AddInt { .. }
                 | Instr::Lt { .. }
                 | Instr::Le { .. }
@@ -1524,6 +1605,7 @@ pub(crate) fn activation_free(proto: &FuncProto) -> bool {
                 | Instr::Eq { .. }
                 | Instr::Ne { .. }
                 | Instr::LooseEq { .. }
+                | Instr::LooseNe { .. }
                 | Instr::TypeOf { .. }
                 | Instr::TypeOfIs { .. }
                 | Instr::TypeOfSame { .. }
@@ -1657,6 +1739,7 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
         let u1 = |a: u16| Uses::one(a);
         let u2 = |a: u16, b: u16| Uses::two(a, b);
         let u3 = |a: u16, b: u16, c: u16| Uses::three(a, b, c);
+        let u4 = |a: u16, b: u16, c: u16, d: u16| Uses::four(a, b, c, d);
         Some(match *i {
             Instr::LoadConst { dst, .. }
             | Instr::LoadInt { dst, .. }
@@ -1664,6 +1747,8 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
             | Instr::LoadNull { dst }
             | Instr::LoadBool { dst, .. }
             | Instr::LoadGlobal { dst, .. }
+            | Instr::LoadGlobalOrUndefined { dst, .. }
+            | Instr::LoadCallee { dst }
             | Instr::NewObject { dst, .. }
             | Instr::NewPlannedObject { dst, .. }
             | Instr::MakeFunc { dst, .. } => (u0(), Some(dst)),
@@ -1700,6 +1785,8 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
             Instr::Pad2Conditional { dst, src } => (u1(src), Some(dst)),
             Instr::AddInt { dst, a, .. } => (u1(a), Some(dst)),
             Instr::Neg { dst, a }
+            | Instr::BitNot { dst, a }
+            | Instr::ToNum { dst, a }
             | Instr::Not { dst, a }
             | Instr::TypeOf { dst, a }
             | Instr::TypeOfIs { dst, a, .. } => (u1(a), Some(dst)),
@@ -1831,7 +1918,7 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
                 },
                 Some(done_dst),
             ),
-            Instr::LooseEq { dst, a, b } => (u2(a, b), Some(dst)),
+            Instr::LooseEq { dst, a, b } | Instr::LooseNe { dst, a, b } => (u2(a, b), Some(dst)),
             Instr::MathOp {
                 dst,
                 callee,
@@ -1923,6 +2010,38 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
             // Leaves the body; the fixpoint's fall-through edge after it only
             // costs precision.
             Instr::Throw { src } => (u1(src), None),
+            // Cold bail-only ops admitted in medium/large unmetered Tier-C
+            // bodies (`tierc_cold_bail_op`): exact uses so `cross_uninit_mask`
+            // and `tierc_operands_in_bounds` cover interpreter replay at `ip`.
+            Instr::JsonStringify {
+                dst,
+                val,
+                space,
+                callee,
+                this_v,
+            } => (u4(val, space, callee, this_v), Some(dst)),
+            Instr::JsonParse {
+                dst,
+                a,
+                callee,
+                this_v,
+            } => (u3(a, callee, this_v), Some(dst)),
+            Instr::CallWithThisSpread {
+                dst,
+                callee,
+                this_v,
+                args,
+            } => (u3(callee, this_v, args), Some(dst)),
+            Instr::ArrayFrom {
+                dst,
+                src,
+                mapfn,
+                callee,
+                this_v,
+                ..
+            } => (u4(src, mapfn, callee, this_v), Some(dst)),
+            Instr::DeleteIndex { dst, obj, key, .. } => (u2(obj, key), Some(dst)),
+            Instr::Pow { dst, a, b } => (u2(a, b), Some(dst)),
             _ => return None,
         })
     }
@@ -1932,7 +2051,7 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 mod smallvec {
     pub(super) struct Uses {
-        regs: [u16; 3],
+        regs: [u16; 4],
         len: u8,
         /// Contiguous extra range `[base, base+count)` (call/math args).
         range: (u16, u16),
@@ -1940,35 +2059,42 @@ mod smallvec {
     impl Uses {
         pub(super) fn new() -> Uses {
             Uses {
-                regs: [0; 3],
+                regs: [0; 4],
                 len: 0,
                 range: (0, 0),
             }
         }
         pub(super) fn one(a: u16) -> Uses {
             Uses {
-                regs: [a, 0, 0],
+                regs: [a, 0, 0, 0],
                 len: 1,
                 range: (0, 0),
             }
         }
         pub(super) fn two(a: u16, b: u16) -> Uses {
             Uses {
-                regs: [a, b, 0],
+                regs: [a, b, 0, 0],
                 len: 2,
                 range: (0, 0),
             }
         }
         pub(super) fn three(a: u16, b: u16, c: u16) -> Uses {
             Uses {
-                regs: [a, b, c],
+                regs: [a, b, c, 0],
                 len: 3,
+                range: (0, 0),
+            }
+        }
+        pub(super) fn four(a: u16, b: u16, c: u16, d: u16) -> Uses {
+            Uses {
+                regs: [a, b, c, d],
+                len: 4,
                 range: (0, 0),
             }
         }
         pub(super) fn range(base: u16, count: u16) -> Uses {
             Uses {
-                regs: [0; 3],
+                regs: [0; 4],
                 len: 0,
                 range: (base, count),
             }
@@ -2160,7 +2286,8 @@ fn plan_tierc_block_sroa_site(
         // bytecode boxes those sources explicitly, but a hand-built malformed
         // proto must not reach a deopt after this allocation was erased.
         if !aliases.is_empty()
-            && matches!(instr, Instr::MakeClosure { .. } | Instr::MakeArrow { .. })
+            && (matches!(instr, Instr::MakeClosure { .. } | Instr::MakeArrow { .. })
+                || tierc_cold_bail_op(instr).is_some())
         {
             return None;
         }
@@ -2275,8 +2402,9 @@ fn plan_tierc_block_sroa(
 ) -> TiercBlockSroaPlan {
     const MAX_SITES: usize = 16;
 
+    static GC_STRESS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let mut out = TiercBlockSroaPlan::default();
-    if crate::env_var_os("ZIPP_GC_STRESS").is_some()
+    if *GC_STRESS.get_or_init(|| crate::env_var_os("ZIPP_GC_STRESS").is_some())
         || !proto.eval_sites.is_empty()
         || proto.code.iter().any(|instr| {
             matches!(
@@ -2615,7 +2743,7 @@ mod tierc_block_sroa_tests {
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[allow(clippy::too_many_arguments)]
 fn emit_tierc_general_method(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     ip: usize,
     bail: dynasmrt::DynamicLabel,
     epilogue: dynasmrt::DynamicLabel,
@@ -2633,7 +2761,11 @@ fn emit_tierc_general_method(
     // interpreter CallMethod (`own_slot_direct` is pre-gated on the meter).
     let method_cross = tierc_method_crosscall_enabled();
     let method_done = ops.new_dynamic_label();
-    if own_slot_direct {
+    // When `method_cross` is enabled, `jit_cross_method_call` already resolves
+    // `OwnData` (alongside `ClassMethod` and `ProtoData`) via `ic_call_method_mirror`
+    // in one FFI call and one unwind boundary, making a separate pre-call to
+    // `jit_cross_own_method_call` strictly redundant.
+    if own_slot_direct && !method_cross {
         let direct_helper = crate::vm::jit_cross_own_method_call as *const () as usize;
         let direct_fallback = ops.new_dynamic_label();
         dynasm!(ops
@@ -2976,8 +3108,9 @@ struct LazyTry {
 struct LazyPlan {
     tries: Vec<LazyTry>,
     /// Per ip: in the body of a bracket that keeps its push, so the frame may
-    /// hold a handler there (every ip when the brackets are not analysed).
+    /// hold a handler there (empty when uniform — see `pushed_default`).
     pushed: Vec<bool>,
+    pushed_default: bool,
     /// Every bracket, lazy or not, in push order; empty when not analysed.
     brackets: Vec<PlanBracket>,
 }
@@ -3006,8 +3139,27 @@ enum JumpRoute {
 }
 
 impl LazyPlan {
-    fn none(n: usize) -> Self {
-        LazyPlan { tries: Vec::new(), pushed: vec![true; n], brackets: Vec::new() }
+    fn none(_n: usize) -> Self {
+        LazyPlan {
+            tries: Vec::new(),
+            pushed: Vec::new(),
+            pushed_default: true,
+            brackets: Vec::new(),
+        }
+    }
+
+    fn empty() -> Self {
+        LazyPlan {
+            tries: Vec::new(),
+            pushed: Vec::new(),
+            pushed_default: false,
+            brackets: Vec::new(),
+        }
+    }
+
+    #[inline]
+    fn is_pushed(&self, ip: usize) -> bool {
+        self.pushed.get(ip).copied().unwrap_or(self.pushed_default)
     }
 
     /// The next step of a jump to `target` from `ip` (a `JumpFinally`, or an
@@ -3205,6 +3357,9 @@ fn lazy_tries(code: &[Instr]) -> LazyPlan {
         open.push(brs.len());
         brs.push(Bracket { push: ip, pop: usize::MAX, pops: Vec::new(), packed, finally, end, parent });
     }
+    if brs.is_empty() && open.is_empty() {
+        return LazyPlan::empty();
+    }
     if !open.is_empty() || brs.iter().any(|b| b.finally.is_some_and(|(t, _, _)| b.pop >= t as usize)) {
         return LazyPlan::none(n);
     }
@@ -3234,6 +3389,24 @@ fn lazy_tries(code: &[Instr]) -> LazyPlan {
         let enclosing = brs.iter().filter(|c| c.push < ip && ip < c.pop && c.push < t && t <= c.pop).count();
         jumps && enclosing == floor as usize && !(brs[b].push < t && t <= ip)
     };
+    // Pre-collect all control-flow edges once so functions with many `try`
+    // brackets do not re-scan the entire bytecode O(brackets * code.len()) times.
+    // kind: 1 = JumpFinally, 2 = plain Jump, 0 = other control op.
+    let mut ctrl_edges: Vec<(usize, usize, u8)> = Vec::new();
+    for (at, i) in code.iter().enumerate() {
+        let targets = control_targets(i);
+        if targets[0].is_none() && targets[1].is_none() {
+            continue;
+        }
+        let kind = match i {
+            Instr::JumpFinally { .. } => 1u8,
+            Instr::Jump { .. } => 2u8,
+            _ => 0u8,
+        };
+        for target in targets.into_iter().flatten() {
+            ctrl_edges.push((at, target as usize, kind));
+        }
+    }
     for b in (0..brs.len()).rev() {
         let (push, pop) = (brs[b].push, brs[b].pop);
         let child = |c: Option<usize>| c.is_some_and(|c| nest && lazy[c]);
@@ -3252,23 +3425,20 @@ fn lazy_tries(code: &[Instr]) -> LazyPlan {
             // bracket never encloses; a catch on the way is only left.
             Instr::Return { .. } | Instr::ReturnUndefined => brs[b].finally.is_some() || nest,
             _ => true,
-        }) && code.iter().enumerate().all(|(at, i)| {
+        }) && ctrl_edges.iter().all(|&(at, target, kind)| {
             // A routed jump leaves the body (`jump_ok`), forward or back; so
             // does the jump to this bracket's own `finally` after its first
             // pop (the `try`'s way out, before the catch block).
-            let leaves = jumps && matches!(i, Instr::JumpFinally { .. });
-            let own_exit = at > 0 && pop_of[at - 1] == Some(b) && matches!(i, Instr::Jump { .. });
-            control_targets(i).into_iter().flatten().all(|target| {
-                let target = target as usize;
-                let inside = at > push && at < pop;
-                if inside {
-                    (target > at && (target <= pop || leaves))
-                        || (leaves && target <= push)
-                        || (own_exit && brs[b].finally.is_some_and(|(t, _, _)| t as usize == target))
-                } else {
-                    at == push || target <= push || target > pop
-                }
-            })
+            let inside = at > push && at < pop;
+            if inside {
+                let leaves = jumps && kind == 1;
+                let own_exit = at > 0 && kind == 2 && pop_of[at - 1] == Some(b);
+                (target > at && (target <= pop || leaves))
+                    || (leaves && target <= push)
+                    || (own_exit && brs[b].finally.is_some_and(|(t, _, _)| t as usize == target))
+            } else {
+                at == push || target <= push || target > pop
+            }
         });
         lazy[b] = closed;
     }
@@ -3298,7 +3468,7 @@ fn lazy_tries(code: &[Instr]) -> LazyPlan {
         // ...and no `break`/`continue` either.
         brackets.clear();
     }
-    LazyPlan { tries, pushed, brackets }
+    LazyPlan { tries, pushed, pushed_default: false, brackets }
 }
 
 /// B206 direct entry: whether the loop headed at a yield head `head` may run
@@ -3434,7 +3604,18 @@ pub(crate) fn compile_proto_mem(
     if meter.is_some()
         && proto.code.iter().any(|instr| match instr {
             Instr::DeleteProp { .. }
+            | Instr::JsonStringify { .. }
+            | Instr::JsonParse { .. }
+            | Instr::CallWithThisSpread { .. }
+            | Instr::ArrayFrom { .. }
+            | Instr::DeleteIndex { .. }
+            | Instr::Pow { .. }
             | Instr::LooseEq { .. }
+            | Instr::LooseNe { .. }
+            | Instr::BitNot { .. }
+            | Instr::ToNum { .. }
+            | Instr::LoadGlobalOrUndefined { .. }
+            | Instr::LoadCallee { .. }
             | Instr::Mod { .. }
             | Instr::CheckCoercible { .. }
             | Instr::MakeFunc { .. }
@@ -3458,7 +3639,7 @@ pub(crate) fn compile_proto_mem(
     {
         return None;
     }
-    let mut ops = dynasmrt::x64::Assembler::new().ok()?;
+    let mut ops = crate::codegen::new_x64_asm();
     let n = proto.code.len();
     // A Python body (see `codegen::py`).
     let py = has_py_ops(&proto.code);
@@ -3519,8 +3700,9 @@ pub(crate) fn compile_proto_mem(
     // taking the f64 overflow path — `trunc_only_arith_ips` carries the proof,
     // `ZIPP_NO_INT32_TRUNC_ADD=1` the exact old emission.
     let trunc_arith = trunc_only_arith_ips(proto);
-    let n_trunc_arith = trunc_arith.iter().filter(|&&t| t).count();
-    if n_trunc_arith != 0 && crate::jitlog_enabled() {
+    let has_trunc_arith = trunc_arith.iter().any(|&t| t);
+    if has_trunc_arith && crate::jitlog_enabled() {
+        let n_trunc_arith = trunc_arith.iter().filter(|&&t| t).count();
         eprintln!("[jit] fn{func_id} Tier-C int32-trunc arith sites={n_trunc_arith}");
     }
     // Double-only arithmetic (`float_op_plan`), its operands and results kept
@@ -3583,7 +3765,7 @@ pub(crate) fn compile_proto_mem(
             block_sroa.finalized_sites, block_sroa.array_sites, block_sroa.reads
         );
     }
-    let mut upval_forward = vec![None; n];
+    let mut upval_forward: FxHashMap<usize, u16> = FxHashMap::default();
     if tierc_upval_forward_enabled() {
         for ip in 1..n {
             let Instr::UpvalGet { idx, .. } = proto.code[ip] else {
@@ -3592,90 +3774,120 @@ pub(crate) fn compile_proto_mem(
             if targeted[ip] {
                 continue;
             }
-            upval_forward[ip] = match proto.code[ip - 1] {
-                Instr::UpvalGet { dst, idx: previous }
-                | Instr::UpvalSet {
-                    src: dst,
-                    idx: previous,
-                } if previous == idx => Some(dst),
-                _ => None,
-            };
+            if let Instr::UpvalGet { dst, idx: previous }
+            | Instr::UpvalSet {
+                src: dst,
+                idx: previous,
+            } = proto.code[ip - 1]
+            {
+                if previous == idx {
+                    upval_forward.insert(ip, dst);
+                }
+            }
         }
     }
-    let n_upval_forwards = upval_forward.iter().flatten().count();
-    if n_upval_forwards != 0 && crate::jitlog_enabled() {
-        eprintln!("[jit] fn{func_id} Tier-C upval-forward sites={n_upval_forwards}");
+    if !upval_forward.is_empty() && crate::jitlog_enabled() {
+        eprintln!(
+            "[jit] fn{func_id} Tier-C upval-forward sites={}",
+            upval_forward.len()
+        );
     }
-    let mut upval_inc = vec![None; n];
-    let mut upval_inc_covered = vec![false; n];
+    let mut upval_inc: FxHashMap<usize, TiercUpvalIncI32> = FxHashMap::default();
+    let mut upval_inc_covered: Vec<bool> = Vec::new();
     if meter.is_none() && tierc_upval_inc_i32_enabled() {
         for ip in 0..n.saturating_sub(5) {
-            if upval_inc_covered[ip] || targeted[ip + 1..ip + 6].iter().any(|&target| target) {
+            if !matches!(proto.code[ip], Instr::UpvalGet { .. }) {
+                continue;
+            }
+            if upval_inc_covered.get(ip).copied().unwrap_or(false)
+                || targeted[ip + 1..ip + 6].iter().any(|&target| target)
+            {
                 continue;
             }
             let Some(plan) = tierc_upval_inc_i32_at(&proto.code, ip) else {
                 continue;
             };
-            upval_inc[ip] = Some(plan);
+            upval_inc.insert(ip, plan);
+            if upval_inc_covered.is_empty() {
+                upval_inc_covered.resize(n, false);
+            }
             upval_inc_covered[ip + 1..ip + 6].fill(true);
         }
     }
-    let n_upval_incs = upval_inc.iter().flatten().count();
-    if n_upval_incs != 0 && crate::jitlog_enabled() {
-        eprintln!("[jit] fn{func_id} Tier-C upval-inc-i32 sites={n_upval_incs}");
+    if !upval_inc.is_empty() && crate::jitlog_enabled() {
+        eprintln!(
+            "[jit] fn{func_id} Tier-C upval-inc-i32 sites={}",
+            upval_inc.len()
+        );
     }
-    let mut upval_xorshift = vec![None; n];
-    let mut upval_xorshift_covered = vec![false; n];
+    let mut upval_xorshift: FxHashMap<usize, TiercUpvalXorShift> = FxHashMap::default();
+    let mut upval_xorshift_covered: Vec<bool> = Vec::new();
     if meter.is_none() && tierc_upval_xorshift_enabled() {
         for ip in 0..n {
-            if upval_xorshift_covered[ip] {
+            if !matches!(proto.code[ip], Instr::UpvalGet { .. }) {
+                continue;
+            }
+            if upval_xorshift_covered.get(ip).copied().unwrap_or(false) {
                 continue;
             }
             let Some(plan) = tierc_upval_xorshift_at(&proto.code, &targeted, ip) else {
                 continue;
             };
             let end = ip + usize::from(plan.count) * 6;
-            upval_xorshift[ip] = Some(plan);
+            upval_xorshift.insert(ip, plan);
+            if upval_xorshift_covered.is_empty() {
+                upval_xorshift_covered.resize(n, false);
+            }
             upval_xorshift_covered[ip + 1..end].fill(true);
         }
     }
-    let n_upval_xorshift_chains = upval_xorshift.iter().flatten().count();
-    let n_upval_xorshift_steps: usize = upval_xorshift
-        .iter()
-        .flatten()
-        .map(|plan| usize::from(plan.count))
-        .sum();
-    if n_upval_xorshift_chains != 0 && crate::jitlog_enabled() {
+    if !upval_xorshift.is_empty() && crate::jitlog_enabled() {
+        let n_upval_xorshift_steps: usize = upval_xorshift
+            .values()
+            .map(|plan| usize::from(plan.count))
+            .sum();
         eprintln!(
-            "[jit] fn{func_id} Tier-C upval-xorshift chains={n_upval_xorshift_chains} steps={n_upval_xorshift_steps}"
+            "[jit] fn{func_id} Tier-C upval-xorshift chains={} steps={n_upval_xorshift_steps}",
+            upval_xorshift.len()
         );
     }
-    let mut global_xorshift = vec![None; n];
-    let mut global_xorshift_covered = vec![false; n];
+    let mut global_xorshift: FxHashMap<usize, TiercGlobalXorShift> = FxHashMap::default();
+    let mut global_xorshift_covered: Vec<bool> = Vec::new();
     if meter.is_none() && tierc_global_xorshift_enabled() {
         for ip in 0..n {
-            if global_xorshift_covered[ip] {
+            if !matches!(proto.code[ip], Instr::LoadGlobal { .. }) {
+                continue;
+            }
+            if global_xorshift_covered.get(ip).copied().unwrap_or(false) {
                 continue;
             }
             let Some(plan) = tierc_global_xorshift_at(&proto.code, &targeted, ip) else {
                 continue;
             };
             let end = ip + usize::from(plan.count) * 6;
-            global_xorshift[ip] = Some(plan);
+            global_xorshift.insert(ip, plan);
+            if global_xorshift_covered.is_empty() {
+                global_xorshift_covered.resize(n, false);
+            }
             global_xorshift_covered[ip + 1..end].fill(true);
         }
     }
     // B205: mark the five ops after each fused random-scale window start as
     // covered — the fused arm materializes every destination in bytecode
     // order, and the plan builder required them untargeted.
-    let mut random_fuse_covered = vec![false; n];
-    if meter.is_none() {
+    let mut random_fuse_covered: Vec<bool> = Vec::new();
+    if meter.is_none() && !random_fuse.is_empty() {
         for (&ip, fp) in random_fuse.iter() {
             let span = if fp.upval_alph.is_some() { 7 } else { 6 };
+            let overlaps_gx = !global_xorshift_covered.is_empty()
+                && global_xorshift_covered[ip..ip + span].iter().any(|&c| c);
             if ip + span <= n
                 && !targeted[ip + 1..ip + span].iter().any(|&t| t)
-                && !global_xorshift_covered[ip..ip + span].iter().any(|&c| c)
+                && !overlaps_gx
             {
+                if random_fuse_covered.is_empty() {
+                    random_fuse_covered.resize(n, false);
+                }
                 random_fuse_covered[ip + 1..ip + span].fill(true);
             }
         }
@@ -3690,15 +3902,14 @@ pub(crate) fn compile_proto_mem(
             );
         }
     }
-    let n_global_xorshift_chains = global_xorshift.iter().flatten().count();
-    let n_global_xorshift_steps: usize = global_xorshift
-        .iter()
-        .flatten()
-        .map(|plan| usize::from(plan.count))
-        .sum();
-    if n_global_xorshift_chains != 0 && crate::jitlog_enabled() {
+    if !global_xorshift.is_empty() && crate::jitlog_enabled() {
+        let n_global_xorshift_steps: usize = global_xorshift
+            .values()
+            .map(|plan| usize::from(plan.count))
+            .sum();
         eprintln!(
-            "[jit] fn{func_id} Tier-C global-xorshift chains={n_global_xorshift_chains} steps={n_global_xorshift_steps}"
+            "[jit] fn{func_id} Tier-C global-xorshift chains={} steps={n_global_xorshift_steps}",
+            global_xorshift.len()
         );
     }
     // A label per ip; `labels[n]` is the fall-off-the-end (ReturnUndefined). All
@@ -3708,6 +3919,22 @@ pub(crate) fn compile_proto_mem(
     let epilogue = ops.new_dynamic_label();
     // Every bail block after the code (`DeferredBails`).
     let deferred_bails = super::emit_misc::DeferredBails::begin();
+    // Shared per-function out-of-line stubs and deferred property miss/slow
+    // tails emitted after the epilogue, keeping the hot bytecode stream compact
+    // in L1i (~3-5x higher hot-path code density).
+    let mut eq_stub: Option<dynasmrt::DynamicLabel> = None;
+    let mut truthy_stub: Option<dynasmrt::DynamicLabel> = None;
+    let mut loose_eq_stub: Option<dynasmrt::DynamicLabel> = None;
+    let mut cross3_dyn_stub: Option<dynasmrt::DynamicLabel> = None;
+    let mut fn_call_dyn_stub: Option<dynasmrt::DynamicLabel> = None;
+    let mut is_array_stub: Option<dynasmrt::DynamicLabel> = None;
+    let mut deferred_prop_cold: Vec<DeferredPropCold> = Vec::new();
+    let can_cross3_dyn = meter.is_none()
+        && crate::codegen::cross3_enabled()
+        && crate::codegen::cross3_dyn_enabled()
+        && crate::codegen::cross3_inline_enabled()
+        && crate::codegen::cross3_grow_enabled()
+        && crate::codegen::cross3_sloppy_enabled();
     // ── Q4 leaf-call inlining (Tier C) ── inline a monomorphic plain-leaf callee
     // at a Call site over a scratch window carved above the whole-function frame.
     let do_leaf = !leaf_plan.is_empty();
@@ -3725,8 +3952,12 @@ pub(crate) fn compile_proto_mem(
     // slot @ c3+40); + a 16B leaf-headroom-flag slot when inlining (48 and 16
     // both keep the frame's 16-alignment after the 6 pushes).
     let do_cross3 = meter.is_none()
-        && cross_plan.values().any(|site| {
-            !site.cross3.is_empty() || (site.cross3m.is_some() && tierc_cross3m_enabled())
+        && cross_plan.iter().any(|(&ip, site)| {
+            !site.cross3.is_empty()
+                || (site.cross3m.is_some() && tierc_cross3m_enabled())
+                || (can_cross3_dyn
+                    && site.class_method
+                    && (site.proto_read.is_some() || class_read.contains_key(&ip)))
         });
     let cursor_off: i32 = 40;
     let c3_off: i32 = cursor_off
@@ -3786,7 +4017,10 @@ pub(crate) fn compile_proto_mem(
         .code
         .iter()
         .any(|i| matches!(i, Instr::GetProp { .. } | Instr::SetProp { .. }));
-    let precise_entry_pins = crate::env_var_os("ZIPP_NO_TIERC_PRECISE_PINS").is_none();
+    let precise_entry_pins = {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| crate::env_var_os("ZIPP_NO_TIERC_PRECISE_PINS").is_none())
+    };
     let leaf_needs_version_pins = leaf_plan
         .values()
         .any(|p| (p.same_proto_fid.is_none() && p.slot_guard.is_none()) || !p.nested.is_empty());
@@ -3840,7 +4074,10 @@ pub(crate) fn compile_proto_mem(
     // at their sole growth sites. Loading them rdi-relative avoids three Win64
     // helper round-trips on every tiny Tier-C entry. The off-switch restores
     // the historical helper prologue for a same-binary process A/B.
-    let direct_entry_bases = crate::env_var_os("ZIPP_NO_TIERC_DIRECT_BASES").is_none();
+    let direct_entry_bases = {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| crate::env_var_os("ZIPP_NO_TIERC_DIRECT_BASES").is_none())
+    };
     if precise_entry_pins && crate::jitlog_enabled() {
         eprintln!(
             "[jit] fn{func_id} Tier-C entry-pins globals={} version-ic={} headroom={} method-global={} bases={}",
@@ -3970,9 +4207,9 @@ pub(crate) fn compile_proto_mem(
     // (skipping two ips would skip a charge). The Int path then stores dst,
     // the boxed 0 into z and the result into d2, and jumps to ip+3; the f64
     // and concat paths fall into the unchanged ip+1 / ip+2 code.
-    let fuse_or: Vec<Option<(u16, u16)>> = {
-        let mut v = vec![None; n];
-        if crate::codegen::trunc_or_fuse_enabled() && blocks.is_none() {
+    let fuse_or: FxHashMap<usize, (u16, u16)> = {
+        let mut map = FxHashMap::default();
+        if has_trunc_arith && crate::codegen::trunc_or_fuse_enabled() && blocks.is_none() {
             let mut targeted = vec![false; n];
             for instr in &proto.code {
                 let t = match *instr {
@@ -4019,11 +4256,11 @@ pub(crate) fn compile_proto_mem(
                 };
                 let pair = (a == dst && b == z) || (a == z && b == dst);
                 if pair && z != dst && !targeted[ip + 1] && !targeted[ip + 2] {
-                    v[ip] = Some((z, d2));
+                    map.insert(ip, (z, d2));
                 }
             }
         }
-        v
+        map
     };
     let mut meter_stubs: Vec<(dynasmrt::DynamicLabel, usize)> = Vec::new();
     // Each lazy `try`, the exit its body takes, and for each ip the one it is
@@ -4071,7 +4308,11 @@ pub(crate) fn compile_proto_mem(
         }
     }
     let lazy_exit: Vec<dynasmrt::DynamicLabel> = lazy_try.iter().map(|_| ops.new_dynamic_label()).collect();
-    let mut lazy_at: Vec<Option<dynasmrt::DynamicLabel>> = vec![None; n];
+    let mut lazy_at: Vec<Option<dynasmrt::DynamicLabel>> = if lazy_try.is_empty() {
+        Vec::new()
+    } else {
+        vec![None; n]
+    };
     for (t, &exit) in lazy_try.iter().zip(&lazy_exit) {
         lazy_at[t.push + 1..t.pop].fill(Some(exit));
     }
@@ -4212,23 +4453,26 @@ pub(crate) fn compile_proto_mem(
             if yield_heads.contains(&(ip as u32)) {
                 mark(ip);
             }
-            if fuse_or[ip].is_some() {
+            if fuse_or.contains_key(&ip) {
                 mark(ip + 3);
             }
             if let Some(Instr::JumpIfFalse { .. } | Instr::JumpIfTrue { .. }) = proto.code.get(ip + 1) {
                 mark(ip + 2);
             }
-            if upval_inc[ip].is_some() {
+            if upval_inc.contains_key(&ip) {
                 mark(ip + 6);
             }
-            if let Some(plan) = upval_xorshift[ip] {
+            if let Some(plan) = upval_xorshift.get(&ip) {
                 mark(ip + usize::from(plan.count) * 6);
             }
-            if let Some(plan) = global_xorshift[ip] {
+            if let Some(plan) = global_xorshift.get(&ip) {
                 mark(ip + usize::from(plan.count) * 6);
             }
             if let Some(p) = leaf_plan.get(&ip).and_then(|lp| lp.span_code_unit_pred).and_then(|p| p.pair) {
                 mark(p.resume_ip as usize);
+            }
+            if let Some((_, cases)) = str_case_chains.get(&ip) {
+                mark(ip + 3 * cases.len());
             }
         }
         t
@@ -4268,7 +4512,7 @@ pub(crate) fn compile_proto_mem(
     if tierc_yield_entry_enabled() && !frame_free_body {
         for &h in yield_heads {
             let h = h as usize;
-            if h >= n || lazy_at[h].is_some() {
+            if h >= n || lazy_at.get(h).copied().flatten().is_some() {
                 continue;
             }
             let Some(exits) = yield_entry_exits(proto, h, &targeted) else {
@@ -4277,7 +4521,11 @@ pub(crate) fn compile_proto_mem(
             let backs: Vec<usize> = (h + 1..n)
                 .filter(|&j| matches!(proto.code[j], Instr::Jump { target } if target as usize == h))
                 .collect();
-            if backs.is_empty() || backs.iter().any(|&j| lazy_at[j].is_some()) {
+            if backs.is_empty()
+                || backs
+                    .iter()
+                    .any(|&j| lazy_at.get(j).copied().flatten().is_some())
+            {
                 continue;
             }
             for j in backs {
@@ -4300,7 +4548,7 @@ pub(crate) fn compile_proto_mem(
         }
         dynasm!(ops ; => labels[ip]);
         // Every way out of a lazy `try`'s body, for this op's arms below.
-        let epilogue = lazy_at[ip].unwrap_or(epilogue);
+        let epilogue = lazy_at.get(ip).copied().flatten().unwrap_or(epilogue);
         if fc_slots != 0 {
             // What the previous op did to the registers the cache holds, then
             // this op's entry: a jump target starts with nothing cached.
@@ -4400,10 +4648,13 @@ pub(crate) fn compile_proto_mem(
         // helper at their only predecessor. No internal jump may target them
         // (the plan checked `targeted`), and metered compilation never creates
         // a plan, so sharing their labels with the next live op is safe.
-        if upval_inc_covered[ip] || upval_xorshift_covered[ip] || global_xorshift_covered[ip] {
+        if upval_inc_covered.get(ip).copied().unwrap_or(false)
+            || upval_xorshift_covered.get(ip).copied().unwrap_or(false)
+            || global_xorshift_covered.get(ip).copied().unwrap_or(false)
+        {
             continue;
         }
-        if random_fuse_covered[ip] {
+        if random_fuse_covered.get(ip).copied().unwrap_or(false) {
             continue;
         }
         // B205: the fused `Math.random()*k|0` window. Guards then commit;
@@ -4656,7 +4907,9 @@ pub(crate) fn compile_proto_mem(
                 // multi-char string (bits rooted in jit_const_strings). Mirrors
                 // the region LoadConst arm. mem_can_compile gated the kinds.
                 if let Some((x, cases)) = str_case_chains.get(&ip) {
-                    emit_str_case_bits(&mut ops, *x, cases, &labels);
+                    let all_atoms = cases.iter().all(|c| heap.is_atom_bits(c.bits));
+                    let after_label = labels.get(ip + 3 * cases.len()).copied();
+                    emit_str_case_bits(&mut ops, *x, cases, &labels, all_atoms, after_label);
                 }
                 let c = proto.constants[idx as usize];
                 let bits = single_char_const_bits(proto, c)
@@ -5120,8 +5373,15 @@ pub(crate) fn compile_proto_mem(
                     ; call rax
                 );
             }
-            Instr::Throw { .. } => {
-                // The interpreter raises (and unwinds this frame's handlers).
+            Instr::Throw { .. }
+            | Instr::JsonStringify { .. }
+            | Instr::JsonParse { .. }
+            | Instr::CallWithThisSpread { .. }
+            | Instr::ArrayFrom { .. }
+            | Instr::DeleteIndex { .. }
+            | Instr::Pow { .. } => {
+                // Cold bail-only op (or Python Throw): resume in the
+                // interpreter at `ip` (after lazy-try pushes via `epilogue`).
                 dynasm!(ops
                     ; mov DWORD [rsi], ip as i32
                     ; jmp => epilogue
@@ -5134,7 +5394,7 @@ pub(crate) fn compile_proto_mem(
                 // returns. Lazy brackets hold only lazy ones, so no pushed
                 // `finally` comes first.
                 let next_finally = lazy_finally(lazy_try, ip);
-                let static_return = next_finally.is_some() || !lazy_plan.pushed[ip];
+                let static_return = next_finally.is_some() || !lazy_plan.is_pushed(ip);
                 let resumes = jump_ends.get(&ip);
                 if static_return || resumes.is_some() {
                     // A normal completion goes on, a return as above, a routed
@@ -5648,78 +5908,19 @@ pub(crate) fn compile_proto_mem(
                 );
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
-            Instr::LooseEq { dst, a, b } => {
-                let helper = crate::vm::jit_loose_null_eq as *const () as usize;
+            op @ (Instr::LooseEq { dst, a, b } | Instr::LooseNe { dst, a, b }) => {
+                let is_ne = matches!(op, Instr::LooseNe { .. });
+                let helper = crate::vm::jit_loose_eq as *const () as usize;
                 if crate::vm::tierc_loose_null_inline_enabled() {
-                    use crate::vm::host_api::{
-                        JIT_HTMLDDA_IDX_OFFSET, JIT_HTMLDDA_SCALAR_ENABLED_OFFSET,
-                    };
-                    let a_nullish = ops.new_dynamic_label();
-                    let b_nullish = ops.new_dynamic_label();
-                    let check_other = ops.new_dynamic_label();
-                    let equal = ops.new_dynamic_label();
-                    let not_equal = ops.new_dynamic_label();
-                    let heap_slow = ops.new_dynamic_label();
-                    let done = ops.new_dynamic_label();
-                    // Admission restricts this to an adjacent `x == null`, but
-                    // recheck both live operands so an unusual internal entry
-                    // still declines exactly like the helper. Once one is
-                    // proven nullish, the other is equal iff it is nullish or
-                    // the singleton [[IsHTMLDDA]] exotic. The scalar-disabled
-                    // heap edge preserves the HashSet/counter ablation through
-                    // the incumbent helper; all ordinary values are call-free.
+                    let stub = *loose_eq_stub.get_or_insert_with(|| ops.new_dynamic_label());
                     dynasm!(ops
-                        ; mov rax, [rbx + dreg(a)]
-                        ; mov r10, [rbx + dreg(b)]
-                        ; mov r11, QWORD Value::NULL.bits() as i64
-                        ; cmp rax, r11
-                        ; je => a_nullish
-                        ; mov r11, QWORD Value::UNDEFINED.bits() as i64
-                        ; cmp rax, r11
-                        ; je => a_nullish
-                        ; mov r11, QWORD Value::NULL.bits() as i64
-                        ; cmp r10, r11
-                        ; je => b_nullish
-                        ; mov r11, QWORD Value::UNDEFINED.bits() as i64
-                        ; cmp r10, r11
-                        ; je => b_nullish
-                        ; jmp => bail
-                        ; => a_nullish
-                        ; mov rax, r10
-                        ; jmp => check_other
-                        ; => b_nullish
-                        // rax already holds the other operand.
-                        ; => check_other
-                        ; mov r11, QWORD Value::NULL.bits() as i64
-                        ; cmp rax, r11
-                        ; je => equal
-                        ; mov r11, QWORD Value::UNDEFINED.bits() as i64
-                        ; cmp rax, r11
-                        ; je => equal
-                        ; mov r10, rax
-                        ; shr r10, 48
-                        ; cmp r10d, TAG_HEAP_HI as i32
-                        ; jne => not_equal
-                        ; cmp BYTE [rdi + JIT_HTMLDDA_SCALAR_ENABLED_OFFSET as i32], 0
-                        ; je => heap_slow
-                        ; cmp eax, DWORD [rdi + JIT_HTMLDDA_IDX_OFFSET as i32]
-                        ; je => equal
-                        ; => not_equal
-                        ; mov rax, QWORD Value::FALSE.bits() as i64
-                        ; jmp => done
-                        ; => equal
-                        ; mov rax, QWORD Value::TRUE.bits() as i64
-                        ; jmp => done
-                        ; => heap_slow
-                        ; mov rcx, rdi
                         ; mov rdx, [rbx + dreg(a)]
                         ; mov r8, [rbx + dreg(b)]
-                        ; mov rax, QWORD helper as i64
-                        ; call rax
+                        ; mov r9d, is_ne as i32
+                        ; call => stub
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64
                         ; cmp rax, r10
                         ; je => bail
-                        ; => done
                         ; mov [rbx + dreg(dst)], rax
                     );
                 } else {
@@ -5727,6 +5928,7 @@ pub(crate) fn compile_proto_mem(
                         ; mov rcx, rdi
                         ; mov rdx, [rbx + dreg(a)]
                         ; mov r8, [rbx + dreg(b)]
+                        ; mov r9d, is_ne as i32
                         ; mov rax, QWORD helper as i64
                         ; call rax
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64
@@ -5745,7 +5947,7 @@ pub(crate) fn compile_proto_mem(
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::LoadGlobal { dst, idx } => {
-                if let Some(plan) = global_xorshift[ip] {
+                if let Some(&plan) = global_xorshift.get(&ip) {
                     // The normal Tier-C global route has already proved this
                     // is a live, direct slot. One Int guard at the first read
                     // replaces the twelve generic ToInt32 checks in a three-
@@ -5774,8 +5976,32 @@ pub(crate) fn compile_proto_mem(
                     emit_region_bail(&mut ops, ip, bail, epilogue);
                 }
             }
+            Instr::LoadGlobalOrUndefined { dst, idx } => {
+                // `globals_ok` + `try_run_jit`'s route check guarantee the slot
+                // is live and directly routable (never UNINITIALIZED or own-prop
+                // shadowed), matching `LoadGlobal` verbatim.
+                emit_route_guard(&mut ops, bail);
+                dynasm!(ops
+                    ; mov rax, [r12 + (idx as i32) * 8]
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::LoadCallee { dst } => {
+                let helper = crate::vm::jit_load_callee as *const () as usize;
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rax, QWORD helper as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
             Instr::UpvalGet { dst, idx } => {
-                if let Some(plan) = upval_inc[ip] {
+                if let Some(&plan) = upval_inc.get(&ip) {
                     // One cell resolution replaces the exact six-op captured
                     // counter sequence. Failure is a pure prefix and resumes at
                     // this UpvalGet. Success returns OLD Int bits; materialize
@@ -5848,7 +6074,7 @@ pub(crate) fn compile_proto_mem(
                     box_eax(&mut ops, plan.new_dst);
                     emit_region_bail(&mut ops, ip, bail, epilogue);
                     dynasm!(ops ; jmp => labels[ip + 6]);
-                } else if let Some(plan) = upval_xorshift[ip] {
+                } else if let Some(&plan) = upval_xorshift.get(&ip) {
                     // Resolve the exact live cell once, require an Int before
                     // any mutation, and commit the bounded generic transform.
                     // The helper returns the old Int bits. The emitted straight
@@ -5868,7 +6094,7 @@ pub(crate) fn compile_proto_mem(
                     emit_region_bail(&mut ops, ip, bail, epilogue);
                     let resume = ip + usize::from(plan.count) * 6;
                     dynasm!(ops ; jmp => labels[resume]);
-                } else if let Some(src) = upval_forward[ip] {
+                } else if let Some(&src) = upval_forward.get(&ip) {
                     // The preceding helper successfully loaded/stored these
                     // exact bits. Guard the internal UNINITIALIZED sentinel so
                     // even malformed bytecode that stored it still replays this
@@ -5999,7 +6225,7 @@ pub(crate) fn compile_proto_mem(
                     dynasm!(ops ; jo => f64_path);
                 }
                 box_eax(&mut ops, dst);
-                match fuse_or[ip] {
+                match fuse_or.get(&ip).copied() {
                     Some((z, d2)) => {
                         // B267: see the `Add` arm.
                         dynasm!(ops
@@ -6033,6 +6259,60 @@ pub(crate) fn compile_proto_mem(
                     ; xorpd xmm0, xmm1
                 );
                 store_xmm(&mut ops, dst);
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::BitNot { dst, a } => {
+                // `~a`: fast inline ToInt32 + `not eax` + box; pure helper for
+                // non-i32 doubles, null, undefined, bool, and string primitives;
+                // bails cleanly for BigInt / Symbol / Object.
+                let slow = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                let helper = crate::vm::jit_bit_not_slow as *const () as usize;
+                load_toint32(&mut ops, a, slow);
+                dynasm!(ops ; not eax);
+                box_eax(&mut ops, dst);
+                dynasm!(ops
+                    ; jmp => done
+                    ; => slow
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + dreg(a)]
+                    ; mov rax, QWORD helper as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov [rbx + dreg(dst)], rax
+                    ; => done
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::ToNum { dst, a } => {
+                // `+a`: numbers (Int or Double — top16 outside 0x7FFA..=0x7FFD)
+                // pass straight through unchanged; pure helper converts null,
+                // undefined, bool, and string; bails cleanly for BigInt / Symbol
+                // / Object.
+                let slow = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                let helper = crate::vm::jit_to_num_slow as *const () as usize;
+                dynasm!(ops
+                    ; mov rax, [rbx + dreg(a)]
+                    ; mov r10, rax
+                    ; shr r10, 48
+                    ; sub r10d, (INT_TAG_HI + 1) as i32
+                    ; cmp r10d, 3
+                    ; jbe => slow
+                    ; jmp => done
+                    ; => slow
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + dreg(a)]
+                    ; mov rax, QWORD helper as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; => done
+                    ; mov [rbx + dreg(dst)], rax
+                );
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::Bitwise { dst, a, b, op } => {
@@ -6139,27 +6419,38 @@ pub(crate) fn compile_proto_mem(
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::Not { dst, a } => {
-                // `!x`: a Bool flips its payload bit in place (the tag survives
-                // the xor); anything else asks the read-only `jit_truthy`
-                // helper (handles Int/double/heap incl. empty strings and
-                // [[IsHTMLDDA]]) and flips its 0/1.
-                let slow = ops.new_dynamic_label();
+                // `!x`: inline Bool, Int, undefined, null; Heap/Double/SmallBigInt
+                // delegate to the shared per-function `truthy_stub` (5-byte call).
+                let stub = *truthy_stub.get_or_insert_with(|| ops.new_dynamic_label());
                 let done_n = ops.new_dynamic_label();
                 dynasm!(ops
                     ; mov rax, [rbx + dreg(a)]
                     ; mov r10, rax
                     ; shr r10, 48
                     ; cmp r10d, (INT_TAG_HI + 1) as i32   // Bool tag 0x7FFA
-                    ; jne => slow
-                    ; xor rax, 1                          // flip the payload bit
+                    ; jne > not_bool
+                    ; xor rax, 1
                     ; mov [rbx + dreg(dst)], rax
                     ; jmp => done_n
-                    ; => slow
-                    ; mov rcx, rdi                        // vm
-                    ; mov rdx, rax                        // value bits
-                    ; mov rax, QWORD heap.truthy as i64
-                    ; call rax
-                    ; xor rax, 1                          // !truthy
+                    ; not_bool:
+                    ; cmp r10d, INT_TAG_HI as i32         // Int tag 0x7FF9
+                    ; jne > not_int
+                    ; test eax, eax
+                    ; sete al
+                    ; movzx eax, al
+                    ; jmp > box_res
+                    ; not_int:
+                    ; cmp r10d, 0x7FFC                    // Undefined -> !false = true
+                    ; je > ret_one
+                    ; mov r8, QWORD crate::value::Value::NULL.bits() as i64
+                    ; cmp rax, r8                         // Null -> !false = true
+                    ; je > ret_one
+                    ; call => stub                        // eax = 0/1 (truthy)
+                    ; xor eax, 1
+                    ; jmp > box_res
+                    ; ret_one:
+                    ; mov eax, 1
+                    ; box_res:
                     ; mov r8, QWORD BOOL_TAG as i64
                     ; or rax, r8
                     ; mov [rbx + dreg(dst)], rax
@@ -6391,7 +6682,7 @@ pub(crate) fn compile_proto_mem(
                         dynasm!(ops ; jo => ovf.unwrap_or(f64_path));
                     }
                     box_eax(&mut ops, dst);
-                    match fuse_or[ip] {
+                    match fuse_or.get(&ip).copied() {
                         Some((z, d2)) => {
                             // B267: the `| 0` of a wrapped Int is the identity.
                             dynasm!(ops
@@ -6454,44 +6745,101 @@ pub(crate) fn compile_proto_mem(
                     Instr::Eq { .. } => Cmp::Eq,
                     _ => Cmp::Ne,
                 };
-                // B118: Int+Int compare feeding the NEXT ip's JumpIf branches on
-                // flags (bool still stored); non-Int falls through to the
-                // unchanged generic sequence below.
-                if let Some((iff, tgt)) = cmp_branch_pair(ip, dst) {
-                    let t = labels[tgt as usize];
-                    let ft = labels[ip + 2];
-                    match cmp_const_operand(ip, a, b, cmp) {
-                        Some((reg, imm, c)) => crate::codegen::emit_misc::emit_fused_cmp_imm_branch_head(
-                            &mut ops, dst, reg, imm, c, iff, t, ft,
-                        ),
-                        None => emit_fused_cmp_branch_head(&mut ops, dst, a, b, cmp, iff, t, ft),
+                if matches!(cmp, Cmp::Eq | Cmp::Ne) && super::emit_misc::poly_eq_fast_enabled() {
+                    let is_ne = matches!(cmp, Cmp::Ne);
+                    let stub = *eq_stub.get_or_insert_with(|| ops.new_dynamic_label());
+                    dynasm!(ops
+                        ; mov rax, [rbx + dreg(a)]
+                        ; mov rcx, [rbx + dreg(b)]
+                        ; mov rdx, rax
+                        ; shr rdx, 48
+                        ; sub edx, TAG_LO as i32
+                        ; cmp rax, rcx
+                        ; jne > diff
+                        ; cmp edx, (TAG_HI - TAG_LO) as i32
+                        ; jbe > is_eq
+                        ; call => stub
+                        ; jmp > from_stub
+                        ; diff:
+                        ; cmp edx, (TAG_HI - TAG_LO) as i32
+                        ; ja > do_stub
+                        ; mov r8, rcx
+                        ; shr r8, 48
+                        ; sub r8d, TAG_LO as i32
+                        ; cmp r8d, (TAG_HI - TAG_LO) as i32
+                        ; ja > do_stub
+                        ; and edx, r8d
+                        ; test dl, 4                          // both == TAG_HEAP_HI - TAG_LO (4)?
+                        ; jz > is_ne_lbl
+                        ; do_stub:
+                        ; call => stub
+                        ; from_stub:
+                    );
+                    if is_ne {
+                        dynasm!(ops ; xor eax, 1);
                     }
-                }
-                match cmp {
-                    Cmp::Eq => region_poly_eq(
-                        &mut ops,
-                        ip,
-                        bail,
-                        epilogue,
-                        dst,
-                        a,
-                        b,
-                        false,
-                        heap.strict_eq,
-                    ),
-                    Cmp::Ne => region_poly_eq(
-                        &mut ops,
-                        ip,
-                        bail,
-                        epilogue,
-                        dst,
-                        a,
-                        b,
-                        true,
-                        heap.strict_eq,
-                    ),
-                    // The append cursor's proof is of a body with no helper call.
-                    _ => dcmp(&mut ops, ip, bail, epilogue, dst, a, b, cmp, str_append_cursor.is_none()),
+                    dynasm!(ops
+                        ; jmp > box_res
+                        ; is_eq:
+                        ; mov eax, (!is_ne) as i32
+                        ; jmp > box_res
+                        ; is_ne_lbl:
+                        ; mov eax, is_ne as i32
+                        ; box_res:
+                        ; mov r8, QWORD BOOL_TAG as i64
+                        ; or rax, r8
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                    if let Some((iff, tgt)) = cmp_branch_pair(ip, dst) {
+                        let t = labels[tgt as usize];
+                        let ft = labels[ip + 2];
+                        dynasm!(ops ; test al, 1);
+                        if iff {
+                            dynasm!(ops ; jz => t ; jmp => ft);
+                        } else {
+                            dynasm!(ops ; jnz => t ; jmp => ft);
+                        }
+                    }
+                } else {
+                    // B118: Int+Int compare feeding the NEXT ip's JumpIf branches on
+                    // flags (bool still stored); non-Int falls through to the
+                    // unchanged generic sequence below.
+                    if let Some((iff, tgt)) = cmp_branch_pair(ip, dst) {
+                        let t = labels[tgt as usize];
+                        let ft = labels[ip + 2];
+                        match cmp_const_operand(ip, a, b, cmp) {
+                            Some((reg, imm, c)) => crate::codegen::emit_misc::emit_fused_cmp_imm_branch_head(
+                                &mut ops, dst, reg, imm, c, iff, t, ft,
+                            ),
+                            None => emit_fused_cmp_branch_head(&mut ops, dst, a, b, cmp, iff, t, ft),
+                        }
+                    }
+                    match cmp {
+                        Cmp::Eq => region_poly_eq(
+                            &mut ops,
+                            ip,
+                            bail,
+                            epilogue,
+                            dst,
+                            a,
+                            b,
+                            false,
+                            heap.strict_eq,
+                        ),
+                        Cmp::Ne => region_poly_eq(
+                            &mut ops,
+                            ip,
+                            bail,
+                            epilogue,
+                            dst,
+                            a,
+                            b,
+                            true,
+                            heap.strict_eq,
+                        ),
+                        // The append cursor's proof is of a body with no helper call.
+                        _ => dcmp(&mut ops, ip, bail, epilogue, dst, a, b, cmp, str_append_cursor.is_none()),
+                    }
                 }
             }
             Instr::Jump { target } => {
@@ -6524,24 +6872,28 @@ pub(crate) fn compile_proto_mem(
                 dynasm!(ops ; jmp => labels[target as usize]);
             }
             Instr::JumpIfFalse { cond, target } | Instr::JumpIfTrue { cond, target } => {
-                // Int/Bool condition tests its payload directly; anything else
-                // asks the read-only `jit_truthy` helper. (Copied from mem path.)
+                // Int/Bool/undefined/null branch inline; Heap/Double/SmallBigInt
+                // delegate to the shared per-function `truthy_stub` (5-byte call).
                 let if_false = matches!(proto.code[ip], Instr::JumpIfFalse { .. });
                 let t = labels[target as usize];
-                let testit = ops.new_dynamic_label();
+                let stub = *truthy_stub.get_or_insert_with(|| ops.new_dynamic_label());
+                let done_j = ops.new_dynamic_label();
+                let is_false = if if_false { t } else { done_j };
                 dynasm!(ops
                     ; mov rax, [rbx + dreg(cond)]
                     ; mov r10, rax
                     ; shr r10, 48
                     ; cmp r10d, INT_TAG_HI as i32          // Int
-                    ; je => testit
+                    ; je > testit
                     ; cmp r10d, (INT_TAG_HI + 1) as i32    // Bool
-                    ; je => testit
-                    ; mov rcx, rdi                         // vm
-                    ; mov rdx, rax                         // value bits
-                    ; mov rax, QWORD heap.truthy as i64
-                    ; call rax                             // rax = 0/1
-                    ; => testit
+                    ; je > testit
+                    ; cmp r10d, 0x7FFC                     // Undefined -> false
+                    ; je => is_false
+                    ; mov r8, QWORD crate::value::Value::NULL.bits() as i64
+                    ; cmp rax, r8                          // Null -> false
+                    ; je => is_false
+                    ; call => stub                         // eax = 0/1
+                    ; testit:
                     ; test eax, eax
                 );
                 if if_false {
@@ -6549,6 +6901,7 @@ pub(crate) fn compile_proto_mem(
                 } else {
                     dynasm!(ops ; jnz => t);
                 }
+                dynasm!(ops ; => done_j);
             }
             Instr::JumpIfNotLt { a, b, target } => {
                 djump_if_not_cmp(
@@ -6634,16 +6987,16 @@ pub(crate) fn compile_proto_mem(
                 callee,
                 this_v,
             } => {
-                // `Array.isArray(v)` → Bool bits; deopt sentinel for the rare
-                // throwing case (revoked Proxy → interpreter re-executes + throws,
-                // safe to redo — the check is side-effect-free). Pure, no refetch.
+                // `Array.isArray(v)` → Bool bits via shared per-function inline
+                // mirror stub (handles primitives, dense Arrays, shaped Objects,
+                // Strings, Functions, Class instances with zero FFI call; falls
+                // back to `heap.is_array` for Proxies / non-dense Arrays / DICT).
+                let stub = *is_array_stub.get_or_insert_with(|| ops.new_dynamic_label());
                 dynasm!(ops
-                    ; mov rcx, rdi                        // vm
                     ; mov rdx, [rbx + dreg(a)]            // value bits
                     ; mov r8, [rbx + dreg(callee)]        // captured callee bits
                     ; mov r9, [rbx + dreg(this_v)]        // captured receiver bits
-                    ; mov rax, QWORD heap.is_array as i64
-                    ; call rax
+                    ; call => stub
                     ; mov r10, QWORD SELF_CALL_DEOPT as i64
                     ; cmp rax, r10
                     ; je => bail
@@ -6793,8 +7146,8 @@ pub(crate) fn compile_proto_mem(
                 // only the two shared with the miss path survive here. `miss` went
                 // with them -- it was reached solely by a `jmp` to the instruction
                 // after it.
-                let via_ic = ops.new_dynamic_label();
                 let cont = ops.new_dynamic_label();
+                let miss_lbl = ops.new_dynamic_label();
                 // B114: accessor-way dispatch target (as the region arm),
                 // SITE-GATED exactly as there.
                 let site_emit = ic_emit
@@ -6878,10 +7231,12 @@ pub(crate) fn compile_proto_mem(
                 }
                 // A dense Array's length through its array mirror, ahead of the
                 // eight-way probe it always misses and the helper after it.
-                if crate::codegen::quick_len_enabled()
-                    && crate::codegen::arr_len_mirror_enabled()
-                    && proto.string_constants.get(name as usize).is_some_and(|s| s == "length")
-                {
+                let is_length = crate::codegen::quick_len_enabled()
+                    && proto
+                        .string_constants
+                        .get(name as usize)
+                        .is_some_and(|s| s == "length");
+                if is_length && crate::codegen::arr_len_mirror_enabled() {
                     emit_arr_mirror_len(&mut ops, obj, dst, cont);
                 }
                 emit_ic_probe(
@@ -6893,94 +7248,27 @@ pub(crate) fn compile_proto_mem(
                     acc,
                     site_emit.direct_miss,
                 );
-                // ── B190a: quick `.length` prefix ── exactly the region arm's
-                // (Str/Cons/dense-Array lengths are uncachable in the IC, so a
-                // length read missed to the FULL property helper per read).
-                if crate::codegen::quick_len_enabled()
-                    && proto
-                        .string_constants
-                        .get(name as usize)
-                        .is_some_and(|s| s == "length")
-                {
-                    let ql_miss = ops.new_dynamic_label();
-                    dynasm!(ops
-                        ; mov rcx, rdi
-                        ; mov rdx, rax                    // obj_bits from the probe
-                        ; mov rax, QWORD heap.quick_len as i64
-                        ; call rax
-                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
-                        ; cmp rax, r10
-                        ; je => ql_miss
-                        ; mov [rbx + dreg(dst)], rax
-                        ; jmp => cont
-                        ; => ql_miss
-                        ; mov rax, [rbx + dreg(obj)]      // reload for the miss helper
-                    );
-                }
+                // Outline the cold miss / slow / accessor / refetch tail to
+                // the end of the function so hot IC hits never skip across
+                // ~300 bytes of cold code in L1i.
                 dynasm!(ops
-                    ; mov rcx, rdi                        // vm
-                    ; mov rdx, rax                        // obj_bits (rax survives the probe)
-                    ; mov r8d, ic_site as i32             // site_idx
-                    ; mov r9, QWORD packed as i64         // (func_id<<32)|name_idx
-                    ; mov rax, QWORD heap.get_prop_miss as i64
-                    ; call rax
-                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
-                    ; cmp rax, r10
-                    ; je => bail
-                    ; mov r10, QWORD PROP_VIA_IC as i64
-                    ; cmp rax, r10
-                    ; je => via_ic
-                    ; mov [rbx + dreg(dst)], rax
-                    ; jmp => cont
-                    // ── accessor / class receiver: the interpreter-IC slow helper
-                    // resolves it (may frame-call a getter — user code).
-                    ; => via_ic
-                    ; mov rcx, rdi                        // vm
-                    ; mov rdx, rbx                        // caller window base
-                    ; mov r8, QWORD packed_fip as i64     // (func_id<<32)|ip
-                    ; mov r9, QWORD (((name as u64) << 32) | obj as u64) as i64
-                    ; mov rax, QWORD heap.get_prop_slow as i64
-                    ; call rax
-                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
-                    ; cmp rax, r10
-                    ; je => bail
-                    ; mov r10, QWORD CALL_THREW as i64
-                    ; cmp rax, r10
-                    ; je => bail
-                    ; mov [rbx + dreg(dst)], rax
+                    ; jmp => miss_lbl
+                    ; => cont
                 );
-                if let Some(acc) = acc {
-                    // ── accessor-WAY hit (B114): r9 = the matched way; the
-                    // helper dispatches the getter directly (region arm, minus
-                    // the TA refetch Tier C doesn't have).
-                    let join = ops.new_dynamic_label();
-                    dynasm!(ops
-                        ; jmp => join
-                        ; => acc
-                        ; mov [rsp + 32], r9                  // 5th arg: way ptr
-                        ; mov rcx, rdi                        // vm
-                        ; mov rdx, rbx                        // caller window base
-                        ; mov r8, QWORD packed_fip as i64     // (func_id<<32)|ip
-                        ; mov r9, QWORD (((name as u64) << 32) | obj as u64) as i64
-                        ; mov rax, QWORD heap.get_prop_acc as i64
-                        ; call rax
-                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
-                        ; cmp rax, r10
-                        ; je => bail
-                        ; mov r10, QWORD CALL_THREW as i64
-                        ; cmp rax, r10
-                        ; je => bail
-                        ; mov [rbx + dreg(dst)], rax
-                        ; => join
-                    );
-                }
-                if let Some(join) = acc_lane_join {
-                    dynasm!(ops ; => join);
-                }
-                // The miss/slow helpers may have allocated (versions Vec) or
-                // frame-called a getter (nested compile) — re-derive r13/r14.
-                emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
-                dynasm!(ops ; => cont);
+                deferred_prop_cold.push(DeferredPropCold::Get {
+                    miss_lbl,
+                    cont,
+                    bail,
+                    acc,
+                    acc_lane_join,
+                    quick_len: is_length,
+                    dst,
+                    obj,
+                    name,
+                    ic_site,
+                    packed,
+                    packed_fip,
+                });
                 emit_region_bail(&mut ops, ip, bail, epilogue);
                 ic_site += 1;
             }
@@ -7067,62 +7355,24 @@ pub(crate) fn compile_proto_mem(
                     acc,
                     site_emit.direct_miss,
                 );
+                let miss_lbl = ops.new_dynamic_label();
                 dynasm!(ops
-                    ; mov rcx, rdi                        // vm
-                    ; mov rdx, rax                        // obj_bits
-                    ; mov r8, [rbx + dreg(val)]           // val_bits
-                    ; mov r9, QWORD packed as i64         // (func_id<<32)|name_idx
-                    ; mov QWORD [rsp + 32], ic_site as i32 // 5th arg: site_idx (stack)
-                    ; mov rax, QWORD heap.set_prop_miss as i64
-                    ; call rax
-                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
-                    ; cmp rax, r10
-                    ; je => bail
-                    ; mov r10, QWORD PROP_VIA_IC as i64
-                    ; cmp rax, r10
-                    ; jne => cont
-                    // ── setter / class receiver: interpreter-IC slow helper
-                    // (may frame-call a setter — user code).
-                    ; mov rcx, rdi                        // vm
-                    ; mov rdx, rbx                        // caller window base
-                    ; mov r8, QWORD packed_fip as i64     // (func_id<<32)|ip
-                    ; mov r9, QWORD (((name as u64) << 32) | ((obj as u64) << 16) | val as u64) as i64
-                    ; mov rax, QWORD heap.set_prop_slow as i64
-                    ; call rax
-                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
-                    ; cmp rax, r10
-                    ; je => bail
-                    ; mov r10, QWORD CALL_THREW as i64
-                    ; cmp rax, r10
-                    ; je => bail
+                    ; jmp => miss_lbl
+                    ; => cont
                 );
-                if let Some(acc) = acc {
-                    // ── accessor-WAY hit (B114): direct setter dispatch.
-                    let join = ops.new_dynamic_label();
-                    dynasm!(ops
-                        ; jmp => join
-                        ; => acc
-                        ; mov [rsp + 32], r9                  // 5th arg: way ptr
-                        ; mov rcx, rdi                        // vm
-                        ; mov rdx, rbx                        // caller window base
-                        ; mov r8, QWORD packed_fip as i64     // (func_id<<32)|ip
-                        ; mov r9, QWORD (((name as u64) << 32) | ((obj as u64) << 16) | val as u64) as i64
-                        ; mov rax, QWORD heap.set_prop_acc as i64
-                        ; call rax
-                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
-                        ; cmp rax, r10
-                        ; je => bail
-                        ; mov r10, QWORD CALL_THREW as i64
-                        ; cmp rax, r10
-                        ; je => bail
-                        ; => join
-                    );
-                }
-                if let Some(join) = acc_lane_join {
-                    dynasm!(ops ; => join);
-                }
-                emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
-                dynasm!(ops ; => cont);
+                deferred_prop_cold.push(DeferredPropCold::Set {
+                    miss_lbl,
+                    cont,
+                    bail,
+                    acc,
+                    acc_lane_join,
+                    obj,
+                    val,
+                    name,
+                    ic_site,
+                    packed,
+                    packed_fip,
+                });
                 emit_region_bail(&mut ops, ip, bail, epilogue);
                 ic_site += 1;
             }
@@ -7230,7 +7480,7 @@ pub(crate) fn compile_proto_mem(
                         "add" => 2,
                         _ => 3,
                     };
-                    let load_args = |ops: &mut dynasmrt::x64::Assembler| match argc {
+                    let load_args = |ops: &mut crate::codegen::X64Asm| match argc {
                         2 => dynasm!(ops
                             ; mov r8, [rbx + dreg(arg_base)]
                             ; mov r9, [rbx + dreg(arg_base + 1)]
@@ -7495,6 +7745,40 @@ pub(crate) fn compile_proto_mem(
                     // method IC had each declined. A decline (not a pristine
                     // DataView, an argument needing coercion, an error to
                     // throw) did nothing, and the route below redoes the call.
+                    let fn_call_done = (key == "call" && can_cross3_dyn && argc <= 256).then(|| {
+                        let stub =
+                            *fn_call_dyn_stub.get_or_insert_with(|| ops.new_dynamic_label());
+                        let _ = cross3_dyn_stub.get_or_insert_with(|| ops.new_dynamic_label());
+                        let general = ops.new_dynamic_label();
+                        let done = ops.new_dynamic_label();
+                        if argc == 0 {
+                            dynasm!(ops
+                                ; mov rax, [rbx + dreg(obj)]
+                                ; xor ecx, ecx
+                                ; call => stub
+                            );
+                        } else {
+                            dynasm!(ops
+                                ; mov rax, [rbx + dreg(obj)]
+                                ; mov rdx, [rbx + dreg(arg_base)]
+                                ; lea r8, [rbx + dreg(arg_base + 1)]
+                                ; mov ecx, (0x100 | (argc - 1) as i32)
+                                ; call => stub
+                            );
+                        }
+                        dynasm!(ops
+                            ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                            ; cmp rax, r10
+                            ; je => general
+                            ; mov r10, QWORD CALL_THREW as i64
+                            ; cmp rax, r10
+                            ; je => bail
+                            ; mov [rbx + dreg(dst)], rax
+                            ; jmp => done
+                            ; => general
+                        );
+                        done
+                    });
                     let dv_slot = crate::vm::typedarray::dataview_proto_slot(key)
                         .filter(|_| (1..=3).contains(&argc) && tierc_dv_lane_enabled());
                     let dv_done = dv_slot.map(|slot| {
@@ -7602,38 +7886,68 @@ pub(crate) fn compile_proto_mem(
                     // (`jit_method_callee`), then called natively by the arm
                     // that names its fid, the receiver as `this`. A lookup that
                     // declines and a method no arm names take the route below.
-                    let class_lane = cross_plan
-                        .get(&ip)
-                        .copied()
-                        .filter(|site| do_cross3 && site.class_method && !site.cross3.is_empty());
+                    let class_lane = cross_plan.get(&ip).copied().filter(|site| {
+                        do_cross3
+                            && site.class_method
+                            && (!site.cross3.is_empty()
+                                || (can_cross3_dyn
+                                    && argc <= 255
+                                    && (class_read.contains_key(&ip)
+                                        || site.proto_read.is_some())))
+                    });
                     let class_done = ops.new_dynamic_label();
                     if let Some(site) = class_lane {
                         let lookup_miss = ops.new_dynamic_label();
                         let have_callee = ops.new_dynamic_label();
-                        // The method the class-method lane's guards name
-                        // (`ClassReadPlan`) without the lookup's call; a
-                        // receiver they do not hold for takes the lookup.
+                        let dyn_only = site.cross3.is_empty();
+                        // The method the class-method or prototype-method lane's
+                        // guards name (`ClassReadPlan` / `ProtoReadLane`) without
+                        // an FFI lookup; a receiver they do not hold for takes
+                        // `jit_method_callee` when static cross3 arms exist, or
+                        // falls straight through to `jit_call_method_ic` when
+                        // `dyn_only` (avoiding a double FFI miss).
                         if let Some(lane) = class_read.get(&ip) {
-                            let guard_miss = ops.new_dynamic_label();
+                            let guard_miss = if dyn_only {
+                                lookup_miss
+                            } else {
+                                ops.new_dynamic_label()
+                            };
                             emit_class_read_guard(&mut ops, obj, lane, guard_miss);
                             dynasm!(ops
                                 ; mov rax, QWORD lane.value as i64
                                 ; jmp => have_callee
-                                ; => guard_miss
                             );
+                            if !dyn_only {
+                                dynasm!(ops ; => guard_miss);
+                            }
+                        } else if let Some(plane) = site.proto_read {
+                            let guard_miss = if dyn_only {
+                                lookup_miss
+                            } else {
+                                ops.new_dynamic_label()
+                            };
+                            emit_proto_read_guard(&mut ops, obj, &plane, guard_miss);
+                            dynasm!(ops ; jmp => have_callee);
+                            if !dyn_only {
+                                dynasm!(ops ; => guard_miss);
+                            }
                         }
-                        dynasm!(ops
-                            ; mov rcx, rdi                        // vm
-                            ; mov rdx, [rbx + dreg(obj)]          // receiver bits
-                            ; mov r8, QWORD packed_fip as i64     // (func_id<<32)|ip
-                            ; mov rax, QWORD crate::vm::jit_method_callee as *const () as i64
-                            ; call rax
-                            ; mov r10, QWORD SELF_CALL_DEOPT as i64
-                            ; cmp rax, r10
-                            ; je => lookup_miss
-                            ; => have_callee
-                            ; mov [rsp + c3_off + 48], rax        // the arms' callee
-                        );
+                        if !dyn_only {
+                            dynasm!(ops
+                                ; mov rcx, rdi                        // vm
+                                ; mov rdx, [rbx + dreg(obj)]          // receiver bits
+                                ; mov r8, QWORD packed_fip as i64     // (func_id<<32)|ip
+                                ; mov rax, QWORD crate::vm::jit_method_callee as *const () as i64
+                                ; call rax
+                                ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                                ; cmp rax, r10
+                                ; je => lookup_miss
+                                ; => have_callee
+                                ; mov [rsp + c3_off + 48], rax        // the arms' callee
+                            );
+                        } else {
+                            dynasm!(ops ; => have_callee);
+                        }
                         for c3plan in site.cross3.iter() {
                             emit_cross3_call(
                                 &mut ops,
@@ -7649,6 +7963,29 @@ pub(crate) fn compile_proto_mem(
                                 class_done,
                                 refetch.is_some(),
                                 None,
+                            );
+                        }
+                        if can_cross3_dyn && argc <= 255 {
+                            let dyn_lbl = *cross3_dyn_stub
+                                .get_or_insert_with(|| ops.new_dynamic_label());
+                            let dyn_fb = ops.new_dynamic_label();
+                            if !dyn_only {
+                                dynasm!(ops ; mov rax, [rsp + c3_off + 48]);
+                            }
+                            dynasm!(ops
+                                ; mov rdx, [rbx + dreg(obj)]
+                                ; lea r8, [rbx + dreg(arg_base)]
+                                ; mov ecx, (0x100 | argc as i32)
+                                ; call => dyn_lbl
+                                ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                                ; cmp rax, r10
+                                ; je => dyn_fb
+                                ; mov r10, QWORD CALL_THREW as i64
+                                ; cmp rax, r10
+                                ; je => bail
+                                ; mov [rbx + dreg(dst)], rax
+                                ; jmp => class_done
+                                ; => dyn_fb
                             );
                         }
                         dynasm!(ops ; => lookup_miss);
@@ -7684,6 +8021,9 @@ pub(crate) fn compile_proto_mem(
                         dynasm!(ops ; => done);
                     }
                     if let Some(done) = dv_done {
+                        dynasm!(ops ; => done);
+                    }
+                    if let Some(done) = fn_call_done {
                         dynasm!(ops ; => done);
                     }
                 }
@@ -7737,6 +8077,7 @@ pub(crate) fn compile_proto_mem(
                 // Skipped when the site is leaf-inlined (strictly cheaper).
                 let cross_site = cross_plan.get(&ip).copied();
                 let cross = cross_site.is_some() && leaf_plan.get(&ip).is_none();
+                let dyn_call = can_cross3_dyn && argc <= 255 && leaf_plan.get(&ip).is_none();
                 let cross_done = ops.new_dynamic_label();
                 if cross {
                     let site = cross_site.expect("cross site disappeared during emission");
@@ -7763,6 +8104,26 @@ pub(crate) fn compile_proto_mem(
                                 None,
                             );
                         }
+                    }
+                    if dyn_call {
+                        let dyn_lbl =
+                            *cross3_dyn_stub.get_or_insert_with(|| ops.new_dynamic_label());
+                        let dyn_fb = ops.new_dynamic_label();
+                        dynasm!(ops
+                            ; mov rax, [rbx + dreg(callee)]
+                            ; lea r8, [rbx + dreg(arg_base)]
+                            ; mov ecx, argc as i32
+                            ; call => dyn_lbl
+                            ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                            ; cmp rax, r10
+                            ; je => dyn_fb
+                            ; mov r10, QWORD CALL_THREW as i64
+                            ; cmp rax, r10
+                            ; je => bail
+                            ; mov [rbx + dreg(dst)], rax
+                            ; jmp => cross_done
+                            ; => dyn_fb
+                        );
                     }
                     let same_proto2 = site.same_proto2;
                     let packed_cross: u64 = match same_proto2 {
@@ -7804,6 +8165,25 @@ pub(crate) fn compile_proto_mem(
                     dynasm!(ops
                         ; jmp => cross_done
                         ; => cross_fallback
+                    );
+                } else if dyn_call {
+                    let dyn_lbl =
+                        *cross3_dyn_stub.get_or_insert_with(|| ops.new_dynamic_label());
+                    let dyn_fb = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; mov rax, [rbx + dreg(callee)]
+                        ; lea r8, [rbx + dreg(arg_base)]
+                        ; mov ecx, argc as i32
+                        ; call => dyn_lbl
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => dyn_fb
+                        ; mov r10, QWORD CALL_THREW as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov [rbx + dreg(dst)], rax
+                        ; jmp => cross_done
+                        ; => dyn_fb
                     );
                 }
                 // Q4 leaf-call inlining: a monomorphic plain-leaf callee is inlined
@@ -7861,7 +8241,7 @@ pub(crate) fn compile_proto_mem(
                         None,
                     );
                 }
-                if cross {
+                if cross || dyn_call {
                     dynasm!(ops ; => cross_done);
                 }
             }
@@ -8466,6 +8846,10 @@ pub(crate) fn compile_proto_mem(
                     .then(|| cross_plan.get(&ip).copied())
                     .flatten()
                     .filter(|site| !site.cross3.is_empty());
+                let dyn_cwt = can_cross3_dyn
+                    && argc <= 255
+                    && lane_done.is_none()
+                    && leaf_plan.get(&ip).is_none();
                 let cross_done = ops.new_dynamic_label();
                 if let Some(site) = cwt_cross {
                     for c3plan in site.cross3.iter() {
@@ -8485,6 +8869,27 @@ pub(crate) fn compile_proto_mem(
                             None,
                         );
                     }
+                }
+                if dyn_cwt {
+                    let dyn_lbl =
+                        *cross3_dyn_stub.get_or_insert_with(|| ops.new_dynamic_label());
+                    let dyn_fb = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; mov rax, [rbx + dreg(callee)]
+                        ; mov rdx, [rbx + dreg(this_v)]
+                        ; lea r8, [rbx + dreg(arg_base)]
+                        ; mov ecx, (0x100 | argc as i32)
+                        ; call => dyn_lbl
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => dyn_fb
+                        ; mov r10, QWORD CALL_THREW as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov [rbx + dreg(dst)], rax
+                        ; jmp => cross_done
+                        ; => dyn_fb
+                    );
                 }
                 // A leaf callee that never reads `this`, or a strict one that
                 // does (bound to the receiver), inlined under its guard; a
@@ -8532,7 +8937,7 @@ pub(crate) fn compile_proto_mem(
                 if let Some(done) = lane_done {
                     dynasm!(ops ; => done);
                 }
-                if cwt_cross.is_some() {
+                if cwt_cross.is_some() || dyn_cwt {
                     dynasm!(ops ; => cross_done);
                 }
             }
@@ -8913,7 +9318,7 @@ pub(crate) fn compile_proto_mem(
                         ; mov [rbx + dreg(kind_reg)], rax
                         ; jmp => labels[target as usize]
                     );
-                } else if protected_returns[ip] && route_returns {
+                } else if protected_returns.get(ip).copied().unwrap_or(false) && route_returns {
                     // A return completion must traverse every still-active
                     // for-of/user finally: `jit_return_finally` deposits it and
                     // answers the first one, or that none is left.
@@ -8933,7 +9338,7 @@ pub(crate) fn compile_proto_mem(
                         ; mov rax, [rbx + dreg(src)]
                         ; jmp => clean_exit
                     );
-                } else if protected_returns[ip] {
+                } else if protected_returns.get(ip).copied().unwrap_or(false) {
                     // Resume on the untouched Return: a metered run's charges
                     // and a Python body's completions stay the interpreter's.
                     dynasm!(ops
@@ -8959,7 +9364,7 @@ pub(crate) fn compile_proto_mem(
                         ; mov [rbx + dreg(kind_reg)], rax
                         ; jmp => labels[target as usize]
                     );
-                } else if protected_returns[ip] && route_returns {
+                } else if protected_returns.get(ip).copied().unwrap_or(false) && route_returns {
                     let returns = ops.new_dynamic_label();
                     dynasm!(ops
                         ; mov rcx, rdi
@@ -8976,7 +9381,7 @@ pub(crate) fn compile_proto_mem(
                         ; mov rax, QWORD Value::UNDEFINED.bits() as i64
                         ; jmp => clean_exit
                     );
-                } else if protected_returns[ip] {
+                } else if protected_returns.get(ip).copied().unwrap_or(false) {
                     dynasm!(ops
                         ; mov DWORD [rsi], ip as i32
                         ; jmp => epilogue
@@ -9098,6 +9503,28 @@ pub(crate) fn compile_proto_mem(
         emit_ta_read_stub(&mut ops, ta_read_stub);
         emit_ta_write_stub(&mut ops, ta_write_stub);
     }
+    if let Some(lbl) = eq_stub {
+        emit_strict_eq_stub(&mut ops, lbl, heap.strict_eq);
+    }
+    if let Some(lbl) = truthy_stub {
+        emit_truthy_stub(&mut ops, lbl, heap.truthy);
+    }
+    if let Some(lbl) = loose_eq_stub {
+        emit_loose_eq_stub(&mut ops, lbl);
+    }
+    if let Some(lbl) = is_array_stub {
+        emit_is_array_stub(&mut ops, lbl, heap.is_array);
+    }
+    if let Some(lbl) = fn_call_dyn_stub {
+        let dyn_target = cross3_dyn_stub.expect("fn_call_dyn_stub requires cross3_dyn_stub");
+        emit_fn_call_dyn_stub(&mut ops, lbl, dyn_target);
+    }
+    if let Some(lbl) = cross3_dyn_stub {
+        emit_cross3_dyn_stub(&mut ops, lbl, proto.reg_count.max(1), &heap, refetch);
+    }
+    for cold in deferred_prop_cold {
+        emit_deferred_prop_cold(&mut ops, cold, &heap);
+    }
 
     // The IC-site cursor must have consumed exactly the sites `Jit::compile`
     // reserved (one per GetProp/SetProp). A mismatch ⇒ a GetProp's `[r14+off]`
@@ -9122,7 +9549,7 @@ pub(crate) fn compile_proto_mem(
         Vec::new()
     };
     deferred_bails.flush(&mut ops);
-    let buf = ops.finalize().ok()?;
+    let buf = crate::codegen::finalize_code(ops)?;
     let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
     if !op_offsets.is_empty() {
         write_op_offsets(func_id, entry_ptr as u64, &proto.code, &op_offsets);
@@ -9288,7 +9715,7 @@ fn ta_cache_regs(proto: &FuncProto, metered: bool) -> Vec<u16> {
 /// call. Clobbers rax, rcx, rdx, r8-r11, xmm0, xmm1, as that call does.
 #[allow(clippy::too_many_arguments)]
 fn emit_ta_cache_get(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     slot: i32,
     dst: u16,
     obj: u16,
@@ -9301,8 +9728,18 @@ fn emit_ta_cache_get(
     let general = ops.new_dynamic_label();
     let epoch = &crate::heap::TA_DATA_EPOCH as *const _ as i64;
     let versions = crate::vm::host_api::JIT_VERSIONS_RAW_OFFSET as i32;
+    let has_ta = crate::vm::host_api::JIT_HAS_TYPED_ARRAY_OFFSET as i32;
     let helper = crate::vm::jit_get_index_ta_fill as *const () as i64;
     dynasm!(ops
+        // Fast reject non-Int keys (string/symbol `o[k]`) and VMs with no
+        // TypedArrays before touching the cache slot or calling `ta_fill`.
+        ; mov rdx, [rbx + dreg(key)]
+        ; mov r10, rdx
+        ; shr r10, 48
+        ; cmp r10d, INT_TAG_HI as i32
+        ; jne => general
+        ; cmp BYTE [rdi + has_ta], 0
+        ; je => general
         ; mov rax, [rbx + dreg(obj)]
         ; cmp rax, [rsp + slot]
         ; jne => fill
@@ -9322,11 +9759,6 @@ fn emit_ta_cache_get(
         ; mov r10d, [r10 + rcx * 4]
         ; cmp r10d, [rsp + slot + 28]
         ; jne => fill
-        ; mov rdx, [rbx + dreg(key)]
-        ; mov r10, rdx
-        ; shr r10, 48
-        ; cmp r10d, INT_TAG_HI as i32
-        ; jne => general
         ; mov edx, edx                         // a negative index is huge
         ; cmp rdx, r11
         ; jae => general
@@ -9337,8 +9769,8 @@ fn emit_ta_cache_get(
         ; jmp => done
         ; => fill
         ; mov rcx, rdi
-        ; mov rdx, rax
-        ; mov r8, [rbx + dreg(key)]
+        ; mov r8, rdx                          // key_bits (already loaded)
+        ; mov rdx, rax                         // obj_bits
         ; lea r9, [rsp + slot]
         ; mov rax, QWORD helper
         ; call rax
@@ -9362,7 +9794,7 @@ fn emit_ta_cache_get(
 /// to that call.
 #[allow(clippy::too_many_arguments)]
 fn emit_ta_cache_set(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     slot: i32,
     obj: u16,
     key: u16,
@@ -9375,8 +9807,16 @@ fn emit_ta_cache_set(
     let general = ops.new_dynamic_label();
     let epoch = &crate::heap::TA_DATA_EPOCH as *const _ as i64;
     let versions = crate::vm::host_api::JIT_VERSIONS_RAW_OFFSET as i32;
+    let has_ta = crate::vm::host_api::JIT_HAS_TYPED_ARRAY_OFFSET as i32;
     let helper = crate::vm::jit_set_index_ta_fill as *const () as i64;
     dynasm!(ops
+        ; mov rdx, [rbx + dreg(key)]
+        ; mov r10, rdx
+        ; shr r10, 48
+        ; cmp r10d, INT_TAG_HI as i32
+        ; jne => general
+        ; cmp BYTE [rdi + has_ta], 0
+        ; je => general
         ; mov rax, [rbx + dreg(obj)]
         ; cmp rax, [rsp + slot]
         ; jne => fill
@@ -9394,11 +9834,6 @@ fn emit_ta_cache_set(
         ; jne => fill
         ; cmp BYTE [rsp + slot + 25], 0
         ; je => general
-        ; mov rdx, [rbx + dreg(key)]
-        ; mov r10, rdx
-        ; shr r10, 48
-        ; cmp r10d, INT_TAG_HI as i32
-        ; jne => general
         ; mov edx, edx
         ; cmp rdx, r11
         ; jae => general
@@ -9413,8 +9848,8 @@ fn emit_ta_cache_set(
         ; lea r10, [rsp + slot]
         ; mov [rsp + 32], r10                   // 5th arg: the record
         ; mov rcx, rdi
-        ; mov rdx, rax
-        ; mov r8, [rbx + dreg(key)]
+        ; mov r8, rdx                           // key_bits (already loaded)
+        ; mov rdx, rax                          // obj_bits
         ; mov r9, [rbx + dreg(val)]
         ; mov rax, QWORD helper
         ; call rax
@@ -9430,7 +9865,7 @@ fn emit_ta_cache_set(
 /// a float kind, and returns 1 in `eax`; anything else (a double into an
 /// integer kind, a non-Number) stores nothing and returns 0. Clobbers r10,
 /// xmm0.
-pub(crate) fn emit_ta_write_stub(ops: &mut dynasmrt::x64::Assembler, stub: dynasmrt::DynamicLabel) {
+pub(crate) fn emit_ta_write_stub(ops: &mut crate::codegen::X64Asm, stub: dynasmrt::DynamicLabel) {
     let (int, dbl, fail, ok) = (
         ops.new_dynamic_label(),
         ops.new_dynamic_label(),
@@ -9519,13 +9954,937 @@ pub(crate) fn emit_ta_write_stub(ops: &mut dynasmrt::x64::Assembler, stub: dynas
     );
 }
 
+enum DeferredPropCold {
+    Get {
+        miss_lbl: dynasmrt::DynamicLabel,
+        cont: dynasmrt::DynamicLabel,
+        bail: dynasmrt::DynamicLabel,
+        acc: Option<dynasmrt::DynamicLabel>,
+        acc_lane_join: Option<dynasmrt::DynamicLabel>,
+        quick_len: bool,
+        dst: u16,
+        obj: u16,
+        name: u32,
+        ic_site: u32,
+        packed: u64,
+        packed_fip: u64,
+    },
+    Set {
+        miss_lbl: dynasmrt::DynamicLabel,
+        cont: dynasmrt::DynamicLabel,
+        bail: dynasmrt::DynamicLabel,
+        acc: Option<dynasmrt::DynamicLabel>,
+        acc_lane_join: Option<dynasmrt::DynamicLabel>,
+        obj: u16,
+        val: u16,
+        name: u32,
+        ic_site: u32,
+        packed: u64,
+        packed_fip: u64,
+    },
+}
+
+/// Shared per-function `===` slow stub (called via near `call` from `Instr::Eq`
+/// and `Instr::Ne` when either operand is a double or both are distinct Heap
+/// values). Input: `rax = a_bits`, `rcx = b_bits`, `rdi = vm`. Output: `eax = 1`
+/// iff `a === b`, `0` otherwise. Preserves callee-saved registers.
+fn emit_strict_eq_stub(
+    ops: &mut crate::codegen::X64Asm,
+    stub: dynasmrt::DynamicLabel,
+    strict_eq_helper: usize,
+) {
+    let a_dbl = ops.new_dynamic_label();
+    let b_dbl = ops.new_dynamic_label();
+    let both_dbl = ops.new_dynamic_label();
+    let check_atoms = ops.new_dynamic_label();
+    let ret_false = ops.new_dynamic_label();
+    let call_helper = ops.new_dynamic_label();
+    dynasm!(ops
+        ; => stub
+        ; mov rdx, rax
+        ; shr rdx, 48
+        ; sub edx, TAG_LO as i32
+        ; cmp edx, (TAG_HI - TAG_LO) as i32
+        ; ja => a_dbl
+        ; mov r8, rcx
+        ; shr r8, 48
+        ; sub r8d, TAG_LO as i32
+        ; cmp r8d, (TAG_HI - TAG_LO) as i32
+        ; ja => b_dbl
+        // Both distinct Heap values: interned prefix or Heap::atoms inequality.
+        ; mov edx, eax
+        ; mov r10d, ecx
+        ; cmp edx, USER_OBJ_START as i32
+        ; jae => check_atoms
+        ; cmp r10d, USER_OBJ_START as i32
+        ; jb => ret_false
+        ; => check_atoms
+        ; mov r11, [rdi + crate::vm::host_api::JIT_ATOMS_WORDS_OFFSET as i32]
+        ; mov r8, rdx
+        ; shr r8, 6
+        ; cmp r8, r11
+        ; jae => call_helper
+        ; mov r9, r10
+        ; shr r9, 6
+        ; cmp r9, r11
+        ; jae => call_helper
+        ; mov r11, [rdi + crate::vm::host_api::JIT_ATOMS_RAW_OFFSET as i32]
+        ; mov r8, [r11 + r8 * 8]
+        ; bt r8, rdx
+        ; jnc => call_helper
+        ; mov r9, [r11 + r9 * 8]
+        ; bt r9, r10
+        ; jnc => call_helper
+        ; => ret_false
+        ; xor eax, eax
+        ; ret
+        ; => a_dbl
+        ; mov r8, rcx
+        ; shr r8, 48
+        ; sub r8d, TAG_LO as i32
+        ; cmp r8d, (TAG_HI - TAG_LO) as i32
+        ; ja => both_dbl
+        ; test r8d, r8d                       // b is Int iff r8d == 0
+        ; jnz => ret_false
+        ; movq xmm0, rax
+        ; cvtsi2sd xmm1, ecx
+        ; ucomisd xmm0, xmm1
+        ; sete al
+        ; setnp cl
+        ; and al, cl
+        ; movzx eax, al
+        ; ret
+        ; => b_dbl
+        ; test edx, edx                       // a is Int iff edx == 0
+        ; jnz => ret_false
+        ; cvtsi2sd xmm0, eax
+        ; movq xmm1, rcx
+        ; ucomisd xmm0, xmm1
+        ; sete al
+        ; setnp cl
+        ; and al, cl
+        ; movzx eax, al
+        ; ret
+        ; => both_dbl
+        ; movq xmm0, rax
+        ; movq xmm1, rcx
+        ; ucomisd xmm0, xmm1
+        ; sete al
+        ; setnp cl
+        ; and al, cl
+        ; movzx eax, al
+        ; ret
+        ; => call_helper
+        ; sub rsp, 40                         // 32B shadow + 8B alignment
+        ; mov rdx, rax
+        ; mov r8, rcx
+        ; mov rcx, rdi
+        ; mov rax, QWORD strict_eq_helper as i64
+        ; call rax
+        ; add rsp, 40
+        ; ret
+    );
+}
+
+/// Shared per-function truthiness stub for Heap / Double / SmallBigInt values.
+/// Input: `rax = val_bits`, `r10d = (rax >> 48) as u32`, `rdi = vm`.
+/// Output: `eax = 0` or `1`. Preserves callee-saved registers.
+fn emit_truthy_stub(
+    ops: &mut crate::codegen::X64Asm,
+    stub: dynasmrt::DynamicLabel,
+    truthy_helper: usize,
+) {
+    use crate::vm::host_api::{
+        JIT_ARR_MIRROR_LEN_OFFSET, JIT_ARR_MIRROR_RAW_OFFSET, JIT_HOT_FID_OFF,
+        JIT_HOT_MIRROR_RAW_OFFSET, JIT_HOT_VALS_OFF, JIT_HTMLDDA_IDX_OFFSET,
+        JIT_HTMLDDA_SCALAR_ENABLED_OFFSET,
+    };
+    let call_helper = ops.new_dynamic_label();
+    let ret_true = ops.new_dynamic_label();
+    let ret_false = ops.new_dynamic_label();
+    dynasm!(ops
+        ; => stub
+        ; cmp r10d, 0x7FFD
+        ; jne => call_helper
+        ; cmp BYTE [rdi + JIT_HTMLDDA_SCALAR_ENABLED_OFFSET as i32], 0
+        ; je => call_helper
+        ; mov r10d, eax                       // zero-extended heap idx
+        ; cmp r10d, DWORD [rdi + JIT_HTMLDDA_IDX_OFFSET as i32]
+        ; je => ret_false                     // IsHTMLDDA is falsy
+        ; cmp r10d, crate::heap::INTERN_EMPTY as i32
+        ; je => ret_false                     // interned "" is falsy
+        ; mov r11, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
+        ; lea r11, [r11 + r10 * 8]
+        ; cmp DWORD [r11 + r10 * 8], 0        // settled non-DICT object
+        ; jne => ret_true
+        ; cmp DWORD [r11 + r10 * 8 + JIT_HOT_FID_OFF as i32], crate::heap::FID_MIRROR_NONE as i32
+        ; jne => ret_true                     // non-empty Str, Func/Closure, Class instance, Ctor
+        ; cmp QWORD [r11 + r10 * 8 + JIT_HOT_VALS_OFF as i32], 0
+        ; jne => ret_true                     // settled DICT HeapObj::Object is truthy
+        ; cmp r10d, DWORD [rdi + JIT_ARR_MIRROR_LEN_OFFSET as i32]
+        ; jae => call_helper
+        ; mov r11, [rdi + JIT_ARR_MIRROR_RAW_OFFSET as i32]
+        ; shl r10, 4
+        ; cmp QWORD [r11 + r10], 0            // live dense Array is truthy
+        ; jne => ret_true
+        ; => call_helper
+        ; sub rsp, 40                         // 32B shadow + 8B alignment
+        ; mov rcx, rdi
+        ; mov rdx, rax
+        ; mov rax, QWORD truthy_helper as i64
+        ; call rax
+        ; add rsp, 40
+        ; ret
+        ; => ret_true
+        ; mov eax, 1
+        ; ret
+        ; => ret_false
+        ; xor eax, eax
+        ; ret
+    );
+}
+
+/// Shared per-function `==` / `!=` stub.
+/// Input: `rdx = a_bits`, `r8 = b_bits`, `r9d = is_ne` (0/1), `rdi = vm`.
+/// Output: `rax = Value::bool(...).bits()` or `SELF_CALL_DEOPT`.
+/// Leaves `rdx`, `r8`, `r9` untouched so the slow path calls `jit_loose_eq` directly.
+fn emit_loose_eq_stub(ops: &mut crate::codegen::X64Asm, stub: dynasmrt::DynamicLabel) {
+    use crate::vm::host_api::{JIT_HTMLDDA_IDX_OFFSET, JIT_HTMLDDA_SCALAR_ENABLED_OFFSET};
+    let helper = crate::vm::jit_loose_eq as *const () as usize;
+    let not_both_int = ops.new_dynamic_label();
+    let a_nullish = ops.new_dynamic_label();
+    let b_nullish = ops.new_dynamic_label();
+    let check_other = ops.new_dynamic_label();
+    let equal = ops.new_dynamic_label();
+    let not_equal = ops.new_dynamic_label();
+    let slow_call = ops.new_dynamic_label();
+    dynasm!(ops
+        ; => stub
+        ; mov rcx, rdx
+        ; shr rcx, 48
+        ; cmp ecx, INT_TAG_HI as i32
+        ; jne => not_both_int
+        ; mov rax, r8
+        ; shr rax, 48
+        ; cmp eax, INT_TAG_HI as i32
+        ; jne => not_both_int
+        ; cmp edx, r8d
+        ; je => equal
+        ; jmp => not_equal
+        ; => not_both_int
+        ; mov r11, QWORD Value::NULL.bits() as i64
+        ; mov r10, QWORD Value::UNDEFINED.bits() as i64
+        ; cmp rdx, r11
+        ; je => a_nullish
+        ; cmp rdx, r10
+        ; je => a_nullish
+        ; cmp r8, r11
+        ; je => b_nullish
+        ; cmp r8, r10
+        ; je => b_nullish
+        ; jmp => slow_call
+        ; => a_nullish
+        ; mov rax, r8
+        ; jmp => check_other
+        ; => b_nullish
+        ; mov rax, rdx
+        ; => check_other
+        ; cmp rax, r11
+        ; je => equal
+        ; cmp rax, r10
+        ; je => equal
+        ; mov rcx, rax
+        ; shr rcx, 48
+        ; cmp ecx, TAG_HEAP_HI as i32
+        ; jne => not_equal
+        ; cmp BYTE [rdi + JIT_HTMLDDA_SCALAR_ENABLED_OFFSET as i32], 0
+        ; je => slow_call
+        ; cmp eax, DWORD [rdi + JIT_HTMLDDA_IDX_OFFSET as i32]
+        ; je => equal
+        ; => not_equal
+        ; mov rax, QWORD BOOL_TAG as i64
+        ; xor rax, r9
+        ; ret
+        ; => equal
+        ; mov rax, QWORD (BOOL_TAG | 1) as i64
+        ; xor rax, r9
+        ; ret
+        ; => slow_call
+        ; sub rsp, 40                         // 32B shadow + 8B alignment
+        ; mov rcx, rdi
+        ; mov rax, QWORD helper as i64
+        ; call rax
+        ; add rsp, 40
+        ; ret
+    );
+}
+
+/// Shared per-function `Array.isArray(v)` stub.
+/// Input: `rdx = v_bits`, `r8 = callee_bits`, `r9 = this_v_bits`, `rdi = vm`.
+/// Output: `rax = Value::bool(...).bits()` or `SELF_CALL_DEOPT`.
+fn emit_is_array_stub(
+    ops: &mut crate::codegen::X64Asm,
+    stub: dynasmrt::DynamicLabel,
+    is_array_helper: usize,
+) {
+    use crate::vm::host_api::{
+        JIT_ARRAY_CTOR_BITS_OFFSET, JIT_ARRAY_IS_ARRAY_BITS_OFFSET, JIT_ARR_MIRROR_LEN_OFFSET,
+        JIT_ARR_MIRROR_RAW_OFFSET, JIT_HOT_FID_OFF, JIT_HOT_MIRROR_RAW_OFFSET,
+        JIT_OBJ_REALM_NONEMPTY_OFFSET,
+    };
+    let check_hot = ops.new_dynamic_label();
+    let slow_call = ops.new_dynamic_label();
+    let ret_true = ops.new_dynamic_label();
+    let ret_false = ops.new_dynamic_label();
+    dynasm!(ops
+        ; => stub
+        ; cmp BYTE [rdi + JIT_OBJ_REALM_NONEMPTY_OFFSET as i32], 0
+        ; jne => slow_call
+        ; cmp r8, [rdi + JIT_ARRAY_IS_ARRAY_BITS_OFFSET as i32]
+        ; jne => slow_call
+        ; cmp r9, [rdi + JIT_ARRAY_CTOR_BITS_OFFSET as i32]
+        ; jne => slow_call
+        ; mov r10, rdx
+        ; shr r10, 48
+        ; cmp r10d, TAG_HEAP_HI as i32
+        ; jne => ret_false
+        ; mov ecx, edx
+        ; cmp ecx, DWORD [rdi + JIT_ARR_MIRROR_LEN_OFFSET as i32]
+        ; jae => check_hot
+        ; mov r11, [rdi + JIT_ARR_MIRROR_RAW_OFFSET as i32]
+        ; mov r10, rcx
+        ; shl r10, 4
+        ; cmp QWORD [r11 + r10], 0
+        ; jne => ret_true
+        ; => check_hot
+        ; mov r11, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
+        ; lea r11, [r11 + rcx * 8]
+        ; cmp DWORD [r11 + rcx * 8], 0
+        ; jne => ret_false
+        ; cmp DWORD [r11 + rcx * 8 + JIT_HOT_FID_OFF as i32], crate::heap::FID_MIRROR_NONE as i32
+        ; jne => ret_false
+        ; => slow_call
+        ; sub rsp, 40                         // 32B shadow + 8B alignment
+        ; mov rcx, rdi
+        ; mov rax, QWORD is_array_helper as i64
+        ; call rax
+        ; add rsp, 40
+        ; ret
+        ; => ret_true
+        ; mov rax, QWORD Value::TRUE.bits() as i64
+        ; ret
+        ; => ret_false
+        ; mov rax, QWORD Value::FALSE.bits() as i64
+        ; ret
+    );
+}
+
+/// Shared per-function `fn.call(thisArg, ...)` pristine-guard prefix stub.
+/// Proves `%Function.prototype%.call` is pristine, `fn` has no own `"call"`
+/// property in `fn_props`, and `fn` has no `proto_of` override, then
+/// tail-jumps directly into `cross3_dyn_stub` to execute the callee natively.
+/// Preserves `rax`, `rdx`, `r8`, `ecx`.
+fn emit_fn_call_dyn_stub(
+    ops: &mut crate::codegen::X64Asm,
+    stub: dynasmrt::DynamicLabel,
+    dyn_target: dynasmrt::DynamicLabel,
+) {
+    use crate::vm::host_api::{
+        JIT_FN_CALL_NATIVE_BITS_OFFSET, JIT_FN_PROPS_HAS_CALL_OFFSET,
+        JIT_FN_PROTO_CALL_SLOT_OFFSET, JIT_FN_PROTO_IDX_OFFSET, JIT_FN_PROTO_SHAPE_OFFSET,
+        JIT_HOT_MIRROR_RAW_OFFSET, JIT_HOT_VALS_OFF, JIT_PROTO_LEN_OFFSET, JIT_PROTO_RAW_OFFSET,
+    };
+    let proto_ok = ops.new_dynamic_label();
+    let decline = ops.new_dynamic_label();
+    dynasm!(ops
+        ; => stub
+        ; cmp BYTE [rdi + JIT_FN_PROPS_HAS_CALL_OFFSET as i32], 0
+        ; jne => decline
+        ; mov r10, rax
+        ; shr r10, 48
+        ; cmp r10d, TAG_HEAP_HI as i32
+        ; jne => decline
+        ; mov r10d, eax
+        ; cmp r10, [rdi + JIT_PROTO_LEN_OFFSET as i32]
+        ; jae => proto_ok
+        ; mov r11, [rdi + JIT_PROTO_RAW_OFFSET as i32]
+        ; cmp QWORD [r11 + r10 * 8], 0
+        ; jne => decline
+        ; => proto_ok
+        ; mov r10d, DWORD [rdi + JIT_FN_PROTO_IDX_OFFSET as i32]
+        ; mov r9, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
+        ; lea r9, [r9 + r10 * 8]
+        ; mov r11d, DWORD [r9 + r10 * 8]
+        ; test r11d, r11d
+        ; jz => decline
+        ; cmp r11d, DWORD [rdi + JIT_FN_PROTO_SHAPE_OFFSET as i32]
+        ; jne => decline
+        ; mov r9, [r9 + r10 * 8 + JIT_HOT_VALS_OFF as i32]
+        ; mov r10d, DWORD [rdi + JIT_FN_PROTO_CALL_SLOT_OFFSET as i32]
+        ; mov r11, [r9 + r10 * 8]
+        ; cmp r11, [rdi + JIT_FN_CALL_NATIVE_BITS_OFFSET as i32]
+        ; jne => decline
+        ; jmp => dyn_target
+        ; => decline
+        ; mov rax, QWORD SELF_CALL_DEOPT as i64
+        ; ret
+    );
+}
+
+/// Shared per-function dynamic native-to-native `CROSS3` trampoline for
+/// polymorphic `Call`, `CallWithThis`, and `CallMethod` sites.
+///
+/// Entry contract (`call => stub` from a 16-byte-aligned Tier-C body):
+/// - `rax` = callee Value bits
+/// - `rdx` = explicit `this` Value bits (only read when `ecx & 0x100 != 0`)
+/// - `r8`  = `&regs[arg_base]`
+/// - `ecx` = `(has_this << 8) | argc` (`argc <= 255`)
+/// - `rdi` = `vm: *mut Vm`, `rbx` = caller register window base
+///
+/// Returns in `rax`: return Value bits, `SELF_CALL_DEOPT` (pure-prefix
+/// decline, nothing mutated), or `CALL_THREW` (callee threw; caller bails).
+/// Refetches `r13`/`r14` when `refetch.is_some()` on every non-decline return.
+fn emit_cross3_dyn_stub(
+    ops: &mut crate::codegen::X64Asm,
+    stub: dynasmrt::DynamicLabel,
+    caller_regs: u16,
+    heap: &HeapHelpers,
+    refetch: Option<(usize, usize)>,
+) {
+    use crate::codegen::{CROSS_DYN_ARROW, CROSS_DYN_OK, CROSS_DYN_STRICT};
+    use crate::vm::host_api::{
+        JIT_ACTIVATION_OFFSET, JIT_CALL_DEPTH_OFFSET, JIT_CROSS_TABLE_LEN_OFFSET,
+        JIT_CROSS_TABLE_RAW_OFFSET, JIT_EVAL_SCOPE_NONEMPTY_OFFSET, JIT_GC_REQUESTED_OFFSET,
+        JIT_GC_STRESS_OFFSET, JIT_GLOBAL_ROUTE_EPOCH_OFFSET, JIT_GLOBAL_THIS_BITS_OFFSET,
+        JIT_HOT_FID_OFF, JIT_HOT_MIRROR_RAW_OFFSET, JIT_OBJ_REALM_NONEMPTY_OFFSET,
+        JIT_REALM_GLOBALS_NONEMPTY_OFFSET, JIT_REGS_HW_OFFSET, JIT_REGS_LEN_OFFSET,
+        JIT_REGS_PTR_OFFSET, JIT_ROOT_DEPTH_OFFSET, JIT_ROOT_SLOTS_OFFSET,
+        JIT_THIS_MIRROR_RAW_OFFSET, JIT_UPVALS_MIRROR_RAW_OFFSET,
+    };
+    let fast_decline = ops.new_dynamic_label();
+    let decline_pop = ops.new_dynamic_label();
+    let this_arrow = ops.new_dynamic_label();
+    let this_plain = ops.new_dynamic_label();
+    let this_sloppy_plain = ops.new_dynamic_label();
+    let this_ready = ops.new_dynamic_label();
+    let inline_noroot = ops.new_dynamic_label();
+    let inline_entered = ops.new_dynamic_label();
+    let grow = ops.new_dynamic_label();
+    let entered_fast = ops.new_dynamic_label();
+    let copy_loop = ops.new_dynamic_label();
+    let copy_done = ops.new_dynamic_label();
+    let zero_loop = ops.new_dynamic_label();
+    let zero_done = ops.new_dynamic_label();
+    let noroot = ops.new_dynamic_label();
+    let slow_finish = ops.new_dynamic_label();
+
+    let fill_counter = crate::vm::crossstats::stats_enabled()
+        .then(|| crate::vm::crossstats::fill_fast_counter_addr());
+    let root_counter = crate::vm::activationrootstats::stats_enabled()
+        .then(|| crate::vm::activationrootstats::nested_counter_addr());
+
+    let act = JIT_ACTIVATION_OFFSET as i32;
+    let depth = JIT_CALL_DEPTH_OFFSET as i32;
+    // Frame size 120 = 8 mod 16: with the 8B return address from `call => stub`,
+    // `rsp` is 16-byte aligned for all nested native/Win64 helper calls.
+    // Layout:
+    //   [rsp +   0..32]  Win64 shadow space
+    //   [rsp +  32]      5th arg slot (for jit_cross3_finish)
+    //   [rsp +  40..64]  saved prior activation (24B)
+    //   [rsp +  64]      window base | flags (also temp rax spill around refetch)
+    //   [rsp +  72]      callee_bits
+    //   [rsp +  80]      resolved this_bits
+    //   [rsp +  88]      arg_ptr
+    //   [rsp +  96]      &CrossEntryRec (valid only BEFORE callee call)
+    //   [rsp + 104]      bail_ip (u32)
+    //   [rsp + 108]      fid (u32)
+    //   [rsp + 112]      argc (u32, 0..=255)
+    //   [rsp + 116]      callee_idx (u32)
+    const STUB_FRAME: i32 = 120;
+
+    dynasm!(ops
+        ; => stub
+        // 1. Pre-frame fast guards (builtins/natives/uncompiled decline in ~8 ops).
+        ; mov r10, rax
+        ; shr r10, 48
+        ; cmp r10d, TAG_HEAP_HI as i32
+        ; jne => fast_decline
+        ; mov r10d, eax
+        ; mov r11, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
+        ; lea r11, [r11 + r10 * 8]
+        ; mov r9d, DWORD [r11 + r10 * 8 + JIT_HOT_FID_OFF as i32]
+        ; cmp r9d, DWORD [rdi + JIT_CROSS_TABLE_LEN_OFFSET as i32]
+        ; jae => fast_decline
+        ; mov r11, [rdi + JIT_CROSS_TABLE_RAW_OFFSET as i32]
+        ; shl r9, 5
+        ; add r11, r9
+        ; mov r9, [r11]
+        ; test r9, r9
+        ; jz => fast_decline
+        ; mov r9d, DWORD [r11 + 12]
+        ; test r9d, CROSS_DYN_OK as i32
+        ; jz => fast_decline
+        ; cmp BYTE [rdi + JIT_OBJ_REALM_NONEMPTY_OFFSET as i32], 0
+        ; jne => fast_decline
+        ; cmp BYTE [rdi + JIT_EVAL_SCOPE_NONEMPTY_OFFSET as i32], 0
+        ; jne => fast_decline
+        ; cmp BYTE [rdi + JIT_REALM_GLOBALS_NONEMPTY_OFFSET as i32], 0
+        ; jne => fast_decline
+        ; cmp DWORD [rdi + depth], crate::vm::native_call_cap() as i32
+        ; jae => fast_decline
+        ; cmp DWORD [rdi + JIT_GLOBAL_ROUTE_EPOCH_OFFSET as i32], 0
+        ; jne => fast_decline
+        ; cmp BYTE [rdi + JIT_GC_REQUESTED_OFFSET as i32], 0
+        ; jne => fast_decline
+        ; cmp BYTE [rdi + JIT_GC_STRESS_OFFSET as i32], 0
+        ; jne => fast_decline
+
+        // 2. Allocate stub frame and resolve `this` before mutating VM state.
+        ; sub rsp, STUB_FRAME
+        ; mov [rsp + 72], rax
+        ; mov [rsp + 88], r8
+        ; mov [rsp + 96], r11
+        ; mov DWORD [rsp + 116], r10d
+        ; mov eax, DWORD [r11 + 28]
+        ; mov DWORD [rsp + 108], eax
+
+        ; test r9d, CROSS_DYN_ARROW as i32
+        ; jnz => this_arrow
+        ; test ecx, 0x100
+        ; jz => this_plain
+        ; test r9d, CROSS_DYN_STRICT as i32
+        ; jnz => this_ready
+        // Sloppy method / `fn.call(thisArg, ...)`: substitute `globalThis` for
+        // `null`/`undefined` (OrdinaryCallBindThis), and accept heap JS objects
+        // (shaped Object, class instance, or dense Array) verbatim without
+        // ToObject boxing.
+        ; mov rax, QWORD Value::UNDEFINED.bits() as i64
+        ; cmp rdx, rax
+        ; je => this_sloppy_plain
+        ; mov rax, QWORD Value::NULL.bits() as i64
+        ; cmp rdx, rax
+        ; je => this_sloppy_plain
+        ; mov rax, rdx
+        ; shr rax, 48
+        ; cmp eax, TAG_HEAP_HI as i32
+        ; jne => decline_pop
+        ; mov eax, edx
+        ; mov r8, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
+        ; lea r8, [r8 + rax * 8]
+        ; cmp DWORD [r8 + rax * 8], 0
+        ; jg => this_ready
+        ; mov r9d, DWORD [r8 + rax * 8 + JIT_HOT_FID_OFF as i32]
+        ; cmp r9d, crate::heap::FID_MIRROR_CLASS as i32
+        ; jb => decline_pop
+        ; cmp r9d, crate::heap::FID_MIRROR_NONE as i32
+        ; jne => this_ready
+        ; cmp eax, DWORD [rdi + crate::vm::host_api::JIT_ARR_MIRROR_LEN_OFFSET as i32]
+        ; jae => decline_pop
+        ; mov r8, [rdi + crate::vm::host_api::JIT_ARR_MIRROR_RAW_OFFSET as i32]
+        ; shl rax, 4
+        ; cmp QWORD [r8 + rax], 0
+        ; jne => this_ready
+        ; jmp => decline_pop
+
+        ; => this_arrow
+        ; mov rdx, [rdi + JIT_THIS_MIRROR_RAW_OFFSET as i32]
+        ; mov rdx, [rdx + r10 * 8]
+        ; jmp => this_ready
+
+        ; => this_plain
+        ; test r9d, CROSS_DYN_STRICT as i32
+        ; jz => this_sloppy_plain
+        ; mov rdx, QWORD Value::UNDEFINED.bits() as i64
+        ; jmp => this_ready
+
+        ; => this_sloppy_plain
+        ; mov rdx, [rdi + JIT_GLOBAL_THIS_BITS_OFFSET as i32]
+
+        ; => this_ready
+        ; mov [rsp + 80], rdx
+        ; and ecx, 0xFF
+        ; mov DWORD [rsp + 112], ecx
+
+        // 3. Save prior activation and open callee register window inline.
+        ; mov rax, [rdi + act]
+        ; mov [rsp + 40], rax
+        ; mov rax, [rdi + act + 8]
+        ; mov [rsp + 48], rax
+        ; mov rax, [rdi + act + 16]
+        ; mov [rsp + 56], rax
+
+        ; mov rax, [rdi + JIT_REGS_PTR_OFFSET as i32]
+        ; mov r8, [rdi + JIT_REGS_LEN_OFFSET as i32]
+        ; lea rdx, [rax + r8 * 8]
+        ; lea rcx, [rbx + dreg(caller_regs)]
+        ; cmp rdx, rcx
+        ; jne => decline_pop
+        ; movzx eax, WORD [r11 + 24]
+        ; add r8, rax
+        ; cmp r8, [rdi + JIT_REGS_HW_OFFSET as i32]
+        ; ja => grow
+        ; mov r9, rdx
+        ; cmp WORD [rdi + act], 0x0101
+        ; jne => inline_noroot
+        ; cmp DWORD [rdi + JIT_ROOT_DEPTH_OFFSET as i32],
+            crate::vm::native_call_cap() as i32 - 2
+        ; jae => decline_pop
+        ; or rdx, 2
+        ; => inline_noroot
+        ; mov [rsp + 64], rdx
+        ; mov [rdi + JIT_REGS_LEN_OFFSET as i32], r8
+        ; test dl, 2
+        ; jz => inline_entered
+        ; mov eax, DWORD [rdi + JIT_ROOT_DEPTH_OFFSET as i32]
+        ; lea rcx, [rax + rax * 2]
+        ; lea rcx, [rdi + rcx * 8 + JIT_ROOT_SLOTS_OFFSET as i32]
+        ; mov rax, [rsp + 40]
+        ; mov [rcx], rax
+        ; mov rax, [rsp + 48]
+        ; mov [rcx + 8], rax
+        ; mov rax, [rsp + 56]
+        ; mov [rcx + 16], rax
+        ; inc DWORD [rdi + JIT_ROOT_DEPTH_OFFSET as i32]
+    );
+    if let Some(addr) = root_counter {
+        dynasm!(ops
+            ; mov rax, QWORD addr as i64
+            ; lock inc QWORD [rax]
+        );
+    }
+    dynasm!(ops
+        ; => inline_entered
+        ; mov r10d, DWORD [rsp + 116]
+        ; mov rax, r10
+        ; shl rax, 32
+        ; or rax, 0x0101
+        ; mov [rdi + act], rax
+        ; mov [rdi + act + 8], r10
+        ; mov rax, [rdi + JIT_UPVALS_MIRROR_RAW_OFFSET as i32]
+        ; mov rax, [rax + r10 * 8]
+        ; mov [rdi + act + 16], rax
+    );
+    if let Some(addr) = fill_counter {
+        dynasm!(ops
+            ; mov rax, QWORD addr as i64
+            ; lock inc QWORD [rax]
+        );
+    }
+    dynasm!(ops
+        ; xor eax, eax
+        ; jmp => entered_fast
+
+        // High-water grow cold path through `jit_cross3_enter`.
+        ; => grow
+        ; mov rcx, rdi
+        ; lea rdx, [rbx + dreg(caller_regs)]
+        ; movzx r8d, WORD [r11 + 24]
+        ; mov r9d, DWORD [rsp + 116]
+        ; mov rax, QWORD heap.cross3_enter as i64
+        ; call rax
+        ; test rax, rax
+        ; jz => decline_pop
+        ; mov [rsp + 64], rax
+        ; mov r9, rax
+        ; and r9, -4
+        ; mov r11, [rsp + 96]
+
+        // 4. Populate callee registers: `this`, `min(argc, param_count)` args,
+        //    and `(uninit_mask | param_all_mask) & !written_mask` undefined fill.
+        ; => entered_fast
+        ; mov rdx, [rsp + 80]
+        ; mov [r9], rdx
+        ; mov ecx, DWORD [rsp + 112]
+        ; movzx edx, WORD [r11 + 26]
+        ; cmp ecx, edx
+        ; cmova ecx, edx
+        ; mov r8, [rsp + 88]
+        ; xor r10d, r10d
+        ; => copy_loop
+        ; cmp r10d, ecx
+        ; jae => copy_done
+        ; mov rdx, [r8 + r10 * 8]
+        ; mov [r9 + r10 * 8 + 8], rdx
+        ; inc r10d
+        ; jmp => copy_loop
+        ; => copy_done
+
+        ; test al, 1
+        ; jnz => zero_done
+        // `ecx` = copy_n (<= param_count <= 62), so copy_n + 1 <= 63.
+        ; inc ecx
+        ; mov r8d, 1
+        ; shl r8, cl
+        ; dec r8
+        ; movzx ecx, WORD [r11 + 26]
+        ; inc ecx
+        ; mov r10d, 1
+        ; shl r10, cl
+        ; dec r10
+        ; or r10, [r11 + 16]
+        ; not r8
+        ; and r10, r8
+        ; jz => zero_done
+        ; mov rdx, QWORD Value::UNDEFINED.bits() as i64
+        ; => zero_loop
+        ; bsf rcx, r10
+        ; mov [r9 + rcx * 8], rdx
+        ; lea r8, [r10 - 1]
+        ; and r10, r8
+        ; jnz => zero_loop
+        ; => zero_done
+
+        // 5. Direct native call, activation restore, window close / mid-body finish.
+        ; inc DWORD [rdi + depth]
+        ; mov DWORD [rsp + 104], crate::codegen::NO_BAIL as i32
+        ; mov rax, [r11]
+        ; mov rcx, r9
+        ; lea rdx, [rsp + 104]
+        ; mov r8, rdi
+        ; call rax
+
+        ; mov rdx, [rsp + 64]
+        ; mov r11, [rsp + 40]
+        ; mov [rdi + act], r11
+        ; mov r11, [rsp + 48]
+        ; mov [rdi + act + 8], r11
+        ; mov r11, [rsp + 56]
+        ; mov [rdi + act + 16], r11
+        ; test dl, 2
+        ; jz => noroot
+        ; dec DWORD [rdi + JIT_ROOT_DEPTH_OFFSET as i32]
+        ; => noroot
+        ; mov r10d, DWORD [rsp + 104]
+        ; cmp r10d, crate::codegen::NO_BAIL as i32
+        ; jne => slow_finish
+
+        // Clean native return.
+        ; dec DWORD [rdi + depth]
+        ; and rdx, -4
+        ; mov r11, [rdi + JIT_REGS_PTR_OFFSET as i32]
+        ; sub rdx, r11
+        ; shr rdx, 3
+        ; mov [rdi + JIT_REGS_LEN_OFFSET as i32], rdx
+    );
+    if let Some((vb, icb)) = refetch {
+        dynasm!(ops ; mov [rsp + 64], rax);
+        emit_refetch_pinned(ops, vb, Some(icb));
+        dynasm!(ops ; mov rax, [rsp + 64]);
+    }
+    dynasm!(ops
+        ; add rsp, STUB_FRAME
+        ; ret
+
+        // Mid-body bail: complete through `jit_cross3_finish`.
+        ; => slow_finish
+        ; mov rcx, rdi
+        ; mov rdx, [rsp + 64]
+        ; and rdx, -4
+        ; mov r8, r10
+        ; shl r8, 32
+        ; mov eax, DWORD [rsp + 112]
+        ; shl eax, 24
+        ; or eax, DWORD [rsp + 108]
+        ; or r8, rax
+        ; mov r9, [rsp + 72]
+        ; mov r11, [rsp + 88]
+        ; mov [rsp + 32], r11
+        ; mov rax, QWORD heap.cross3_finish as i64
+        ; call rax
+    );
+    if let Some((vb, icb)) = refetch {
+        dynasm!(ops ; mov [rsp + 64], rax);
+        emit_refetch_pinned(ops, vb, Some(icb));
+        dynasm!(ops ; mov rax, [rsp + 64]);
+    }
+    dynasm!(ops
+        ; add rsp, STUB_FRAME
+        ; ret
+
+        ; => decline_pop
+        ; add rsp, STUB_FRAME
+        ; => fast_decline
+        ; mov rax, QWORD SELF_CALL_DEOPT as i64
+        ; ret
+    );
+}
+
+/// Flush one deferred `GetProp` / `SetProp` cold miss + slow + accessor + refetch
+/// block after the function epilogue, keeping the hot IC probe stream dense in L1i.
+fn emit_deferred_prop_cold(
+    ops: &mut crate::codegen::X64Asm,
+    cold: DeferredPropCold,
+    heap: &HeapHelpers,
+) {
+    match cold {
+        DeferredPropCold::Get {
+            miss_lbl,
+            cont,
+            bail,
+            acc,
+            acc_lane_join,
+            quick_len,
+            dst,
+            obj,
+            name,
+            ic_site,
+            packed,
+            packed_fip,
+        } => {
+            let via_ic = ops.new_dynamic_label();
+            dynasm!(ops ; => miss_lbl);
+            if quick_len {
+                let ql_miss = ops.new_dynamic_label();
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, rax
+                    ; mov rax, QWORD heap.quick_len as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => ql_miss
+                    ; mov [rbx + dreg(dst)], rax
+                    ; jmp => cont
+                    ; => ql_miss
+                    ; mov rax, [rbx + dreg(obj)]
+                );
+            }
+            dynasm!(ops
+                ; mov rcx, rdi
+                ; mov rdx, rax
+                ; mov r8d, ic_site as i32
+                ; mov r9, QWORD packed as i64
+                ; mov rax, QWORD heap.get_prop_miss as i64
+                ; call rax
+                ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                ; cmp rax, r10
+                ; je => bail
+                ; mov r10, QWORD PROP_VIA_IC as i64
+                ; cmp rax, r10
+                ; je => via_ic
+                ; mov [rbx + dreg(dst)], rax
+                ; jmp => cont
+                ; => via_ic
+                ; mov rcx, rdi
+                ; mov rdx, rbx
+                ; mov r8, QWORD packed_fip as i64
+                ; mov r9, QWORD (((name as u64) << 32) | obj as u64) as i64
+                ; mov rax, QWORD heap.get_prop_slow as i64
+                ; call rax
+                ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                ; cmp rax, r10
+                ; je => bail
+                ; mov r10, QWORD CALL_THREW as i64
+                ; cmp rax, r10
+                ; je => bail
+                ; mov [rbx + dreg(dst)], rax
+            );
+            if let Some(acc) = acc {
+                let join = ops.new_dynamic_label();
+                dynasm!(ops
+                    ; jmp => join
+                    ; => acc
+                    ; mov [rsp + 32], r9
+                    ; mov rcx, rdi
+                    ; mov rdx, rbx
+                    ; mov r8, QWORD packed_fip as i64
+                    ; mov r9, QWORD (((name as u64) << 32) | obj as u64) as i64
+                    ; mov rax, QWORD heap.get_prop_acc as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov r10, QWORD CALL_THREW as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov [rbx + dreg(dst)], rax
+                    ; => join
+                );
+            }
+            if let Some(join) = acc_lane_join {
+                dynasm!(ops ; => join);
+            }
+            emit_refetch_pinned(ops, heap.versions_base, Some(heap.ic_base));
+            dynasm!(ops ; jmp => cont);
+        }
+        DeferredPropCold::Set {
+            miss_lbl,
+            cont,
+            bail,
+            acc,
+            acc_lane_join,
+            obj,
+            val,
+            name,
+            ic_site,
+            packed,
+            packed_fip,
+        } => {
+            dynasm!(ops
+                ; => miss_lbl
+                ; mov rcx, rdi
+                ; mov rdx, rax
+                ; mov r8, [rbx + dreg(val)]
+                ; mov r9, QWORD packed as i64
+                ; mov QWORD [rsp + 32], ic_site as i32
+                ; mov rax, QWORD heap.set_prop_miss as i64
+                ; call rax
+                ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                ; cmp rax, r10
+                ; je => bail
+                ; mov r10, QWORD PROP_VIA_IC as i64
+                ; cmp rax, r10
+                ; jne => cont
+                ; mov rcx, rdi
+                ; mov rdx, rbx
+                ; mov r8, QWORD packed_fip as i64
+                ; mov r9, QWORD (((name as u64) << 32) | ((obj as u64) << 16) | val as u64) as i64
+                ; mov rax, QWORD heap.set_prop_slow as i64
+                ; call rax
+                ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                ; cmp rax, r10
+                ; je => bail
+                ; mov r10, QWORD CALL_THREW as i64
+                ; cmp rax, r10
+                ; je => bail
+            );
+            if let Some(acc) = acc {
+                let join = ops.new_dynamic_label();
+                dynasm!(ops
+                    ; jmp => join
+                    ; => acc
+                    ; mov [rsp + 32], r9
+                    ; mov rcx, rdi
+                    ; mov rdx, rbx
+                    ; mov r8, QWORD packed_fip as i64
+                    ; mov r9, QWORD (((name as u64) << 32) | ((obj as u64) << 16) | val as u64) as i64
+                    ; mov rax, QWORD heap.set_prop_acc as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov r10, QWORD CALL_THREW as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; => join
+                );
+            }
+            if let Some(join) = acc_lane_join {
+                dynasm!(ops ; => join);
+            }
+            emit_refetch_pinned(ops, heap.versions_base, Some(heap.ic_base));
+            dynasm!(ops ; jmp => cont);
+        }
+    }
+}
+
 /// The element read `emit_ta_cache_get` calls: `ecx` the kind (a numeric
 /// `TA_KINDS` index, 0 to 8), `r9` the element base, `rdx` the index, in
 /// bounds; the element's Value in `rax`, boxed as `ta_interp_numeric_get_view`
 /// boxes it (an integer kind as an Int, a u32 past i32 and the float kinds
 /// through `Value::num`'s narrowing, NaN canonical). Clobbers rcx, r10,
 /// xmm0, xmm1.
-pub(crate) fn emit_ta_read_stub(ops: &mut dynasmrt::x64::Assembler, stub: dynasmrt::DynamicLabel) {
+pub(crate) fn emit_ta_read_stub(ops: &mut crate::codegen::X64Asm, stub: dynasmrt::DynamicLabel) {
     let (u8_, i8_, i16_, u16_, i32_, u32_, f32_, f64_) = (
         ops.new_dynamic_label(),
         ops.new_dynamic_label(),
@@ -9775,6 +11134,9 @@ fn str_case_chains(
             let (Some(&bits), Some(s)) = (const_strs.get(&idx), text(idx)) else {
                 break;
             };
+            if !Value::from_bits(bits).is_heap() {
+                break;
+            }
             let x = if a == c {
                 b
             } else if b == c {
@@ -9805,43 +11167,101 @@ fn str_case_chains(
     out
 }
 
-/// The head of a [`str_case_chains`] run: `x`'s bits against each case's;
-/// on a match, the registers the run writes up to that case (each literal,
-/// and `false` for each test before it, `true` for its own), then a jump to
-/// its target. No match falls through to the run.
+/// Emit only the final visible write for each distinct register (`case.c`,
+/// `case.t`) written across `cases` in execution order, avoiding O(k^2) dead
+/// stores on long `switch (node.type)` chains.
+fn emit_final_case_writes(
+    ops: &mut crate::codegen::X64Asm,
+    cases: &[StrCase],
+    matched_last: bool,
+) {
+    let mut writes: Vec<(u16, u64)> = Vec::new();
+    let mut set_reg = |r: u16, v: u64| {
+        if let Some(slot) = writes.iter_mut().find(|(reg, _)| *reg == r) {
+            slot.1 = v;
+        } else {
+            writes.push((r, v));
+        }
+    };
+    let last = cases.len().saturating_sub(1);
+    for (j, case) in cases.iter().enumerate() {
+        set_reg(case.c, case.bits);
+        set_reg(case.t, BOOL_TAG | u64::from(matched_last && j == last));
+    }
+    for (reg, val) in writes {
+        dynasm!(ops
+            ; mov r10, QWORD val as i64
+            ; mov [rbx + dreg(reg)], r10
+        );
+    }
+}
+
+/// The head of a [`str_case_chains`] run: checks `x`'s heap tag once, then
+/// compares `x`'s 32-bit heap index against each unique case literal.
+/// - On match: writes only the final values of registers touched up to that
+///   case and jumps to `case.target`.
+/// - On non-heap `x` (or an atom `x` when every case literal is an atom): no
+///   case can equal `x` by content either, so writes the final no-match
+///   register values and jumps straight past the entire `LoadConst; Eq;
+///   JumpIfTrue` run (`after_label`).
+/// - On non-atom heap `x` (e.g. a dynamically built string): falls through
+///   into the original run to compare by content.
 fn emit_str_case_bits(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     x: u16,
     cases: &[StrCase],
     labels: &[dynasmrt::DynamicLabel],
+    all_atoms: bool,
+    after_label: Option<dynasmrt::DynamicLabel>,
 ) {
     let fall = ops.new_dynamic_label();
+    let no_match_done = after_label.map(|_| ops.new_dynamic_label());
     let lands: Vec<_> = cases.iter().map(|_| ops.new_dynamic_label()).collect();
-    dynasm!(ops ; mov rax, [rbx + dreg(x)]);
+    let non_heap_target = no_match_done.unwrap_or(fall);
+    dynasm!(ops
+        ; mov rax, [rbx + dreg(x)]
+        ; mov r10, rax
+        ; shr r10, 32
+        ; cmp r10d, 0x7FFD_0000               // Heap Value (top16 = 0x7FFD, bits 32..48 = 0)
+        ; jne => non_heap_target
+    );
     for (case, &land) in cases.iter().zip(&lands) {
         if case.check {
             dynasm!(ops
-                ; mov r10, QWORD case.bits as i64
-                ; cmp rax, r10
+                ; cmp eax, (case.bits as u32) as i32
                 ; je => land
             );
         }
     }
+    if all_atoms {
+        if let Some(done) = no_match_done {
+            let atoms_words_off = crate::vm::host_api::JIT_ATOMS_WORDS_OFFSET as i32;
+            let atoms_raw_off = crate::vm::host_api::JIT_ATOMS_RAW_OFFSET as i32;
+            dynasm!(ops
+                ; mov edx, eax                     // zero-extended heap idx
+                ; mov r8, rdx
+                ; shr r8, 6
+                ; cmp r8, [rdi + atoms_words_off]
+                ; jae => fall
+                ; mov r11, [rdi + atoms_raw_off]
+                ; mov r8, [r11 + r8 * 8]
+                ; bt r8, rdx
+                ; jc => done                       // atom != all atom cases => cannot match
+            );
+        }
+    }
     dynasm!(ops ; jmp => fall);
+    if let (Some(done), Some(after)) = (no_match_done, after_label) {
+        dynasm!(ops ; => done);
+        emit_final_case_writes(ops, cases, false);
+        dynasm!(ops ; jmp => after);
+    }
     for (k, (case, &land)) in cases.iter().zip(&lands).enumerate() {
         if !case.check {
             continue;
         }
         dynasm!(ops ; => land);
-        for (j, before) in cases[..=k].iter().enumerate() {
-            let answer = BOOL_TAG | u64::from(j == k);
-            dynasm!(ops
-                ; mov r10, QWORD before.bits as i64
-                ; mov [rbx + dreg(before.c)], r10
-                ; mov r10, QWORD answer as i64
-                ; mov [rbx + dreg(before.t)], r10
-            );
-        }
+        emit_final_case_writes(ops, &cases[..=k], true);
         dynasm!(ops ; jmp => labels[case.target as usize]);
     }
     dynasm!(ops ; => fall);
@@ -9972,7 +11392,7 @@ pub(crate) fn float_op_plan(code: &[Instr], cands: &[bool], arith_fb: Option<&[u
 /// as its double; anything else jumps to `bail`), copied into a cache slot
 /// when the body has one to give (not `keep`, an operand the op still reads).
 fn float_operand(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     fc: &mut FloatCache,
     reg: u16,
     scratch: u8,
@@ -10000,7 +11420,7 @@ fn float_operand(
 /// the next compile makes it generic.
 #[allow(clippy::too_many_arguments)]
 fn emit_float_binop(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     fc: &mut FloatCache,
     func_id: u32,
     ip: usize,
@@ -10047,7 +11467,7 @@ fn emit_float_binop(
 /// gives it, and cached. The generic arm's `emit_box_num` would make an
 /// integral root an Int: the same number.
 fn emit_float_unary_sqrt(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     fc: &mut FloatCache,
     dst: u16,
     arg: u16,
@@ -10075,7 +11495,7 @@ fn emit_float_unary_sqrt(
 /// among them) before the probe and helpers, which may run user code.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_prop_shape_get(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     obj: u16,
     dst: u16,
     shape: u32,
@@ -10119,7 +11539,7 @@ pub(crate) fn emit_prop_shape_get(
 /// `zero` as `emit_prop_shape_get`'s.
 #[allow(clippy::too_many_arguments)]
 fn emit_prop_shape_set(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     obj: u16,
     val: u16,
     shape: u32,
@@ -10172,7 +11592,7 @@ fn emit_prop_shape_set(
 /// alive as the class's chain does: a changed member bumps the version or
 /// the epoch. Anything else falls through with the receiver's bits in rax.
 fn emit_class_read_get(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     obj: u16,
     dst: u16,
     lane: &crate::codegen::ClassReadLane,
@@ -10193,7 +11613,7 @@ fn emit_class_read_get(
 /// with the class at the lane's version and epoch, jumps to `miss` with the
 /// receiver's bits in rax. Clobbers rcx, r9, r10 and r11.
 pub(crate) fn emit_class_read_guard(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     obj: u16,
     lane: &crate::codegen::ClassReadLane,
     miss: dynasmrt::DynamicLabel,
@@ -10225,12 +11645,77 @@ pub(crate) fn emit_class_read_guard(
     );
 }
 
+/// Inline stamped prototype-method read guard for ES5 `Foo.prototype.m()`
+/// calls: proves a plain shaped receiver matches one of `lane.recv_shapes`
+/// (so has no own shadowing property), carries `FID_MIRROR_NONE`, has
+/// `proto_of[idx] == lane.first_bits`, `heap.chain_epoch == lane.chain_epoch`,
+/// and loads the LIVE method Value directly from `lane.holder_slot_addr` into
+/// `rax` (valid for both shaped and dictionary-mode prototype holders while
+/// `chain_epoch` stands still). On any mismatch, jumps to `miss`. Clobbers
+/// rax, rcx, rdx, r8, r9, r10, r11.
+pub(crate) fn emit_proto_read_guard(
+    ops: &mut crate::codegen::X64Asm,
+    obj: u16,
+    lane: &crate::codegen::ProtoReadLane,
+    miss: dynasmrt::DynamicLabel,
+) {
+    let hot_off = crate::vm::host_api::JIT_HOT_MIRROR_RAW_OFFSET as i32;
+    let fid_off = crate::vm::host_api::JIT_HOT_FID_OFF as i32;
+    let chain_epoch_off = crate::vm::host_api::JIT_CHAIN_EPOCH_OFFSET as i32;
+    let proto_raw = crate::vm::host_api::JIT_PROTO_RAW_OFFSET as i32;
+    let proto_len = crate::vm::host_api::JIT_PROTO_LEN_OFFSET as i32;
+    let n_shapes = (lane.n_shapes as usize).clamp(1, 4);
+    dynasm!(ops
+        ; mov rax, [rbx + dreg(obj)]
+        ; mov r10, rax
+        ; shr r10, 48
+        ; cmp r10d, 0x7FFD                    // a heap value
+        ; jne => miss
+        ; mov ecx, eax                        // heap idx (zero-extended)
+        ; mov r11, [rdi + hot_off]
+        ; lea r9, [r11 + rcx*8]
+    );
+    if n_shapes == 1 {
+        dynasm!(ops
+            ; cmp DWORD [r9 + rcx*8], lane.recv_shapes[0] as i32
+            ; jne => miss
+        );
+    } else {
+        let shape_ok = ops.new_dynamic_label();
+        dynasm!(ops ; mov edx, DWORD [r9 + rcx*8]);
+        for &sh in &lane.recv_shapes[..n_shapes] {
+            dynasm!(ops
+                ; cmp edx, sh as i32
+                ; je => shape_ok
+            );
+        }
+        dynasm!(ops
+            ; jmp => miss
+            ; => shape_ok
+        );
+    }
+    dynasm!(ops
+        ; cmp DWORD [r9 + rcx*8 + fid_off], crate::heap::FID_MIRROR_NONE as i32
+        ; jne => miss
+        ; cmp DWORD [rdi + chain_epoch_off], lane.chain_epoch as i32
+        ; jne => miss
+        ; cmp rcx, [rdi + proto_len]
+        ; jae => miss
+        ; mov r8, [rdi + proto_raw]
+        ; mov r10, QWORD lane.first_bits as i64
+        ; cmp [r8 + rcx*8], r10               // proto_of[idx] == first_bits
+        ; jne => miss
+        ; mov r8, QWORD lane.holder_slot_addr as i64
+        ; mov rax, [r8]
+    );
+}
+
 /// Go on at the ip in eax, which a `JumpFinally`'s or an `EndFinally`'s
 /// routing returned: the label of whichever of `landings` it is (every
 /// `break`/`continue` target and `finally` entry of the body), else the
 /// interpreter, at that ip (the routing is done; it must not run again).
 fn emit_ip_dispatch(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     labels: &[dynasmrt::DynamicLabel],
     landings: &[u32],
     epilogue: dynasmrt::DynamicLabel,
@@ -10249,7 +11734,7 @@ fn emit_ip_dispatch(
 
 /// Zero the receiver-cache slots at `offs` (`RecvCache`): on a lane's miss
 /// path, before code that may run user code or change a map.
-fn emit_recv_cache_zero(ops: &mut dynasmrt::x64::Assembler, offs: &[i32]) {
+fn emit_recv_cache_zero(ops: &mut crate::codegen::X64Asm, offs: &[i32]) {
     for &off in offs {
         dynasm!(ops ; mov QWORD [rsp + off], 0);
     }
@@ -10259,7 +11744,7 @@ fn emit_recv_cache_zero(ops: &mut dynasmrt::x64::Assembler, offs: &[i32]) {
 /// value at `slot` of the vals base in the frame slot at `off`, and the op is
 /// done; a zeroed slot falls through to the full lane.
 fn emit_recv_cached_get(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     off: i32,
     dst: u16,
     slot: u32,
@@ -10281,7 +11766,7 @@ fn emit_recv_cached_get(
 /// store and barrier as `emit_prop_shape_set`'s; a zeroed slot falls through
 /// to the full lane.
 fn emit_recv_cached_set(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     off: i32,
     obj: u16,
     val: u16,
@@ -10309,8 +11794,11 @@ fn emit_recv_cached_set(
 /// Whether `ZIPP_PERF_MAP=ops` (Linux) or `ZIPP_PROF_PC_CODE` (the sampler's
 /// code dump) asks for per-op offsets (`write_op_offsets`).
 pub(crate) fn perf_map_ops() -> bool {
-    (cfg!(target_os = "linux") && crate::env_var_os("ZIPP_PERF_MAP").is_some_and(|v| v == "ops"))
-        || crate::env_var_os("ZIPP_PROF_PC_CODE").is_some()
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        (cfg!(target_os = "linux") && crate::env_var_os("ZIPP_PERF_MAP").is_some_and(|v| v == "ops"))
+            || crate::env_var_os("ZIPP_PROF_PC_CODE").is_some()
+    })
 }
 
 /// Append `func_id body_start ip offset op` lines for one Tier C body to

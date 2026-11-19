@@ -39,7 +39,7 @@ const X1: u8 = 1;
 const X2: u8 = 2;
 const X3: u8 = 3;
 
-type Asm = dynasmrt::x64::Assembler;
+type Asm = crate::codegen::X64Asm;
 
 struct Em<'a> {
     ops: Asm,
@@ -214,9 +214,23 @@ impl Em<'_> {
                     );
                 }
                 if site.class_method && arms {
-                    // The method the receiver's class has, looked up and
+                    // The method the receiver's class or prototype has, looked up and
                     // not called, then called by the arm naming its fid.
                     let lookup_miss = self.ops.new_dynamic_label();
+                    let have_callee = self.ops.new_dynamic_label();
+                    if let Some(plane) = site.proto_read {
+                        let guard_miss = self.ops.new_dynamic_label();
+                        crate::codegen::proto_mem::emit_proto_read_guard(
+                            &mut self.ops,
+                            obj,
+                            &plane,
+                            guard_miss,
+                        );
+                        dynasm!(self.ops
+                            ; jmp => have_callee
+                            ; => guard_miss
+                        );
+                    }
                     let fip = ((f.func_id as u64) << 32 | ip as u64) as i64;
                     dynasm!(self.ops
                         ; mov rcx, rdi
@@ -227,6 +241,7 @@ impl Em<'_> {
                         ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
                         ; cmp rax, r10
                         ; je => lookup_miss
+                        ; => have_callee
                         ; mov [rsp + c3 + 48], rax
                     );
                     for arm in site.cross3.iter() {
@@ -2432,7 +2447,7 @@ impl Em<'_> {
 }
 
 pub(crate) fn emit(f: &Func, a: &Alloc) -> Option<JitFn> {
-    let mut ops = Asm::new().ok()?;
+    let mut ops = crate::codegen::new_x64_asm();
     let block_labels: Vec<DynamicLabel> = f.blocks.iter().map(|_| ops.new_dynamic_label()).collect();
     let stubs: Vec<DynamicLabel> = f.states.iter().map(|_| ops.new_dynamic_label()).collect();
     let epilogue = ops.new_dynamic_label();
@@ -2646,7 +2661,7 @@ pub(crate) fn emit(f: &Func, a: &Alloc) -> Option<JitFn> {
         ; pop rbx
         ; ret
     );
-    let buf = em.ops.finalize().ok()?;
+    let buf = crate::codegen::finalize_code(em.ops)?;
     let entry = buf.ptr(dynasmrt::AssemblyOffset(0));
     // `ZIPP_OPT_DUMP=<dir>`: the body's bytes, for a disassembler.
     if let Some(dir) = crate::env_var_os("ZIPP_OPT_DUMP") {

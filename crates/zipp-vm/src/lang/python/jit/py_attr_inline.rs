@@ -108,7 +108,7 @@ fn layout_shape(l: u32) -> u32 {
 /// Heap-tag and bounds-check the value in `rax`, leaving its heap index in
 /// r10 and `&mirror[idx]` addressable as `[r9 + r10 * 8]` (the 16-byte
 /// record: r9 = base + idx * 8); jump to `miss` otherwise. Clobbers r10, r9.
-fn mirror_of_rax(ops: &mut dynasmrt::x64::Assembler, miss: dynasmrt::DynamicLabel) {
+fn mirror_of_rax(ops: &mut crate::codegen::X64Asm, miss: dynasmrt::DynamicLabel) {
     use crate::vm::host_api::{JIT_HOT_MIRROR_LEN_OFFSET, JIT_HOT_MIRROR_RAW_OFFSET};
     dynasm!(ops
         ; mov r10, rax
@@ -136,12 +136,12 @@ pub(crate) const PY_METHOD_SETTLE: u64 = 1 << 63;
 /// `Vm::jit_py_attr_miss`, which runs the step exactly as `Vm::jit_py_op`
 /// does. `false` (nothing emitted) when the body's plan lacks the site.
 pub(crate) fn emit_py_attr_site(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     func_id: u32,
     ip: usize,
     instr: &Instr,
     labels: &PyLabels,
-    refetch: &mut dyn FnMut(&mut dynasmrt::x64::Assembler),
+    refetch: &mut dyn FnMut(&mut crate::codegen::X64Asm),
     done: dynasmrt::DynamicLabel,
 ) -> bool {
     let miss = ops.new_dynamic_label();
@@ -197,7 +197,7 @@ env_off_switch! {
 /// to `settle`, any other failed guard to `miss`. `false` (nothing emitted)
 /// without a method plan for the site.
 pub(crate) fn emit_py_method_inline(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     ip: usize,
     instr: &Instr,
     miss: dynasmrt::DynamicLabel,
@@ -272,7 +272,7 @@ pub(crate) fn emit_py_method_inline(
 /// mirror jumps to `settle`, any other failed guard to `miss`. `false`
 /// (nothing emitted) without a plan.
 fn emit_py_attr_inline(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     ip: usize,
     instr: &Instr,
     miss: dynasmrt::DynamicLabel,

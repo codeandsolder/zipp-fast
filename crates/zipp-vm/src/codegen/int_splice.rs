@@ -1808,7 +1808,7 @@ fn splice_ud(i: &Instr) -> Option<(Vec<u16>, Option<u16>)> {
 /// with `rsp` 16-aligned — true whenever the region pins a view, and always on
 /// the GPR tier. Otherwise a shadow frame is carved for the one call.
 pub(crate) fn emit_int_splice_entry_guards(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     entry: &IntEntry<'_>,
     has_shadow: bool,
     entry_bail: dynasmrt::DynamicLabel,

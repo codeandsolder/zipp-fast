@@ -6,3 +6,4 @@ license.workspace = true
 description = "ZIPP's own PHP 8.x front end: dual-mode HTML/PHP lexer, AST, and recursive-descent parser."
 
 [dependencies]
+zipp-numparse = { path = "../../../../../zipp-numparse" }

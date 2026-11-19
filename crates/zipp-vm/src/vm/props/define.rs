@@ -938,6 +938,12 @@ impl<'p> Vm<'p> {
             }
             _ => {
                 self.fn_props_gen = self.fn_props_gen.wrapping_add(1);
+                match key {
+                    "call" => self.fn_props_has_call = 1,
+                    "apply" => self.fn_props_has_apply = 1,
+                    "bind" => self.fn_props_has_bind = 1,
+                    _ => {}
+                }
                 self.fn_props
                     .entry(idx)
                     .or_insert_with(ObjMap::new_side_table)

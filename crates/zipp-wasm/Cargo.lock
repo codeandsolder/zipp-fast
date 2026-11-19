@@ -261,6 +261,9 @@ dependencies = [
 [[package]]
 name = "zipp-phpparse"
 version = "0.0.36"
+dependencies = [
+ "zipp-numparse",
+]
 
 [[package]]
 name = "zipp-pyparse"

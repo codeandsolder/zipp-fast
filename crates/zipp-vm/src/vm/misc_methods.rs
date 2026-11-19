@@ -374,6 +374,9 @@ impl<'p> Vm<'p> {
             // It must come BEFORE `jit.compile`: compile blacklists on failure and
             // FN_DEAD is sticky, so declining afterwards would kill the callback for
             // the life of the process instead of for this call.
+            if matches!(proto_ref.code.first(), Some(Instr::LazyCompile)) {
+                return None;
+            }
             if !proto_ref.code.iter().all(|ins| match *ins {
                 Instr::LoadGlobal { idx, .. } | Instr::LoadGlobalOrUndefined { idx, .. } => {
                     self.global_slot_directly_routable(idx)
@@ -392,9 +395,15 @@ impl<'p> Vm<'p> {
                 .and_then(|s| self.globals.get(s as usize).copied())
                 .unwrap_or(Value::UNDEFINED)
                 .bits();
-            let heap_helper_addrs = self.jit_heap_helper_addrs();
+            let mut heap_helper_addrs = self.jit_heap_helper_addrs();
             let const_strs = self.jit_build_const_strs(fid);
-            let mut leaf_plan = if crate::env_var_os("ZIPP_NO_TIERC_LEAF").is_none() {
+            heap_helper_addrs.atoms_raw = self.heap.atoms_raw;
+            heap_helper_addrs.atoms_words = self.heap.atoms_words;
+            let tierc_leaf_on = {
+                static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                *ON.get_or_init(|| crate::env_var_os("ZIPP_NO_TIERC_LEAF").is_none())
+            };
+            let mut leaf_plan = if tierc_leaf_on {
                 self.build_leaf_inline_plan(fid, 0, (proto_ref.code.len() - 1) as u32)
             } else {
                 rustc_hash::FxHashMap::default()
@@ -402,12 +411,25 @@ impl<'p> Vm<'p> {
             // Callback compilation happens outside a live caller bytecode
             // frame/site, so there is no receiver exemplar to bake.
             let method_plan = rustc_hash::FxHashMap::default();
-            let (mut cross_plan, cross_pending, _cross_baked) = self.build_cross_call_plan(fid, None, true);
+            let (mut cross_plan, cross_pending, cross_baked) = self.build_cross_call_plan(fid, None, true);
             self.plan_new_lanes(fid, &mut cross_plan, &mut leaf_plan);
             self.jit.note_cross_pending(fid, &cross_pending);
+            self.jit.note_cross_baked(fid, &cross_baked);
             let plain_makefunc = self.build_plain_makefunc_plan(fid);
             let prop_shape = self.build_prop_shape_plan(fid);
             let class_read = self.build_class_read_plan(fid);
+            if crate::codegen::direct_ic_miss_enabled() && !self.jit.metered() {
+                for (ip, instr) in proto_ref.code.iter().enumerate() {
+                    let is_set = match instr {
+                        Instr::GetProp { .. } => false,
+                        Instr::SetProp { .. } => true,
+                        _ => continue,
+                    };
+                    if self.ic_site_is_rotating_own(fid, ip, is_set) {
+                        self.jit.preseed_direct_miss_site(fid, ip as u32);
+                    }
+                }
+            }
             self.jit.compile(
                 fid,
                 proto_ref,

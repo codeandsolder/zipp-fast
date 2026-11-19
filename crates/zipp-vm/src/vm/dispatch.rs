@@ -220,20 +220,35 @@ impl<'p> Vm<'p> {
         }
     }
 
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    #[inline(always)]
+    fn dispatch_needs_step_hook(&self) -> bool {
+        #[cfg(all(feature = "instrument", not(feature = "meter-only")))]
+        {
+            self.instr_rec.is_some()
+        }
+        #[cfg(not(all(feature = "instrument", not(feature = "meter-only"))))]
+        {
+            false
+        }
+    }
+
     fn run_loop_body(&mut self, stop_depth: usize) -> Result<Value, Thrown> {
         loop {
-            // The main loop is compiled twice: with the lite loop's hook for an
-            // interpreter-only VM (`lite_entry_ok`), and without it for every
-            // other, whose code is then what it was before the lite loop (the
-            // hook alone moved the JIT build's Python calls by 4-5%).
+            // The main loop is specialized for:
+            // - interpreter-only unmetered (`<true, false>`): lite loop, zero JIT/step hooks
+            // - JIT-enabled unmetered (`<false, false>`): JIT hooks, zero per-op `step_hot` RMW
+            // - metered/instrumented (`<false, true>`): per-op `step_hot` check
             #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
             let body = if self.lite_entry_ok() {
-                self.dispatch_body::<true>(stop_depth)
+                self.dispatch_body::<true, false>(stop_depth)
+            } else if self.dispatch_needs_step_hook() {
+                self.dispatch_body::<false, true>(stop_depth)
             } else {
-                self.dispatch_body::<false>(stop_depth)
+                self.dispatch_body::<false, false>(stop_depth)
             };
             #[cfg(any(feature = "meter-only", feature = "safe-sandbox"))]
-            let body = self.dispatch_body::<false>(stop_depth);
+            let body = self.dispatch_body::<false, true>(stop_depth);
             match body {
                 Ok(v) => return Ok(v),
                 Err(t) => {
@@ -414,7 +429,10 @@ impl<'p> Vm<'p> {
     /// (`lite_entry_ok`), so frames may run in the lite loop and the native
     /// tiers and the per-frame statistics are skipped. Neither the JIT nor the
     /// statistics switch on during a run, so nothing is lost.
-    pub(crate) fn dispatch_body<const LITE: bool>(&mut self, stop_depth: usize) -> Result<Value, Thrown> {
+    pub(crate) fn dispatch_body<const LITE: bool, const STEP_HOOK: bool>(
+        &mut self,
+        stop_depth: usize,
+    ) -> Result<Value, Thrown> {
         // Set when the lite loop has just handed the top frame over: the main
         // loop then runs it to its next frame transition.
         #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
@@ -476,39 +494,45 @@ impl<'p> Vm<'p> {
                 // are immutable and JIT-safe (each runtime kind has an off
                 // switch; see `jit_func_eligible`).
                 && self.jit_func_eligible(func_id)
-                // Dense tier check first: a known-ineligible (FN_DEAD) function
-                // pays ONE array read per call here, not 2-3 hash probes.
-                && self.jit.fn_state(func_id) != crate::codegen::FN_DEAD
-                && !self.func(func_id as usize).is_generator
-                && !self.func(func_id as usize).is_async
+                && !running.is_generator
+                && !running.is_async
+                && !matches!(running.code.first(), Some(Instr::LazyCompile))
             {
-                if let Some((result, bail)) = self.try_run_jit(func_id, base) {
-                    if bail == crate::codegen::NO_BAIL {
-                        // Native code returned: behave like a `Return`.
-                        if self.pop_frame_with(result, stop_depth) {
-                            return Ok(result);
+                let state = self.jit.fn_state(func_id);
+                if state == crate::codegen::FN_COMPILED {
+                    if let Some((result, bail)) = self.try_run_jit(func_id, base) {
+                        if bail == crate::codegen::NO_BAIL {
+                            // Native code returned: behave like a `Return`.
+                            if self.pop_frame_with(result, stop_depth) {
+                                return Ok(result);
+                            }
+                            continue; // re-enter outer loop with caller frame
                         }
-                        continue; // re-enter outer loop with caller frame
+                        // A bail can mean two things:
+                        // (a) a normal deopt (non-int operand, overflow): resume the
+                        //     interpreter at the recorded ip with consistent regs.
+                        // (b) a self-recursive call threw (e.g. RangeError) and the
+                        //     helper signalled deopt with `pending_throw` set — the
+                        //     whole native chain must UNWIND, not resume. Detect (b)
+                        //     by the pending throw and return Err so `run_loop`
+                        //     dispatches it to the nearest handler / propagates it.
+                        if self.pending_throw.is_some() {
+                            // Persist ip for coherence, then unwind. The message is
+                            // recomputed by run_loop from pending_throw.
+                            let top = self.frames.len() - 1;
+                            self.frames[top].ip = bail as usize;
+                            return Err(Thrown(String::new()));
+                        }
+                        // (a): resume the interpreter at the recorded ip.
+                        if interp_stats::enabled() {
+                            interp_stats::bump_region(func_id, u32::MAX, bail);
+                        }
+                        ip = bail as usize;
                     }
-                    // A bail can mean two things:
-                    // (a) a normal deopt (non-int operand, overflow): resume the
-                    //     interpreter at the recorded ip with consistent regs.
-                    // (b) a self-recursive call threw (e.g. RangeError) and the
-                    //     helper signalled deopt with `pending_throw` set â€” the
-                    //     whole native chain must UNWIND, not resume. Detect (b)
-                    //     by the pending throw and return Err so `run_loop`
-                    //     dispatches it to the nearest handler / propagates it.
-                    if self.pending_throw.is_some() {
-                        // Persist ip for coherence, then unwind. The message is
-                        // recomputed by run_loop from pending_throw.
-                        let top = self.frames.len() - 1;
-                        self.frames[top].ip = bail as usize;
-                        return Err(Thrown(String::new()));
+                } else if state == crate::codegen::FN_COLD {
+                    if self.jit.record_and_should_compile(func_id) {
+                        self.jit_compile_on_entry(func_id, base);
                     }
-                    // (a): resume the interpreter at the recorded ip.
-                    ip = bail as usize;
-                } else if self.jit.record_and_should_compile(func_id) {
-                    self.jit_compile_on_entry(func_id, base);
                 }
             }
 
@@ -522,8 +546,9 @@ impl<'p> Vm<'p> {
                 && self.jit_enabled
                 && self.jit_func_eligible(func_id)
                 && self.jit.fn_state(func_id) != crate::codegen::FN_DEAD
-                && !self.func(func_id as usize).is_generator
-                && !self.func(func_id as usize).is_async
+                && !running.is_generator
+                && !running.is_async
+                && !matches!(running.code.first(), Some(Instr::LazyCompile))
             {
                 if let Some((result, bail)) = self.try_run_jit(func_id, base) {
                     if bail == crate::codegen::NO_BAIL {
@@ -570,6 +595,14 @@ impl<'p> Vm<'p> {
             } else {
                 running.code.as_slice()
             };
+
+            // Hoist the frame's `IcTable` base pointer once per frame entry:
+            // eliminates `ic_func_eligible` + double `site_ics[func_id][ip]`
+            // bounds-checked pointer chases on every `GetProp` / `SetProp` /
+            // `CallMethod` / `Call`. Refreshed lazily after an IC fill when
+            // the function had no table on entry.
+            #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+            let mut ic_cells = self.ic_func_cells_raw(func_id, icode.len());
 
             // `ZIPP_INTERPSTATS=1`: this frame is about to be INTERPRETED from
             // `ip` (the native tiers above either bailed here or did not take
@@ -619,7 +652,7 @@ impl<'p> Vm<'p> {
                 // `step_hot` holds `i64::MAX` there and the hook never fires:
                 // it was a read-modify-write of the VM per instruction.
                 #[cfg(all(feature = "instrument", not(feature = "meter-only")))]
-                if !LITE {
+                if STEP_HOOK {
                     self.step_hot -= 1;
                     if self.step_hot < 0 {
                         if let Err(msg) = self.instrument_step_hot_out(base, ip, instr) {
@@ -2699,476 +2732,84 @@ impl<'p> Vm<'p> {
                     }
                     Instr::Jump { target } => {
                         let t = target as usize;
-                        // A backward jump is a loop back-edge â€” poll the GC here so
+                        // A backward jump is a loop back-edge — poll the GC here so
                         // a tight allocating loop (which never leaves this inner
                         // loop) still gets collected. Safe: all live Values are in
                         // regs, and gc_lock guards any native built-in up-stack.
                         if t < ip {
                             self.maybe_gc();
-                        }
-                        // The loop's `Jit::region_dead_state`, as the region
-                        // check below reads it (0 when that check never ran).
-                        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-                        let mut dead = 0u8;
-                        // â”€â”€ OSR tier â”€â”€ a backward jump is a loop back-edge. After
-                        // the region heats up, compile `[target, ip]` (the loop
-                        // body, headed at `target`) and run it natively; the
-                        // native code returns the ip to resume at (a clean loop
-                        // exit or a guard bail). Gated like the function JIT:
-                        // enabled, and not inside a native self-recursion.
-                        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-                        if !LITE
-                            && self.jit_enabled
-                            && self.jit_recurse_depth == 0
-                            && self.jit_func_eligible(func_id)
-                            && t < ip
-                            // Dense region-state check first: a permanently
-                            // blacklisted loop pays two array reads per
-                            // back-edge here, not 2 hash probes (`get_region`
-                            // miss + `region_blacklist` hit). Mirrors the
-                            // FN_DEAD check at frame entry — see
-                            // `Jit::region_dead_state`. `ZIPP_NO_DENSE_BACKEDGE=1`
-                            // restores the old always-probe path.
-                            && {
-                                dead = self.jit.region_dead_state(func_id, t as u32);
-                                dead == 0
-                            }
-                        {
-                            if let Some(resume) = self.try_run_osr(func_id, t as u32, base) {
-                                // A region exit with a pending exception (a
-                                // frame-called function threw — `CALL_THREW`):
-                                // UNWIND to this frame's handlers instead of
-                                // resuming (re-executing the call would double
-                                // its side effects). Mirrors the function-JIT
-                                // bail-(b) path above.
-                                if self.pending_throw.is_some() {
-                                    let top = self.frames.len() - 1;
-                                    self.frames[top].ip = resume;
-                                    return Err(Thrown(String::new()));
-                                }
-                                ip = resume;
-                                continue;
-                            }
-                            // A global op whose slot is still UNINITIALIZED may
-                            // be own-prop-backed (eval-created / `this.x` bindings):
-                            // raw JIT slot accesses would bypass the own property.
-                            // Don't compile yet; a later attempt re-checks
-                            // (`region_defer_globals` re-arms the threshold a
-                            // bounded number of times). Checked ONLY
-                            // when the back-edge counter trips, so a rejected /
-                            // still-counting loop never pays the body scan.
-                            if self.jit.record_region(func_id, t as u32) {
-                                // ── whole-loop region end ── a loop whose body has
-                                // several `continue`s compiles to MANY back-edges
-                                // `Jump{target==header}`. The back-edge that heats
-                                // up first (this `ip`) may be a MIDDLE one, leaving
-                                // the branches below it (a later `if`/`else` arm)
-                                // outside the region — the native code would then
-                                // exit to the interpreter on every iteration that
-                                // takes one of those arms and re-enter (death by
-                                // OSR churn). Extend the region to the LAST back-edge
-                                // to this header (`Jump{target==t}` at the highest
-                                // ip): that is the loop's textual bottom, so the
-                                // region spans the whole body. Every intermediate
-                                // back-edge becomes an in-region jump to the header
-                                // label (region_target handles it), and the only
-                                // out-of-region transfer stays the loop-exit jump
-                                // (an exit stub). A nested loop has its OWN header,
-                                // so its back-edges don't target `t` and don't
-                                // extend us past this loop.
-                                let region_end = {
-                                    let proto = self.func(func_id as usize);
-                                    let last = proto.code.len() - 1;
-                                    let mut e = (ip as usize).min(last);
-                                    for p in (ip as usize + 1)..=last {
-                                        if matches!(proto.code[p], Instr::Jump { target } if target as usize == t)
+                            // ── OSR tier ── a backward jump is a loop back-edge. After
+                            // the region heats up, compile `[target, ip]` (the loop
+                            // body, headed at `target`) and run it natively; the
+                            // native code returns the ip to resume at (a clean loop
+                            // exit or a guard bail). Gated like the function JIT:
+                            // enabled, and not inside a native self-recursion.
+                            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                            if !LITE
+                                && self.jit_enabled
+                                && self.jit_recurse_depth == 0
+                                && self.jit_func_eligible(func_id)
+                            {
+                                let dead = self.jit.region_dead_state(func_id, t as u32);
+                                if dead == 0 {
+                                    if self.jit.has_compiled_region(func_id) {
+                                        if let Some(resume) =
+                                            self.try_run_osr(func_id, t as u32, base)
                                         {
-                                            e = p;
+                                            if self.pending_throw.is_some() {
+                                                let top = self.frames.len() - 1;
+                                                self.frames[top].ip = resume;
+                                                return Err(Thrown(String::new()));
+                                            }
+                                            ip = resume;
+                                            continue;
                                         }
                                     }
-                                    e
-                                };
-                                let region_globals_ok = {
-                                    let proto = self.func(func_id as usize);
-                                    let s = t as usize;
-                                    let e = region_end;
-                                    // Shared predicate — see `global_slot_directly_routable`.
-                                    // A store additionally refuses a slot the global
-                                    // object now shadows with a real descriptor.
-                                    proto.code[s..=e].iter().all(|ins| match *ins {
-                                        Instr::LoadGlobal { idx, .. }
-                                        | Instr::LoadGlobalOrUndefined { idx, .. } => {
-                                            self.global_slot_directly_routable(idx)
-                                        }
-                                        Instr::StoreGlobal { idx, .. }
-                                        | Instr::StoreGlobalStrict { idx, .. }
-                                        | Instr::StoreGlobalResolved { idx, .. } => {
-                                            self.global_store_slot_directly_routable(idx)
-                                        }
-                                        _ => true,
-                                    })
-                                };
-                                if !region_globals_ok {
-                                    // Re-arm (bounded): a later threshold
-                                    // re-checks in case the slot was
-                                    // initialized meanwhile.
-                                    self.jit.region_defer_globals(func_id, t as u32);
-                                    ip = t;
-                                    continue;
-                                }
-                                // ── call-mix gate ── a Call/CallMethod site
-                                // whose interpreter IC stayed EMPTY through the
-                                // warmup (a native/megamorphic callee) will
-                                // fall back through the helper on EVERY
-                                // iteration (~10ns FFI overhead vs the
-                                // interpreter). Compile only when the region
-                                // has enough other ops for the native savings
-                                // to cover that (op count ≥ 20× such sites) —
-                                // e.g. a DataView-call loop with heavy bit math
-                                // wins, a bare `m.get(k)` loop would lose.
-                                let region_call_mix_ok = {
-                                    let proto = self.func(func_id as usize);
-                                    let s = t as usize;
-                                    let e = region_end;
-                                    let mut fallback = 0usize;
-                                    for (off, ins) in proto.code[s..=e].iter().enumerate() {
-                                        match ins {
-                                            Instr::CallMethod { name, argc, .. } => {
-                                                let key = proto
-                                                    .string_constants
-                                                    .get(*name as usize)
-                                                    .map(|x| x.as_str());
-                                                if *argc == 1
-                                                    && matches!(
-                                                        key,
-                                                        Some("push")
-                                                            | Some("charCodeAt")
-                                                            | Some("indexOf")
-                                                            | Some("get")
-                                                            | Some("has")
-                                                    )
-                                                {
-                                                    continue; // dedicated helpers
-                                                }
-                                                if (*argc == 2
-                                                    || (*argc == 1
-                                                        && crate::codegen::substring1_intrinsic_enabled()))
-                                                    && matches!(
-                                                        key,
-                                                        Some("substring") | Some("slice")
-                                                    )
-                                                {
-                                                    continue; // dedicated helper
-                                                }
-                                                // Collection MUTATORS have no
-                                                // intrinsic yet, but a region full
-                                                // of them is still worth compiling
-                                                // for the surrounding loop work —
-                                                // map-set-heavy compiled NOTHING
-                                                // because of this. Named
-                                                // explicitly rather than by
-                                                // loosening the ratio, which was
-                                                // tried and cost
-                                                // async-promise-chain 8%. Only
-                                                // sites that never resolved a user
-                                                // function reach here, so a user
-                                                // `obj.set()` is unaffected.
-                                                if matches!(
-                                                    key,
-                                                    Some("set") | Some("delete") | Some("add")
-                                                ) {
-                                                    continue;
-                                                }
-                                                if (*argc == 1 || *argc == 2)
-                                                    && key.is_some_and(|k| {
-                                                        crate::codegen::dv_get_kind(k).is_some()
-                                                    })
-                                                {
-                                                    continue; // dedicated DataView get* helper
-                                                }
-                                                // `it.next()` on a generator or a
-                                                // built-in iterator: the builtin
-                                                // fallback steps it directly
-                                                // (`generator_method`, the
-                                                // `ITER_NEXT` lane), so the loop
-                                                // around it — the `done`/`value`
-                                                // reads and the work — is worth
-                                                // compiling; it ran on the
-                                                // interpreter.
-                                                if *argc == 0 && key == Some("next") {
-                                                    continue;
-                                                }
-                                                // `a.pop()`: the builtin fallback
-                                                // pops a dense Array in place
-                                                // (`try_builtin_method`); a stack
-                                                // loop of push/pop ran on the
-                                                // interpreter for want of it.
-                                                if *argc == 0 && key == Some("pop") {
-                                                    continue;
-                                                }
-                                                // B82: `f.call(…)` (0-3 forwarded
-                                                // args) / `f.apply(this[, arr])`
-                                                // sites are served per-call by
-                                                // `try_fn_call_apply_inline` (an
-                                                // inline-eligible user target) or
-                                                // by the `hasOwnProperty.call`
-                                                // intrinsic — the IC stays empty
-                                                // (the resolved `call`/`apply` is
-                                                // a native) but the helper does
-                                                // NOT fall back per iteration.
-                                                if crate::codegen::call_inline_enabled()
-                                                    && ((*argc <= 4 && key == Some("call"))
-                                                        || (*argc <= 2 && key == Some("apply")))
-                                                {
-                                                    continue;
-                                                }
+                                    if self.jit.record_region(func_id, t as u32) {
+                                        if let Some(resume) =
+                                            self.jit_compile_osr_on_backedge(func_id, t, ip, base)
+                                        {
+                                            if self.pending_throw.is_some() {
+                                                let top = self.frames.len() - 1;
+                                                self.frames[top].ip = resume;
+                                                return Err(Thrown(String::new()));
                                             }
-                                            Instr::Call { .. } => {}
-                                            _ => continue,
-                                        }
-                                        let site = (func_id as usize)
-                                            .checked_sub(0)
-                                            .and_then(|f| self.site_ics.get(f))
-                                            .and_then(|x| x.as_ref())
-                                            .and_then(|slots| slots.get(s + off))
-                                            .and_then(|x| x.site.as_deref());
-                                        if let Some(site) = site {
-                                            if site.n == 0 && site.misses >= 4 {
-                                                fallback += 1;
-                                            }
+                                            ip = resume;
+                                            continue;
                                         }
                                     }
-                                    fallback == 0 || (e - s + 1) >= fallback * 20
-                                };
-                                if !region_call_mix_ok {
-                                    self.jit.blacklist_region(func_id, t as u32);
-                                    ip = t;
-                                    continue;
-                                }
-                                // Pre-intern the region's multi-char string
-                                // constants so the emitter can embed their bits
-                                // as immediates. Rooted for the VM's life in
-                                // `jit_const_strings` (compiled code isn't
-                                // traced by the GC).
-                                let pending: Vec<u32> = {
-                                    let proto = self.func(func_id as usize);
-                                    proto.code[t..=region_end]
-                                        .iter()
-                                        .filter_map(|ins| match *ins {
-                                            Instr::LoadConst { idx, .. } => {
-                                                let c = proto.constants[idx as usize];
-                                                if c.is_heap()
-                                                    && (c.heap_index() & STRING_CONST_BIT) != 0
-                                                {
-                                                    Some(idx)
-                                                } else {
-                                                    None
-                                                }
+                                } else if dead == crate::codegen::REGION_DEAD {
+                                    if let Some((result, bail)) =
+                                        self.try_run_tierc_osr(func_id, t as u32, base)
+                                    {
+                                        if bail == crate::codegen::NO_BAIL {
+                                            if self.pop_frame_with(result, stop_depth) {
+                                                return Ok(result);
                                             }
-                                            _ => None,
-                                        })
-                                        .collect()
-                                };
-                                let mut const_strs: rustc_hash::FxHashMap<u32, u64> =
-                                    rustc_hash::FxHashMap::default();
-                                for idx in pending {
-                                    if const_strs.contains_key(&idx) {
+                                            break;
+                                        }
+                                        if self.pending_throw.is_some() {
+                                            let top = self.frames.len() - 1;
+                                            self.frames[top].ip = bail as usize;
+                                            return Err(Thrown(String::new()));
+                                        }
+                                        ip = bail as usize;
                                         continue;
                                     }
-                                    const_strs.insert(idx, self.jit_const_str_bits(func_id, idx));
-                                }
-                                // ── TypedArray pin plan ── from LIVE state: tie
-                                // each GetIndex/SetIndex to a pinned-TA snapshot
-                                // when its receiver re-reads from a stable
-                                // source (un-stored global / never-written reg)
-                                // that holds a non-BigInt TypedArray NOW. The
-                                // hint is verified per access by an identity
-                                // guard, so a stale/wrong hint is always safe.
-                                let ta_plan = self.build_ta_pin_plan(
-                                    func_id,
-                                    t as u32,
-                                    region_end as u32,
-                                    base,
-                                );
-                                // Q4 leaf-call inline plan: monomorphic plain-leaf
-                                // callees at this region's Call sites (read-only —
-                                // built before the &proto borrow below).
-                                let mut leaf_plan = self.build_leaf_inline_plan(
-                                    func_id,
-                                    t as u32,
-                                    region_end as u32,
-                                );
-                                // Bounded dense `array[key](args...)` leaves for
-                                // the INTEGER splice. Built from the same live
-                                // frame snapshot as TA/method plans; emitted code
-                                // independently revalidates every identity/version
-                                // tuple before running any region instruction.
-                                let computed_leaf_plan = self.build_dense_computed_leaf_plan(
-                                    func_id,
-                                    t as u32,
-                                    region_end as u32,
-                                    base,
-                                );
-                                // Q7 method-call inline plan (reads the live receiver
-                                // exemplar at each CallMethod's obj reg — needs `base`).
-                                let method_plan = self.build_method_inline_plan(
-                                    func_id,
-                                    t as u32,
-                                    region_end as u32,
-                                    base,
-                                    false,
-                                );
-                                // Nursery: a baked trivial-setter arm stores
-                                // `this.<field>` CALL-FREE (`emit_mi_body`'s
-                                // SetProp{obj:0} — `mov [vals_ptr+slot*8]`),
-                                // so no barrier ever sees it. Register every
-                                // storing arm's receiver as a persistent
-                                // minor-trace root instead (at most eight arms
-                                // per site, baked into the code).
-                                if self.heap.nursery_on() {
-                                    for plan in method_plan.values() {
-                                        for shape in &plan.shapes {
-                                            let stores = shape.body.iter().any(|op| {
-                                                matches!(
-                                                    op,
-                                                    crate::bytecode::Instr::SetProp { obj: 0, .. }
-                                                        | crate::bytecode::Instr::SuperSet { .. }
-                                                )
-                                            });
-                                            if stores {
-                                                let v =
-                                                    crate::value::Value::from_bits(shape.recv_bits);
-                                                if v.is_heap() {
-                                                    self.heap.register_scan_root(v.heap_index());
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                let proto: *const crate::bytecode::FuncProto =
-                                    self.func(func_id as usize);
-                                // SAFETY: program functions are immutable during run.
-                                let proto_ref = unsafe { &*proto };
-                                let mut heap_helper_addrs = self.jit_heap_helper_addrs();
-                                heap_helper_addrs.acc_lanes = self.build_acc_lane_plan(func_id);
-                                // ── globals that are NOT slot bindings ──
-                                // An UNINITIALIZED slot is not an empty binding:
-                                // a script GlobalDeclarationInstantiation
-                                // ($262.evalScript, and the test262 harness
-                                // prelude) parks its var/function bindings as OWN
-                                // PROPERTIES of the global object and leaves the
-                                // slot UNINITIALIZED on purpose, so the
-                                // interpreter's Load/StoreGlobal own-prop
-                                // fallbacks govern them. A region compiles
-                                // LoadGlobal to a bare `mov rax,[r12+idx*8]` with
-                                // no such fallback, so it would read the sentinel
-                                // and hand the region `undefined`.
-                                //
-                                // That is a TIER DIVERGENCE, the failure mode this
-                                // engine gates hardest against: a harness function
-                                // called in a loop worked for the interpreted
-                                // iterations and turned into "undefined is not a
-                                // function" the instant the region tiered up —
-                                // always at the same iteration, which reads like a
-                                // scoping bug and is not one. Decline the region;
-                                // the interpreter is already correct.
-                                //
-                                // The scan that used to sit HERE was a byte-for-byte
-                                // duplicate of `region_globals_ok` above, over the
-                                // identical `[t..=region_end]` range — and it declined
-                                // WITHOUT `region_defer`, so a region rejected only by
-                                // this copy was never reconsidered even after the
-                                // binding became a real slot (`record_region` returns
-                                // true once per key). Folded into the single gate
-                                // above, which does re-arm. One fewer hand-maintained
-                                // copy of a cross-tier fact is the whole point of B66.
-                                // Tier-C cross-call plan (B83) — the region's Call
-                                // sites get the native→native attempt too.
-                                let (mut cross_plan, cross_pending, cross_baked) =
-                                    self.build_cross_call_plan(func_id, Some(base), false);
-                                self.plan_new_lanes(func_id, &mut cross_plan, &mut leaf_plan);
-                                self.jit.note_cross_baked(func_id, &cross_baked);
-                                // B199: a "no entry yet" decline at a REGION is
-                                // deferred (capped) instead of baked — the callee
-                                // is being called from this very loop, so its
-                                // entry lands within a threshold window and the
-                                // region then compiles WITH the lane. An evicted
-                                // live region cannot recompile mid-run, so
-                                // prevention beats the whole-fn retry here.
-                                if !cross_pending.is_empty()
-                                    && self.jit.cross_defer_allowed(func_id, t as u32)
-                                {
-                                    self.jit.region_defer(func_id, t as u32);
-                                    ip = t;
-                                    continue;
-                                }
-                                self.jit.note_cross_pending(func_id, &cross_pending);
-                                // A Python loop: which of its `PyCall` sites
-                                // call a native, for the call-bound gate
-                                // (`codegen::py`).
-                                #[cfg(feature = "python")]
-                                self.py_native_call_sites(func_id);
-                                self.jit.compile_region(
-                                    func_id,
-                                    proto_ref,
-                                    t as u32,
-                                    region_end as u32,
-                                    &self.globals,
-                                    &self.heap,
-                                    jit_globals_base as *const () as usize,
-                                    heap_helper_addrs,
-                                    self.program.global_count, // field-global pool base
-                                    FIELD_POOL as u32,
-                                    &const_strs,
-                                    &ta_plan,
-                                    &leaf_plan,
-                                    &computed_leaf_plan,
-                                    &method_plan,
-                                    &cross_plan,
-                                );
-                                if let Some(resume) = self.try_run_osr(func_id, t as u32, base) {
-                                    if self.pending_throw.is_some() {
-                                        let top = self.frames.len() - 1;
-                                        self.frames[top].ip = resume;
-                                        return Err(Thrown(String::new()));
-                                    }
-                                    ip = resume;
-                                    continue;
                                 }
                             }
-                        }
-                        // A loop no region serves: its function's Tier C body,
-                        // entered at the loop head (`try_run_tierc_osr`).
-                        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-                        if dead == crate::codegen::REGION_DEAD {
-                            if let Some((result, bail)) = self.try_run_tierc_osr(func_id, t as u32, base) {
-                                if bail == crate::codegen::NO_BAIL {
-                                    // The body returned: as a `Return`.
-                                    if self.pop_frame_with(result, stop_depth) {
-                                        return Ok(result);
+                            // The loop runner's back-edge (`vm/loop_tier.rs`).
+                            #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                            if LITE {
+                                ip = self.loop_back_edge(func_id, base, t, icode);
+                                if ip >= super::loop_tier::LOOP_THROWN {
+                                    if ip == super::loop_tier::LOOP_FRAMES {
+                                        break;
                                     }
-                                    break;
+                                    return Err(self.loop_thrown());
                                 }
-                                if self.pending_throw.is_some() {
-                                    let top = self.frames.len() - 1;
-                                    self.frames[top].ip = bail as usize;
-                                    return Err(Thrown(String::new()));
-                                }
-                                ip = bail as usize;
                                 continue;
                             }
-                        }
-                        // The loop runner's back-edge (`vm/loop_tier.rs`).
-                        #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
-                        if LITE && t < ip {
-                            ip = self.loop_back_edge(func_id, base, t, icode);
-                            if ip >= super::loop_tier::LOOP_THROWN {
-                                if ip == super::loop_tier::LOOP_FRAMES {
-                                    break;
-                                }
-                                return Err(self.loop_thrown());
-                            }
-                            continue;
                         }
                         ip = t;
                     }
@@ -3740,43 +3381,48 @@ impl<'p> Vm<'p> {
                         // `ic_get_prop` call further down. A getter way 0
                         // names is called from here as that call's would be.
                         #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
-                        match self.ic_get_prop_way0(func_id, ip, o, name) {
-                            GetAct::Value(v) => {
-                                self.set(base, dst, v);
-                                ip += 1;
-                                continue;
-                            }
-                            GetAct::Accessor {
-                                fid,
-                                closure,
-                                getter,
-                            } => {
-                                // A leaf getter (`get v() { return this._v; }`)
-                                // runs without a frame (`lite::leaf_scan`).
-                                #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
-                                if LITE {
-                                    if let Some(v) = self.leaf_call(fid, closure, o, true, base, 0, 0) {
-                                        self.set(base, dst, v);
-                                        ip += 1;
-                                        continue;
-                                    }
+                        if !ic_cells.is_null() {
+                            // SAFETY: `ic_cells` points to `func_id`'s live `IcTable`
+                            // whose length equals `icode.len() > ip`.
+                            let cell = unsafe { &*ic_cells.add(ip) };
+                            match self.ic_get_prop_way0_cell(cell, func_id, o, name) {
+                                GetAct::Value(v) => {
+                                    self.set(base, dst, v);
+                                    ip += 1;
+                                    continue;
                                 }
-                                // A shaped receiver is an object: no boxing.
-                                self.setup_call_this_outlined(
+                                GetAct::Accessor {
                                     fid,
                                     closure,
-                                    o,
-                                    true,
-                                    base,
-                                    0,
-                                    0,
-                                    dst,
-                                    ip + 1,
                                     getter,
-                                )?;
-                                break;
+                                } => {
+                                    // A leaf getter (`get v() { return this._v; }`)
+                                    // runs without a frame (`lite::leaf_scan`).
+                                    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                                    if LITE {
+                                        if let Some(v) = self.leaf_call(fid, closure, o, true, base, 0, 0) {
+                                            self.set(base, dst, v);
+                                            ip += 1;
+                                            continue;
+                                        }
+                                    }
+                                    // A shaped receiver is an object: no boxing.
+                                    self.setup_call_this_outlined(
+                                        fid,
+                                        closure,
+                                        o,
+                                        true,
+                                        base,
+                                        0,
+                                        0,
+                                        dst,
+                                        ip + 1,
+                                        getter,
+                                    )?;
+                                    break;
+                                }
+                                GetAct::None => {}
                             }
-                            GetAct::None => {}
                         }
                         #[cfg(all(not(feature = "jit"), not(feature = "safe-sandbox")))]
                         if let Some(v) = self.ic_get_prop_own_hit(func_id, ip, o) {
@@ -3906,7 +3552,12 @@ impl<'p> Vm<'p> {
                         // resolve through the per-site cache; a cached class /
                         // own / chain GETTER frame-calls on THIS dispatch loop
                         // (ret_dst = dst) instead of a nested run_loop.
-                        match self.ic_get_prop(func_id, ip, o, &key) {
+                        let ic_get_act = self.ic_get_prop(func_id, ip, o, &key);
+                        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+                        if ic_cells.is_null() {
+                            ic_cells = self.ic_func_cells_raw(func_id, icode.len());
+                        }
+                        match ic_get_act {
                             GetAct::Value(v) => {
                                 self.set(base, dst, v);
                                 ip += 1;
@@ -3989,32 +3640,37 @@ impl<'p> Vm<'p> {
                         // else is the full `ic_set_prop` call below. An append
                         // or a setter way 0 names is taken from here too.
                         #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
-                        match self.ic_set_prop_way0(func_id, ip, o, v, name) {
-                            SetAct::Done => {
-                                ip += 1;
-                                continue;
-                            }
-                            SetAct::Setter {
-                                fid,
-                                closure,
-                                setter,
-                            } => {
-                                // A shaped receiver is an object: no boxing.
-                                self.setup_call_this_outlined(
+                        if !ic_cells.is_null() {
+                            // SAFETY: `ic_cells` points to `func_id`'s live `IcTable`
+                            // whose length equals `icode.len() > ip`.
+                            let cell_ptr = unsafe { ic_cells.add(ip) };
+                            match self.ic_set_prop_way0_cell(cell_ptr, func_id, ip, o, v, name) {
+                                SetAct::Done => {
+                                    ip += 1;
+                                    continue;
+                                }
+                                SetAct::Setter {
                                     fid,
                                     closure,
-                                    o,
-                                    true,
-                                    base,
-                                    val,
-                                    1,
-                                    RET_DISCARD,
-                                    ip + 1,
                                     setter,
-                                )?;
-                                break;
+                                } => {
+                                    // A shaped receiver is an object: no boxing.
+                                    self.setup_call_this_outlined(
+                                        fid,
+                                        closure,
+                                        o,
+                                        true,
+                                        base,
+                                        val,
+                                        1,
+                                        RET_DISCARD,
+                                        ip + 1,
+                                        setter,
+                                    )?;
+                                    break;
+                                }
+                                SetAct::None => {}
                             }
-                            SetAct::None => {}
                         }
                         #[cfg(all(not(feature = "jit"), not(feature = "safe-sandbox")))]
                         if self.ic_set_prop_own_hit(func_id, ip, o, v) {
@@ -4052,7 +3708,12 @@ impl<'p> Vm<'p> {
                         // slot writes directly; a cached class/own SETTER
                         // frame-calls on THIS dispatch loop with the value as
                         // its argument and ret_dst = RET_DISCARD.
-                        match self.ic_set_prop(func_id, ip, o, &key, v) {
+                        let ic_set_act = self.ic_set_prop(func_id, ip, o, &key, v);
+                        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+                        if ic_cells.is_null() {
+                            ic_cells = self.ic_func_cells_raw(func_id, icode.len());
+                        }
+                        match ic_set_act {
                             SetAct::Done => {
                                 // The hardened WASM profile has no trace rows to
                                 // preserve. When a proven plain own-data store is
@@ -4175,6 +3836,7 @@ impl<'p> Vm<'p> {
                                     unreachable!("object kind changed across write barrier")
                                 };
                                 m.define(key, v, crate::heap::PropAttr::data());
+                                self.heap.bump_version(oi);
                             } else {
                                 let k = key.to_string();
                                 self.set_prop(o, &k, v, false)?;
@@ -4203,6 +3865,7 @@ impl<'p> Vm<'p> {
                                     unreachable!("object kind changed across write barrier")
                                 };
                                 m.push_static_data(key, v);
+                                self.heap.bump_version(oi);
                             } else {
                                 let k = key.to_string();
                                 self.set_prop(o, &k, v, false)?;
@@ -4597,7 +4260,19 @@ impl<'p> Vm<'p> {
                         // heap-version guarded) resolved to a plain user
                         // function skips the Proxy/native/bound/ctor probes
                         // and the generator/async flag loads.
-                        if let Some(call) = self.ic_call(func_id, ip, callee_v) {
+                        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+                        let call_hit = if !ic_cells.is_null() {
+                            // SAFETY: `ic_cells` points to `func_id`'s live `IcTable`
+                            // whose length equals `icode.len() > ip`.
+                            self.ic_call_cell(unsafe { ic_cells.add(ip) }, func_id, ip, callee_v)
+                        } else {
+                            let hit = self.ic_call(func_id, ip, callee_v);
+                            ic_cells = self.ic_func_cells_raw(func_id, icode.len());
+                            hit
+                        };
+                        #[cfg(not(all(feature = "jit", not(feature = "safe-sandbox"))))]
+                        let call_hit = self.ic_call(func_id, ip, callee_v);
+                        if let Some(call) = call_hit {
                             #[cfg(all(feature = "meter-only", not(feature = "jit")))]
                             if argc == 1 && call.fib_global != crate::vm::ic::IC_NO_FIB_GLOBAL {
                                 let arg = self.get(base, arg_base);
@@ -4833,7 +4508,13 @@ impl<'p> Vm<'p> {
                         // alone (`ic_call_method_mirror`): a hit needs neither
                         // the name nor the receiver's slot and map.
                         #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
-                        let early = self.ic_call_method_mirror(func_id, ip, recv);
+                        let early = if !ic_cells.is_null() {
+                            // SAFETY: `ic_cells` points to `func_id`'s live `IcTable`
+                            // whose length equals `icode.len() > ip`.
+                            self.ic_call_method_mirror_cell(unsafe { &*ic_cells.add(ip) }, recv)
+                        } else {
+                            None
+                        };
                         #[cfg(not(all(feature = "jit", not(feature = "safe-sandbox"))))]
                         let early: Option<(u32, u32, Value)> = None;
                         // A site named for a numeric DataView accessor
@@ -4877,7 +4558,14 @@ impl<'p> Vm<'p> {
                         if object_recv {
                             let hit = match early {
                                 Some(hit) => Some(hit),
-                                None => self.ic_call_method(func_id, ip, recv, key),
+                                None => {
+                                    let h = self.ic_call_method(func_id, ip, recv, key);
+                                    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+                                    if ic_cells.is_null() {
+                                        ic_cells = self.ic_func_cells_raw(func_id, icode.len());
+                                    }
+                                    h
+                                }
                             };
                             if let Some((fid, closure, callee)) = hit {
                                 // A leaf callee runs without a frame (`lite::leaf_scan`).
@@ -5831,7 +5519,13 @@ impl<'p> Vm<'p> {
         let table = running.fused.str_switch(running, ip).and_then(|sw| {
             let found = if v.is_heap() {
                 let idx = v.heap_index();
-                self.heap.flatten(idx);
+                #[cfg(feature = "jit")]
+                let is_flat = self.heap.is_flat_str_mirror(idx as usize);
+                #[cfg(not(feature = "jit"))]
+                let is_flat = matches!(self.heap.get(idx), HeapObj::Str(_));
+                if !is_flat {
+                    self.heap.flatten(idx);
+                }
                 match self.heap.get(idx) {
                     HeapObj::Str(s) => sw.find(s.as_bytes()),
                     _ => Ok(None),
@@ -5854,14 +5548,18 @@ impl<'p> Vm<'p> {
             self.set(base, dst, Value::bool(r));
             return if r { target as usize } else { ip + 3 };
         };
-        let case = found.unwrap_or(n as usize - 1);
-        let (idx, target) = sw.cases[case];
-        let c = self.resolve_const_slot(func_id, idx);
-        self.set(base, ldst, c);
-        self.set(base, dst, Value::bool(found.is_some()));
-        if found.is_some() {
+        if let Some(case) = found {
+            let (_, target) = sw.cases[case];
+            // `v` is strictly equal (`===`) to the matched string literal, so
+            // reusing `v` is semantically identical and avoids `resolve_const_slot`.
+            self.set(base, ldst, v);
+            self.set(base, dst, Value::bool(true));
             target as usize
         } else {
+            let (idx, _) = sw.cases[n as usize - 1];
+            let c = self.resolve_const_slot(func_id, idx);
+            self.set(base, ldst, c);
+            self.set(base, dst, Value::bool(false));
             sw.after as usize
         }
     }
@@ -6329,6 +6027,8 @@ impl<'p> Vm<'p> {
             forin_keys: jit_forin_keys as *const () as usize,
             acc_lanes: None,
             priv_lanes: None,
+            atoms_raw: self.heap.atoms_raw,
+            atoms_words: self.heap.atoms_words,
         }
     }
 
@@ -6609,7 +6309,7 @@ impl<'p> Vm<'p> {
     /// Rooted for the VM's life in `jit_const_strings` either way (compiled
     /// code isn't traced by the GC).
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-    fn jit_const_str_bits(&mut self, func_id: u32, idx: u32) -> u64 {
+    pub(crate) fn jit_const_str_bits(&mut self, func_id: u32, idx: u32) -> u64 {
         let v = if jit_shared_const_strs_enabled() {
             self.resolve_const_slot(func_id, idx)
         } else {

@@ -181,6 +181,10 @@ pub(crate) const JIT_PROTO_LEN_OFFSET: usize = core::mem::offset_of!(Vm<'static>
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_PROTO_COUNT_OFFSET: usize = core::mem::offset_of!(Vm<'static>, proto_of)
     + core::mem::offset_of!(crate::slot_table::ProtoTable, count);
+/// `Heap::chain_epoch` for inline stamped prototype-method guards (`emit_proto_read_guard`).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_CHAIN_EPOCH_OFFSET: usize = core::mem::offset_of!(Vm<'static>, heap)
+    + core::mem::offset_of!(crate::heap::Heap, chain_epoch);
 
 /// VM-relative byte offsets of the heap's shape/vals mirror bases (B178).
 /// The shape-way probes load the base pointers through the live VM argument
@@ -361,18 +365,60 @@ pub(crate) const JIT_GC_REQUESTED_OFFSET: usize = core::mem::offset_of!(Vm<'stat
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_GC_STRESS_OFFSET: usize = core::mem::offset_of!(Vm<'static>, gc_stress);
 /// B199: raw base of the live cross-entry table, derived through the VM per
-/// access (growth re-caches it). Records are 16 bytes: entry @+0 (0 = none),
-/// mask_gen @+8 — the lane addresses `[base + fid*16 (+8)]` with the fid a
-/// baked constant displacement.
+/// access (growth re-caches it). Records are 32 bytes: entry @+0 (0 = none),
+/// mask_gen @+8, dyn_flags @+12, uninit_mask @+16, reg_count @+24,
+/// param_count @+26, fid @+28 — static lanes address `[base + fid*32 (+8)]`
+/// and `cross3_dyn_stub` shifts `fid << 5`.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_CROSS_TABLE_RAW_OFFSET: usize = core::mem::offset_of!(Vm<'static>, jit)
     + core::mem::offset_of!(crate::codegen::Jit, cross_table_raw);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_CROSS_TABLE_LEN_OFFSET: usize = core::mem::offset_of!(Vm<'static>, jit)
+    + core::mem::offset_of!(crate::codegen::Jit, cross_table_len);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_GLOBAL_THIS_BITS_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, global_this_bits);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_FN_PROTO_IDX_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, fn_proto);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_FN_PROTO_SHAPE_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, fn_proto_shape);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_FN_PROTO_CALL_SLOT_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, fn_proto_call_slot);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_FN_CALL_NATIVE_BITS_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, fn_call_native_bits);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_FN_PROPS_HAS_CALL_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, fn_props_has_call);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_ARRAY_CTOR_BITS_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, array_ctor_bits);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_ARRAY_IS_ARRAY_BITS_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, array_is_array_bits);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_OBJ_PROTO_IDX_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, obj_proto);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_OBJ_PROTO_SETUP_VER_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, obj_proto_setup_ver);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_HAS_TYPED_ARRAY_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, heap) + core::mem::offset_of!(crate::heap::Heap, has_typed_array);
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 const _: () = {
     use crate::codegen::CrossEntryRec as R;
     assert!(core::mem::offset_of!(R, entry) == 0);
     assert!(core::mem::offset_of!(R, mask_gen) == 8);
-    assert!(core::mem::size_of::<R>() == 16);
+    assert!(core::mem::offset_of!(R, dyn_flags) == 12);
+    assert!(core::mem::offset_of!(R, uninit_mask) == 16);
+    assert!(core::mem::offset_of!(R, reg_count) == 24);
+    assert!(core::mem::offset_of!(R, param_count) == 26);
+    assert!(core::mem::offset_of!(R, fid) == 28);
+    assert!(core::mem::size_of::<R>() == 32);
 };
 
 /// VM-relative byte offsets of the three call-environment blocker bytes

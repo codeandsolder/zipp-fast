@@ -48,18 +48,18 @@ pub(crate) struct PyLabels {
 }
 
 pub(crate) fn emit_py_load_bigint(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     func_id: u32,
     ip: usize,
     dst: u16,
     bail: dynasmrt::DynamicLabel,
-    refetch: &mut dyn FnMut(&mut dynasmrt::x64::Assembler),
+    refetch: &mut dyn FnMut(&mut crate::codegen::X64Asm),
 ) {
     unreachable!("no Python body in this build")
 }
 
 pub(crate) fn emit_py_jump_if_not(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     a: u16,
     b: u16,
     le: bool,
@@ -70,30 +70,30 @@ pub(crate) fn emit_py_jump_if_not(
 }
 
 pub(crate) fn emit_py_add_int(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     dst: u16,
     a: u16,
     imm: i32,
     upd: bool,
     bail: dynasmrt::DynamicLabel,
-    refetch: &mut dyn FnMut(&mut dynasmrt::x64::Assembler),
+    refetch: &mut dyn FnMut(&mut crate::codegen::X64Asm),
 ) {
     unreachable!("no Python body in this build")
 }
 
 pub(crate) fn emit_py_op(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     func_id: u32,
     ip: usize,
     instr: &Instr,
     labels: &PyLabels,
-    refetch: &mut dyn FnMut(&mut dynasmrt::x64::Assembler),
+    refetch: &mut dyn FnMut(&mut crate::codegen::X64Asm),
 ) {
     unreachable!("no Python body in this build")
 }
 
 pub(crate) fn emit_py_array_append(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     arr: u16,
     val: u16,
     bail: dynasmrt::DynamicLabel,
@@ -102,28 +102,28 @@ pub(crate) fn emit_py_array_append(
 }
 
 pub(crate) fn emit_py_new_array(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     reg_count: u16,
     dst: u16,
     arg_base: u16,
     argc: u16,
     bail: dynasmrt::DynamicLabel,
-    refetch: &mut dyn FnMut(&mut dynasmrt::x64::Assembler),
+    refetch: &mut dyn FnMut(&mut crate::codegen::X64Asm),
 ) {
     unreachable!("no Python body in this build")
 }
 
 pub(crate) fn emit_py_load_const(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     func_id: u32,
     dst: u16,
     idx: u32,
-    refetch: &mut dyn FnMut(&mut dynasmrt::x64::Assembler),
+    refetch: &mut dyn FnMut(&mut crate::codegen::X64Asm),
 ) {
     unreachable!("no Python body in this build")
 }
 
-pub(crate) fn emit_py_push_handler(ops: &mut dynasmrt::x64::Assembler, catch_target: u32, catch_reg: u16) {
+pub(crate) fn emit_py_push_handler(ops: &mut crate::codegen::X64Asm, catch_target: u32, catch_reg: u16) {
     unreachable!("no Python body in this build")
 }
 

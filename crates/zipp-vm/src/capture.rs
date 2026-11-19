@@ -127,9 +127,32 @@ mod memo {
             let Some(e) = s.last().and_then(|(_, m)| m.get(&key)) else {
                 return false;
             };
+            out.reserve(e.len());
             for &(p, n) in e.iter() {
                 // SAFETY: the caller's contract; the bytes were a `&str`.
                 out.insert(unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(p, n)) });
+            }
+            true
+        })
+    }
+
+    /// Visit each memoised name for `key` without allocating a temporary set;
+    /// stops early if `f` returns `false`. Returns `true` on a cache hit.
+    ///
+    /// # Safety
+    /// Same as [`get`]: `key` names a live AST node of the innermost session.
+    #[cfg(not(feature = "safe-sandbox"))]
+    pub unsafe fn for_each(key: Key, mut f: impl FnMut(&str) -> bool) -> bool {
+        STACK.with(|s| {
+            let s = s.borrow();
+            let Some(e) = s.last().and_then(|(_, m)| m.get(&key)) else {
+                return false;
+            };
+            for &(p, n) in e.iter() {
+                // SAFETY: the caller's contract; the bytes were a `&str`.
+                if !f(unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(p, n)) }) {
+                    break;
+                }
             }
             true
         })
@@ -163,6 +186,19 @@ fn memo_get<'a, T>(node: &'a T, span: (u32, u32), kind: u8, out: &mut Names<'a>)
 #[cfg(feature = "safe-sandbox")]
 #[inline]
 fn memo_get<'a, T>(_node: &'a T, _span: (u32, u32), _kind: u8, _out: &mut Names<'a>) -> bool {
+    false
+}
+
+#[cfg(not(feature = "safe-sandbox"))]
+#[inline]
+fn memo_for_each<T>(node: &T, span: (u32, u32), kind: u8, f: impl FnMut(&str) -> bool) -> bool {
+    // SAFETY: same as `memo_get`.
+    unsafe { memo::for_each((node as *const T as usize, span.0, span.1, kind), f) }
+}
+
+#[cfg(feature = "safe-sandbox")]
+#[inline]
+fn memo_for_each<T>(_node: &T, _span: (u32, u32), _kind: u8, _f: impl FnMut(&str) -> bool) -> bool {
     false
 }
 
@@ -692,48 +728,115 @@ pub fn copy_box_names(
     body: &[Stmt],
     captured: &HashSet<String>,
 ) -> HashSet<String> {
-    if !params_ast.is_some_and(|p| p.simple) || !params.iter().any(|p| captured.contains(p.as_str())) {
+    if !params_ast.is_some_and(|p| p.simple) {
         return HashSet::default();
     }
-    let mut scan = WriteScan::default();
+    let mut targets: Vec<&str> = Vec::new();
+    for p in params {
+        if captured.contains(p.as_str()) && !targets.contains(&p.as_str()) {
+            targets.push(p.as_str());
+        }
+    }
+    if targets.is_empty() {
+        return HashSet::default();
+    }
+    let mut scan = WriteScan::new(&targets);
     for s in body {
         scan.stmt(s);
+        if scan.done() {
+            return HashSet::default();
+        }
     }
-    if scan.with_seen {
-        return HashSet::default();
-    }
-    params
-        .iter()
-        .filter(|p| {
-            captured.contains(p.as_str())
-                && !scan.written.contains(p.as_str())
-                && !scan.blocked.contains(p.as_str())
-        })
-        .cloned()
-        .collect()
+    scan.into_remaining()
 }
 
-/// [`copy_box_names`]' walk: every name written (an assignment, update or
-/// for-in/of target, at any depth) or declared (a `var`/`let`/`const`, a
-/// function, class or catch binding, a parameter of a nested function, an
-/// import) anywhere in a body, and the free names of the nested functions
-/// that are not function or arrow expressions. Exhaustive over the tree, as
-/// `expr_refs` is: a missed write would let a closure see a stale copy.
-#[derive(Default)]
-struct WriteScan<'a> {
-    written: Names<'a>,
-    blocked: Names<'a>,
+/// [`copy_box_names`]' walk: eliminates any candidate parameter in `targets`
+/// that is written (an assignment, update or for-in/of target, at any depth),
+/// declared (a `var`/`let`/`const`, a function, class or catch binding, a
+/// parameter of a nested function, an import) anywhere in a body, or captured
+/// by a nested function that is not a function/arrow expression, or invalidated
+/// by a `with` statement. Stops immediately once every candidate is ruled out.
+struct WriteScan<'t> {
+    targets: &'t [&'t str],
+    /// Bit `i` is 1 while `targets[i]` is still a viable copy-box candidate.
+    remaining: u64,
+    /// Overflow set for functions with > 64 distinct captured parameters.
+    overflow: Names<'t>,
     with_seen: bool,
 }
 
-impl<'a> WriteScan<'a> {
-    fn stmts(&mut self, v: &'a [Stmt]) {
+impl<'t> WriteScan<'t> {
+    fn new(targets: &'t [&'t str]) -> Self {
+        let n_inline = targets.len().min(64);
+        let remaining = if n_inline == 64 {
+            u64::MAX
+        } else {
+            (1u64 << n_inline) - 1
+        };
+        let mut overflow = Names::default();
+        if targets.len() > 64 {
+            for &name in &targets[64..] {
+                overflow.insert(name);
+            }
+        }
+        Self {
+            targets,
+            remaining,
+            overflow,
+            with_seen: false,
+        }
+    }
+
+    #[inline]
+    fn done(&self) -> bool {
+        self.with_seen || (self.remaining == 0 && self.overflow.is_empty())
+    }
+
+    #[inline]
+    fn mark(&mut self, name: &str) {
+        let mut m = self.remaining;
+        while m != 0 {
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            if self.targets[i] == name {
+                self.remaining &= !(1u64 << i);
+            }
+        }
+        if !self.overflow.is_empty() {
+            self.overflow.remove(name);
+        }
+    }
+
+    fn into_remaining(self) -> HashSet<String> {
+        if self.with_seen {
+            return HashSet::default();
+        }
+        let mut out = HashSet::default();
+        let mut m = self.remaining;
+        while m != 0 {
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            out.insert(self.targets[i].to_string());
+        }
+        for name in self.overflow {
+            out.insert(name.to_string());
+        }
+        out
+    }
+
+    fn stmts(&mut self, v: &[Stmt]) {
         for s in v {
+            if self.done() {
+                return;
+            }
             self.stmt(s);
         }
     }
 
-    fn stmt(&mut self, s: &'a Stmt) {
+    fn stmt(&mut self, s: &Stmt) {
+        if self.done() {
+            return;
+        }
         match s {
             Stmt::Block(v) => self.stmts(v),
             Stmt::Empty | Stmt::Debugger | Stmt::Break(_) | Stmt::Continue(_) => {}
@@ -779,6 +882,9 @@ impl<'a> WriteScan<'a> {
             Stmt::Switch { disc, cases } => {
                 self.expr(disc);
                 for c in cases {
+                    if self.done() {
+                        return;
+                    }
                     if let Some(t) = &c.test {
                         self.expr(t);
                     }
@@ -788,6 +894,9 @@ impl<'a> WriteScan<'a> {
             Stmt::Try { block, handler, finalizer } => {
                 self.stmts(block);
                 if let Some(h) = handler {
+                    if self.done() {
+                        return;
+                    }
                     if let Some(p) = &h.param {
                         self.pattern(p);
                     }
@@ -798,10 +907,8 @@ impl<'a> WriteScan<'a> {
                 }
             }
             Stmt::Labeled { body, .. } => self.stmt(body),
-            Stmt::With { object, body } => {
+            Stmt::With { .. } => {
                 self.with_seen = true;
-                self.expr(object);
-                self.stmt(body);
             }
             Stmt::VarDecl(d) => self.var_decl(d),
             Stmt::FnDecl(f) => self.blocked_function(f),
@@ -810,10 +917,10 @@ impl<'a> WriteScan<'a> {
                 for sp in &i.specifiers {
                     match sp {
                         ImportSpecifier::Default(n) | ImportSpecifier::Namespace(n) => {
-                            self.written.insert(&**n);
+                            self.mark(n);
                         }
                         ImportSpecifier::Named { local, .. } => {
-                            self.written.insert(&**local);
+                            self.mark(local);
                         }
                     }
                 }
@@ -828,8 +935,11 @@ impl<'a> WriteScan<'a> {
         }
     }
 
-    fn var_decl(&mut self, d: &'a crate::parse::ast::VarDecl) {
+    fn var_decl(&mut self, d: &crate::parse::ast::VarDecl) {
         for decl in &d.decls {
+            if self.done() {
+                return;
+            }
             self.pattern(&decl.id);
             if let Some(i) = &decl.init {
                 self.expr(i);
@@ -838,18 +948,25 @@ impl<'a> WriteScan<'a> {
     }
 
     /// A binding pattern: every name it binds is a declaration.
-    fn pattern(&mut self, p: &'a Pattern) {
+    fn pattern(&mut self, p: &Pattern) {
+        if self.done() {
+            return;
+        }
         match p {
-            Pattern::Ident(n) => {
-                self.written.insert(&**n);
-            }
+            Pattern::Ident(n) => self.mark(n),
             Pattern::Array(els) => {
                 for el in els.iter().flatten() {
+                    if self.done() {
+                        return;
+                    }
                     self.pattern(&el.pat);
                 }
             }
             Pattern::Object { props, rest } => {
                 for pr in props {
+                    if self.done() {
+                        return;
+                    }
                     self.prop_key(&pr.key);
                     self.pattern(&pr.value);
                 }
@@ -865,15 +982,19 @@ impl<'a> WriteScan<'a> {
         }
     }
 
-    fn target(&mut self, t: &'a Target) {
+    fn target(&mut self, t: &Target) {
+        if self.done() {
+            return;
+        }
         match t {
-            Target::Ident { name, .. } => {
-                self.written.insert(&**name);
-            }
+            Target::Ident { name, .. } => self.mark(name),
             Target::Member(m) => self.member(m),
             Target::Call(c) => self.call(c),
             Target::Array(els) => {
                 for el in els.iter().flatten() {
+                    if self.done() {
+                        return;
+                    }
                     self.target(&el.target);
                     if let Some(d) = &el.default {
                         self.expr(d);
@@ -882,6 +1003,9 @@ impl<'a> WriteScan<'a> {
             }
             Target::Object { props, rest } => {
                 for p in props {
+                    if self.done() {
+                        return;
+                    }
                     self.prop_key(&p.key);
                     self.target(&p.target);
                     if let Some(d) = &p.default {
@@ -895,27 +1019,30 @@ impl<'a> WriteScan<'a> {
         }
     }
 
-    fn prop_key(&mut self, k: &'a PropKey) {
+    fn prop_key(&mut self, k: &PropKey) {
         match k {
             PropKey::Computed(e) => self.expr(e),
             PropKey::Ident(_) | PropKey::Str(_) | PropKey::Num(_) | PropKey::Private(_) => {}
         }
     }
 
-    fn member(&mut self, m: &'a Member) {
+    fn member(&mut self, m: &Member) {
         self.expr(&m.object);
         if let MemberProp::Computed(k) = &m.prop {
             self.expr(k);
         }
     }
 
-    fn call(&mut self, c: &'a crate::parse::ast::CallExpr) {
+    fn call(&mut self, c: &crate::parse::ast::CallExpr) {
         self.expr(&c.callee);
         self.args(&c.args);
     }
 
-    fn args(&mut self, args: &'a [Arg]) {
+    fn args(&mut self, args: &[Arg]) {
         for a in args {
+            if self.done() {
+                return;
+            }
             match a {
                 Arg::Expr(e) | Arg::Spread(e) => self.expr(e),
             }
@@ -924,35 +1051,85 @@ impl<'a> WriteScan<'a> {
 
     /// A function or arrow EXPRESSION's insides (its own name and parameters
     /// count as declarations).
-    fn function(&mut self, f: &'a Function) {
+    fn function(&mut self, f: &Function) {
+        if self.done() {
+            return;
+        }
         if let Some(n) = &f.name {
-            self.written.insert(&**n);
+            self.mark(n);
+            if self.done() {
+                return;
+            }
         }
         for p in &f.params.items {
             self.pattern(p);
+            if self.done() {
+                return;
+            }
         }
         self.stmts(&f.body.stmts);
     }
 
     /// A nested function some other path makes (a declaration, a method, an
     /// accessor): what it captures is blocked, and its insides are walked.
-    fn blocked_function(&mut self, f: &'a Function) {
-        fn_node_free(f, &mut self.blocked);
+    fn blocked_function(&mut self, f: &Function) {
+        if self.done() {
+            return;
+        }
+        let hit = memo_for_each(f, (f.span.start, f.span.end), 0, |name| {
+            self.mark(name);
+            !self.done()
+        });
+        if !hit {
+            let mut tmp = Names::default();
+            fn_node_free(f, &mut tmp);
+            for name in tmp {
+                self.mark(name);
+                if self.done() {
+                    return;
+                }
+            }
+        }
+        if self.done() {
+            return;
+        }
         self.function(f);
     }
 
-    fn blocked_class(&mut self, c: &'a Class) {
-        class_free(c, &mut self.blocked);
+    fn blocked_class(&mut self, c: &Class) {
+        if self.done() {
+            return;
+        }
+        let mut tmp = Names::default();
+        class_free(c, &mut tmp);
+        for name in tmp {
+            self.mark(name);
+            if self.done() {
+                return;
+            }
+        }
         if let Some(n) = &c.name {
-            self.written.insert(&**n);
+            self.mark(n);
+            if self.done() {
+                return;
+            }
         }
         for d in &c.decorators {
             self.expr(d);
+            if self.done() {
+                return;
+            }
         }
         if let Some(s) = &c.superclass {
             self.expr(s);
+            if self.done() {
+                return;
+            }
         }
         for m in &c.body {
+            if self.done() {
+                return;
+            }
             match m {
                 ClassMember::Method(m) => {
                     self.prop_key(&m.key);
@@ -979,7 +1156,10 @@ impl<'a> WriteScan<'a> {
         }
     }
 
-    fn expr(&mut self, e: &'a Expr) {
+    fn expr(&mut self, e: &Expr) {
+        if self.done() {
+            return;
+        }
         match e {
             Expr::Ident(_)
             | Expr::This
@@ -994,6 +1174,9 @@ impl<'a> WriteScan<'a> {
             | Expr::ImportMeta => {}
             Expr::Array(els, _) => {
                 for el in els.iter().flatten() {
+                    if self.done() {
+                        return;
+                    }
                     match el {
                         ArrayElem::Expr(e) | ArrayElem::Spread(e) => self.expr(e),
                     }
@@ -1001,6 +1184,9 @@ impl<'a> WriteScan<'a> {
             }
             Expr::Object(members, _) => {
                 for m in members {
+                    if self.done() {
+                        return;
+                    }
                     match m {
                         ObjectMember::Prop { key, value, init, .. } => {
                             self.prop_key(key);
@@ -1021,12 +1207,18 @@ impl<'a> WriteScan<'a> {
             }
             Expr::Template(t) => {
                 for e in &t.exprs {
+                    if self.done() {
+                        return;
+                    }
                     self.expr(e);
                 }
             }
             Expr::TaggedTemplate { tag, quasi } => {
                 self.expr(tag);
                 for e in &quasi.exprs {
+                    if self.done() {
+                        return;
+                    }
                     self.expr(e);
                 }
             }
@@ -1054,12 +1246,18 @@ impl<'a> WriteScan<'a> {
             Expr::Chain(inner) => self.expr(inner),
             Expr::Seq(v) => {
                 for e in v {
+                    if self.done() {
+                        return;
+                    }
                     self.expr(e);
                 }
             }
             Expr::Arrow(a) => {
                 for p in &a.params.items {
                     self.pattern(p);
+                    if self.done() {
+                        return;
+                    }
                 }
                 match &a.body {
                     ArrowBody::Expr(e) => self.expr(e),

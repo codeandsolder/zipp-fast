@@ -2833,6 +2833,10 @@ impl<'p> Vm<'p> {
         // global slots by name (see get_prop/set_prop/has_own_property).
         let global_this = self.setup_object(ObjMap::new());
         self.global_this = global_this;
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        {
+            self.global_this_bits = Value::heap(global_this).bits();
+        }
         self.heap.pin_mirror_dict(global_this);
         // The test262 `$262` host object: { global, detachArrayBuffer, gc }.
         let d262_detach = self.setup_native(DOLLAR262_DETACH);
@@ -2861,6 +2865,30 @@ impl<'p> Vm<'p> {
             } else {
                 u32::MAX
             };
+            self.heap.refresh_mirror(self.fn_proto);
+            if let HeapObj::Object(m) = self.heap.get(self.fn_proto) {
+                let sh = m.shape();
+                if sh != crate::shape::DICT {
+                    if let Some(slot) = m.pos("call") {
+                        if !m.attr_at(slot).accessor {
+                            self.fn_proto_shape = sh;
+                            self.fn_proto_call_slot = slot as u32;
+                            self.fn_call_native_bits = m.val_at(slot).bits();
+                        }
+                    }
+                }
+            }
+            if self.array_ctor != 0 {
+                if let HeapObj::Object(m) = self.heap.get(self.array_ctor) {
+                    if let Some(v) = m.get("isArray") {
+                        self.array_ctor_bits = Value::heap(self.array_ctor).bits();
+                        self.array_is_array_bits = v.bits();
+                    }
+                }
+            }
+            if self.obj_proto != 0 {
+                self.obj_proto_setup_ver = self.heap.version_of(self.obj_proto);
+            }
         }
         // `$262.agent`: the full multi-agent surface (vm/agents.rs). getReport
         // must exist (returning null on empty) even before any worker agent

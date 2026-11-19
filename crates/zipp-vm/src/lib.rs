@@ -999,9 +999,6 @@ fn compile_main_for_run<'a>(
     }
     let min_functions = match compile::run_lazy() {
         compile::RunLazy::Off => return Ok((compile::compile_main_program(ast, src)?, None)),
-        compile::RunLazy::Large if vm::large_programs_run_jit() => {
-            return Ok((compile::compile_main_program(ast, src)?, None))
-        }
         compile::RunLazy::Large => compile::LAZY_MIN_FUNCTIONS,
         compile::RunLazy::All => 0,
     };

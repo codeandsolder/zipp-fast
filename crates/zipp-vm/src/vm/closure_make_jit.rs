@@ -182,7 +182,7 @@ pub(crate) extern "win64" fn jit_make_cell(
         return crate::codegen::SELF_CALL_DEOPT;
     }
     let reg_count = reg_count as usize;
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    crate::vm::helpers_misc::catch_effectful_jit_u64(|| {
         let vm = unsafe { &mut *(vm as *mut Vm) };
         let Some((caller, instr)) = site_instr(vm, packed_fip) else {
             return crate::codegen::SELF_CALL_DEOPT;
@@ -191,11 +191,7 @@ pub(crate) extern "win64" fn jit_make_cell(
             return crate::codegen::SELF_CALL_DEOPT;
         }
         make_cell_commit(vm, regs, reg_count, instr)
-    })) {
-        Ok(bits) => bits,
-        // A panic past the allocation/side-table commit must never replay.
-        Err(_) => std::process::abort(),
-    }
+    })
 }
 
 /// The commit half of [`jit_make_cell`] and [`jit_region_make_fn`]'s cell ops,
@@ -264,7 +260,7 @@ pub(crate) extern "win64" fn jit_region_make_fn(
         return crate::codegen::SELF_CALL_DEOPT;
     }
     let reg_count = reg_count as usize;
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    crate::vm::helpers_misc::catch_effectful_jit_u64(|| {
         let vm = unsafe { &mut *(vm as *mut Vm) };
         let Some((caller, instr)) = site_instr(vm, packed_fip) else {
             return crate::codegen::SELF_CALL_DEOPT;
@@ -326,10 +322,7 @@ pub(crate) extern "win64" fn jit_region_make_fn(
             | Instr::MarkCellConst { .. } => make_cell_commit(vm, regs, reg_count, instr),
             _ => crate::codegen::SELF_CALL_DEOPT,
         }
-    })) {
-        Ok(bits) => bits,
-        Err(_) => std::process::abort(),
-    }
+    })
 }
 
 /// `MakeClosure { dst, func_id }` and `MakeArrow { dst, func_id, this_reg }`.
@@ -349,7 +342,7 @@ pub(crate) extern "win64" fn jit_make_closure(
         return crate::codegen::SELF_CALL_DEOPT;
     }
     let reg_count = reg_count as usize;
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    crate::vm::helpers_misc::catch_effectful_jit_u64(|| {
         let vm = unsafe { &mut *(vm as *mut Vm) };
         let Some((caller, instr)) = site_instr(vm, packed_fip) else {
             return crate::codegen::SELF_CALL_DEOPT;
@@ -430,10 +423,7 @@ pub(crate) extern "win64" fn jit_make_closure(
         vm.inherit_private_brands(Value::heap(site.active), idx);
         vm.realm_tag_new(idx);
         Value::heap(idx).bits()
-    })) {
-        Ok(bits) => bits,
-        Err(_) => std::process::abort(),
-    }
+    })
 }
 
 /// `CellSetChecked { cell, src }` — the TDZ-checked sibling of the region
@@ -449,7 +439,7 @@ pub(crate) extern "win64" fn jit_cell_set_tdz_checked(
     if vm.is_null() {
         return crate::codegen::SELF_CALL_DEOPT;
     }
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    crate::vm::helpers_misc::catch_effectful_jit_u64(|| {
         let vm = unsafe { &mut *(vm as *mut Vm) };
         let cell = Value::from_bits(cell_bits);
         if !cell.is_heap() || cell.heap_index() as usize >= vm.heap.len() {
@@ -461,11 +451,7 @@ pub(crate) extern "win64" fn jit_cell_set_tdz_checked(
         }
         vm.heap.cell_set(idx, Value::from_bits(val_bits));
         0
-    })) {
-        Ok(bits) => bits,
-        // The barrier/write may have committed; never replay past it.
-        Err(_) => std::process::abort(),
-    }
+    })
 }
 
 /// `ArrayCtor { dst, callee, arg_base, argc, .. }` — the interpreter arm's dense subset:
@@ -495,7 +481,7 @@ pub(crate) extern "win64" fn jit_array_ctor(
     {
         return crate::codegen::SELF_CALL_DEOPT;
     }
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    crate::vm::helpers_misc::catch_effectful_jit_u64(|| {
         let vm = unsafe { &mut *(vm as *mut Vm) };
         let callee = Value::from_bits(callee_bits);
         if guard_present && !vm.bare_builtin_is_intrinsic(vm.array_ctor, callee) {
@@ -521,10 +507,7 @@ pub(crate) extern "win64" fn jit_array_ctor(
             (0..argc).map(read).collect()
         };
         Value::heap(vm.heap.alloc(HeapObj::Array(arr))).bits()
-    })) {
-        Ok(bits) => bits,
-        Err(_) => std::process::abort(),
-    }
+    })
 }
 
 #[cfg(all(test, feature = "jit", target_arch = "x86_64"))]

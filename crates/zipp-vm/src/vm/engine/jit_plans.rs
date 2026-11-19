@@ -646,6 +646,7 @@ impl<'p> Vm<'p> {
             /// All snapshots carry the exact length in the same slot.
             Len,
         }
+        let mut jump_prefix: Option<Vec<u32>> = None;
         for aip in s..=e {
             // `captured` is the spec-order lowering of `obj.m(args)`: the
             // property value is obtained before evaluating any argument and
@@ -732,12 +733,11 @@ impl<'p> Vm<'p> {
                         } if get_dst == callee && get_obj == this_v => name,
                         _ => continue,
                     };
+                    let jp = jump_prefix.get_or_insert_with(|| jump_target_prefix(&proto.code));
                     if proto.code[get_ip + 1..aip].iter().any(|ins| {
                         crate::codegen::writes_reg(ins).is_some_and(|r| r == callee || r == this_v)
-                    }) || proto.code.iter().any(|ins| {
-                        slot_guard_jump_targets(ins)
-                            .any(|target| (get_ip + 1..=aip).contains(&(target as usize)))
-                    }) {
+                    }) || has_jump_target_in(jp, get_ip + 1, aip)
+                    {
                         continue;
                     }
                     let recv = match proto
@@ -815,7 +815,7 @@ impl<'p> Vm<'p> {
             // reject the arbitrary Call itself, while the MEM tier owns the
             // post-call refresh contract used here.
             let call_result_candidate = matches!(recv, Recv::Str | Recv::Len)
-                && crate::env_var_os("ZIPP_NO_CALL_RESULT_STR_PIN").is_none()
+                && call_result_str_pin_enabled()
                 && writer.is_some_and(|wip| matches!(proto.code[wip], Instr::Call { .. }));
             let call_written = call_result_candidate
                 && call_result_reaches_lookup_on_all_paths(&proto.code, s, e, lookup_ip, obj);
@@ -1231,6 +1231,7 @@ impl<'p> Vm<'p> {
             })
             .collect();
 
+        let mut jump_prefix: Option<Vec<u32>> = None;
         for ip in s..=e {
             let Some(site) = crate::codegen::computed_call_site(caller, s, ip) else {
                 continue;
@@ -1268,10 +1269,8 @@ impl<'p> Vm<'p> {
                 if reg == obj && cursor == lookup_ip {
                     drop_obj_def = Some(def_ip);
                 }
-                if caller.code.iter().any(|ins| {
-                    slot_guard_jump_targets(ins)
-                        .any(|t| (def_ip + 1..=cursor).contains(&(t as usize)))
-                }) {
+                let jp = jump_prefix.get_or_insert_with(|| jump_target_prefix(&caller.code));
+                if has_jump_target_in(jp, def_ip + 1, cursor) {
                     break 'source None;
                 }
                 fallback_ip = fallback_ip.min(def_ip);
@@ -2132,7 +2131,7 @@ impl<'p> Vm<'p> {
         // its lanes keep to strict and arrow callees.
         sloppy_ok: bool,
         pending: &mut Vec<u32>,
-        baked: &mut Vec<u32>,
+        baked: &mut Vec<(u32, u32)>,
     ) -> Option<crate::codegen::SameProtoCross3Plan> {
         if !cross3_finish_fid_fits(fid) {
             return None;
@@ -2146,79 +2145,49 @@ impl<'p> Vm<'p> {
             return None;
         }
         let callee = self.func(fid as usize);
+        if matches!(callee.code.first(), Some(Instr::LazyCompile)) {
+            pending.push(fid);
+            return None;
+        }
         if callee.is_generator
             || callee.is_async
             || callee.rest_reg.is_some()
             || callee.arguments_reg.is_some()
+            || crate::codegen::proto_reads_legacy_fn_props(callee)
             || (crate::codegen::handler_callee_skip_enabled()
                 && crate::codegen::proto_has_handler_ops(callee)
                 && !(self.jit.cross_lazy_ff(fid)
-                    || (fid == caller_fid
-                        && whole_body
-                        && crate::codegen::lazy_frame_free(callee))))
-            || usize::from(callee.param_count) != usize::from(argc)
-            || argc > 6
+                    || (whole_body && crate::codegen::lazy_frame_free(callee))))
+            || callee.param_count > 8
+            || argc > 8
         {
             return None;
         }
         // A sloppy function's `this` at a plain call is its realm's global
         // object (OrdinaryCallBindThis), bound as a constant: the lane runs
-        // only while no second realm exists. A script's (and so a `.ts`
-        // file's) functions are sloppy, and every call to one took the
-        // generic cross-call helper: a seventh of the expression compiler.
-        let sloppy_this = if callee.lexical_this || callee.is_strict {
-            None
+        // only while no second realm exists. At a method call (`!sloppy_ok`),
+        // a sloppy callee still takes the lane when the emitted guard proves
+        // the receiver is a shaped `HeapObj::Object` (`sloppy_obj_this`), which
+        // passes verbatim without `ToObject` boxing.
+        let (sloppy_this, sloppy_obj_this) = if callee.lexical_this || callee.is_strict {
+            (None, false)
         } else if sloppy_ok && crate::codegen::cross3_sloppy_enabled() {
-            Some(if self.global_this == 0 {
-                Value::UNDEFINED.bits()
-            } else {
-                Value::heap(self.global_this).bits()
-            })
+            (
+                Some(if self.global_this == 0 {
+                    Value::UNDEFINED.bits()
+                } else {
+                    Value::heap(self.global_this).bits()
+                }),
+                false,
+            )
+        } else if !sloppy_ok && crate::codegen::cross3_sloppy_enabled() {
+            (None, true)
         } else {
             return None;
         };
         let reg_count = callee.reg_count.max(1);
-        // B270: a body's own recursive site always finds its entry missing —
-        // the plan builds before this compile installs it — and
-        // `note_cross_pending` deliberately never retries a self site, so such
-        // a site stayed on the helper (or, with an empty IC, the framed route)
-        // for the life of the program. The lane loads the entry from the live
-        // table per call and guards the mask generation, so an arm against
-        // the entry ABOUT to be installed is sound: the mask is this proto's
-        // own analysis and the generation is the one `set_cross_entry` will
-        // leave. Until the install lands (this compile) the null entry routes
-        // to the helper exactly as an evicted callee's would. Bodies that
-        // reach themselves through their own global name were left out as
-        // Tier A's shape, but a body this Tier C compile plans is one Tier A
-        // passed over (`fold(e.left)` returns an object), and the lane
-        // revalidates the callee read from the global per call: a script's
-        // recursive functions all call themselves that way, and every such
-        // call took the generic cross-call helper (`ZIPP_NO_CROSS3_SELF_GLOBAL=1`
-        // leaves them out again).
-        // A wide body (> 64 registers) qualifies when its wide fill mask is
-        // empty, as the non-self `wide_empty` admission below: the lane zeroes
-        // nothing. The masks are this proto's own analysis, the same calls the
-        // compile makes before `set_cross_entry`; raytracer's 87-register
-        // `trace` reached its own recursion through the helper only.
-        let self_wide_mask = if fid == caller_fid
-            && reg_count > 64
-            && crate::codegen::crosscall2_enabled()
-            && crate::codegen::crosscall_wide_mask_enabled()
-            && crate::codegen::cross3_wide_enabled()
-            && crate::codegen::cross_uninit_mask(callee) == u64::MAX
-        {
-            crate::codegen::cross_uninit_wide_mask(callee).and_then(|m| {
-                if m.len() == (reg_count as usize).div_ceil(64)
-                    && m.iter().skip(2).all(|&w| w == 0)
-                {
-                    Some([m.first().copied().unwrap_or(0), m.get(1).copied().unwrap_or(0)])
-                } else {
-                    None
-                }
-            })
-        } else {
-            None
-        };
+        let (cached_small_mask, callee_wide_mask) = self.jit.cached_cross_uninit(fid, callee);
+        let self_wide_mask = if fid == caller_fid { callee_wide_mask } else { None };
         let self_arm = fid == caller_fid
             && whole_body
             && crate::codegen::cross3_self_enabled()
@@ -2230,6 +2199,16 @@ impl<'p> Vm<'p> {
                     .iter()
                     .any(|i| matches!(i, Instr::LoadGlobal { idx, .. } if *idx == own))
             }));
+        // Speculative CROSS3 arm for a not-yet-compiled non-self callee: the
+        // emitted lane reads `cross_table[fid].entry` dynamically per call and
+        // falls through to the helper while null, then activates automatically
+        // the instant `fid` compiles without evicting or recompiling callers.
+        let spec_arm = fid != caller_fid
+            && self.jit_func_eligible(fid)
+            && self.jit.fn_state(fid) != crate::codegen::FN_DEAD
+            && (reg_count <= 64 || callee_wide_mask.is_some())
+            && crate::codegen::markdown_inline_plan(callee).is_none()
+            && !(callee.reg_count == 43 && callee.code.len() == 64);
         let parked = self.jit.cross_parked_mask(fid);
         let mut self_wide: Option<[u64; 2]> = None;
         let (uninit_mask, json_walk, markdown_inline, mask_gen) = match self.jit.cross_entry_lane(fid)
@@ -2243,20 +2222,16 @@ impl<'p> Vm<'p> {
                 // for the wide words: the generation it leaves is this one.
                 self_wide = self_wide_mask;
                 if crate::jitlog_enabled() {
-                    let wm = self_wide_mask.unwrap_or([0, 0]);
                     eprintln!(
                         "[cross] fn{caller_fid}@{call_ip} CROSS3 wide self arm (regs={reg_count}, mask={:#x}:{:#x})",
-                        wm[1], wm[0]
+                        self_wide_mask.unwrap_or([0, 0])[1],
+                        self_wide_mask.unwrap_or([0, 0])[0]
                     );
                 }
                 (0, None, None, self.jit.cross_mask_gen_after_set(fid, u64::MAX))
             }
             None if self_arm => {
-                let mask = if crate::codegen::crosscall2_enabled() {
-                    crate::codegen::cross_uninit_mask(callee)
-                } else {
-                    u64::MAX
-                };
+                let mask = cached_small_mask;
                 if crate::jitlog_enabled() {
                     eprintln!(
                         "[cross] fn{caller_fid}@{call_ip} CROSS3 self arm against the entry this compile installs (mask={mask:#x})"
@@ -2268,6 +2243,18 @@ impl<'p> Vm<'p> {
             // and the null entry routes to the helper until then.
             None if parked.is_some() => {
                 (parked.unwrap_or(u64::MAX), None, None, self.jit.cross_mask_gen(fid))
+            }
+            None if spec_arm && callee_wide_mask.is_some() => {
+                self_wide = callee_wide_mask;
+                (0, None, None, self.jit.cross_mask_gen_after_set(fid, u64::MAX))
+            }
+            None if spec_arm => {
+                let mask = cached_small_mask;
+                if mask == u64::MAX {
+                    pending.push(fid);
+                    return None;
+                }
+                (mask, None, None, self.jit.cross_mask_gen_after_set(fid, mask))
             }
             None => {
                 if crate::jitlog_enabled() {
@@ -2318,13 +2305,15 @@ impl<'p> Vm<'p> {
             }
             return None;
         }
-        baked.push(fid);
+        baked.push((fid, mask_gen));
         Some(crate::codegen::SameProtoCross3Plan {
             fid,
             callee_regs: reg_count,
             argc,
+            param_count: callee.param_count,
             arrow_this: callee.lexical_this,
             sloppy_this,
+            sloppy_obj_this,
             mask_gen,
             uninit_mask: uninit_mask_words,
             act_free: crate::codegen::cross3_act_free_enabled() && crate::codegen::activation_free(callee),
@@ -2401,7 +2390,7 @@ impl<'p> Vm<'p> {
         func_id: u32,
         exemplar_base: Option<usize>,
         whole_body: bool,
-    ) -> (crate::codegen::CrossCallPlan, Vec<u32>, Vec<u32>) {
+    ) -> (crate::codegen::CrossCallPlan, Vec<u32>, Vec<(u32, u32)>) {
         // A Python program's own bodies take none of these plans (see
         // `Vm::py_plans_skipped`).
         if self.py_plans_skipped(func_id) {
@@ -2410,9 +2399,9 @@ impl<'p> Vm<'p> {
         let mut plan = crate::codegen::CrossCallPlan::default();
         // B199: callee fids whose entry was missing at plan time.
         let mut pending: Vec<u32> = Vec::new();
-        // B229: callees this plan BAKES a lane against (see `note_cross_baked`).
-        let mut baked: Vec<u32> = Vec::new();
-        if crate::env_var_os("ZIPP_NO_CROSSCALL").is_some() {
+        // B229: `(callee_fid, expected_mask_gen)` lanes baked by this plan.
+        let mut baked: Vec<(u32, u32)> = Vec::new();
+        if !crosscall_enabled() {
             return (plan, pending, baked);
         }
         let caller = self.func(func_id as usize);
@@ -2487,6 +2476,7 @@ impl<'p> Vm<'p> {
                 || (callee.rest_reg.is_some()
                     && !crate::codegen::tierc_rest_enabled())
                 || callee.arguments_reg.is_some()
+            || crate::codegen::proto_reads_legacy_fn_props(callee)
                 // B213: handler-op bodies never received a cross entry, so a
                 // specialized attempt would decline on every call and the
                 // pend below would never resolve — take the framed path.
@@ -2603,6 +2593,7 @@ impl<'p> Vm<'p> {
                     cross3,
                     cross3m: None,
                     class_method: false,
+                    proto_read: None,
                     class_getter: false,
                     new_lane: None,
                 },
@@ -2775,6 +2766,7 @@ impl<'p> Vm<'p> {
                         || callee.is_async
                         || callee.rest_reg.is_some()
                         || callee.arguments_reg.is_some()
+            || crate::codegen::proto_reads_legacy_fn_props(callee)
                         || usize::from(callee.param_count) != usize::from(argc)
                         // B213: see the call arm — no entry can ever exist.
                         || (crate::codegen::handler_callee_skip_enabled()
@@ -2831,12 +2823,12 @@ impl<'p> Vm<'p> {
             let Instr::CallMethod { argc, .. } = *instr else {
                 continue;
             };
-            if !self.ic_site_only_class_methods(func_id, ip) {
+            if !self.ic_site_only_class_or_proto_methods(func_id, ip) {
                 continue;
             }
             let mut cross3 = crate::codegen::Cross3CallPlan::default();
             if class_lane {
-                for fid in self.ic_class_method_fids(func_id, ip) {
+                for fid in self.ic_method_lane_fids(func_id, ip) {
                     if let Some(arm) =
                         self.build_cross3_call_arm(func_id, ip, fid, argc, whole_body, false, &mut pending, &mut baked)
                     {
@@ -2849,11 +2841,18 @@ impl<'p> Vm<'p> {
                     }
                 }
             }
+            let proto_read =
+                if class_lane && (!cross3.is_empty() || crate::codegen::cross3_dyn_enabled()) {
+                    self.ic_proto_method_read(func_id, ip)
+                } else {
+                    None
+                };
             let site = plan
                 .entry(ip)
                 .or_insert_with(crate::codegen::CrossCallSitePlan::default);
             site.class_method = true;
             site.cross3 = cross3;
+            site.proto_read = proto_read;
         }
         // GetProp sites that have only ever resolved to class getters
         // (`while (q.size > 0)`): the getter is looked up through the class
@@ -3155,6 +3154,7 @@ impl<'p> Vm<'p> {
         let caller = self.func(func_id as usize);
         let reg_window = caller.reg_count;
         let log = crate::jitlog_enabled();
+        let mut jump_prefix: Option<Vec<u32>> = None;
         for ip in start as usize..=end as usize {
             // A `CallWithThis` site (`o.f(x)` with its callee read before the
             // arguments, as `this.cmp(h[i], h[p])` is) inlines a callee whose
@@ -3196,7 +3196,7 @@ impl<'p> Vm<'p> {
             // polymorphic site only when every filled way names the same
             // FuncProto; later gates require that proto to be capture-free and
             // non-arrow, and emitted code re-checks the LIVE callee's proto.
-            let poly_on = crate::env_var_os("ZIPP_NO_POLY_LEAF_INLINE").is_none();
+            let poly_on = poly_leaf_inline_enabled();
             let upval_rep = (poly_on && !with_this)
                 .then(|| {
                     self.leaf_upval_callee_representative(func_id, start as usize, ip, callee_reg)
@@ -3653,7 +3653,14 @@ impl<'p> Vm<'p> {
             {
                 None
             } else {
-                match self.slot_guard_key(func_id, start as usize, ip, callee_bits, callee_ver) {
+                match self.slot_guard_key(
+                    func_id,
+                    start as usize,
+                    ip,
+                    callee_bits,
+                    callee_ver,
+                    &mut jump_prefix,
+                ) {
                     Ok((g, addr, gen)) => {
                         if log {
                             eprintln!("[leaf] fn{func_id}@{ip} slot_guard=g{g}@gen{gen}");
@@ -3895,6 +3902,7 @@ impl<'p> Vm<'p> {
         call_ip: usize,
         callee_bits: u64,
         callee_ver: u32,
+        jump_prefix: &mut Option<Vec<u32>>,
     ) -> Result<(u32, u64, u32), &'static str> {
         let caller = self.func(func_id as usize);
         let Instr::Call { callee, .. } = caller.code[call_ip] else {
@@ -3916,13 +3924,9 @@ impl<'p> Vm<'p> {
         let Some((def_ip, g)) = def else {
             return Err("nearest-def-not-loadglobal");
         };
-        for ins in &caller.code {
-            for t in slot_guard_jump_targets(ins) {
-                let t = t as usize;
-                if t > def_ip && t <= call_ip {
-                    return Err("jump-target-in-gap");
-                }
-            }
+        let jp = jump_prefix.get_or_insert_with(|| jump_target_prefix(&caller.code));
+        if has_jump_target_in(jp, def_ip + 1, call_ip) {
+            return Err("jump-target-in-gap");
         }
         if g >= self.program.global_count {
             return Err("pool-slot");
@@ -3981,7 +3985,7 @@ impl<'p> Vm<'p> {
         // Elements of an `arr[i]` receiver's array looked at for candidates.
         const MI_ARRAY_CAND_SCAN: usize = 256;
         let mut plan = rustc_hash::FxHashMap::default();
-        if crate::env_var_os("ZIPP_NO_METHOD_INLINE").is_some() {
+        if !method_inline_enabled() {
             return plan; // kill-switch (live through all stages)
         }
         #[cfg(feature = "instrument")]
@@ -4024,6 +4028,7 @@ impl<'p> Vm<'p> {
             argc: u16,
         }
         let mut captured_methods = Vec::new();
+        let mut jump_prefix: Option<Vec<u32>> = None;
         for call_ip in start as usize..=end as usize {
             let (callee, this_v, arg_base, argc) = match caller.code[call_ip] {
                 Instr::CallWithThis {
@@ -4049,12 +4054,11 @@ impl<'p> Vm<'p> {
                 }
                 _ => continue,
             };
+            let jp = jump_prefix.get_or_insert_with(|| jump_target_prefix(&caller.code));
             if caller.code[get_ip + 1..call_ip].iter().any(|ins| {
                 crate::codegen::writes_reg(ins).is_some_and(|r| r == callee || r == this_v)
-            }) || caller.code.iter().any(|ins| {
-                slot_guard_jump_targets(ins)
-                    .any(|target| (get_ip + 1..=call_ip).contains(&(target as usize)))
-            }) {
+            }) || has_jump_target_in(jp, get_ip + 1, call_ip)
+            {
                 continue;
             }
             captured_methods.push(CapturedMethodSite {
@@ -5786,6 +5790,56 @@ fn slot_guard_def(i: &Instr) -> Option<Option<u16>> {
         | Instr::ReturnUndefined => None,
         _ => return None,
     })
+}
+
+env_off_switch! {
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn call_result_str_pin_enabled() = "ZIPP_NO_CALL_RESULT_STR_PIN"
+}
+env_off_switch! {
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn crosscall_enabled() = "ZIPP_NO_CROSSCALL"
+}
+env_off_switch! {
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn poly_leaf_inline_enabled() = "ZIPP_NO_POLY_LEAF_INLINE"
+}
+env_off_switch! {
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn method_inline_enabled() = "ZIPP_NO_METHOD_INLINE"
+}
+
+/// Prefix-sum of control-flow jump targets in `code` (`prefix[ip + 1] - prefix[ip]`
+/// is nonzero iff some instruction in `code` targets `ip`), turning repeated
+/// `(lo..=hi)` dominance gap checks from `O(code.len())` into `O(1)`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn jump_target_prefix(code: &[Instr]) -> Vec<u32> {
+    let n = code.len();
+    let mut prefix = vec![0u32; n + 1];
+    for ins in code {
+        for t in slot_guard_jump_targets(ins) {
+            let ti = t as usize;
+            if ti < n {
+                prefix[ti + 1] = 1;
+            }
+        }
+    }
+    let mut acc = 0u32;
+    for slot in &mut prefix {
+        acc += *slot;
+        *slot = acc;
+    }
+    prefix
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn has_jump_target_in(prefix: &[u32], lo: usize, hi: usize) -> bool {
+    let hi_clamped = hi.min(prefix.len().saturating_sub(2));
+    if lo > hi_clamped {
+        return false;
+    }
+    prefix[hi_clamped + 1] > prefix[lo]
 }
 
 /// W12 slot-guard control model: the jump targets this op carries. These are

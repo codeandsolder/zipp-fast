@@ -80,17 +80,31 @@ fn jit_wanted(program: &Program) -> bool {
     if crate::env_var_os("ZIPP_NOJIT").is_some() {
         return false;
     }
-    program.python_natives
+    if program.python_natives
         || program.php_natives
         || program.functions.len() < JIT_LARGE_PROGRAM_FUNCS
         || crate::env_var_os("ZIPP_JIT_LARGE").is_some()
+    {
+        return true;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::env_var_os("ZIPP_NO_JIT_LARGE").is_none()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
 }
 
 /// Whether a VM over a JavaScript program of [`JIT_LARGE_PROGRAM_FUNCS`] or
-/// more functions starts with its JIT on (`ZIPP_JIT_LARGE`, see
-/// [`jit_wanted`]).
+/// more functions starts with its JIT on (see [`jit_wanted`]).
+#[allow(dead_code)]
 pub(crate) fn large_programs_run_jit() -> bool {
-    #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    return crate::env_var_os("ZIPP_NOJIT").is_none()
+        && crate::env_var_os("ZIPP_NO_JIT_LARGE").is_none();
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     return crate::env_var_os("ZIPP_NOJIT").is_none() && crate::env_var_os("ZIPP_JIT_LARGE").is_some();
     #[cfg(not(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64"))))]
     false
@@ -333,11 +347,7 @@ impl<'p> Vm<'p> {
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             mi_recv: rustc_hash::FxHashMap::default(),
             idx_key_scratch: String::new(),
-            keyed_slot_memo: vec![
-                crate::vm::indexing_date::KeyedSlotMemo::EMPTY;
-                crate::vm::indexing_date::KEYED_SLOT_MEMO_SLOTS
-            ]
-            .into_boxed_slice(),
+            keyed_slot_memo: Vec::new(),
             own_slot_cache: (0..crate::vm::ic::OWN_SLOT_CACHE_SLOTS)
                 .map(|_| std::cell::Cell::new(crate::vm::ic::OwnSlot::EMPTY))
                 .collect(),
@@ -722,7 +732,32 @@ impl<'p> Vm<'p> {
             realm_ctor_main: Default::default(),
             fn_proto_override: rustc_hash::FxHashMap::default(),
             instanceof_memo: vec![crate::vm::InstanceofMemo::EMPTY; crate::vm::INSTANCEOF_MEMO_SLOTS].into_boxed_slice(),
+            #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+            instanceof_pair_memo: vec![
+                crate::vm::InstanceofPairMemo::EMPTY;
+                crate::vm::INSTANCEOF_PAIR_SLOTS
+            ]
+            .into_boxed_slice(),
             fn_props_gen: 0,
+            fn_props_has_call: 0,
+            fn_props_has_apply: 0,
+            fn_props_has_bind: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            es5_proto_memo: Vec::new(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            dict_prop_memo: Vec::new(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            fn_proto_shape: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            fn_proto_call_slot: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            fn_call_native_bits: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            array_ctor_bits: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            array_is_array_bits: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            obj_proto_setup_ver: u32::MAX,
             fn_proto_readonly: rustc_hash::FxHashSet::default(),
             objproto_method_memo: [(crate::shape::DICT, 0, 0); 3],
             is_htmldda: Default::default(),
@@ -782,6 +817,8 @@ impl<'p> Vm<'p> {
             set_iter_proto: 0,
             string_iter_proto: 0,
             global_this: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            global_this_bits: Value::UNDEFINED.bits(),
             rng_state: 0x9E37_79B9_7F4A_7C15, // fixed seed (golden-ratio constant)
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit: {
@@ -791,6 +828,11 @@ impl<'p> Vm<'p> {
                 jit.set_python_program(program.python_natives, &program.functions);
                 #[cfg(feature = "php")]
                 jit.set_php_program(program.php_natives, &program.functions);
+                jit.set_large_program_thresholds(
+                    program.functions.len(),
+                    program.python_natives,
+                    program.php_natives,
+                );
                 jit
             },
             #[cfg(all(feature = "jit", target_arch = "aarch64"))]
@@ -818,7 +860,7 @@ impl<'p> Vm<'p> {
             // The sentinel version never equals a live object's, so the first
             // use recomputes against the real `%Function.prototype%`.
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-            ci_pristine: (u32::MAX, u32::MAX, u32::MAX),
+            ci_pristine: crate::vm::CiPristine::EMPTY,
             ta_len_base: (0, 0, 0),
             ta_len_kind_ver: [0; 12],
             ta_len_kinds: 0,

@@ -33,7 +33,7 @@ use std::hash::{BuildHasher, Hash, Hasher};
 /// Collection size at which an indexed operation switches from the linear
 /// scan to building (and from then on maintaining) the hash index. Small
 /// collections never touch the index machinery.
-pub(crate) const INDEX_THRESHOLD: usize = 48;
+pub(crate) const INDEX_THRESHOLD: usize = 16;
 
 /// The SameValueZero key representation: a u64 that SameValueZero-equal keys
 /// map to (a table hit is always CONFIRMED against the stored key with
@@ -761,18 +761,44 @@ fn svz_position(heap: &Heap, keys: &[Value], key: Value) -> Option<usize> {
         }
         return keys.iter().position(|&k| k.is_number() && k.as_f64() == n);
     }
+    // Map/Set keys are unique under SameValueZero, so an exact bits match is
+    // ALWAYS the unique position without touching `heap.objs` at all.
+    if let Some(pos) = keys.iter().position(|&k| k.bits() == key.bits()) {
+        return Some(pos);
+    }
     if key.is_heap() {
-        match heap.get(key.heap_index()) {
+        let key_idx = key.heap_index();
+        // Fast non-string/non-BigInt miss short-circuit via HotMirror:
+        // shaped Objects, Funcs/Closures, Class instances, and Ctors compare
+        // purely by identity (already checked above), avoiding cold `heap.objs`
+        // loads on every small-Map/Set miss.
+        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+        {
+            let mir = heap.hot_mirror_of(key_idx);
+            if mir.shape != crate::shape::DICT
+                || (mir.fid != crate::heap::FID_MIRROR_NONE
+                    && mir.fid != crate::heap::FID_MIRROR_STR)
+            {
+                return None;
+            }
+        }
+        match heap.get(key_idx) {
             HeapObj::Str(s) => {
                 let want = s.as_bytes();
+                let key_atom = heap.is_atom(key_idx);
                 return keys.iter().position(|&k| {
-                    k.bits() == key.bits()
-                        || (k.is_heap()
-                            && match heap.get(k.heap_index()) {
-                                HeapObj::Str(t) => t.as_bytes() == want,
-                                HeapObj::Cons { .. } => heap.str_eq(k.heap_index(), key.heap_index()),
-                                _ => false,
-                            })
+                    if !k.is_heap() {
+                        return false;
+                    }
+                    let ki = k.heap_index();
+                    if key_atom && heap.is_atom(ki) {
+                        return false;
+                    }
+                    match heap.get(ki) {
+                        HeapObj::Str(t) => t.as_bytes() == want,
+                        HeapObj::Cons { .. } => heap.str_eq(ki, key_idx),
+                        _ => false,
+                    }
                 });
             }
             HeapObj::Cons { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_) => {
@@ -781,7 +807,7 @@ fn svz_position(heap: &Heap, keys: &[Value], key: Value) -> Option<usize> {
             _ => {}
         }
     }
-    keys.iter().position(|&k| k.bits() == key.bits())
+    None
 }
 
 /// Incremental SameValueZero finder over a LOCAL keys Vec still being built
@@ -837,12 +863,20 @@ impl<'p> Vm<'p> {
     /// (building it on first use). This is THE lookup every Map/Set/WeakMap/
     /// WeakSet get/has/set/add/delete/upsert routes through.
     pub(crate) fn coll_find(&mut self, idx: u32, key: Value) -> Option<usize> {
-        // Flatten a rope key up front (no-op tag check when already flat):
-        // hashing reads the bytes without materializing a copy, every stored
-        // key is flat (it was a probe key once), and `str_eq` confirms hits
-        // on the flat-flat byte-compare fast path.
+        // Flatten a rope key up front (skip when HotMirror proves non-Cons:
+        // non-empty flat Str, shaped Object, Func/Closure, Class instance).
         if key.is_heap() {
-            self.heap.flatten(key.heap_index());
+            let kidx = key.heap_index();
+            #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+            let may_be_cons = {
+                let mir = self.heap.hot_mirror_of(kidx);
+                mir.shape == crate::shape::DICT && mir.fid == crate::heap::FID_MIRROR_NONE
+            };
+            #[cfg(not(all(feature = "jit", not(feature = "safe-sandbox"))))]
+            let may_be_cons = true;
+            if may_be_cons {
+                self.heap.flatten(kidx);
+            }
         }
         let heap = &self.heap;
         let keys: &[Value] = match heap.get(idx) {
@@ -877,7 +911,17 @@ impl<'p> Vm<'p> {
     #[inline]
     pub(crate) fn coll_lookup_proven_fast(&mut self, idx: u32, key: Value, op: u64) -> u64 {
         if key.is_heap() {
-            self.heap.flatten(key.heap_index());
+            let kidx = key.heap_index();
+            #[cfg(not(feature = "safe-sandbox"))]
+            let may_be_cons = {
+                let mir = self.heap.hot_mirror_of(kidx);
+                mir.shape == crate::shape::DICT && mir.fid == crate::heap::FID_MIRROR_NONE
+            };
+            #[cfg(feature = "safe-sandbox")]
+            let may_be_cons = true;
+            if may_be_cons {
+                self.heap.flatten(kidx);
+            }
         }
         let heap = &self.heap;
         let (keys, vals): (&[Value], Option<&[Value]>) = match heap.get(idx) {

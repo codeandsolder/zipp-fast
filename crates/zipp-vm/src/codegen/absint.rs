@@ -189,6 +189,10 @@ pub(crate) fn analyze_int_guards_strict(
         return FxHashSet::default();
     }
     let mut cands: FxHashSet<u32> = strict_globs.clone();
+    let log_absint = {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| crate::env_var_os("ZIPP_ABSINT_LOG").is_some())
+    };
     loop {
         let mut seeded = entry.clone();
         for &g in &cands {
@@ -196,14 +200,14 @@ pub(crate) fn analyze_int_guards_strict(
         }
         match analyze_run(proto, s, e, seeded, dv) {
             None => {
-                if crate::env_var_os("ZIPP_ABSINT_LOG").is_some() {
+                if log_absint {
                     eprintln!("[absint] [{s},{e}] analyze_run=None (unsupported op or no convergence)");
                 }
                 strict_globs.clear();
                 return FxHashSet::default();
             }
             Some((states, elide)) => {
-                if crate::env_var_os("ZIPP_ABSINT_LOG").is_some() {
+                if log_absint {
                     let mut c: Vec<u32> = cands.iter().copied().collect();
                     c.sort_unstable();
                     eprintln!("[absint] [{s},{e}] cands={c:?} elided={}", elide.len());

@@ -49,7 +49,7 @@ pub const PROP_VIA_IC: u64 = 0x7FFE_DEAD_BEEF_0002;
 /// the prologue (rsp stays 16-aligned: prologue did 3 pushes + sub 40 = 64B).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_self_call(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     ip: usize,
     bail: dynasmrt::DynamicLabel,
     self_entry: dynasmrt::DynamicLabel,

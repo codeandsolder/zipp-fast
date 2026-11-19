@@ -245,6 +245,18 @@ env_off_switch! {
 /// directly — the specialized attempt would decline on EVERY call (react's
 /// diff: 130k futile enter-helper prefixes + generic re-dispatches per run),
 /// and its missing entry would sit in the B199 pending set forever.
+/// Whether a sloppy function may inspect legacy `f.arguments` or `f.caller`
+/// (which walk `Vm::frames`, so frame-free cross-calls must not enter it).
+#[inline]
+pub(crate) fn proto_reads_legacy_fn_props(proto: &crate::bytecode::FuncProto) -> bool {
+    !proto.is_strict
+        && !proto.lexical_this
+        && proto
+            .string_constants
+            .iter()
+            .any(|s| s == "arguments" || s == "caller")
+}
+
 pub(crate) fn proto_has_handler_ops(proto: &crate::bytecode::FuncProto) -> bool {
     proto
         .code
@@ -716,6 +728,13 @@ env_off_switch! {
 }
 
 env_off_switch! {
+    /// `ZIPP_NO_CROSS3_DYN=1`: disables the shared per-function dynamic native
+    /// cross-call trampoline (`emit_cross3_dyn_stub`) for polymorphic Call /
+    /// CallWithThis / CallMethod sites.
+    fn cross3_dyn_enabled() = "ZIPP_NO_CROSS3_DYN"
+}
+
+env_off_switch! {
     /// `ZIPP_NO_CROSS3_ACT_FREE=1`: every inline cross call installs its
     /// callee's activation (and roots a frame-free prior), even when the
     /// callee's body never reads it (`activation_free`). Plan-time.
@@ -1142,6 +1161,21 @@ pub struct SpanCodeUnitPairPlan {
 /// One call site selected for Tier-C native cross-call dispatch.
 pub type CrossCallPlan = FxHashMap<usize, CrossCallSitePlan>;
 
+/// Inline stamped prototype-method read guard for ES5 `Foo.prototype.m()`
+/// calls (`emit_proto_read_guard`): proves a plain shaped receiver has no own
+/// property shadowing the method, its `[[Prototype]]` is `first_bits`, every
+/// guarded hop on the chain is unchanged (`chain_epoch`), and reads the LIVE
+/// method Value directly from `holder_slot_addr` (valid for both shaped and
+/// dictionary-mode prototype holders while `chain_epoch` stands still).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProtoReadLane {
+    pub recv_shapes: [u32; 4],
+    pub n_shapes: u8,
+    pub first_bits: u64,
+    pub chain_epoch: u32,
+    pub holder_slot_addr: u64,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CrossCallSitePlan {
     pub same_proto2: Option<SameProtoCross2Plan>,
@@ -1155,10 +1189,13 @@ pub struct CrossCallSitePlan {
     /// receivers, one method fid). Keyed in the same per-ip map — Call and
     /// CallMethod ips never collide.
     pub cross3m: Option<Cross3MethodPlan>,
-    /// A `CallMethod` site whose every cached resolution was a class
-    /// method: Tier C does not first try the own-data method call there,
-    /// which cannot succeed for a member that lives on the class.
+    /// A `CallMethod` site whose every cached resolution was a class or
+    /// prototype method: Tier C does not first try the own-data method call
+    /// there, which cannot succeed for an inherited member.
     pub class_method: bool,
+    /// Inline stamped `FIRST_HEAP` prototype-method read guard for way 0 of a
+    /// prototype-method `CallMethod` site (zero-FFI lookup into `cross3`).
+    pub proto_read: Option<ProtoReadLane>,
     /// A `GetProp` site whose every cached resolution was a class getter
     /// (`q.size`): `cross3` holds an arm per getter, which Tier C calls
     /// with the receiver as `this` once `jit_getter_callee` has looked the
@@ -1273,15 +1310,34 @@ pub struct Cross3MethodPlan {
     pub uninit_mask: [u64; 2],
 }
 
-/// B199: one live cross-entry record — `entry` (0 = none) and the mask
-/// generation the emitted lanes guard. `#[repr(C)]`, 16 bytes, addressed
-/// as `table_base + fid*16` (constant displacement — the fid is baked).
+/// Flags for [`CrossEntryRec::dyn_flags`], enabling `cross3_dyn_stub` to
+/// dispatch ANY already-compiled Tier-C/Tier-O callee natively without baking
+/// its `fid` at the call site.
+pub(crate) const CROSS_DYN_OK: u32 = 1 << 0;
+pub(crate) const CROSS_DYN_ARROW: u32 = 1 << 1;
+pub(crate) const CROSS_DYN_STRICT: u32 = 1 << 2;
+pub(crate) const CROSS_DYN_SLOPPY: u32 = 1 << 3;
+/// Sentinel slot stored in a 32-way shape-pair IC entry (`fill_shape_pair`)
+/// when the static property key is provably absent from this shape and from
+/// pristine `%Object.prototype%`. Bit 31 distinguishes it from real slot indices
+/// (`<= 0x00FF_FFFF`) in `emit_ic_probe`.
+pub(crate) const SHAPE_PAIR_ABSENT_SLOT: u32 = 0x8000_0000;
+
+/// B199: one live cross-entry record — `entry` (0 = none), the mask generation
+/// static lanes guard, plus the dynamic metadata (`dyn_flags`, `uninit_mask`,
+/// `reg_count`, `param_count`, `fid`) that `cross3_dyn_stub` reads for
+/// polymorphic native-to-native calls. `#[repr(C)]`, 32 bytes (power of two),
+/// addressed as `table_base + fid*32`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CrossEntryRec {
     pub entry: u64,
     pub mask_gen: u32,
-    pub _pad: u32,
+    pub dyn_flags: u32,
+    pub uninit_mask: u64,
+    pub reg_count: u16,
+    pub param_count: u16,
+    pub fid: u32,
 }
 
 /// B205: the fused `Math.random() * k | 0` window against a recognized
@@ -1341,15 +1397,22 @@ pub struct SameProtoCross3Plan {
     pub fid: u32,
     /// Callee frame size (`reg_count.max(1)`).
     pub callee_regs: u16,
-    /// Site argc — admitted only when it equals the callee's `param_count`.
+    /// Site argument count (copied up to `param_count`; extra args ignored).
     pub argc: u16,
+    /// Callee declared `param_count` (missing formals past `argc` receive
+    /// `Value::UNDEFINED`).
+    pub param_count: u16,
     /// `this` policy: true = arrow (captured `this` via the heap's
-    /// this-mirror); false = strict plain function (`this = undefined`).
+    /// this-mirror); false = plain/method function.
     pub arrow_this: bool,
     /// A sloppy callee at a plain `Call`: the `this` its call binds, the
     /// global object's bits (the lane runs only while no second realm
     /// exists, so it is the callee's realm's). `None` for a strict callee.
     pub sloppy_this: Option<u64>,
+    /// A sloppy callee at a method call (`CallWithThis` / `CallMethod` / getter):
+    /// the receiver must be verified to be a shaped `HeapObj::Object`
+    /// (`hot_mirror.shape != DICT`) so `this` needs no `ToObject` boxing.
+    pub sloppy_obj_this: bool,
     /// The may-read-before-write register mask, valid while the callee's
     /// live `CrossEntryRec::mask_gen` equals `mask_gen`; the entry itself
     /// is loaded from the live table per call (B199), never baked.
@@ -2044,6 +2107,10 @@ pub struct HeapHelperAddrs {
     /// The compiling function's private-field lanes (`PrivLanePlan`), when
     /// the caller planned them.
     pub(crate) priv_lanes: Option<&'static PrivLanePlan>,
+    /// Snapshot of `Heap::atoms_raw` and `Heap::atoms_words` taken after
+    /// `jit_build_const_strs` for compile-time atom proofs in `str_case_chains`.
+    pub(crate) atoms_raw: u64,
+    pub(crate) atoms_words: u64,
 }
 
 env_off_switch! {
@@ -2150,6 +2217,8 @@ impl HeapHelperAddrs {
             forin_keys: self.forin_keys,
             acc_lanes: self.acc_lanes,
             priv_lanes: self.priv_lanes,
+            atoms_raw: self.atoms_raw,
+            atoms_words: self.atoms_words,
             ic_base_idx,
             opt_tier_up: 0,
         }
@@ -2163,7 +2232,8 @@ impl HeapHelperAddrs {
 /// once per `Jit::compile` call (compiles are rare relative to execution).
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 fn fnjit_mem_enabled() -> bool {
-    crate::env_var_os("ZIPP_NO_FNJIT_MEM").is_none()
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::env_var_os("ZIPP_NO_FNJIT_MEM").is_none())
 }
 
 /// Whether Tier C will try `proto` (it may still decline in the emitter).
@@ -2495,7 +2565,8 @@ env_off_switch! {
 /// rare relative to execution) — zero per-call cost either way.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) fn crosscall2_enabled() -> bool {
-    crate::env_var_os("ZIPP_NO_CROSSCALL2").is_none()
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::env_var_os("ZIPP_NO_CROSSCALL2").is_none())
 }
 
 /// Same-binary A/B switch for extending W7's selective callee-window fill to
@@ -2504,7 +2575,8 @@ pub(crate) fn crosscall2_enabled() -> bool {
 /// W7 still restores the pre-W7 full-fill path for every function.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) fn crosscall_wide_mask_enabled() -> bool {
-    crate::env_var_os("ZIPP_NO_CROSSCALL_WIDE_MASK").is_none()
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::env_var_os("ZIPP_NO_CROSSCALL_WIDE_MASK").is_none())
 }
 
 /// A Tier-C function whose bytecode is the compiler's exact recursive
@@ -2629,10 +2701,11 @@ pub(crate) fn markdown_escape_html_proto(proto: &FuncProto) -> bool {
 /// slot number. As with the helper proof, register count is intentionally not a
 /// semantic gate. `ZIPP_NO_MARKDOWN_INLINE_REDUCE=1` omits the plan entirely.
 pub(crate) fn markdown_inline_plan(proto: &FuncProto) -> Option<MarkdownInlinePlan> {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // The name first: it rejects every function but one, and the switch is a
-    // read of the process environment.
+    // read of the process environment (cached once per process).
     if proto.name != "renderInline"
-        || crate::env_var_os("ZIPP_NO_MARKDOWN_INLINE_REDUCE").is_some()
+        || *DISABLED.get_or_init(|| crate::env_var_os("ZIPP_NO_MARKDOWN_INLINE_REDUCE").is_some())
         || proto.param_count != 1
         || proto.length != 1
         || !proto.is_strict
@@ -2677,9 +2750,10 @@ pub(crate) fn markdown_inline_plan(proto: &FuncProto) -> Option<MarkdownInlinePl
 /// hide getters, coercions, a different visit order, or observable work between
 /// recursive calls. `ZIPP_NO_JSON_WALK_REDUCE=1` omits the plan entirely.
 fn json_walk_plan(proto: &FuncProto, const_strs: &FxHashMap<u32, u64>) -> Option<JsonWalkPlan> {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if proto.param_count != 1
         || proto.reg_count != 43
-        || crate::env_var_os("ZIPP_NO_JSON_WALK_REDUCE").is_some()
+        || *DISABLED.get_or_init(|| crate::env_var_os("ZIPP_NO_JSON_WALK_REDUCE").is_some())
         || !proto.is_strict
         || !proto.simple_params
         || proto.rest_reg.is_some()
@@ -3023,9 +3097,253 @@ fn json_walk_plan(proto: &FuncProto, const_strs: &FxHashMap<u32, u64>) -> Option
     })
 }
 
+/// Heap-backed x86_64 assembler — avoids allocating a fresh OS virtual mapping
+/// and `VirtualProtect`/`mprotect` transition per compiled function.
+pub(crate) type X64Asm = dynasmrt::VecAssembler<dynasmrt::x64::X64Relocation>;
+
+#[inline]
+pub(crate) fn new_x64_asm() -> X64Asm {
+    X64Asm::new(0)
+}
+
+env_off_switch!(
+    /// Cached `ZIPP_GC_STRESS` check so region compilation never scans the
+    /// process environment on every back-edge compile.
+    fn sroa_gc_stress_off() = "ZIPP_GC_STRESS"
+);
+
+#[cfg(windows)]
+env_off_switch!(
+    /// Default-on kill switch for the 2 MB strict-W^X dual-mapped JIT code
+    /// slab pool (`ZIPP_NO_CODE_SLAB=1` restores one OS mapping per compile).
+    fn code_slab_enabled() = "ZIPP_NO_CODE_SLAB"
+);
+
+#[cfg(windows)]
+mod win_wx {
+    use core::ffi::c_void;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    const SLAB_SIZE: usize = 2 * 1024 * 1024;
+    const INVALID_HANDLE_VALUE: isize = -1;
+    const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+    const FILE_MAP_WRITE: u32 = 0x0002;
+    const FILE_MAP_READ: u32 = 0x0004;
+    const FILE_MAP_EXECUTE: u32 = 0x0020;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateFileMappingW(
+            file: isize,
+            attrs: *const c_void,
+            protect: u32,
+            max_size_high: u32,
+            max_size_low: u32,
+            name: *const u16,
+        ) -> isize;
+        fn MapViewOfFile(
+            mapping: isize,
+            desired_access: u32,
+            file_offset_high: u32,
+            file_offset_low: u32,
+            bytes_to_map: usize,
+        ) -> *mut u8;
+        fn UnmapViewOfFile(base_addr: *const c_void) -> i32;
+        fn CloseHandle(handle: isize) -> i32;
+        fn FlushInstructionCache(
+            process: isize,
+            base_address: *const c_void,
+            size: usize,
+        ) -> i32;
+        fn GetCurrentProcess() -> isize;
+    }
+
+    /// Dual-mapped 2 MB strict-W^X code slab: `rw` is mapped `PAGE_READWRITE`
+    /// (never executable) and `rx` is mapped `PAGE_EXECUTE_READ` (never
+    /// writable) over the same anonymous pagefile section. No page is ever
+    /// simultaneously writable and executable, while packing ~500-1000 compiled
+    /// functions into one OS mapping with zero per-function `VirtualProtect`
+    /// calls and tight L1 iTLB locality.
+    pub(crate) struct WxSlab {
+        rw: *mut u8,
+        rx: *const u8,
+        cap: usize,
+    }
+
+    impl WxSlab {
+        fn new(size: usize) -> Option<Self> {
+            unsafe {
+                let h = CreateFileMappingW(
+                    INVALID_HANDLE_VALUE,
+                    core::ptr::null(),
+                    PAGE_EXECUTE_READWRITE,
+                    ((size as u64) >> 32) as u32,
+                    size as u32,
+                    core::ptr::null(),
+                );
+                if h == 0 {
+                    return None;
+                }
+                let rw = MapViewOfFile(h, FILE_MAP_WRITE, 0, 0, size);
+                let rx = MapViewOfFile(h, FILE_MAP_READ | FILE_MAP_EXECUTE, 0, 0, size);
+                CloseHandle(h);
+                if rw.is_null() || rx.is_null() {
+                    if !rw.is_null() {
+                        UnmapViewOfFile(rw.cast());
+                    }
+                    if !rx.is_null() {
+                        UnmapViewOfFile(rx.cast());
+                    }
+                    return None;
+                }
+                Some(Self {
+                    rw,
+                    rx: rx as *const u8,
+                    cap: size,
+                })
+            }
+        }
+    }
+
+    impl Drop for WxSlab {
+        fn drop(&mut self) {
+            unsafe {
+                UnmapViewOfFile(self.rx.cast());
+                UnmapViewOfFile(self.rw.cast());
+            }
+        }
+    }
+
+    struct WxSlabPool {
+        current: Option<(Rc<WxSlab>, usize)>,
+    }
+
+    thread_local! {
+        static CODE_POOL: RefCell<WxSlabPool> = const { RefCell::new(WxSlabPool { current: None }) };
+    }
+
+    pub(super) fn alloc_from_slab(bytes: &[u8]) -> Option<(Rc<WxSlab>, *const u8, usize)> {
+        if bytes.is_empty() || bytes.len() > SLAB_SIZE || !super::code_slab_enabled() {
+            return None;
+        }
+        CODE_POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if let Some((ref slab, ref mut used)) = pool.current {
+                // Recycle the slab from byte 0 once every previous VM that held
+                // functions inside it has dropped (strong_count == 1).
+                if Rc::strong_count(slab) == 1 && *used > 0 {
+                    unsafe {
+                        FlushInstructionCache(GetCurrentProcess(), slab.rx.cast(), *used);
+                    }
+                    *used = 0;
+                }
+                let start = (*used + 15) & !15;
+                if let Some(end) = start.checked_add(bytes.len()) {
+                    if end <= slab.cap {
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                bytes.as_ptr(),
+                                slab.rw.add(start),
+                                bytes.len(),
+                            );
+                            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+                            let rx_ptr = slab.rx.add(start);
+                            *used = end;
+                            return Some((Rc::clone(slab), rx_ptr, bytes.len()));
+                        }
+                    }
+                }
+            }
+            let slab = Rc::new(WxSlab::new(SLAB_SIZE)?);
+            unsafe {
+                core::ptr::copy_nonoverlapping(bytes.as_ptr(), slab.rw, bytes.len());
+                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            }
+            let rx_ptr = slab.rx;
+            let len = bytes.len();
+            pool.current = Some((Rc::clone(&slab), len));
+            Some((slab, rx_ptr, len))
+        })
+    }
+}
+
+/// Backing executable storage for one compiled native function or region.
+pub(crate) enum CodeBuf {
+    #[cfg(windows)]
+    Slab {
+        _slab: std::rc::Rc<win_wx::WxSlab>,
+        ptr: *const u8,
+        len: usize,
+    },
+    Owned(ExecutableBuffer),
+}
+
+impl CodeBuf {
+    fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.is_empty() {
+            return None;
+        }
+        #[cfg(windows)]
+        if let Some((slab, ptr, len)) = win_wx::alloc_from_slab(bytes) {
+            return Some(CodeBuf::Slab {
+                _slab: slab,
+                ptr,
+                len,
+            });
+        }
+        let mut mb = dynasmrt::mmap::MutableBuffer::new(bytes.len()).ok()?;
+        mb.set_len(bytes.len());
+        mb[..bytes.len()].copy_from_slice(bytes);
+        let exec = mb.make_exec().ok()?;
+        Some(CodeBuf::Owned(exec))
+    }
+
+    #[inline]
+    pub(crate) fn as_ptr(&self) -> *const u8 {
+        match self {
+            #[cfg(windows)]
+            CodeBuf::Slab { ptr, .. } => *ptr,
+            CodeBuf::Owned(buf) => buf.as_ptr(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            #[cfg(windows)]
+            CodeBuf::Slab { len, .. } => *len,
+            CodeBuf::Owned(buf) => buf.len(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn ptr(&self, offset: dynasmrt::AssemblyOffset) -> *const u8 {
+        debug_assert!(offset.0 <= self.len());
+        // SAFETY: `offset` lies within `[0, self.len()]` of the backing RX mapping.
+        unsafe { self.as_ptr().add(offset.0) }
+    }
+}
+
+impl core::ops::Deref for CodeBuf {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        // SAFETY: both `Slab` (`PAGE_EXECUTE_READ`) and `Owned` are readable
+        // immutable executable mappings of `self.len()` bytes.
+        unsafe { core::slice::from_raw_parts(self.as_ptr(), self.len()) }
+    }
+}
+
+pub(crate) fn finalize_code(ops: X64Asm) -> Option<CodeBuf> {
+    let bytes = ops.finalize().ok()?;
+    CodeBuf::from_bytes(&bytes)
+}
+
 /// One compiled native function plus the buffer backing it.
 pub struct JitFn {
-    _buf: ExecutableBuffer,
+    _buf: CodeBuf,
     entry: *const u8,
     /// `(global slot, the Value bits it held at compile time)` when this body
     /// contains a SELF-CALL — Tier A's `emit_self_call`, which emits a direct
@@ -3229,6 +3547,10 @@ const DIRECT_MISS_EVICTION_THRESHOLD: IcRotCursor = 32;
 const DIRECT_MISS_RECOMPILE_CAP: u8 = 4;
 /// Cross-entry retries per Tier O function (`evict_for_cross_retry`).
 const OPT_CROSS_RETRIES: u8 = 2;
+/// Cross-entry retries per Tier C function (`evict_for_cross_retry`).
+/// Prevents cascading recompile storms in large call graphs (TypeScript,
+/// Babel, Prettier) while still letting hot callers rebake once callees settle.
+const TIERC_CROSS_RETRIES: u8 = 2;
 /// Fallback calls at one compiled call site before its body is recompiled
 /// (`Jit::note_call_fallback`).
 const CALL_FALLBACK_RECOMPILE_THRESHOLD: u32 = 4096;
@@ -3580,7 +3902,18 @@ pub struct Jit {
     /// while doing something else. With `ZIPP_JIT_THRESHOLD=1` the same suite
     /// becomes a JIT gate at no authoring cost.
     threshold_override: u32,
-    counts: FxHashMap<u32, u32>,
+    /// Per-program large-program thresholds set by `set_large_program_thresholds`
+    /// (`0` = use `JIT_THRESHOLD` / `OSR_THRESHOLD`), overridden by
+    /// `threshold_override` when `ZIPP_JIT_THRESHOLD` is set.
+    large_fn_threshold: u32,
+    large_loop_threshold: u32,
+    /// Dense per-func_id call counts, parallel to `fn_state`. Replaces a
+    /// `FxHashMap` lookup+insert on every interpreted call before compile.
+    counts: Vec<u32>,
+    /// Dense per-func_id sticky flag: 1 once any OSR loop region has been
+    /// installed for `func_id`, letting back-edges skip `try_run_osr` hash
+    /// probes on functions that have no compiled loops.
+    fn_has_region: Vec<u8>,
     compiled: FxHashMap<u32, JitFn>,
     /// A non-recursive integer body's Tier A code, kept beside the Tier C body
     /// `compiled` holds for it (see `compile`): Tier A needs neither a frame
@@ -3602,7 +3935,7 @@ pub struct Jit {
     arith_fb: Vec<Option<Box<[u8]>>>,
     regions: FxHashMap<(u32, u32), Region>,
     /// B199: the JIT-facing live cross-entry table, parallel to
-    /// `cross_entries` — one 16-byte record per fid the emitted lanes read
+    /// `cross_entries` — one 32-byte record per fid the emitted lanes read
     /// THROUGH the VM on every call (`entry` null routes to the helper; a
     /// recompiled callee is picked up with no eviction). `mask_gen` bumps
     /// only when the callee's uninit mask CHANGES on a re-set, so the baked
@@ -3612,6 +3945,14 @@ pub struct Jit {
     /// Raw base of `cross_table`, re-derived through the VM per access and
     /// re-cached here on growth (the mirror discipline).
     pub(crate) cross_table_raw: u64,
+    /// Current length of `cross_table`, mirrored for `cross3_dyn_stub`'s
+    /// bounds check (which simultaneously rejects non-Func/Closure mirror fids
+    /// since every sentinel `FID_MIRROR_*` is >= `0x7FFF_FFFE`).
+    pub(crate) cross_table_len: u32,
+    /// Memoized `(cross_uninit_mask, wide_uninit_2words)` per `func_id`,
+    /// avoiding repeated dataflow fixpoint scans when multiple callers plan
+    /// speculative/static CROSS3 arms against the same callee.
+    cross_uninit_cache: std::cell::RefCell<FxHashMap<u32, (u64, Option<[u64; 2]>)>>,
     /// B199 retry: callers whose plan declined a site for "no entry yet",
     /// keyed by the missing callee. Drained at that callee's first
     /// `set_cross_entry`: the callers' compiled artifacts are parked and
@@ -3632,7 +3973,7 @@ pub struct Jit {
     /// baked a good lane, then the callee was evicted and recompiled with a
     /// different fill mask, bumping `mask_gen` and stranding that lane on the
     /// helper route for the rest of the run.
-    cross_baked: FxHashMap<u32, Vec<u32>>,
+    cross_baked: FxHashMap<u32, Vec<(u32, u32)>>,
     /// B199: deferrals spent per region key waiting on a missing callee
     /// entry — capped so a callee that never compiles (blacklisted) cannot
     /// keep a region interpreting forever.
@@ -3642,6 +3983,11 @@ pub struct Jit {
     region_global_defers: FxHashMap<(u32, u32), u8>,
     fn_global_defers: FxHashMap<u32, u8>,
     region_counts: FxHashMap<(u32, u32), u32>,
+    /// Direct-mapped 2048-slot writeback cache over `region_counts` for hot
+    /// non-runtime loop back-edges (`key = (func_id<<32)|entry_ip`, `u64::MAX`
+    /// = empty). Lazily allocated on first `record_region` so interpreter-only
+    /// VMs pay 0 bytes.
+    region_hot: Vec<(u64, u32)>,
     /// Dense per-function [`Jit::tierc_osr_state`].
     osr_state: Vec<u8>,
     /// Failed [`Jit::tierc_osr_settle`]s per function, toward
@@ -3731,6 +4077,8 @@ pub struct Jit {
     opt_bodies: rustc_hash::FxHashSet<u32>,
     /// Cross-entry retries each Tier O function has had (`OPT_CROSS_RETRIES`).
     opt_cross_retries: FxHashMap<u32, u8>,
+    /// Cross-entry retries each Tier C function has had (`TIERC_CROSS_RETRIES`).
+    tierc_cross_retries: FxHashMap<u32, u8>,
     /// Slow property reads per Tier O site, and replans per function
     /// (`Jit::opt_slow_read_due`, `opt_replan`).
     opt_slow_reads: FxHashMap<(u32, u32), u32>,
@@ -4084,7 +4432,7 @@ impl Jit {
         if *left == 0 {
             self.region_counts.remove(&key);
         }
-        if let Some(c) = self.counts.get_mut(&func_id) {
+        if let Some(c) = self.counts.get_mut(func_id as usize) {
             *c = JIT_THRESHOLD - step;
         }
         true
@@ -4132,11 +4480,30 @@ impl Jit {
         self.python_only
     }
 
+    /// Configure adaptive JIT compile thresholds for large JavaScript programs
+    /// (`>= 256` functions) so hot loops OSR-compile quickly while warm
+    /// straight-line helpers wait long enough to amortize Tier-C compile cost.
+    /// Small programs (`< 256` functions) keep `JIT_THRESHOLD` / `OSR_THRESHOLD`.
+    pub fn set_large_program_thresholds(&mut self, func_count: usize, is_python: bool, is_php: bool) {
+        if is_python || is_php || func_count < 256 {
+            self.large_fn_threshold = 0;
+            self.large_loop_threshold = 0;
+        } else if func_count < 1024 {
+            self.large_fn_threshold = 64;
+            self.large_loop_threshold = 32;
+        } else {
+            self.large_fn_threshold = 256;
+            self.large_loop_threshold = 128;
+        }
+    }
+
     /// Interpreter entries before a function is offered to the JIT.
     #[inline]
     fn fn_threshold(&self) -> u32 {
         if self.threshold_override != 0 {
             self.threshold_override
+        } else if self.large_fn_threshold != 0 {
+            self.large_fn_threshold
         } else {
             JIT_THRESHOLD
         }
@@ -4149,6 +4516,8 @@ impl Jit {
             self.threshold_override
         } else if self.python_program {
             PY_OSR_THRESHOLD
+        } else if self.large_loop_threshold != 0 {
+            self.large_loop_threshold
         } else {
             OSR_THRESHOLD
         }
@@ -4171,7 +4540,9 @@ impl Jit {
         self.fn_reg_region.clear();
         self.compiled.clear();
         self.counts.clear();
+        self.fn_has_region.clear();
         self.region_counts.clear();
+        self.region_hot.clear();
         // `region_dead` is deliberately KEPT: it mirrors `region_blacklist`
         // membership only (never compiled-ness), and the blacklist survives
         // this reset too. `fn_state` below cannot stay for the same reason in
@@ -4186,6 +4557,7 @@ impl Jit {
         // bodies; pre-B199 the global-epoch guard covered this resume).
         for r in self.cross_table.iter_mut() {
             r.entry = 0;
+            r.dyn_flags = 0;
         }
         self.cross_code_epoch = self.cross_code_epoch.wrapping_add(1);
         self.cross_wide_uninit.clear();
@@ -4204,6 +4576,12 @@ impl Jit {
     #[cfg(feature = "instrument")]
     pub fn metered(&self) -> bool {
         self.meter.is_some()
+    }
+
+    #[cfg(not(feature = "instrument"))]
+    #[inline]
+    pub fn metered(&self) -> bool {
+        false
     }
 
     /// Look up compiled native code for `func_id`, if any.
@@ -4258,13 +4636,56 @@ impl Jit {
         self.blacklist.contains(&func_id)
     }
 
+    #[inline]
+    fn clear_count(&mut self, func_id: u32) {
+        if let Some(c) = self.counts.get_mut(func_id as usize) {
+            *c = 0;
+        }
+    }
+
+    #[inline]
+    fn set_count(&mut self, func_id: u32, val: u32) {
+        let i = func_id as usize;
+        if self.counts.len() <= i {
+            self.counts.resize(i + 1, 0);
+        }
+        self.counts[i] = val;
+    }
+
+    #[inline(always)]
+    pub fn has_compiled_region(&self, func_id: u32) -> bool {
+        self.fn_has_region.get(func_id as usize).copied().unwrap_or(0) != 0
+    }
+
+    #[inline]
+    fn mark_has_region(&mut self, func_id: u32) {
+        let i = func_id as usize;
+        if self.fn_has_region.len() <= i {
+            self.fn_has_region.resize(i + 1, 0);
+        }
+        self.fn_has_region[i] = 1;
+    }
+
+    /// Reset any JIT state for a lazily-compiled function whose stub was just
+    /// replaced with its real bytecode.
+    pub fn forget_stub(&mut self, func_id: u32) {
+        self.blacklist.remove(&func_id);
+        self.clear_count(func_id);
+        self.set_fn_state(func_id, FN_COLD);
+    }
+
+    #[inline]
     pub fn record_and_should_compile(&mut self, func_id: u32) -> bool {
-        if self.compiled.contains_key(&func_id) || self.blacklist.contains(&func_id) {
+        if self.fn_state(func_id) != FN_COLD {
             return false;
         }
-        let c = self.counts.entry(func_id).or_insert(0);
-        *c += 1;
-        *c == self.fn_threshold()
+        let i = func_id as usize;
+        if self.counts.len() <= i {
+            self.counts.resize(i + 1, 0);
+        }
+        let c = self.counts[i].wrapping_add(1);
+        self.counts[i] = c;
+        c == self.fn_threshold()
     }
 
     /// Native entry + W7 window-fill mask for the cross-call fast path, or
@@ -4360,9 +4781,48 @@ impl Jit {
             .and_then(Option::as_deref)
     }
 
+    /// Memoized `(small_mask, wide_2words)` for `func_id` — computes the
+    /// may-read-before-write dataflow analysis at most once per function.
+    pub fn cached_cross_uninit(
+        &self,
+        func_id: u32,
+        proto: &FuncProto,
+    ) -> (u64, Option<[u64; 2]>) {
+        if let Some(&cached) = self.cross_uninit_cache.borrow().get(&func_id) {
+            return cached;
+        }
+        let small = if crosscall2_enabled() {
+            cross_uninit_mask(proto)
+        } else {
+            u64::MAX
+        };
+        let reg_count = proto.reg_count.max(1);
+        let wide = if reg_count > 64
+            && small == u64::MAX
+            && crosscall2_enabled()
+            && crosscall_wide_mask_enabled()
+            && cross3_wide_enabled()
+        {
+            cross_uninit_wide_mask(proto).and_then(|m| {
+                if m.len() == (reg_count as usize).div_ceil(64)
+                    && m.iter().skip(2).all(|&w| w == 0)
+                {
+                    Some([m.first().copied().unwrap_or(0), m.get(1).copied().unwrap_or(0)])
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+        self.cross_uninit_cache.borrow_mut().insert(func_id, (small, wide));
+        (small, wide)
+    }
+
     fn set_cross_entry(
         &mut self,
         func_id: u32,
+        proto: &FuncProto,
         entry: *const u8,
         uninit_mask: u64,
         wide_uninit_mask: Option<Box<[u64]>>,
@@ -4409,24 +4869,69 @@ impl Jit {
         if self.cross_table.len() <= i {
             self.cross_table.resize(i + 1, CrossEntryRec::default());
             self.cross_table_raw = self.cross_table.as_ptr() as u64;
+            self.cross_table_len = self.cross_table.len() as u32;
         }
         if prev_mask != uninit_mask || wide_changed {
             self.cross_table[i].mask_gen = self.cross_table[i].mask_gen.wrapping_add(1);
-            // B229: every lane baked against the OLD generation now guards
-            // false forever. Re-plan those callers — the B199 discipline:
-            // park the artifacts and let hotness re-trigger, no blacklists.
-            if let Some(callers) = self.cross_baked.remove(&func_id) {
-                for caller in callers {
-                    if caller != func_id {
-                        self.evict_for_cross_retry(caller);
+            let new_gen = self.cross_table[i].mask_gen;
+            // B229: every lane baked against an OLD generation now guards
+            // false forever. Re-plan ONLY those callers whose baked
+            // `expected_gen != new_gen`; callers that speculatively predicted
+            // `new_gen` stay live with zero eviction and remain tracked for
+            // any later bump.
+            let mut to_evict = Vec::new();
+            if let Some(callers) = self.cross_baked.get_mut(&func_id) {
+                callers.retain(|&(caller, expected_gen)| {
+                    if caller != func_id && expected_gen != new_gen {
+                        to_evict.push(caller);
+                        false
+                    } else {
+                        true
                     }
+                });
+                if callers.is_empty() {
+                    self.cross_baked.remove(&func_id);
                 }
+            }
+            for caller in to_evict {
+                self.evict_for_cross_retry(caller);
             }
         }
         // B272: a frame-backed entry is never visible to emitted lanes — they
         // read this slot natively and cannot push a frame — so it stays null
         // and every lane baked against the fid keeps routing to the helper.
         self.cross_table[i].entry = if needs_frame { 0 } else { entry as u64 };
+        let reg_count = proto.reg_count.max(1);
+        let dyn_ok = !needs_frame
+            && func_id < 0x0100_0000
+            && !proto.is_generator
+            && !proto.is_async
+            && proto.rest_reg.is_none()
+            && proto.arguments_reg.is_none()
+            && proto.eval_sites.is_empty()
+            && !has_py_ops(&proto.code)
+            && json_walk.is_none()
+            && markdown_inline.is_none()
+            && reg_count <= 64
+            && uninit_mask != u64::MAX
+            && proto.param_count <= 62
+            && (1 + proto.param_count as usize) <= reg_count as usize;
+        self.cross_table[i].dyn_flags = if dyn_ok {
+            CROSS_DYN_OK
+                | if proto.lexical_this {
+                    CROSS_DYN_ARROW
+                } else if proto.is_strict {
+                    CROSS_DYN_STRICT
+                } else {
+                    CROSS_DYN_SLOPPY
+                }
+        } else {
+            0
+        };
+        self.cross_table[i].uninit_mask = uninit_mask;
+        self.cross_table[i].reg_count = reg_count;
+        self.cross_table[i].param_count = proto.param_count;
+        self.cross_table[i].fid = func_id;
         self.cross_code_epoch = self.cross_code_epoch.wrapping_add(1);
         self.cross_parked.remove(&func_id);
         if let Some(callers) = self.cross_pending.remove(&func_id) {
@@ -4459,18 +4964,30 @@ impl Jit {
 
     /// B199 retry: record that `caller`'s plan declined sites because these
     /// `callees` had no cross entry yet. Bounded and deduplicated.
-    /// B229: record that `caller` baked a lane against each of `callees`.
-    pub fn note_cross_baked(&mut self, caller: u32, callees: &[u32]) {
+    /// B229: record that `caller` baked a lane against each `(callee, expected_gen)`.
+    /// Also ensures `cross_table` covers every baked callee fid so speculative
+    /// CROSS3 arms targeting not-yet-compiled callees always read in-bounds.
+    pub fn note_cross_baked(&mut self, caller: u32, callees: &[(u32, u32)]) {
+        if let Some(max_fid) = callees.iter().map(|&(fid, _)| fid).max() {
+            let need = max_fid as usize + 1;
+            if self.cross_table.len() < need {
+                self.cross_table.resize(need, CrossEntryRec::default());
+                self.cross_table_raw = self.cross_table.as_ptr() as u64;
+                self.cross_table_len = self.cross_table.len() as u32;
+            }
+        }
         if !cross_retry_enabled() || !cross_rebake_enabled() {
             return;
         }
-        for &callee in callees {
+        for &(callee, expected_gen) in callees {
             if callee == caller {
                 continue;
             }
             let v = self.cross_baked.entry(callee).or_default();
-            if v.len() < 16 && !v.contains(&caller) {
-                v.push(caller);
+            if let Some(entry) = v.iter_mut().find(|(c, _)| *c == caller) {
+                entry.1 = expected_gen;
+            } else if v.len() < 16 {
+                v.push((caller, expected_gen));
             }
         }
     }
@@ -4515,7 +5032,7 @@ impl Jit {
                 self.note_reg_region_removed(key.0, &r);
                 self.retired.push(r);
             }
-            self.region_counts.remove(&key);
+            self.clear_region_count(key.0, key.1);
         }
         // A Tier O body takes a callee's new cross entry into its emitted
         // call lanes too, but only twice: its other recompiles are its own.
@@ -4526,12 +5043,22 @@ impl Jit {
             }
             *n += 1;
         }
+        // Cap Tier C cross-entry retries as well (matching Tier O) so a caller
+        // with dozens of callees in a large program does not evict and cascade
+        // its own callers on every new callee compile.
+        if !self.opt_bodies.contains(&fid) && self.compiled.contains_key(&fid) {
+            let n = self.tierc_cross_retries.entry(fid).or_insert(0);
+            if *n >= TIERC_CROSS_RETRIES {
+                return;
+            }
+            *n += 1;
+        }
         if let Some(f) = self.compiled.remove(&fid) {
             if crate::jitlog_enabled() {
                 eprintln!("[cross] Tier C fn{fid} evicted for cross-entry retry");
             }
             self.retired_fns.push(f);
-            self.counts.remove(&fid);
+            self.clear_count(fid);
             self.set_fn_state(fid, FN_COLD);
             self.clear_cross_entry(fid);
             self.cross_parked.insert(fid);
@@ -4580,6 +5107,7 @@ impl Jit {
             // Null entry: dependent lanes route to the helper (graceful)
             // and RESUME when a same-mask recompile re-sets it.
             r.entry = 0;
+            r.dyn_flags = 0;
         }
         if let Some(p) = self.cross_entries.get_mut(func_id as usize) {
             // B207 (review): PRESERVE the recorded mask across the clear.
@@ -4805,7 +5333,7 @@ impl Jit {
                     return;
                 }
                 let mask = if needs_frame { u64::MAX } else { cross_uninit_mask(proto) };
-                self.set_cross_entry(func_id, entry, mask, None, None, None, needs_frame, false);
+                self.set_cross_entry(func_id, proto, entry, mask, None, None, None, needs_frame, false);
                 return;
             }
         }
@@ -4927,10 +5455,11 @@ impl Jit {
                     crate::vm::prof::pc::register(at, n, || format!("fn{func_id} int body"));
                     self.int_bodies.insert(func_id, a);
                 }
-                // An `arguments` body takes no cross entry, framed or not:
-                // only a call setup builds its arguments object, so every
-                // call reaches it through one and `try_run_jit`.
-                if proto.arguments_reg.is_some() {
+                // An `arguments` body (or a sloppy body reading legacy
+                // `f.arguments`/`f.caller`, which walk `Vm::frames`) takes no
+                // cross entry, framed or not: every call reaches it through a
+                // real frame setup and `try_run_jit`.
+                if proto.arguments_reg.is_some() || proto_reads_legacy_fn_props(proto) {
                     self.clear_cross_entry(func_id);
                     return;
                 }
@@ -4975,6 +5504,7 @@ impl Jit {
                 };
                 self.set_cross_entry(
                     func_id,
+                    proto,
                     entry,
                     uninit_mask,
                     wide_uninit_mask,
@@ -5143,6 +5673,7 @@ impl Jit {
         if v[i] == 0 {
             v[i] = REGION_DEAD;
         }
+        self.clear_region_count(func_id, entry_ip);
     }
 
     /// W9: `true` iff `func_id` owns at least one LIVE register-homed region.
@@ -5246,7 +5777,7 @@ impl Jit {
                 eprintln!("[jit] Tier C fn{func_id} EVICTED (yield: reg-homed region landed)");
             }
             self.retired_fns.push(f);
-            self.counts.remove(&func_id);
+            self.clear_count(func_id);
             self.set_fn_state(func_id, FN_COLD);
             self.clear_cross_entry(func_id);
             if self.self_cache.is_some_and(|(id, _)| id == func_id) {
@@ -5255,15 +5786,46 @@ impl Jit {
         }
     }
 
+    #[inline(always)]
+    fn region_hot_idx(func_id: u32, entry_ip: u32) -> usize {
+        ((func_id as usize).wrapping_mul(0x9E37_79B9) ^ entry_ip as usize) & 2047
+    }
+
+    #[inline]
+    fn clear_region_count(&mut self, func_id: u32, entry_ip: u32) {
+        self.region_counts.remove(&(func_id, entry_ip));
+        if !self.region_hot.is_empty() {
+            let k = ((func_id as u64) << 32) | entry_ip as u64;
+            let idx = Self::region_hot_idx(func_id, entry_ip);
+            if self.region_hot[idx].0 == k {
+                self.region_hot[idx] = (u64::MAX, 0);
+            }
+        }
+    }
+
     /// Count a back-edge to the loop headed at `entry_ip`. Returns `true` exactly
     /// once, when the count crosses `OSR_THRESHOLD` and the region is neither
     /// compiled nor blacklisted — the caller should then attempt `compile_region`.
+    #[inline(always)]
     pub fn record_region(&mut self, func_id: u32, entry_ip: u32) -> bool {
+        if self.dense_backedge && !self.region_hot.is_empty() {
+            let k = ((func_id as u64) << 32) | entry_ip as u64;
+            let idx = Self::region_hot_idx(func_id, entry_ip);
+            let slot = &mut self.region_hot[idx];
+            if slot.0 == k {
+                slot.1 += 1;
+                return slot.1 == self.loop_threshold();
+            }
+        }
+        self.record_region_slow(func_id, entry_ip)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn record_region_slow(&mut self, func_id: u32, entry_ip: u32) -> bool {
         let key = (func_id, entry_ip);
         // Called only after a `get_region` miss on the same back-edge, so
-        // `regions` cannot contain the key — only the blacklist gates. This
-        // keeps the per-back-edge cost of a permanently-rejected loop to one
-        // hash probe (plus the counter bump until it is blacklisted).
+        // `regions` cannot contain the key — only the blacklist gates.
         if self.region_blacklist.contains(&key) {
             return false;
         }
@@ -5279,7 +5841,30 @@ impl Jit {
             self.set_region_dead(func_id, entry_ip);
             return false;
         }
-        let threshold = if runtime & RUNTIME_CODE != 0 { RUNTIME_OSR_THRESHOLD } else { self.loop_threshold() };
+        let threshold = if runtime & RUNTIME_CODE != 0 {
+            RUNTIME_OSR_THRESHOLD
+        } else {
+            self.loop_threshold()
+        };
+        if runtime == 0 && self.dense_backedge {
+            if self.region_hot.is_empty() {
+                self.region_hot = vec![(u64::MAX, 0); 2048];
+            }
+            let k = ((func_id as u64) << 32) | entry_ip as u64;
+            let idx = Self::region_hot_idx(func_id, entry_ip);
+            let prev = self.region_hot[idx];
+            if prev.0 != u64::MAX && prev.0 != k {
+                self.region_counts
+                    .insert(((prev.0 >> 32) as u32, prev.0 as u32), prev.1);
+            }
+            let c = if prev.0 == k {
+                prev.1 + 1
+            } else {
+                self.region_counts.remove(&key).unwrap_or(0) + 1
+            };
+            self.region_hot[idx] = (k, c);
+            return c == threshold;
+        }
         let c = self.region_counts.entry(key).or_insert(0);
         *c += 1;
         *c == threshold
@@ -5303,8 +5888,8 @@ impl Jit {
     ///
     /// The sibling of [`Jit::region_defer`], and it was missing — see B65.
     pub fn compile_defer(&mut self, func_id: u32) {
-        if let Some(c) = self.counts.get_mut(&func_id) {
-            *c -= 1;
+        if let Some(c) = self.counts.get_mut(func_id as usize) {
+            *c = c.saturating_sub(1);
         }
     }
 
@@ -5313,6 +5898,14 @@ impl Jit {
     /// the body) but expects it to become safe — re-arm so a later back-edge
     /// re-trips the threshold and re-checks.
     pub fn region_defer(&mut self, func_id: u32, entry_ip: u32) {
+        if !self.region_hot.is_empty() {
+            let k = ((func_id as u64) << 32) | entry_ip as u64;
+            let idx = Self::region_hot_idx(func_id, entry_ip);
+            if self.region_hot[idx].0 == k {
+                self.region_hot[idx].1 = self.region_hot[idx].1.saturating_sub(1);
+                return;
+            }
+        }
         if let Some(c) = self.region_counts.get_mut(&(func_id, entry_ip)) {
             *c -= 1;
         }
@@ -5340,9 +5933,19 @@ impl Jit {
             }
             self.region_blacklist.insert(key);
             self.set_region_dead(func_id, entry_ip);
-            self.region_counts.remove(&key);
-        } else if let Some(c) = self.region_counts.get_mut(&key) {
-            *c = 0;
+            self.clear_region_count(func_id, entry_ip);
+        } else {
+            if !self.region_hot.is_empty() {
+                let k = ((func_id as u64) << 32) | entry_ip as u64;
+                let idx = Self::region_hot_idx(func_id, entry_ip);
+                if self.region_hot[idx].0 == k {
+                    self.region_hot[idx].1 = 0;
+                    return;
+                }
+            }
+            if let Some(c) = self.region_counts.get_mut(&key) {
+                *c = 0;
+            }
         }
     }
 
@@ -5359,8 +5962,8 @@ impl Jit {
             }
             self.blacklist.insert(func_id);
             self.set_fn_state(func_id, FN_DEAD);
-            self.counts.remove(&func_id);
-        } else if let Some(c) = self.counts.get_mut(&func_id) {
+            self.clear_count(func_id);
+        } else if let Some(c) = self.counts.get_mut(func_id as usize) {
             *c = 0;
         }
     }
@@ -5433,7 +6036,7 @@ impl Jit {
         if !self.region_int_blacklist.contains(&key)
             && local_sroa_enabled()
             && meter.is_none()
-            && crate::env_var_os("ZIPP_GC_STRESS").is_none()
+            && sroa_gc_stress_off()
         {
             if let Some(mut local) = plan_local_sroa(proto, start, end) {
                 if local_concat_len_enabled() {
@@ -5491,6 +6094,7 @@ impl Jit {
                             format!("fn{func_id} region [{start},{end}]")
                         });
                     }
+                    self.mark_has_region(func_id);
                     self.regions.insert(
                         key,
                         Region {
@@ -5568,6 +6172,7 @@ impl Jit {
                                 format!("fn{func_id} region [{start},{end}]")
                             });
                         }
+                        self.mark_has_region(func_id);
                         self.regions.insert(
                             key,
                             Region {
@@ -5642,6 +6247,7 @@ impl Jit {
                         format!("fn{func_id} region [{start},{end}]")
                     });
                 }
+                self.mark_has_region(func_id);
                 self.regions.insert(
                     key,
                     Region {
@@ -5716,6 +6322,7 @@ impl Jit {
                         format!("fn{func_id} region [{start},{end}]")
                     });
                 }
+                self.mark_has_region(func_id);
                 self.regions.insert(
                     key,
                     Region {
@@ -5821,7 +6428,7 @@ impl Jit {
                 if boxref_evicted {
                     self.region_boxref_blacklist.insert(key);
                 }
-                self.region_counts.remove(&key);
+                self.clear_region_count(key.0, key.1);
             } else {
                 self.region_blacklist.insert(key);
                 self.set_region_dead(key.0, key.1);
@@ -5857,7 +6464,7 @@ impl Jit {
                 self.retired.push(r);
             }
             self.region_int_blacklist.insert(key);
-            self.region_counts.remove(&key);
+            self.clear_region_count(key.0, key.1);
         }
     }
 
@@ -5991,7 +6598,11 @@ impl Jit {
                     );
                 }
                 self.retired_fns.push(f);
-                self.counts.remove(&m.func_id);
+                // Re-arm one short of `fn_threshold` (matching `evict_tier_c`)
+                // so a proven-hot function recompiles on its next call instead
+                // of suffering another full `fn_threshold` interpreted calls.
+                let rearm = self.fn_threshold().saturating_sub(1);
+                self.set_count(m.func_id, rearm);
                 self.set_fn_state(m.func_id, FN_COLD);
                 self.clear_cross_entry(m.func_id);
                 if self.self_cache.is_some_and(|(id, _)| id == m.func_id) {
@@ -6011,7 +6622,7 @@ impl Jit {
                 }
                 self.note_reg_region_removed(key.0, &r);
                 self.retired.push(r);
-                self.region_counts.remove(&key);
+                self.clear_region_count(key.0, key.1);
             }
         }
         AccWayGate::Recompile
@@ -6083,7 +6694,7 @@ impl Jit {
                 *self.direct_miss_recompiles.entry(owner).or_insert(0) += 1;
                 self.note_reg_region_removed(owner.0, &r);
                 self.retired.push(r);
-                self.region_counts.remove(&owner);
+                self.clear_region_count(owner.0, owner.1);
             }
             return DirectMissGate::Recompile;
         }
@@ -6134,7 +6745,11 @@ impl Jit {
                     );
                 }
                 self.retired_fns.push(f);
-                self.counts.remove(&m.func_id);
+                // Re-arm one short of `fn_threshold` (matching `evict_tier_c`)
+                // so a proven-hot function recompiles on its next call instead
+                // of suffering another full `fn_threshold` interpreted calls.
+                let rearm = self.fn_threshold().saturating_sub(1);
+                self.set_count(m.func_id, rearm);
                 self.set_fn_state(m.func_id, FN_COLD);
                 self.clear_cross_entry(m.func_id);
                 if self.self_cache.is_some_and(|(id, _)| id == m.func_id) {
@@ -6152,10 +6767,19 @@ impl Jit {
                 }
                 self.note_reg_region_removed(key.0, &r);
                 self.retired.push(r);
-                self.region_counts.remove(&key);
+                self.clear_region_count(key.0, key.1);
             }
         }
         DirectMissGate::Recompile
+    }
+
+    /// Pre-seed a polymorphic own-data property op `(func_id, op_ip)` into
+    /// `direct_miss_sites` BEFORE its first Tier-C compile so polymorphic AST
+    /// sites emit the 32-shape direct probe immediately instead of compiling
+    /// an 8-way identity probe and paying a `direct-miss site gate` eviction.
+    #[inline]
+    pub fn preseed_direct_miss_site(&mut self, func_id: u32, op_ip: u32) {
+        self.direct_miss_sites.insert((func_id, op_ip));
     }
 
     /// A call at `(func_id, ip)` in a compiled body reached the site's
@@ -6234,7 +6858,7 @@ impl Jit {
         // `makeOrders`, once a round) would otherwise run interpreted, or in
         // an OSR region, for the rest of the program.
         let rearm = self.fn_threshold().saturating_sub(1);
-        self.counts.insert(func_id, rearm);
+        self.set_count(func_id, rearm);
         self.set_fn_state(func_id, FN_COLD);
         self.clear_cross_entry(func_id);
         if self.self_cache.is_some_and(|(id, _)| id == func_id) {
@@ -6333,7 +6957,7 @@ impl Jit {
     /// packing never coexists with identity fields.
     pub fn fill_shape_pair(&mut self, site: u32, shape: u32, slot: u32) {
         const PAIR_OFFS: [(usize, usize); 4] = [(0, 20), (8, 16), (24, 32), (40, 48)];
-        if slot > 0x00FF_FFFF || shape == crate::shape::DICT {
+        if (slot > 0x00FF_FFFF && slot != SHAPE_PAIR_ABSENT_SLOT) || shape == crate::shape::DICT {
             return;
         }
         let pat = (1u64 << 32) | shape as u64;
@@ -6360,6 +6984,21 @@ impl Jit {
             bytes[off + po..off + po + 8].copy_from_slice(&pat.to_le_bytes());
             bytes[off + so..off + so + 4].copy_from_slice(&slot.to_le_bytes());
         };
+        // Once all 32 shape-pair slots are saturated (slot (7, 3) non-zero),
+        // avoid rescanning and dirtying the 32-way IC on every single miss at
+        // megamorphic AST sites (>32 shapes); rotate 1-in-16 misses so phase
+        // changes still adapt without thrashing the hottest 32 shapes.
+        if read_pat(bytes, JIT_IC_WAYS - 1, 3) != 0 {
+            let r = &mut self.ic_rot[site as usize];
+            let cur_r = *r;
+            *r = cur_r.wrapping_add(1);
+            if cur_r & 15 != 0 {
+                return;
+            }
+            let n = (cur_r >> 4) as usize % (JIT_IC_WAYS * 4);
+            write_pair(bytes, n / 4, n % 4, pat, slot);
+            return;
+        }
         let mut free: Option<(usize, usize)> = None;
         for w in 0..JIT_IC_WAYS {
             for k in 0..4 {
@@ -6529,7 +7168,7 @@ impl Jit {
             ("ic_table_bytes", (self.ic_table.capacity() * std::mem::size_of::<IcEntry>()) as u64),
             ("ic_site_meta_bytes", (self.ic_site_meta.capacity() * std::mem::size_of::<IcSiteMeta>()) as u64),
             ("ic_entry_size", std::mem::size_of::<IcEntry>() as u64),
-            ("call_counters", self.counts.len() as u64),
+            ("call_counters", self.counts.iter().filter(|&&c| c != 0).count() as u64),
             ("blacklisted_functions", self.blacklist.len() as u64),
         ]
     }

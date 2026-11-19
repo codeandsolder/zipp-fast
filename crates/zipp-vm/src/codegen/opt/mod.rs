@@ -423,7 +423,7 @@ impl super::Jit {
         }
         self.retired_fns.push(f);
         let rearm = self.fn_threshold().saturating_sub(1);
-        self.counts.insert(func_id, rearm);
+        self.set_count(func_id, rearm);
         self.set_fn_state(func_id, super::FN_COLD);
         self.clear_cross_entry(func_id);
         if self.self_cache.is_some_and(|(id, _)| id == func_id) {
@@ -517,7 +517,7 @@ impl super::Jit {
         self.retired_fns.push(f);
         self.opt_gen.remove(&func_id);
         let rearm = self.fn_threshold().saturating_sub(1);
-        self.counts.insert(func_id, rearm);
+        self.set_count(func_id, rearm);
         self.set_fn_state(func_id, super::FN_COLD);
         self.clear_cross_entry(func_id);
         if self.self_cache.is_some_and(|(id, _)| id == func_id) {

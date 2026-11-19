@@ -33,7 +33,7 @@ use super::*;
 /// ordering is what the W16 audit removed, so the twins here, in
 /// `emit_int_entry_load_gpr` and in `emit_bool_entry_load` now all agree.
 pub(crate) fn emit_int_entry_load(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     home: u8,
     entry_bail: dynasmrt::DynamicLabel,
 ) {
@@ -81,7 +81,7 @@ pub(crate) fn emit_int_entry_load(
 /// `r10` — `r10` is itself one of `BOOL_GPRS`, so using it here would clobber an
 /// already-loaded bool home on the next iteration of the load loop.
 pub(crate) fn emit_bool_entry_load(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     home: u8,
     bail: dynasmrt::DynamicLabel,
 ) {
@@ -99,7 +99,7 @@ pub(crate) fn emit_bool_entry_load(
 /// the FULL sign-extended i64 immediate, then `movq` (NOT cvtsi2sd — we want the
 /// integer bit pattern, not its f64 form).
 pub(crate) fn emit_int_const(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     plan: &RegionPlan,
     instr: &Instr,
     proto: &FuncProto,
@@ -122,7 +122,7 @@ pub(crate) fn emit_int_const(
 /// exactly JS's rounded result, so ip+1 is sound), or the caller's replay point
 /// when this op came from a spliced body.
 pub(crate) fn emit_i53_guard(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     h: u8,
     resume_ip: i32,
     flush_exit: dynasmrt::DynamicLabel,
@@ -175,7 +175,7 @@ pub(crate) fn copy_clobber(lc: &mut LastCopy, h: u8) {
 /// always in range). `add = true` ⇒ paddq (commutative); else psubq.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_ibin(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     plan: &RegionPlan,
     ip: usize,
     resume_ip: i32,
@@ -253,7 +253,7 @@ pub(crate) fn wt_def_at(proto: &FuncProto, plan: &RegionPlan, ip: usize) -> Opti
 /// instruction at an ip; the per-arm callers pass a def that cannot be a
 /// receiver `LoadGlobal` (they are arms of other ops).
 pub(crate) fn emit_int_wt(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     plan: &RegionPlan,
     dst: u16,
     known_i32: bool,
@@ -283,7 +283,7 @@ pub(crate) fn emit_int_wt(
 /// its prologue-filled gpr mirror when it is a hoisted constant (one `movq`
 /// fewer in the loop body); symmetric for a constant `a`.
 pub(crate) fn emit_icmp_flags(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     plan: &RegionPlan,
     a: u16,
     b: u16,
@@ -302,7 +302,7 @@ pub(crate) fn emit_icmp_flags(
 
 /// `bool_home[dst] = (home[a] <cmp> home[b])` as SIGNED i64 comparison.
 pub(crate) fn emit_icmp(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     plan: &RegionPlan,
     dst: u16,
     a: u16,
@@ -325,7 +325,7 @@ pub(crate) fn emit_icmp(
 /// Box the i64 in xmm home `h` into a Value, leaving the bits in `rax`: Int-tag
 /// if it fits i32 (low 32 masked in), else a double via `cvtsi2sd` (exact since
 /// |x| ≤ 2^53, enforced by the per-op guard). Used by flush_exit.
-pub(crate) fn emit_int_box_from_home(ops: &mut dynasmrt::x64::Assembler, h: u8) {
+pub(crate) fn emit_int_box_from_home(ops: &mut crate::codegen::X64Asm, h: u8) {
     dynasm!(ops ; movq rax, Rx(h));
     emit_int_box_rax(ops);
 }
@@ -334,7 +334,7 @@ pub(crate) fn emit_int_box_from_home(ops: &mut dynasmrt::x64::Assembler, h: u8) 
 /// [`emit_int_box_from_home`], split out (B192) so the GPR tier's
 /// completion-reg write-through can box from a GPR/spill source too.
 /// Scratch: rcx/rdx/xmm0; clobbers FLAGS.
-pub(crate) fn emit_int_box_rax(ops: &mut dynasmrt::x64::Assembler) {
+pub(crate) fn emit_int_box_rax(ops: &mut crate::codegen::X64Asm) {
     let big = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
     dynasm!(ops
@@ -358,7 +358,7 @@ pub(crate) fn emit_int_box_rax(ops: &mut dynasmrt::x64::Assembler) {
 /// and `ret`. `frame` is the post-prologue rsp adjustment to undo (`160` for the
 /// legacy layout, `200 + 32·n_ta` for the pinned-TypedArray layout whose snapshot
 /// slots sit below the xmm saves).
-pub(crate) fn emit_region_restore_n(ops: &mut dynasmrt::x64::Assembler, xmm_off: i32, frame: i32) {
+pub(crate) fn emit_region_restore_n(ops: &mut crate::codegen::X64Asm, xmm_off: i32, frame: i32) {
     for k in 0..10u32 {
         let xi = 6 + k as u8;
         dynasm!(ops ; movdqu Rx(xi), [rsp + xmm_off + (k as i32) * 16]);
@@ -378,7 +378,7 @@ pub(crate) fn emit_region_restore_n(ops: &mut dynasmrt::x64::Assembler, xmm_off:
 /// Materialise a numeric constant (a `LoadInt`/`LoadConst` op) into a value's
 /// xmm home. Shared by the prologue (for hoisted loop-invariants) and the body.
 pub(crate) fn emit_load_const(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     plan: &RegionPlan,
     instr: &Instr,
     proto: &FuncProto,
@@ -416,7 +416,7 @@ pub(crate) fn emit_load_const(
 /// rdx is dead at all three call sites: the two prologue loads take their Value
 /// from rax, and the body's element load has already consumed the pinned base.
 pub(crate) fn emit_box_to_home(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     home: u8,
     bail: dynasmrt::DynamicLabel,
 ) {
@@ -470,7 +470,7 @@ pub(crate) fn home(plan: &RegionPlan, r: u16) -> Home {
 
 /// Emit a register-to-register f64 binop into the dst home, handling aliasing.
 pub(crate) fn emit_dbin(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     plan: &RegionPlan,
     dst: u16,
     a: u16,
@@ -501,7 +501,7 @@ pub(crate) fn emit_dbin(
 }
 
 /// `xmm[d] <op>= xmm[src]`.
-pub(crate) fn emit_dop(ops: &mut dynasmrt::x64::Assembler, d: u8, src: u8, op: DOp) {
+pub(crate) fn emit_dop(ops: &mut crate::codegen::X64Asm, d: u8, src: u8, op: DOp) {
     match op {
         DOp::Add => dynasm!(ops ; addsd Rx(d), Rx(src)),
         DOp::Sub => dynasm!(ops ; subsd Rx(d), Rx(src)),
@@ -510,7 +510,7 @@ pub(crate) fn emit_dop(ops: &mut dynasmrt::x64::Assembler, d: u8, src: u8, op: D
     }
 }
 /// `xmm0 <op>= xmm[src]`.
-pub(crate) fn emit_dop_xmm0(ops: &mut dynasmrt::x64::Assembler, src: u8, op: DOp) {
+pub(crate) fn emit_dop_xmm0(ops: &mut crate::codegen::X64Asm, src: u8, op: DOp) {
     match op {
         DOp::Add => dynasm!(ops ; addsd xmm0, Rx(src)),
         DOp::Sub => dynasm!(ops ; subsd xmm0, Rx(src)),
@@ -521,7 +521,7 @@ pub(crate) fn emit_dop_xmm0(ops: &mut dynasmrt::x64::Assembler, src: u8, op: DOp
 
 /// Emit `bool_home[dst] = (a <cmp> b)` using f64 ordered comparison.
 pub(crate) fn emit_dcmp(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     plan: &RegionPlan,
     dst: u16,
     a: u16,
@@ -576,7 +576,7 @@ pub(crate) enum IcProbe {
 /// the array never shrinks).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_acc_lane(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     lane: &'static AccLane,
     obj: u16,
     get_dst: Option<u16>,
@@ -719,7 +719,7 @@ pub(crate) fn emit_acc_lane(
 /// to `slow`: the helper. Scratch: rax, rcx, r8, r10.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_priv_lane(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     lane: &PrivLane,
     l: &PrivLayout,
     obj: u16,
@@ -813,7 +813,7 @@ pub(crate) fn emit_priv_lane(
 /// `slot_nhops`, was once absent from one of them, and an unmasked count there
 /// is a store at `vals + nhops*2^24*8`. A wild write, not a wrong read.
 pub(crate) fn emit_ic_probe(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     probe_kind: IcProbe,
     obj: u16,
     ic_off: i32,
@@ -913,8 +913,11 @@ pub(crate) fn emit_ic_probe(
             // nothing re-derives a pinned copy.
             let ways = ops.new_dynamic_label();
             let hit = ops.new_dynamic_label();
+            let hit_absent = ops.new_dynamic_label();
+            let absent_ok = ops.new_dynamic_label();
             let skip = ops.new_dynamic_label();
             let hot_off = crate::vm::host_api::JIT_HOT_MIRROR_RAW_OFFSET as i32;
+            let hot_fid = crate::vm::host_api::JIT_HOT_FID_OFF as i32;
             let hot_vals = crate::vm::host_api::JIT_HOT_VALS_OFF as i32;
             let IcProbe::Get { dst } = probe_kind else {
                 unreachable!()
@@ -951,11 +954,35 @@ pub(crate) fn emit_ic_probe(
                 ; jnz => ways
                 ; jmp => skip
                 ; => hit
+                ; test edx, edx
+                ; js => hit_absent                    // SHAPE_PAIR_ABSENT_SLOT (bit 31)
                 ; mov r10, [rdi + hot_off]
                 ; lea r10, [r10 + rcx*8]              // hot base + idx*8
                 ; mov rcx, [r10 + rcx*8 + hot_vals]   // live vals base (idx*16 + 8)
                 ; and edx, 0x00FF_FFFF                // slot (low 24)
                 ; mov rax, [rcx + rdx*8]              // vals[slot] (CALL-FREE)
+                ; mov [rbx + dreg(dst)], rax
+                ; jmp => cont
+                ; => hit_absent
+                ; mov r10, [rdi + hot_off]
+                ; lea r10, [r10 + rcx*8]
+                ; cmp DWORD [r10 + rcx*8 + hot_fid], crate::heap::FID_MIRROR_NONE as i32
+                ; jne => skip
+                ; mov r10d, DWORD [rdi + crate::vm::host_api::JIT_OBJ_PROTO_IDX_OFFSET as i32]
+                ; mov r11d, DWORD [r13 + r10*4]
+                ; cmp r11d, DWORD [rdi + crate::vm::host_api::JIT_OBJ_PROTO_SETUP_VER_OFFSET as i32]
+                ; jne => skip
+                ; cmp rcx, [rdi + crate::vm::host_api::JIT_PROTO_LEN_OFFSET as i32]
+                ; jae => absent_ok
+                ; mov r10, [rdi + crate::vm::host_api::JIT_PROTO_RAW_OFFSET as i32]
+                ; mov r10, [r10 + rcx*8]
+                ; test r10, r10
+                ; jz => absent_ok
+                ; shr r10, 48
+                ; cmp r10d, 0x7FFD                    // custom heap proto => miss; null proto => absent_ok
+                ; je => skip
+                ; => absent_ok
+                ; mov rax, QWORD crate::value::Value::UNDEFINED.bits() as i64
                 ; mov [rbx + dreg(dst)], rax
                 ; jmp => cont
                 ; => skip
@@ -1100,7 +1127,7 @@ env_off_switch!(
 );
 
 pub(crate) fn emit_refetch_pinned(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     versions_base: usize,
     ic_base: Option<usize>,
 ) {
@@ -1171,7 +1198,7 @@ pub(crate) fn emit_refetch_pinned(
 /// The split-receiver arm's code was already exactly this; both arms now share
 /// it. Cost: two L1-resident `mov`s per executed receiver load — see the wave
 /// report for the measurement.
-pub(crate) fn emit_recv_slot_store(ops: &mut dynasmrt::x64::Assembler, dst: u16, idx: u32) {
+pub(crate) fn emit_recv_slot_store(ops: &mut crate::codegen::X64Asm, dst: u16, idx: u32) {
     dynasm!(ops
         ; mov rax, [r12 + (idx as i32) * 8]
         ; mov [rbx + dreg(dst)], rax
@@ -1220,7 +1247,7 @@ pub(crate) fn ta_slot_off(j: usize) -> i32 {
 /// (which may detach/resize a buffer or reassign the source) — the same
 /// discipline as the r13/r14 re-fetch. Clobbers only volatile registers.
 pub(crate) fn emit_refetch_ta(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     snapshot_helper: usize,
     plan: &TaPinPlan,
 ) {
@@ -1247,7 +1274,7 @@ pub(crate) fn emit_refetch_ta(
 /// check (len < 2^31, so any negative i64 compares above it).
 /// Clobbers rcx/r10/xmm0/xmm1.
 pub(crate) fn emit_ta_key(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     key: u16,
     bail: dynasmrt::DynamicLabel,
 ) {
@@ -1277,7 +1304,7 @@ pub(crate) fn emit_ta_key(
 
 /// Box the u32 in `eax` into `regs[dst]`: Int when it fits i32 (mirrors
 /// `Value::num`'s narrowing), else the exact double (the `>>>` boxing pattern).
-pub(crate) fn emit_box_u32(ops: &mut dynasmrt::x64::Assembler, dst: u16) {
+pub(crate) fn emit_box_u32(ops: &mut crate::codegen::X64Asm, dst: u16) {
     let as_dbl = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
     dynasm!(ops
@@ -1303,7 +1330,7 @@ pub(crate) fn emit_box_u32(ops: &mut dynasmrt::x64::Assembler, dst: u16) {
 /// `MathOp` results, whose interpreter arm stores `Value::num(r)` — so a
 /// `Math.floor(x)===3` downstream bits-compare against Int(3) matches.
 /// Clobbers rax/rcx/r10/xmm1.
-pub(crate) fn emit_box_num(ops: &mut dynasmrt::x64::Assembler, dst: u16) {
+pub(crate) fn emit_box_num(ops: &mut crate::codegen::X64Asm, dst: u16) {
     let as_dbl = ops.new_dynamic_label();
     let store_int = ops.new_dynamic_label();
     let canon = ops.new_dynamic_label();
@@ -1347,7 +1374,7 @@ pub(crate) fn emit_box_num(ops: &mut dynasmrt::x64::Assembler, dst: u16) {
 /// Box the double in `xmm0` into `regs[dst]`, CANONICALISING any NaN — raw
 /// TypedArray/DataView bytes could otherwise alias a NaN-box tag (heap-index
 /// forgery). Not int-narrowed (the f64 mem tier's established representation).
-pub(crate) fn emit_box_f64_canon(ops: &mut dynasmrt::x64::Assembler, dst: u16) {
+pub(crate) fn emit_box_f64_canon(ops: &mut crate::codegen::X64Asm, dst: u16) {
     let canon = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
     dynasm!(ops

@@ -931,7 +931,7 @@ fn dst_reg(l: Loc) -> u8 {
 /// Park a staged (rax) dst into its spill slot; emits NOTHING for a resident
 /// home — which is what keeps every resident-only arm byte-identical. A plain
 /// mov, so compare flags survive.
-fn store_dst(ops: &mut dynasmrt::x64::Assembler, l: Loc) {
+fn store_dst(ops: &mut crate::codegen::X64Asm, l: Loc) {
     if let Loc::S(d) = l {
         dynasm!(ops ; mov [rsp + d], rax);
     }
@@ -2124,7 +2124,7 @@ fn lazy_sx_sets(
 /// path is i32 by construction). A wider value takes `entry_bail` — nothing
 /// has been computed, so resuming the header interpreted is always sound.
 fn emit_int_entry_load_gpr(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     home: Loc,
     entry_bail: dynasmrt::DynamicLabel,
     strict_i32: bool,
@@ -2183,7 +2183,7 @@ fn emit_int_entry_load_gpr(
 /// Box the canonical i64 in `rax` into a Value in `rax` (Int if it fits i32,
 /// else a double — exact, |x| ≤ 2^53). The core [`emit_int_box_from_loc`]
 /// wraps with the home load.
-fn emit_int_box_from_rax(ops: &mut dynasmrt::x64::Assembler) {
+fn emit_int_box_from_rax(ops: &mut crate::codegen::X64Asm) {
     let big = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
     dynasm!(ops
@@ -2207,7 +2207,7 @@ fn emit_int_box_from_rax(ops: &mut dynasmrt::x64::Assembler) {
 /// GPR (the pre-W10.3 `emit_int_box_from_gpr`, byte-identical), a spilled home
 /// from its slot (canonical by the slot invariant). The GPR twin of
 /// `emit_int_box_from_home`.
-fn emit_int_box_from_loc(ops: &mut dynasmrt::x64::Assembler, l: Loc) {
+fn emit_int_box_from_loc(ops: &mut crate::codegen::X64Asm, l: Loc) {
     match l {
         Loc::R(h) => dynasm!(ops ; mov rax, Rq(h)),
         Loc::S(d) => dynasm!(ops ; mov rax, [rsp + d]),
@@ -2225,7 +2225,7 @@ fn emit_int_box_from_loc(ops: &mut dynasmrt::x64::Assembler, l: Loc) {
 /// Both candidates are computed, `cmove` selects. A lazy source
 /// canonicalizes on the load. Scratch: rax/rcx/rdx/xmm0; clobbers FLAGS.
 fn emit_int_box_branchless_from_loc(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     l: Loc,
     lazy: &FxHashSet<u8>,
 ) {
@@ -2246,7 +2246,7 @@ fn emit_int_box_branchless_from_loc(
 /// a later numeric definition replaces the whole qword before it can be read.
 /// A dword mov preserves FLAGS, which matters for a receiver LoadGlobal between
 /// a fused compare and branch.
-fn emit_gpr_deopt_shadow_empty(ops: &mut dynasmrt::x64::Assembler, slot: i32) {
+fn emit_gpr_deopt_shadow_empty(ops: &mut crate::codegen::X64Asm, slot: i32) {
     dynasm!(ops ; mov DWORD [rsp + slot + 4], GPR_DEOPT_SHADOW_EMPTY_HI);
 }
 
@@ -2255,7 +2255,7 @@ fn emit_gpr_deopt_shadow_empty(ops: &mut dynasmrt::x64::Assembler, slot: i32) {
 /// non-lazy by `lazy_sx_sets`, but narrowed globals can share a lazy home.
 /// Plain mov/movsxd instructions preserve FLAGS.
 fn emit_gpr_deopt_shadow_store(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     src: Loc,
     slot: i32,
     lazy: &FxHashSet<u8>,
@@ -2279,7 +2279,7 @@ enum GprDeoptShadowDst {
 /// reaches it. The high-dword test is collision-free by the planner's domain
 /// proof above.
 fn emit_gpr_deopt_shadow_flush(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     slot: i32,
     dst: GprDeoptShadowDst,
 ) {
@@ -2311,7 +2311,7 @@ fn emit_gpr_deopt_shadow_flush(
 /// emitted. The caller drops live compare-flag fusion only for the incumbent
 /// boxing path; a raw shadow copy preserves FLAGS.
 fn emit_int_wt_gpr(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     plan: &RegionPlan,
     map: &FxHashMap<u8, Loc>,
     shadow: &GprDeoptShadow,
@@ -2362,7 +2362,7 @@ fn emit_int_wt_gpr(
 
 /// `*resume_ip = v` — through the frame slot that replaced the rsi pointer
 /// (rsi is a numeric home in this mode). rax is dead at every call site.
-fn emit_store_ip(ops: &mut dynasmrt::x64::Assembler, ip_slot: i32, v: i32) {
+fn emit_store_ip(ops: &mut crate::codegen::X64Asm, ip_slot: i32, v: i32) {
     dynasm!(ops ; mov rax, [rsp + ip_slot] ; mov DWORD [rax], v);
 }
 
@@ -2374,7 +2374,7 @@ fn emit_store_ip(ops: &mut dynasmrt::x64::Assembler, ip_slot: i32, v: i32) {
 /// to `bail`). Otherwise returns the label [`emit_mul_negzero_sign`] must
 /// define, reached only on a zero product — off the hot path.
 fn emit_mul_negzero_check(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     b: Src,
     bail: dynasmrt::DynamicLabel,
 ) -> Option<dynasmrt::DynamicLabel> {
@@ -2397,7 +2397,7 @@ fn emit_mul_negzero_check(
 /// non-negative and falls through (to the caller's bail) otherwise. rcx is
 /// scratch; a register `b` was canonicalized in place before the multiply.
 fn emit_mul_negzero_sign(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     a: Src,
     b: Src,
     lazy: &FxHashSet<u8>,
@@ -2417,7 +2417,7 @@ fn emit_mul_negzero_sign(
 /// With `inline` the two constants come as movabs immediates instead — used
 /// when r13/r14 were handed out as homes to make the region fit.
 fn emit_i53_guard_gpr(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     h: Loc,
     resume_ip: i32,
     ip_slot: i32,
@@ -2454,7 +2454,7 @@ fn emit_i53_guard_gpr(
 
 /// Load operand `s` into 64-bit scratch `Rq(scratch)` (imm sign-extends, the
 /// same i64 the home would hold). For arms with no better imm form.
-fn emit_src64(ops: &mut dynasmrt::x64::Assembler, s: Src, scratch: u8) {
+fn emit_src64(ops: &mut crate::codegen::X64Asm, s: Src, scratch: u8) {
     match s {
         Src::R(h) => {
             if h != scratch {
@@ -2472,7 +2472,7 @@ fn emit_src64(ops: &mut dynasmrt::x64::Assembler, s: Src, scratch: u8) {
 /// `movsxd` is exact under either representation — and a plain no-op when the
 /// home is already sign-extended. Emits nothing for a non-lazy home (those
 /// are canonical at all times). Never touches flags.
-fn emit_canon_home(ops: &mut dynasmrt::x64::Assembler, h: u8, lazy: &FxHashSet<u8>) {
+fn emit_canon_home(ops: &mut crate::codegen::X64Asm, h: u8, lazy: &FxHashSet<u8>) {
     if lazy.contains(&h) {
         dynasm!(ops ; movsxd Rq(h), Rd(h));
     }
@@ -2481,7 +2481,7 @@ fn emit_canon_home(ops: &mut dynasmrt::x64::Assembler, h: u8, lazy: &FxHashSet<u
 /// [`emit_src64`] with W8 lazy-home awareness: a lazy source loads through
 /// `movsxd` (same cost as the plain mov) so the scratch holds the canonical
 /// i64 the consumer expects. The home itself is left untouched.
-fn emit_src64_canon(ops: &mut dynasmrt::x64::Assembler, s: Src, scratch: u8, lazy: &FxHashSet<u8>) {
+fn emit_src64_canon(ops: &mut crate::codegen::X64Asm, s: Src, scratch: u8, lazy: &FxHashSet<u8>) {
     match s {
         Src::R(h) if lazy.contains(&h) => dynasm!(ops ; movsxd Rq(scratch), Rd(h)),
         _ => emit_src64(ops, s, scratch),
@@ -2494,7 +2494,7 @@ fn emit_src64_canon(ops: &mut dynasmrt::x64::Assembler, s: Src, scratch: u8, laz
 /// sign-extend — that includes copies into a split/write-through home, whose
 /// per-def boxing reads the full canonical i64. The caller handles the
 /// `sg == d` nothing-to-emit case (it also preserves compare flags there).
-fn emit_home_copy(ops: &mut dynasmrt::x64::Assembler, d: u8, s: Src, lazy: &FxHashSet<u8>) {
+fn emit_home_copy(ops: &mut crate::codegen::X64Asm, d: u8, s: Src, lazy: &FxHashSet<u8>) {
     match s {
         Src::R(sg) if lazy.contains(&sg) && !lazy.contains(&d) => {
             dynasm!(ops ; movsxd Rq(d), Rd(sg));
@@ -2510,7 +2510,7 @@ fn emit_home_copy(ops: &mut dynasmrt::x64::Assembler, d: u8, s: Src, lazy: &FxHa
 /// immediate stores directly (`mov r/m64, imm32` sign-extends). All plain
 /// movs: compare flags survive. The caller handles the same-location
 /// nothing-to-emit case.
-fn emit_loc_copy(ops: &mut dynasmrt::x64::Assembler, d: Loc, s: Src, lazy: &FxHashSet<u8>) {
+fn emit_loc_copy(ops: &mut crate::codegen::X64Asm, d: Loc, s: Src, lazy: &FxHashSet<u8>) {
     match d {
         Loc::R(dg) => emit_home_copy(ops, dg, s, lazy),
         Loc::S(dd) => match s {
@@ -2586,7 +2586,10 @@ pub(crate) fn compile_region_int_gpr(
     // from symbolic home colours to the existing GPR allocator.  The global
     // spill kill switch still disables both uses, and the computed lane's own
     // switch prevents this branch from existing at all.
-    let spills_not_forced_off = crate::env_var_os("ZIPP_NO_GPR_SPILL_SLOTS").is_none();
+    let spills_not_forced_off = {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| crate::env_var_os("ZIPP_NO_GPR_SPILL_SLOTS").is_none())
+    };
     let computed_spill = !entry.computed_guards.is_empty() && spills_not_forced_off;
     // Spec-order member calls add a captured callee prefix and can turn an
     // otherwise seven-home DV loop into a graph-colouring shape that needs one
@@ -2738,13 +2741,7 @@ pub(crate) fn compile_region_int_gpr(
         }
     }
 
-    let mut ops = match dynasmrt::x64::Assembler::new() {
-        Ok(a) => a,
-        Err(_) => {
-            decline_emit("int-gpr-emit: assembler alloc failed");
-            return GprAttempt::OutOfScope;
-        }
-    };
+    let mut ops = crate::codegen::new_x64_asm();
     let in_region: Vec<_> = (s..=e).map(|_| ops.new_dynamic_label()).collect();
     let mut exit_stubs: FxHashMap<u32, dynasmrt::DynamicLabel> = FxHashMap::default();
     let flush_exit = ops.new_dynamic_label();
@@ -4417,9 +4414,9 @@ pub(crate) fn compile_region_int_gpr(
     emit_store_ip(&mut ops, ip_slot, rip(s));
     emit_gpr_region_restore(&mut ops, frame);
 
-    let buf = match ops.finalize() {
-        Ok(b) => b,
-        Err(_) => {
+    let buf = match crate::codegen::finalize_code(ops) {
+        Some(b) => b,
+        None => {
             decline_emit("int-gpr-emit: assembler finalize failed");
             return GprAttempt::OutOfScope;
         }
@@ -4450,7 +4447,7 @@ pub(crate) fn compile_region_int_gpr(
 /// immediate sign-extends, exactly the i64 the home would hold). W8: lazy
 /// operand homes are canonicalized in place first (movsxd never touches
 /// flags, and the fix precedes the cmp anyway).
-fn emit_icmp_flags_gpr(ops: &mut dynasmrt::x64::Assembler, a: Src, b: Src, lazy: &FxHashSet<u8>) {
+fn emit_icmp_flags_gpr(ops: &mut crate::codegen::X64Asm, a: Src, b: Src, lazy: &FxHashSet<u8>) {
     if let Src::R(h) = a {
         emit_canon_home(ops, h, lazy);
     }
@@ -4475,7 +4472,7 @@ fn emit_icmp_flags_gpr(ops: &mut dynasmrt::x64::Assembler, a: Src, b: Src, lazy:
 
 /// Epilogue for the GPR-home frame: undo `frame`, pop the eight saved gprs
 /// (rbp/r15 included — they are home-pool members here), `ret`.
-fn emit_gpr_region_restore(ops: &mut dynasmrt::x64::Assembler, frame: i32) {
+fn emit_gpr_region_restore(ops: &mut crate::codegen::X64Asm, frame: i32) {
     dynasm!(ops
         ; add rsp, frame
         ; pop rbp

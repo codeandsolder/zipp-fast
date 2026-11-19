@@ -43,7 +43,7 @@ env_off_switch! {
 /// collect; the caller binds the returned label after that helper's tail.
 /// `None`: the caller emits the helper alone.
 pub(crate) fn emit_ready_literal(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     proto: &crate::bytecode::FuncProto,
     plan: u16,
     shape: u32,
@@ -58,7 +58,7 @@ pub(crate) fn emit_ready_literal(
 /// `emit_ready_literal` for the literal's plan itself (Tier O, which keeps
 /// the plan's address rather than its function).
 pub(crate) fn emit_ready_literal_of(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     plan: &crate::bytecode::StaticKeyPlan,
     shape: u32,
     val_base: u16,
@@ -88,7 +88,7 @@ pub(crate) fn emit_ready_literal_of(
 
 /// Take the next ready object of slab class `class`, or jump to `miss`:
 /// rdx = its map, rcx = its value cell, rax = its slot.
-fn emit_ready_take(ops: &mut dynasmrt::x64::Assembler, class: usize, miss: dynasmrt::DynamicLabel) {
+fn emit_ready_take(ops: &mut crate::codegen::X64Asm, class: usize, miss: dynasmrt::DynamicLabel) {
     use crate::heap::{ReadyClass, ReadyObj};
     let next = (crate::vm::host_api::JIT_READY_OFFSET + class * std::mem::size_of::<ReadyClass>()) as i32;
     dynasm!(ops
@@ -107,7 +107,7 @@ fn emit_ready_take(ops: &mut dynasmrt::x64::Assembler, class: usize, miss: dynas
 /// the key list `handle` and `shape`, and put it in `dst`. `class`: the
 /// instance's class, for its map and its hot record.
 fn emit_ready_fill(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     handle: u64,
     shape: u32,
     n: i32,
@@ -145,7 +145,7 @@ fn emit_ready_fill(
 /// `lane`'s instance in `dst`, or a fall through to the helper the caller
 /// emits next, nothing done; the caller binds the returned label after it.
 pub(crate) fn emit_new_lane(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     lane: &NewLanePlan,
     callee: u16,
     arg_base: u16,
@@ -166,7 +166,7 @@ pub(crate) fn emit_new_lane(
 /// there. `callee`, `arg_base` (the arguments, consecutive) and `dst` are
 /// registers of the emitting window, already mapped by the caller.
 pub(crate) fn emit_new_lane_into(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     lane: &NewLanePlan,
     callee: u16,
     arg_base: u16,
@@ -191,7 +191,7 @@ pub(crate) fn emit_new_lane_into(
 /// `lane`'s proof, or a jump to `miss`: nothing on the chain the proof read
 /// has moved, and its prototype is one a collection has seen.
 pub(crate) fn emit_new_guards(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     lane: &NewLanePlan,
     miss: dynasmrt::DynamicLabel,
 ) {
@@ -222,7 +222,7 @@ pub(crate) fn emit_new_guards(
 /// done: the finished instance in `dst`. `rg` maps a body register to the
 /// caller's window.
 pub(crate) fn emit_new_instance(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     lane: &NewLanePlan,
     arg_base: u16,
     rg: impl Fn(u16) -> u16,
@@ -273,7 +273,7 @@ pub(crate) fn emit_new_instance(
 ///
 /// `rdi` = vm, `rbx` = register window, as in every arm of both emitters.
 pub(crate) fn emit_typeof_is(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     dst: u16,
     a: u16,
     code: u8,
@@ -419,7 +419,7 @@ pub(crate) fn emit_typeof_is(
 /// for exotic/unsettled heap occupants. Preserves `r8`, `r9` unless `out_reg`
 /// is one of them; clobbers `rax, rcx, rdx, r10, r11`.
 fn emit_classify_typeof_code(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     out_is_r9: bool,
     small_bigint_top: i32,
     slow: dynasmrt::DynamicLabel,
@@ -435,7 +435,7 @@ fn emit_classify_typeof_code(
     let heap_val = ops.new_dynamic_label();
     let heap_non_dict = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
-    let set_code = |ops: &mut dynasmrt::x64::Assembler, c: i32| {
+    let set_code = |ops: &mut crate::codegen::X64Asm, c: i32| {
         if out_is_r9 {
             dynasm!(ops ; mov r9d, c);
         } else {
@@ -514,7 +514,7 @@ fn emit_classify_typeof_code(
 /// settled plain/class objects, non-empty strings, and JS functions/closures
 /// inline via `HotMirror`; exotic heap values fall back to `jit_typeof_same`.
 pub(crate) fn emit_typeof_same(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     dst: u16,
     a: u16,
     b: u16,
@@ -575,7 +575,7 @@ pub(crate) fn emit_typeof_same(
 /// `1` if `base_ptr + max_scratch_top * 8 <= regs_end_raw`, else `0`.
 /// Avoids a Win64 FFI call to `jit_regs_fits` on every Tier-C / region entry.
 pub(crate) fn emit_regs_fits_check(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     max_scratch_top: u64,
     leaf_flag_off: i32,
     helper: usize,
@@ -647,7 +647,7 @@ env_off_switch! {
 /// No calls, no bails, no allocation — safe-point schedule unchanged.
 /// Off switch: `ZIPP_NO_MEM_CMPJUMP=1` (`mem_cmp_fuse_enabled`).
 pub(crate) fn emit_fused_cmp_branch_head(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     dst: u16,
     a: u16,
     b: u16,
@@ -704,7 +704,7 @@ pub(crate) fn emit_fused_cmp_branch_head(
 /// or tag-tested. A non-Int `a` falls to the same generic sequence.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_fused_cmp_imm_branch_head(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     dst: u16,
     a: u16,
     imm: i32,
@@ -785,7 +785,7 @@ pub(crate) fn jit_loop_align() -> usize {
 /// NOPs (the recommended 1- to 9-byte forms), so a loop head that is also
 /// reached by falling through runs one or two NOP instructions, not up to
 /// fifteen single-byte ones.
-pub(crate) fn align_loop_head(ops: &mut dynasmrt::x64::Assembler, align: usize) {
+pub(crate) fn align_loop_head(ops: &mut crate::codegen::X64Asm, align: usize) {
     use dynasmrt::DynasmApi;
     const NOPS: [&[u8]; 10] = [
         &[],
@@ -833,7 +833,7 @@ pub(crate) fn region_target(
     end: u32,
     in_region: &[dynasmrt::DynamicLabel],
     exit_stubs: &mut FxHashMap<u32, dynasmrt::DynamicLabel>,
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
 ) -> dynasmrt::DynamicLabel {
     if target >= start && target <= end {
         in_region[(target - start) as usize]
@@ -861,7 +861,7 @@ pub(crate) enum DOp {
 /// undefined / heap — jumps to `bail` so the interpreter applies complete
 /// ToInt32 semantics. Clobbers rax/r10/xmm0/xmm1.
 pub(crate) fn load_toint32(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     reg: u16,
     bail: dynasmrt::DynamicLabel,
 ) {
@@ -909,7 +909,7 @@ pub(crate) fn load_toint32(
 /// Load `regs[reg]` as an f64 into `xmm{which}` (0 or 1). Int-tagged → cvtsi2sd;
 /// a real double → movq; bool/null/undef/heap → jump to `bail`.
 pub(crate) fn load_num_xmm(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     reg: u16,
     which: u8,
     bail: dynasmrt::DynamicLabel,
@@ -942,7 +942,7 @@ pub(crate) fn load_num_xmm(
 /// and back to check they were integers, a chain of conversions ahead of
 /// the division on every iteration. Off under `ZIPP_NO_INT_MOD=1`.
 pub(crate) fn emit_int_mod_fast(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     dst: u16,
     a: u16,
     b: u16,
@@ -973,7 +973,7 @@ pub(crate) fn emit_int_mod_fast(
 }
 
 /// Store `xmm0` (an f64 result) into `regs[dst]` as a double `Value`.
-pub(crate) fn store_xmm(ops: &mut dynasmrt::x64::Assembler, dst: u16) {
+pub(crate) fn store_xmm(ops: &mut crate::codegen::X64Asm, dst: u16) {
     dynasm!(ops
         ; movq rax, xmm0
         ; mov [rbx + dreg(dst)], rax
@@ -990,7 +990,7 @@ pub(crate) fn store_xmm(ops: &mut dynasmrt::x64::Assembler, dst: u16) {
 /// the remaining GC slot-reuse ABA hole. Any mismatch bails at the MathOp, whose
 /// interpreter arm calls the already-captured callee with the captured receiver.
 pub(crate) fn emit_math_identity_guard(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     op: MathFn,
     callee: u16,
     this_v: u16,
@@ -1105,7 +1105,7 @@ pub(crate) fn emit_math_identity_guard(
 /// arms below assume it, exactly as the region admission check guarantees.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_math_op(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     ip: usize,
     bail: dynasmrt::DynamicLabel,
     epilogue: dynasmrt::DynamicLabel,
@@ -1190,7 +1190,7 @@ pub(crate) fn emit_math_op(
 /// the result as it boxes the helper's (`emit_box_num` canonicalises NaN).
 /// False, having emitted nothing, for every other op or with
 /// `ZIPP_NO_MATH_INLINE=1`; the caller then calls the helper.
-pub(crate) fn emit_math_unary_inline(ops: &mut dynasmrt::x64::Assembler, op: MathFn) -> bool {
+pub(crate) fn emit_math_unary_inline(ops: &mut crate::codegen::X64Asm, op: MathFn) -> bool {
     if !crate::codegen::math_inline_enabled() {
         return false;
     }
@@ -1267,7 +1267,7 @@ pub(crate) fn emit_math_unary_inline(ops: &mut dynasmrt::x64::Assembler, op: Mat
 /// `load_num_xmm` does, so the interpreter runs ToNumber. False, having
 /// emitted nothing, under `ZIPP_NO_MATH_INLINE=1`.
 pub(crate) fn emit_math_clz32(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     arg: u16,
     dst: u16,
     bail: dynasmrt::DynamicLabel,
@@ -1362,7 +1362,7 @@ pub(crate) const MATH_MANY_MAX: u16 = 8;
 /// `ArithFb`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dbinop(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     ip: usize,
     bail: dynasmrt::DynamicLabel,
     epilogue: dynasmrt::DynamicLabel,
@@ -1527,7 +1527,7 @@ pub(crate) enum ArithFb {
 /// xmm1): `Notify` tests its bit and returns the label the caller must place
 /// `emit_arith_fb_stub` at.
 pub(crate) fn emit_arith_fb_check(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     fb: ArithFb,
 ) -> Option<dynasmrt::DynamicLabel> {
     let double = crate::codegen::ARITH_FB_DOUBLE as i8;
@@ -1549,7 +1549,7 @@ pub(crate) fn emit_arith_fb_check(
 /// back to `reload`, which loads the operands again (the call clobbered them)
 /// and now passes the check.
 pub(crate) fn emit_arith_fb_stub(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     fb: ArithFb,
     first: Option<dynasmrt::DynamicLabel>,
     reload: dynasmrt::DynamicLabel,
@@ -1640,7 +1640,14 @@ fn trunc_only_arith_walk(proto: &FuncProto, bounded: bool) -> Vec<bool> {
                     | Instr::WithSet { .. }
             )
         });
-    if by_name_scope {
+    if by_name_scope
+        || !code.iter().any(|i| {
+            matches!(
+                i,
+                Instr::Add { .. } | Instr::Sub { .. } | Instr::AddInt { .. }
+            )
+        })
+    {
         return out;
     }
     // `visited[q] == stamp`: reached by the current candidate's walk (a stamp
@@ -1652,7 +1659,14 @@ fn trunc_only_arith_walk(proto: &FuncProto, bounded: bool) -> Vec<bool> {
             stack.push(q);
         }
     }
-    let uses: Vec<Vec<u16>> = code.iter().map(instr_uses).collect();
+    let mut uses_flat: Vec<u16> = Vec::with_capacity(n * 2);
+    let mut uses_span: Vec<(u32, u32)> = Vec::with_capacity(n);
+    for i in code {
+        let start = uses_flat.len() as u32;
+        instr_uses_into(i, &mut uses_flat);
+        let end = uses_flat.len() as u32;
+        uses_span.push((start, end));
+    }
     let defs: Vec<Option<u16>> = code.iter().map(writes_reg).collect();
     let handler_targets: Vec<usize> = code
         .iter()
@@ -1708,8 +1722,8 @@ fn trunc_only_arith_walk(proto: &FuncProto, bounded: bool) -> Vec<bool> {
         cut_after[x] = if crossed[x] { cut_after[x + 1] } else { x };
     }
     let mut last_read: Vec<usize> = Vec::new();
-    for (q, u) in uses.iter().enumerate() {
-        for &r in u {
+    for (q, &(s, e)) in uses_span.iter().enumerate() {
+        for &r in &uses_flat[s as usize..e as usize] {
             let r = r as usize;
             if r >= last_read.len() {
                 last_read.resize(r + 1, usize::MAX);
@@ -1717,9 +1731,8 @@ fn trunc_only_arith_walk(proto: &FuncProto, bounded: bool) -> Vec<bool> {
             last_read[r] = q;
         }
     }
-    // Per candidate: the arith readers its membership waits on; `None` once a
-    // reader is neither truncating nor arithmetic (or the walk was declined).
-    let mut deps: Vec<Option<Vec<usize>>> = vec![None; n];
+    // Sparse candidates that wait on another arithmetic op to join `out`.
+    let mut pending_deps: Vec<(usize, Vec<usize>)> = Vec::new();
     let mut visited = vec![0u32; n];
     let mut stamp = 0u32;
     let mut stack: Vec<usize> = Vec::new();
@@ -1747,7 +1760,8 @@ fn trunc_only_arith_walk(proto: &FuncProto, bounded: bool) -> Vec<bool> {
         let mut ok = true;
         while let Some(q) = stack.pop() {
             let i = &code[q];
-            if uses[q].contains(&t) {
+            let (us, ue) = uses_span[q];
+            if uses_flat[us as usize..ue as usize].contains(&t) {
                 if matches!(i, Instr::AddInt { .. }) {
                     arith_readers.push(q);
                 } else if !matches!(i, Instr::Bitwise { .. }) {
@@ -1778,21 +1792,23 @@ fn trunc_only_arith_walk(proto: &FuncProto, bounded: bool) -> Vec<bool> {
             }
         }
         if ok {
-            deps[p] = Some(arith_readers);
+            if arith_readers.is_empty() {
+                out[p] = true;
+            } else {
+                pending_deps.push((p, arith_readers));
+            }
         }
     }
     // Least fixpoint: a candidate joins once every arith reader has.
-    loop {
+    while !pending_deps.is_empty() {
         let mut changed = false;
-        for p in 0..n {
-            if out[p] {
+        for (p, readers) in &pending_deps {
+            if out[*p] {
                 continue;
             }
-            if let Some(readers) = &deps[p] {
-                if readers.iter().all(|&q| out[q]) {
-                    out[p] = true;
-                    changed = true;
-                }
+            if readers.iter().all(|&q| out[q]) {
+                out[*p] = true;
+                changed = true;
             }
         }
         if !changed {
@@ -1862,7 +1878,7 @@ pub(crate) fn single_char_const_bits(proto: &FuncProto, c: Value) -> Option<u64>
 ///      is the `s[i] === "7"` and `charCodeAt === 55` hot path (call-free).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn region_poly_eq(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     ip: usize,
     bail: dynasmrt::DynamicLabel,
     epilogue: dynasmrt::DynamicLabel,
@@ -2060,7 +2076,7 @@ env_off_switch! {
 /// Where `dcmp` and `djump_if_not_cmp` send a non-number: their string arm, or
 /// `bail` when the caller's code around them cannot take a call.
 fn not_number_label(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     strings: bool,
     bail: dynasmrt::DynamicLabel,
 ) -> dynasmrt::DynamicLabel {
@@ -2080,7 +2096,7 @@ fn not_number_label(
 /// its caller resuming in the interpreter after each call.
 #[allow(clippy::too_many_arguments)]
 fn emit_relational_tail(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     ip: usize,
     bail: dynasmrt::DynamicLabel,
     epilogue: dynasmrt::DynamicLabel,
@@ -2088,7 +2104,7 @@ fn emit_relational_tail(
     a: u16,
     b: u16,
     cmp: Cmp,
-    answer: impl FnOnce(&mut dynasmrt::x64::Assembler),
+    answer: impl FnOnce(&mut crate::codegen::X64Asm),
 ) {
     if not_number == bail {
         emit_region_bail(ops, ip, bail, epilogue);
@@ -2127,7 +2143,7 @@ fn emit_relational_tail(
 /// emitter around it can take a helper call in the cold arm.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dcmp(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     ip: usize,
     bail: dynasmrt::DynamicLabel,
     epilogue: dynasmrt::DynamicLabel,
@@ -2167,7 +2183,7 @@ pub(crate) fn dcmp(
 /// Only Lt/Le are emitted by the compiler (loop guards).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn djump_if_not_cmp(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     ip: usize,
     bail: dynasmrt::DynamicLabel,
     epilogue: dynasmrt::DynamicLabel,
@@ -2240,7 +2256,7 @@ pub(crate) fn djump_if_not_cmp(
 /// came from `%`) is an index too. Clobbers rax, rcx, rdx, r9, r10, xmm0 and
 /// xmm1, all of which the helper call clobbers anyway.
 pub(crate) fn emit_arr_mirror_get(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     dst: u16,
     obj: u16,
     key: u16,
@@ -2302,7 +2318,7 @@ pub(crate) fn emit_arr_mirror_get(
 /// other receiver fall through to the caller's helper, which proves an
 /// absent answer and repairs the entry. Clobbers rax, rcx, rdx, r9 and r10.
 pub(crate) fn emit_arr_mirror_has(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     dst: u16,
     obj: u16,
     key: u16,
@@ -2354,7 +2370,7 @@ pub(crate) fn emit_arr_mirror_has(
 /// clobbered, which the property probe after it reloads or the helpers it
 /// leads to clobber anyway.
 pub(crate) fn emit_arr_mirror_len(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     obj: u16,
     dst: u16,
     done: dynasmrt::DynamicLabel,
@@ -2399,7 +2415,7 @@ pub(crate) fn emit_arr_mirror_len(
 /// r11 besides the call's volatiles. `ZIPP_NO_BARRIER_FILTER=1` drops the
 /// value's test (the identity-way store's holder test predates it).
 pub(crate) fn emit_heap_store_barrier(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     gen_lane: bool,
     done: dynasmrt::DynamicLabel,
 ) {
@@ -2438,7 +2454,7 @@ pub(crate) fn emit_heap_store_barrier(
 /// length. Jumps to `done`; anything else falls through with rax, rcx, rdx,
 /// r8, r9, r10 and r11 clobbered, which the helper after it clobbers anyway.
 pub(crate) fn emit_arr_mirror_set(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     obj: u16,
     key: u16,
     val: u16,
@@ -2497,7 +2513,7 @@ pub(crate) fn emit_arr_mirror_set(
 /// does. A hole, a dead entry and everything else fall through to the
 /// helper with rax, rcx, rdx, r8, r9 and r10 clobbered.
 pub(crate) fn emit_arr_mirror_iter_step(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     value_dst: u16,
     done_dst: u16,
     iter: u16,
@@ -2563,7 +2579,7 @@ pub(crate) fn emit_arr_mirror_iter_step(
 /// the binding (deleted, or a getter, a setter or read-only attributes put
 /// behind it), and the instruction is the interpreter's. One byte compare
 /// against zero on the path every program but those takes.
-pub(crate) fn emit_route_guard(ops: &mut dynasmrt::x64::Assembler, bail: dynasmrt::DynamicLabel) {
+pub(crate) fn emit_route_guard(ops: &mut crate::codegen::X64Asm, bail: dynasmrt::DynamicLabel) {
     let off = crate::vm::host_api::JIT_ROUTE_DIRTY_OFFSET as i32;
     dynasm!(ops
         ; cmp BYTE [rdi + off], 0
@@ -2581,7 +2597,7 @@ pub(crate) fn emit_route_guard(ops: &mut dynasmrt::x64::Assembler, bail: dynasmr
 /// FFI call and pinned refetch. Clobbers rax, rcx, rdx, r8, r9, r10, r11.
 #[cfg(not(feature = "safe-sandbox"))]
 pub(crate) fn emit_concat_memo_fast(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     dst: u16,
     a: u16,
     b: u16,
@@ -2644,7 +2660,7 @@ pub(crate) fn emit_concat_memo_fast(
 #[cfg(feature = "safe-sandbox")]
 #[inline]
 pub(crate) fn emit_concat_memo_fast(
-    _ops: &mut dynasmrt::x64::Assembler,
+    _ops: &mut crate::codegen::X64Asm,
     _dst: u16,
     _a: u16,
     _b: u16,
@@ -2674,7 +2690,7 @@ impl DeferredBails {
     }
 
     /// Emit every block recorded since [`Self::begin`].
-    pub(crate) fn flush(&self, ops: &mut dynasmrt::x64::Assembler) {
+    pub(crate) fn flush(&self, ops: &mut crate::codegen::X64Asm) {
         let list = DEFERRED_BAILS.with(|d| d.borrow_mut().last_mut().map(std::mem::take).unwrap_or_default());
         for (bail, ip, epilogue) in list {
             dynasm!(ops
@@ -2700,7 +2716,7 @@ impl Drop for DeferredBails {
 /// region's `run` ignores rax and reads only the resume ip. Inside a compile
 /// that defers its bails (`DeferredBails`) the block goes after the code.
 pub(crate) fn emit_region_bail(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     ip: usize,
     bail: dynasmrt::DynamicLabel,
     epilogue: dynasmrt::DynamicLabel,
