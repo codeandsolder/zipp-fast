@@ -10,6 +10,8 @@ use std::process::ExitCode;
 
 mod sandbox;
 mod frontend_cli;
+#[cfg(feature = "php")]
+mod php_server;
 #[cfg(feature = "gpu")]
 mod gpu;
 

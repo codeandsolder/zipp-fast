@@ -765,6 +765,14 @@ impl ScriptState {
         .unwrap_or_default()
     }
 
+    /// Drain raw byte output emitted by a PHP program (`echo`, `print`, inline
+    /// HTML) when running in buffered / HTTP SAPI mode.
+    #[cfg(feature = "php")]
+    pub fn take_php_output(&mut self) -> Vec<u8> {
+        self.with_vm(|vm| std::mem::take(&mut vm.php_output))
+            .unwrap_or_default()
+    }
+
     /// Take the `console.error`/`console.warn` lines produced so far.
     pub fn take_errput(&mut self) -> Vec<String> {
         self.with_vm(|vm| {

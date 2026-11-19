@@ -14,7 +14,7 @@ use crate::bytecode::*;
 use crate::value::Value;
 
 /// Bumped when this file's layout changes.
-pub(crate) const FORMAT: u32 = 4;
+pub(crate) const FORMAT: u32 = 5;
 
 pub(crate) struct Writer {
     pub(crate) out: Vec<u8>,
@@ -762,8 +762,10 @@ pub(crate) fn encode(program: &Program, source: Option<&str>) -> Option<Vec<u8>>
         module_decl_globals,
         python_natives,
         python_lazy,
+        php_natives,
+        php_ctx,
     } = program;
-    if python_lazy.is_some() {
+    if python_lazy.is_some() || php_ctx.is_some() {
         return None;
     }
     let mut w = Writer {
@@ -810,6 +812,7 @@ pub(crate) fn encode(program: &Program, source: Option<&str>) -> Option<Vec<u8>>
     }
     w.u32s(module_decl_globals);
     w.bool(*python_natives);
+    w.bool(*php_natives);
     Some(w.out)
 }
 
@@ -861,6 +864,7 @@ pub(crate) fn decode(bytes: &[u8], source: Option<&str>) -> R<Program> {
     }
     let module_decl_globals = r.u32s()?;
     let python_natives = r.bool()?;
+    let php_natives = r.bool()?;
     if r.at != bytes.len() {
         return Err("trailing bytes after the program".into());
     }
@@ -882,5 +886,7 @@ pub(crate) fn decode(bytes: &[u8], source: Option<&str>) -> R<Program> {
         module_decl_globals,
         python_natives,
         python_lazy: None,
+        php_natives,
+        php_ctx: None,
     })
 }

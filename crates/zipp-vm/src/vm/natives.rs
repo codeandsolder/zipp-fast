@@ -4952,6 +4952,8 @@ impl<'p> Vm<'p> {
             | TD_FATAL_GET | TD_IGNORE_BOM_GET => self.text_codec_native(id, this, args)?,
             #[cfg(feature = "node")]
             NODE_HOST_WRITE..=NODE_HOST_TIMER => self.node_host_native(id, args)?,
+            #[cfg(feature = "php")]
+            PHP_OUTPUT..=PHP_SAPI => self.php_native_call(id, args)?,
             #[cfg(feature = "webassembly")]
             WASM_HOST_OP => self.wasm_host_op(args)?,
             WR_DEREF => {

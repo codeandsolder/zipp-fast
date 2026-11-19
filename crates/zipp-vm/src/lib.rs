@@ -33,6 +33,9 @@ compile_error!("zipp-vm features `safe-sandbox` and `jit` are mutually exclusive
 #[cfg(all(feature = "wasm-lite", feature = "python"))]
 compile_error!("ZIPP Lite omits Python; build the python variant separately");
 
+#[cfg(all(feature = "wasm-lite", feature = "php"))]
+compile_error!("ZIPP Lite omits PHP; build the php variant separately");
+
 /// Rust's bare WASM target has no process environment. Lite resolves native
 /// benchmark switches to their existing absent-variable defaults, removing
 /// cached checks and unreachable alternatives. (An earlier full-build attempt

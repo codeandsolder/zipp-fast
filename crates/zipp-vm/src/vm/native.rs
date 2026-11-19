@@ -354,6 +354,33 @@ pub const ANNEXB_REF_ERROR_NAME: &str = "__zipp_annexb_ref_error__";
 /// natives added by ongoing engine work.
 pub const HOST_CALL: u16 = 950;
 pub const HOST_CALL_NAME: &str = "__zippHostCall";
+
+// PHP frontend private natives (`Program::php_natives`). Bound by slot ONLY in
+// programs built by `lang::php`, so JavaScript programs never see them.
+#[cfg_attr(not(feature = "php"), allow(dead_code))]
+pub const PHP_OUTPUT: u16 = 2200;
+#[cfg_attr(not(feature = "php"), allow(dead_code))]
+pub const PHP_OUTPUT_NAME: &str = "__zipp_php_output";
+#[cfg_attr(not(feature = "php"), allow(dead_code))]
+pub const PHP_INCLUDE: u16 = 2201;
+#[cfg_attr(not(feature = "php"), allow(dead_code))]
+pub const PHP_INCLUDE_NAME: &str = "__zipp_php_include";
+#[cfg_attr(not(feature = "php"), allow(dead_code))]
+pub const PHP_FS: u16 = 2202;
+#[cfg_attr(not(feature = "php"), allow(dead_code))]
+pub const PHP_FS_NAME: &str = "__zipp_php_fs";
+#[cfg_attr(not(feature = "php"), allow(dead_code))]
+pub const PHP_CRYPTO: u16 = 2203;
+#[cfg_attr(not(feature = "php"), allow(dead_code))]
+pub const PHP_CRYPTO_NAME: &str = "__zipp_php_crypto";
+#[cfg_attr(not(feature = "php"), allow(dead_code))]
+pub const PHP_ENV: u16 = 2204;
+#[cfg_attr(not(feature = "php"), allow(dead_code))]
+pub const PHP_ENV_NAME: &str = "__zipp_php_env";
+#[cfg_attr(not(feature = "php"), allow(dead_code))]
+pub const PHP_SAPI: u16 = 2205;
+#[cfg_attr(not(feature = "php"), allow(dead_code))]
+pub const PHP_SAPI_NAME: &str = "__zipp_php_sapi";
 /// The Python runtime's native tensor loops (`vm::py_tensor`), bound to the
 /// reserved global below only in a program the Python frontend built
 /// (`Program::python_natives`): an ordinary JavaScript program never sees it.
@@ -1832,6 +1859,18 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         GLOBAL_ESCAPE => ("escape", 1),
         GLOBAL_UNESCAPE => ("unescape", 1),
         HOST_CALL => (HOST_CALL_NAME, 1),
+        #[cfg(feature = "php")]
+        PHP_OUTPUT => ("", 1),
+        #[cfg(feature = "php")]
+        PHP_INCLUDE => ("", 3),
+        #[cfg(feature = "php")]
+        PHP_FS => ("", 4),
+        #[cfg(feature = "php")]
+        PHP_CRYPTO => ("", 4),
+        #[cfg(feature = "php")]
+        PHP_ENV => ("", 0),
+        #[cfg(feature = "php")]
+        PHP_SAPI => ("", 2),
         #[cfg(feature = "python")]
         PY_TENSOR => ("", 0),
         #[cfg(feature = "python")]

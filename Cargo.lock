@@ -2262,6 +2262,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "zipp-phpparse"
+version = "0.0.36"
+
+[[package]]
 name = "zipp-pyparse"
 version = "0.0.36"
 dependencies = [
@@ -2301,6 +2305,7 @@ dependencies = [
  "wasmtime",
  "wat",
  "zipp-numparse",
+ "zipp-phpparse",
  "zipp-pyparse",
  "zipp-regress",
 ]

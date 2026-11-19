@@ -7,20 +7,25 @@ use std::sync::{Arc, Mutex};
 use zipp_vm::embed::{ConsoleStream, ScriptGoal, ScriptState};
 use zipp_vm::frontend::{
     compile_python_script_files, compile_source, detect_language, Frontend, LanguageId,
-    PythonFile, PythonMode,
+    PhpMode, PythonFile, PythonMode,
 };
 
 pub(super) fn try_run(args: &[String]) -> Option<Result<(), String>> {
     let first = args.first()?.as_str();
     if first != "py"
+        && first != "php"
         && first != "ts"
         && first != "run"
         && first != "--lang"
         && !first.starts_with("--lang=")
         && !is_typescript_file(first)
         && !is_javascript_file(first)
+        && !is_php_file(first)
     {
         return None;
+    }
+    if first == "php" && args.iter().any(|a| a == "-S" || a == "--worker") {
+        return Some(run_php_server_cmd(&args[1..]));
     }
     // One program per process: its compiled runtime is never reused in the
     // process, but compiled code is kept on disk for the next one.
@@ -67,18 +72,82 @@ fn is_typescript_file(arg: &str) -> bool {
     }) && path.is_file()
 }
 
+fn is_php_file(arg: &str) -> bool {
+    let path = Path::new(arg);
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "php" | "phtml"))
+        && path.is_file()
+}
+
+fn run_php_server_cmd(args: &[String]) -> Result<(), String> {
+    #[cfg(not(feature = "php"))]
+    {
+        let _ = args;
+        return Err("PHP support is not built; enable the `php` Cargo feature".into());
+    }
+    #[cfg(feature = "php")]
+    {
+        let mut addr: Option<String> = None;
+        let mut docroot: Option<PathBuf> = None;
+        let mut router: Option<PathBuf> = None;
+        let mut worker_mode = false;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "-S" => {
+                    i += 1;
+                    addr = Some(
+                        args.get(i)
+                            .ok_or("zipp php -S requires HOST:PORT")?
+                            .clone(),
+                    );
+                }
+                "-t" => {
+                    i += 1;
+                    docroot = Some(PathBuf::from(
+                        args.get(i).ok_or("zipp php -t requires DOCROOT")?,
+                    ));
+                }
+                "--worker" => {
+                    worker_mode = true;
+                }
+                other if !other.starts_with('-') && router.is_none() => {
+                    router = Some(PathBuf::from(other));
+                }
+                other => {
+                    return Err(format!("unknown zipp php server option {other:?}"));
+                }
+            }
+            i += 1;
+        }
+        let addr = addr.ok_or("usage: zipp php [--worker] -S HOST:PORT [-t DOCROOT] [ROUTER.php]")?;
+        let docroot = docroot.unwrap_or_else(|| {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        });
+        super::php_server::serve(super::php_server::ServerConfig {
+            addr,
+            docroot,
+            router,
+            worker_mode,
+        })
+    }
+}
+
 fn run(args: &[String]) -> Result<(), String> {
     let first = args[0].as_str();
     let python_command = first == "py";
     let mut explicit = if python_command {
         Some(LanguageId::Python)
+    } else if first == "php" {
+        Some(LanguageId::Php)
     } else if first == "ts" {
         Some(LanguageId::TypeScript)
     } else {
         None
     };
     let mut filename: Option<String> = None;
-    let mut index = if first == "py" || first == "ts" || first == "run" {
+    let mut index = if first == "py" || first == "php" || first == "ts" || first == "run" {
         1
     } else {
         0
@@ -218,6 +287,11 @@ fn run(args: &[String]) -> Result<(), String> {
         let path = Path::new(&filename);
         return run_project(&project_root_of(path), Some(path), &program_args, gpu);
     }
+    // PHP script run from a file gets real filesystem access, `__FILE__`/`__DIR__`,
+    // `argv`, and streaming raw stdout.
+    if detected.language == LanguageId::Php && !stdin && !bytecode {
+        return run_php_file(Path::new(&filename), &source, &program_args);
+    }
     let frontend = match detected.language {
         LanguageId::JavaScript => Frontend::JavaScript {
             goal: ScriptGoal::Compat,
@@ -226,6 +300,9 @@ fn run(args: &[String]) -> Result<(), String> {
             mode: PythonMode::Module,
         },
         LanguageId::TypeScript => Frontend::TypeScript,
+        LanguageId::Php => Frontend::Php {
+            mode: PhpMode::Script,
+        },
     };
     if bytecode {
         // Developer inspection: the compiled program, no execution.
@@ -260,6 +337,8 @@ fn enable_python_jit(state: &mut ScriptState) {
 
 fn execute(mut compiled: zipp_vm::frontend::CompiledSource, gpu: bool) -> Result<(), String> {
     let python = compiled.language() == LanguageId::Python;
+    #[cfg(feature = "php")]
+    let php = compiled.language() == LanguageId::Php;
     let state = compiled.state_mut();
     stream_console(state);
     if python {
@@ -297,7 +376,74 @@ fn execute(mut compiled: zipp_vm::frontend::CompiledSource, gpu: bool) -> Result
     if python {
         return python_exit(state, outcome.map(|_| ()));
     }
+    #[cfg(feature = "php")]
+    if php {
+        let raw = state.take_php_output();
+        if !raw.is_empty() {
+            let _ = io::stdout().lock().write_all(&raw);
+        }
+        return php_exit(state, outcome.map(|_| ()));
+    }
     outcome.map(|_| ())
+}
+
+#[cfg(feature = "php")]
+fn run_php_file(path: &Path, source: &str, program_args: &[String]) -> Result<(), String> {
+    let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let file_str = canon.to_string_lossy().replace('\\', "/");
+    let file_str = file_str.strip_prefix("//?/").unwrap_or(&file_str).to_owned();
+    let base_dir = canon
+        .parent()
+        .map(|p| {
+            let s = p.to_string_lossy().replace('\\', "/");
+            s.strip_prefix("//?/").unwrap_or(&s).to_owned()
+        })
+        .unwrap_or_else(|| ".".to_owned());
+    let mut argv = Vec::with_capacity(1 + program_args.len());
+    argv.push(path.to_string_lossy().into_owned());
+    argv.extend(program_args.iter().cloned());
+
+    let mut compiled = zipp_vm::frontend::compile_php_program(
+        source,
+        zipp_vm::frontend::PhpProgramConfig {
+            file: file_str,
+            base_dir,
+            argv,
+            allow_native_fs: true,
+            stream_stdout: true,
+            ..Default::default()
+        },
+    )?;
+    let state = compiled.state_mut();
+    let outcome = state.run_init();
+    let leftover = state.take_php_output();
+    if !leftover.is_empty() {
+        let _ = io::stdout().lock().write_all(&leftover);
+    }
+    let _ = io::stdout().flush();
+    php_exit(state, outcome.map(|_| ()))
+}
+
+#[cfg(not(feature = "php"))]
+fn run_php_file(_path: &Path, _source: &str, _program_args: &[String]) -> Result<(), String> {
+    Err("PHP support is not built; enable the `php` Cargo feature".into())
+}
+
+#[cfg(feature = "php")]
+fn php_exit(
+    state: &mut zipp_vm::embed::ScriptState,
+    outcome: Result<(), String>,
+) -> Result<(), String> {
+    let status = match state.call_global("__zipp_php_exit_status", &[]) {
+        Ok(zipp_vm::embed::JsValue::Number(code)) => (code as i64 & 0xff) as u8,
+        Ok(zipp_vm::embed::JsValue::String(text)) => {
+            eprintln!("{text}");
+            1
+        }
+        _ => return outcome,
+    };
+    super::request_exit(status);
+    Ok(())
 }
 
 /// A Python program that ended by `SystemExit` sets the process status the way

@@ -5567,6 +5567,42 @@ pub struct Program {
     /// first import rather than up front (see [`PyLazy`]).
     #[cfg_attr(not(feature = "python"), allow(dead_code))]
     pub python_lazy: Option<Box<PyLazy>>,
+    /// Set only on the PHP frontend's runtime program: the VM then binds the
+    /// reserved `__zipp_php_*` private natives by slot.
+    #[cfg_attr(not(feature = "php"), allow(dead_code))]
+    pub php_natives: bool,
+    /// Set only on a PHP program: file context, OPcache compiler callback,
+    /// optional VFS, and optional HTTP SAPI request payload (see [`PhpCtx`]).
+    #[cfg_attr(not(feature = "php"), allow(dead_code))]
+    pub php_ctx: Option<Box<PhpCtx>>,
+}
+
+/// Runtime context owned by a compiled PHP [`Program`].
+#[derive(Clone)]
+#[cfg_attr(not(feature = "php"), allow(dead_code))]
+pub struct PhpCtx {
+    pub file: String,
+    pub base_dir: String,
+    pub rt_slot: u32,
+    pub argv: Vec<String>,
+    pub sapi_request_json: Option<String>,
+    pub vfs: Option<std::sync::Arc<std::collections::HashMap<String, Vec<u8>>>>,
+    pub allow_native_fs: bool,
+    pub stream_stdout: bool,
+    /// Dynamically compile a PHP file or `eval` source into relocatable `FuncProto`s
+    /// starting at `base_func_id` (top-level body last).
+    pub compile_unit: fn(Option<&str>, &str, &str, u32, u32) -> Result<Vec<FuncProto>, String>,
+}
+
+#[cfg_attr(not(feature = "php"), allow(dead_code))]
+impl std::fmt::Debug for PhpCtx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PhpCtx")
+            .field("file", &self.file)
+            .field("base_dir", &self.base_dir)
+            .field("allow_native_fs", &self.allow_native_fs)
+            .finish()
+    }
 }
 
 /// The modules of a Python program that compile on first import: the

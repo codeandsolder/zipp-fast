@@ -1598,7 +1598,7 @@ impl<'p> Vm<'p> {
                             // is one too: the counter of a Python `for` over
                             // a range, every iteration. What `bigint_op`
                             // answers below, without ToNumeric and the call.
-                            #[cfg(feature = "python")]
+                            #[cfg(any(feature = "python", feature = "php"))]
                             if upd {
                                 if let Some(v) = va.small_bigint_val().and_then(|n| Value::small_bigint(n as i128 + imm as i128)) {
                                     self.set(base, dst, v);

@@ -799,6 +799,13 @@ impl Engine {
                  (zipp-<version>-javascript-typescript.wasm)"
                     .into(),
             ),
+            zipp_vm::frontend::LanguageId::Php => zipp_vm::frontend::compile_source(
+                source,
+                zipp_vm::frontend::Frontend::Php {
+                    mode: zipp_vm::frontend::PhpMode::Script,
+                },
+            )
+            .map(|compiled| compiled.into_state()),
         })
     }
 

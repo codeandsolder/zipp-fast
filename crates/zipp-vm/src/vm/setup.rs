@@ -3039,6 +3039,30 @@ impl<'p> Vm<'p> {
                 self.bump_global_gen(slot as u32);
             }
         }
+        // The PHP runtime's private natives (`lang/php/vm/php_natives.rs`): bound
+        // by slot ONLY when `Program::php_natives == true`.
+        #[cfg(feature = "php")]
+        if self.program.php_natives {
+            for &(name, id) in &[
+                (native::PHP_OUTPUT_NAME, native::PHP_OUTPUT),
+                (native::PHP_INCLUDE_NAME, native::PHP_INCLUDE),
+                (native::PHP_FS_NAME, native::PHP_FS),
+                (native::PHP_CRYPTO_NAME, native::PHP_CRYPTO),
+                (native::PHP_ENV_NAME, native::PHP_ENV),
+                (native::PHP_SAPI_NAME, native::PHP_SAPI),
+            ] {
+                let slot = self
+                    .program
+                    .global_names
+                    .iter()
+                    .position(|n| n == name);
+                if let Some(slot) = slot.filter(|&slot| slot < self.globals.len()) {
+                    let h = self.heap.alloc(HeapObj::Native(id));
+                    self.globals[slot] = Value::heap(h);
+                    self.bump_global_gen(slot as u32);
+                }
+            }
+        }
         // The Python runtime's native tensor loops (`vm::py_tensor`): bound
         // by slot, only in the program the Python frontend built, and never
         // entered in `builtin_globals`, so no other program (nor an eval)

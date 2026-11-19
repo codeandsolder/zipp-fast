@@ -17,8 +17,12 @@ use std::path::Path;
 use std::str::FromStr;
 
 mod js;
+mod php;
 mod python;
 pub(crate) mod ts;
+
+#[cfg(feature = "php")]
+pub use php::frontend::PhpProgramConfig;
 
 pub use ts::run_file as run_typescript_file;
 
@@ -67,7 +71,7 @@ pub trait Language: Sync {
 
 /// Every language, the base language first.
 pub fn languages() -> &'static [&'static dyn Language] {
-    &[&js::JavaScript, &python::Python, &ts::TypeScript]
+    &[&js::JavaScript, &python::Python, &ts::TypeScript, &php::Php]
 }
 
 /// The language `id` names.
@@ -84,6 +88,7 @@ pub enum LanguageId {
     JavaScript,
     Python,
     TypeScript,
+    Php,
 }
 impl FromStr for LanguageId {
     type Err = String;
@@ -92,7 +97,7 @@ impl FromStr for LanguageId {
         match languages().iter().find(|l| l.names().contains(&key.as_str())) {
             Some(l) => Ok(l.id()),
             None => Err(format!(
-                "unknown language {value:?}; expected javascript, typescript or python"
+                "unknown language {value:?}; expected javascript, typescript, python or php"
             )),
         }
     }
@@ -101,12 +106,18 @@ impl FromStr for LanguageId {
 pub enum PythonMode {
     Module,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhpMode {
+    Script,
+}
 #[derive(Debug, Clone, Copy)]
 pub enum Frontend {
     JavaScript { goal: ScriptGoal },
     Python { mode: PythonMode },
     /// A TypeScript script (types read and dropped; see `lang/ts`).
     TypeScript,
+    /// A PHP 8.x script or template (`lang/php`).
+    Php { mode: PhpMode },
 }
 impl Frontend {
     pub fn language(self) -> LanguageId {
@@ -114,6 +125,7 @@ impl Frontend {
             Self::JavaScript { .. } => LanguageId::JavaScript,
             Self::Python { .. } => LanguageId::Python,
             Self::TypeScript => LanguageId::TypeScript,
+            Self::Php { .. } => LanguageId::Php,
         }
     }
 }
@@ -141,9 +153,27 @@ pub fn compile_source(source: &str, frontend: Frontend) -> Result<CompiledSource
         Frontend::Python {
             mode: PythonMode::Module,
         }
-        | Frontend::TypeScript => self::language(language).compile(source)?,
+        | Frontend::TypeScript
+        | Frontend::Php {
+            mode: PhpMode::Script,
+        } => self::language(language).compile(source)?,
     };
     Ok(CompiledSource { language, state })
+}
+
+/// Compile a PHP 8.x script or HTTP SAPI request with explicit configuration
+/// (file path, base dir, CLI argv, HTTP request JSON, VFS/FS permissions).
+#[cfg(feature = "php")]
+pub fn compile_php_program(
+    source: &str,
+    config: PhpProgramConfig,
+) -> Result<CompiledSource, String> {
+    let program = php::compile_program(source, config)?;
+    let state = ScriptState::from_program(program);
+    Ok(CompiledSource {
+        language: LanguageId::Php,
+        state,
+    })
 }
 /// A Python state starts with the VM JIT off: an embedder's instruction
 /// budget is charged per interpreted instruction, and compiled code meters by
@@ -327,6 +357,7 @@ pub fn compile_source_to_text(source: &str, frontend: Frontend) -> Result<String
         Frontend::JavaScript { goal } => js::compile_to_text(source, goal),
         Frontend::Python { .. } => language(LanguageId::Python).compile_to_text(source),
         Frontend::TypeScript => language(LanguageId::TypeScript).compile_to_text(source),
+        Frontend::Php { .. } => language(LanguageId::Php).compile_to_text(source),
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -438,7 +469,7 @@ mod tests {
     }
     #[test]
     fn the_table_lists_each_language_once() {
-        for id in [LanguageId::JavaScript, LanguageId::Python, LanguageId::TypeScript] {
+        for id in [LanguageId::JavaScript, LanguageId::Python, LanguageId::TypeScript, LanguageId::Php] {
             assert_eq!(languages().iter().filter(|l| l.id() == id).count(), 1);
             for name in language(id).names() {
                 assert_eq!(name.parse::<LanguageId>().unwrap(), id, "{name}");

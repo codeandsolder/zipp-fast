@@ -3844,6 +3844,13 @@ pub struct Vm<'p> {
     pub(crate) node_host: Value,
     #[cfg(feature = "node")]
     pub(crate) node_cjs: Value,
+    /// Raw byte output buffer for PHP (`lang/php/vm/php_natives.rs`) when not
+    /// streaming directly to OS stdout (tests, HTTP SAPI responses, embedders).
+    #[cfg(feature = "php")]
+    pub(crate) php_output: Vec<u8>,
+    /// Canonical paths already included in this PHP VM (`include_once`/`require_once`).
+    #[cfg(feature = "php")]
+    pub(crate) php_included: rustc_hash::FxHashSet<String>,
     /// `WebAssembly`'s runtime, made on first use (vm/webassembly).
     #[cfg(feature = "webassembly")]
     pub(crate) wasm: Option<Box<webassembly::WasmRuntime>>,
@@ -4103,6 +4110,10 @@ pub(crate) mod prof;
 #[path = "../lang/js/node/mod.rs"]
 pub(crate) mod node;
 
+// ── PHP's half of the VM ── private natives (`__zipp_php_*`).
+#[cfg(feature = "php")]
+#[path = "../lang/php/vm/php_natives.rs"]
+mod php_natives;
 // ── Python's half of the VM ── its instructions' semantics, runtime
 // tables and library natives. The files live with the rest of the language
 // in `lang/python/vm/`; they are modules of `vm` because they implement the

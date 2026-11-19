@@ -220,6 +220,8 @@ fn finish_program(c: &mut Compiler) -> Program {
         module_decl_globals,
         python_natives: false,
         python_lazy: None,
+        php_natives: false,
+        php_ctx: None,
     }
 }
 
@@ -535,6 +537,8 @@ pub fn compile_eval(
         module_decl_globals,
         python_natives: false,
         python_lazy: None,
+        php_natives: false,
+        php_ctx: None,
     })
 }
 

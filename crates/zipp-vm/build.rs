@@ -34,6 +34,14 @@ fn main() {
         println!("cargo:rerun-if-changed={}", root.join(dir).display());
         mirror(&root.join(dir), &out.join(dir));
     }
+    let php_rt = Path::new("src/lang/php/runtime");
+    if php_rt.is_dir() {
+        let php_out = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"))
+            .join("phpsrc")
+            .join("runtime");
+        println!("cargo:rerun-if-changed={}", php_rt.display());
+        mirror(php_rt, &php_out);
+    }
     let gen = out.parent().unwrap();
     // The bytecode codec's per-instruction code (src/bytecode_codec.rs).
     let bytecode = std::fs::read_to_string("src/bytecode.rs").expect("read src/bytecode.rs");

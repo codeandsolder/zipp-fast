@@ -259,6 +259,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "zipp-phpparse"
+version = "0.0.36"
+
+[[package]]
 name = "zipp-pyparse"
 version = "0.0.36"
 dependencies = [
@@ -287,6 +291,7 @@ dependencies = [
  "rustc-hash",
  "self_cell",
  "zipp-numparse",
+ "zipp-phpparse",
  "zipp-pyparse",
  "zipp-regress",
 ]

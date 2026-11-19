@@ -19,6 +19,7 @@ Everything else:
 | [`python/RUNNING.md`](python/RUNNING.md) | Running Python projects |
 | [`python/FRONTEND.md`](python/FRONTEND.md) | Python on ZIPP: scope, integration contract, compiler and runtime |
 | [`python/TORCH_COMPATIBILITY.md`](python/TORCH_COMPATIBILITY.md) | The supported `torch` surface |
+| [`PHP.md`](PHP.md) | PHP 8.x on ZIPP: dual-mode templates, CoW arrays, OOP, built-in HTTP SAPI server & Worker Mode |
 | [`LANGUAGES.md`](LANGUAGES.md) | How the languages share one engine: the base bytecode, what a language overrides, adding a language |
 | [`LANGUAGE_INTEROP.md`](LANGUAGE_INTEROP.md) | Opt-in Python / JavaScript interoperability |
 | [`DEVELOPMENT.md`](DEVELOPMENT.md) | Building, local verification, measuring a change, working rules |

@@ -852,6 +852,10 @@ impl<'p> Vm<'p> {
             node_host: Value::UNDEFINED,
             #[cfg(feature = "node")]
             node_cjs: Value::UNDEFINED,
+            #[cfg(feature = "php")]
+            php_output: Vec::new(),
+            #[cfg(feature = "php")]
+            php_included: rustc_hash::FxHashSet::default(),
             #[cfg(feature = "webassembly")]
             wasm: None,
             #[cfg(feature = "webassembly")]
