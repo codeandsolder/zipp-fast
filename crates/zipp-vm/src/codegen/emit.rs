@@ -854,9 +854,12 @@ pub(crate) fn emit_ic_probe(
                 ; cmp r10d, 0x7FFD                    // Value TAG_HEAP >> 48
                 ; jne => skip
                 ; mov ecx, eax                        // heap idx (low 32)
-                ; mov r9, [rdi + hot_off]
-                ; lea r9, [r9 + rcx*8]                // hot base + idx*8
-                ; mov r11d, [r9 + rcx*8]              // live mirror shape (idx*16)
+                ; mov r10, [rdi + hot_off]
+                ; lea r10, [r10 + rcx*8]              // hot base + idx*8
+                ; lea r10, [r10 + rcx*8]              // &hot_mirror[idx] (idx*16)
+                ; mov r11d, [r10]                     // live mirror shape
+                ; test r11d, r11d                     // DICT (0) never matches a shape pair
+                ; jz => skip
                 ; bts r11, 32                         // compose (1<<32)|shape
                 ; lea r9, [r14 + ic_off]              // way 0 of this site
                 ; mov r8d, JIT_IC_WAYS as i32
@@ -874,14 +877,14 @@ pub(crate) fn emit_ic_probe(
                 ; cmp r11, [r9 + 40]
                 ; mov edx, [r9 + 48]
                 ; je => hit
+                ; cmp QWORD [r9 + 40], 0              // sequential fill: empty slot 3 => later ways empty
+                ; je => skip
                 ; add r9, JIT_IC_STRIDE as i32
                 ; dec r8d
                 ; jnz => ways
                 ; jmp => skip
                 ; => hit
-                ; mov r10, [rdi + hot_off]
-                ; lea r10, [r10 + rcx*8]              // hot base + idx*8
-                ; mov rcx, [r10 + rcx*8 + hot_vals]   // live vals base (idx*16 + 8)
+                ; mov rcx, [r10 + hot_vals]           // live vals base (already in r10!)
                 ; and edx, 0x00FF_FFFF                // slot (low 24)
                 ; mov r10, [rbx + dreg(val)]          // val_bits
                 ; mov [rcx + rdx*8], r10              // vals[slot] = val (COMMIT)
@@ -928,9 +931,12 @@ pub(crate) fn emit_ic_probe(
                 ; cmp r10d, 0x7FFD                    // Value TAG_HEAP >> 48
                 ; jne => skip
                 ; mov ecx, eax                        // heap idx (low 32)
-                ; mov r9, [rdi + hot_off]
-                ; lea r9, [r9 + rcx*8]                // hot base + idx*8
-                ; mov r11d, [r9 + rcx*8]              // live mirror shape (idx*16)
+                ; mov r10, [rdi + hot_off]
+                ; lea r10, [r10 + rcx*8]              // hot base + idx*8
+                ; lea r10, [r10 + rcx*8]              // &hot_mirror[idx] (idx*16)
+                ; mov r11d, [r10]                     // live mirror shape
+                ; test r11d, r11d                     // DICT (0) never matches a shape pair
+                ; jz => skip
                 ; bts r11, 32                         // compose (1<<32)|shape
                 ; lea r9, [r14 + ic_off]              // way 0 of this site
                 ; mov r8d, JIT_IC_WAYS as i32
@@ -949,6 +955,8 @@ pub(crate) fn emit_ic_probe(
                 ; cmp r11, [r9 + 40]
                 ; mov edx, [r9 + 48]
                 ; je => hit
+                ; cmp QWORD [r9 + 40], 0              // sequential fill: empty slot 3 => later ways empty
+                ; je => skip
                 ; add r9, JIT_IC_STRIDE as i32
                 ; dec r8d
                 ; jnz => ways
@@ -956,17 +964,13 @@ pub(crate) fn emit_ic_probe(
                 ; => hit
                 ; test edx, edx
                 ; js => hit_absent                    // SHAPE_PAIR_ABSENT_SLOT (bit 31)
-                ; mov r10, [rdi + hot_off]
-                ; lea r10, [r10 + rcx*8]              // hot base + idx*8
-                ; mov rcx, [r10 + rcx*8 + hot_vals]   // live vals base (idx*16 + 8)
+                ; mov rcx, [r10 + hot_vals]           // live vals base (already in r10!)
                 ; and edx, 0x00FF_FFFF                // slot (low 24)
                 ; mov rax, [rcx + rdx*8]              // vals[slot] (CALL-FREE)
                 ; mov [rbx + dreg(dst)], rax
                 ; jmp => cont
                 ; => hit_absent
-                ; mov r10, [rdi + hot_off]
-                ; lea r10, [r10 + rcx*8]
-                ; cmp DWORD [r10 + rcx*8 + hot_fid], crate::heap::FID_MIRROR_NONE as i32
+                ; cmp DWORD [r10 + hot_fid], crate::heap::FID_MIRROR_NONE as i32
                 ; jne => skip
                 ; mov r10d, DWORD [rdi + crate::vm::host_api::JIT_OBJ_PROTO_IDX_OFFSET as i32]
                 ; mov r11d, DWORD [r13 + r10*4]

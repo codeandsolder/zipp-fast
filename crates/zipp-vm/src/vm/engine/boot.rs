@@ -745,7 +745,19 @@ impl<'p> Vm<'p> {
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             es5_proto_memo: Vec::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            es5_proto_memo_raw: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             dict_prop_memo: Vec::new(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            dict_prop_memo_raw: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            shape_prop_memo: Vec::new(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            shape_prop_memo_raw: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            keyed_slot_memo_raw: 0,
+            deferred_ns_nonempty: 0,
+            mod_ns_nonempty: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             fn_proto_shape: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]

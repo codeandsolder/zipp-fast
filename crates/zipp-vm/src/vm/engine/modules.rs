@@ -855,6 +855,7 @@ impl<'p> Vm<'p> {
                 Err(e) => {
                     self.module_cache.remove(&path);
                     self.module_namespaces.remove(&ns_idx);
+                    self.mod_ns_nonempty = (!self.module_namespaces.is_empty()) as u8;
                     self.module_pending_reexports.remove(&path);
                     return Err(e);
                 }
@@ -1097,6 +1098,7 @@ impl<'p> Vm<'p> {
             vm.module_dfs_unwind(&path);
             vm.module_cache.remove(&path);
             vm.module_namespaces.remove(&ns_idx);
+            vm.mod_ns_nonempty = (!vm.module_namespaces.is_empty()) as u8;
             vm.module_own.remove(&path);
             vm.module_pending_reexports.remove(&path);
             vm.link_pending_deps.truncate(lp_mark);
@@ -1315,6 +1317,7 @@ impl<'p> Vm<'p> {
                 self.module_dfs_unwind(&path);
                 self.module_cache.remove(&path);
                 self.module_namespaces.remove(&ns_idx);
+                self.mod_ns_nonempty = (!self.module_namespaces.is_empty()) as u8;
                 Err(e)
             }
         }
@@ -1587,6 +1590,7 @@ impl<'p> Vm<'p> {
         self.deferred_ns_cache.insert(key, Value::heap(idx));
         self.deferred_ns_state
             .insert(idx, (path, mtype.map(str::to_string)));
+        self.deferred_ns_nonempty = 1;
         Ok(Value::heap(idx))
     }
 
@@ -1622,6 +1626,7 @@ impl<'p> Vm<'p> {
     /// evaluated.
     pub(crate) fn defer_ns_adopt(&mut self, idx: u32, real: Value) {
         self.deferred_ns_state.remove(&idx);
+        self.deferred_ns_nonempty = (!self.deferred_ns_state.is_empty()) as u8;
         if real.is_heap() {
             let rid = real.heap_index();
             if let Some(map) = self.module_namespaces.get(&rid).cloned() {

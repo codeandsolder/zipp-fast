@@ -1317,6 +1317,9 @@ pub(crate) const CROSS_DYN_OK: u32 = 1 << 0;
 pub(crate) const CROSS_DYN_ARROW: u32 = 1 << 1;
 pub(crate) const CROSS_DYN_STRICT: u32 = 1 << 2;
 pub(crate) const CROSS_DYN_SLOPPY: u32 = 1 << 3;
+/// Callee has `reg_count > 64` or an unanalyzed `uninit_mask` (`u64::MAX`);
+/// `cross3_dyn_stub` zeroes `[copy_n + 1 .. reg_count]` when reusing a window.
+pub(crate) const CROSS_DYN_WIDE_ZERO: u32 = 1 << 4;
 /// Sentinel slot stored in a 32-way shape-pair IC entry (`fill_shape_pair`)
 /// when the static property key is provably absent from this shape and from
 /// pristine `%Object.prototype%`. Bit 31 distinguishes it from real slot indices
@@ -4902,6 +4905,7 @@ impl Jit {
         // and every lane baked against the fid keeps routing to the helper.
         self.cross_table[i].entry = if needs_frame { 0 } else { entry as u64 };
         let reg_count = proto.reg_count.max(1);
+        let wide_zero = reg_count > 64 || uninit_mask == u64::MAX;
         let dyn_ok = !needs_frame
             && func_id < 0x0100_0000
             && !proto.is_generator
@@ -4912,12 +4916,12 @@ impl Jit {
             && !has_py_ops(&proto.code)
             && json_walk.is_none()
             && markdown_inline.is_none()
-            && reg_count <= 64
-            && uninit_mask != u64::MAX
+            && reg_count <= 512
             && proto.param_count <= 62
             && (1 + proto.param_count as usize) <= reg_count as usize;
         self.cross_table[i].dyn_flags = if dyn_ok {
             CROSS_DYN_OK
+                | if wide_zero { CROSS_DYN_WIDE_ZERO } else { 0 }
                 | if proto.lexical_this {
                     CROSS_DYN_ARROW
                 } else if proto.is_strict {

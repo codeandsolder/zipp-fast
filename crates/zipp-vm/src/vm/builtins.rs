@@ -1563,20 +1563,28 @@ impl<'p> Vm<'p> {
         name: &str,
         want: u16,
     ) -> bool {
-        let proto = match self.heap.get(idx) {
-            HeapObj::WeakMap { .. } => self.weakmap_proto,
-            HeapObj::WeakSet(_) => self.weakset_proto,
+        let (proto, wm_nid) = match self.heap.get(idx) {
+            HeapObj::WeakMap { .. } => (
+                self.weakmap_proto,
+                match want {
+                    crate::vm::native::WM_GET => Some(0usize),
+                    crate::vm::native::WM_SET => Some(1),
+                    crate::vm::native::WM_HAS => Some(2),
+                    crate::vm::native::WM_DELETE => Some(3),
+                    _ => None,
+                },
+            ),
+            HeapObj::WeakSet(_) => (self.weakset_proto, None),
             _ => return false,
         };
         if proto == 0
-            || !self.realm_global_objs.is_empty()
-            || self.active_realm_proto(proto) != proto
+            || self.realm_global_objs.nonempty_raw != 0
             || (!self.arr_props.is_empty()
                 && self
                     .arr_props
                     .get(&idx)
                     .is_some_and(|props| props.pos(name).is_some()))
-            || (!self.proto_of.is_empty()
+            || (self.proto_of.raw_bits(idx) != 0
                 && self
                     .proto_of
                     .get(&idx)
@@ -1584,14 +1592,34 @@ impl<'p> Vm<'p> {
         {
             return false;
         }
-        match self.heap.get(proto) {
-            HeapObj::Object(map) => map.pos(name).is_some_and(|slot| {
-                let v = map.val_at(slot);
-                !map.attr_at(slot).accessor
-                    && v.is_heap()
-                    && matches!(self.heap.get(v.heap_index()), HeapObj::Native(id) if *id == want)
-            }),
-            _ => false,
+        let HeapObj::Object(map) = self.heap.get(proto) else {
+            return false;
+        };
+        if let Some(nid) = wm_nid {
+            if let Some((ver, slot, bits)) = self.weakmap_intrinsic_memo[nid] {
+                if self.heap.version_of(proto) == ver
+                    && map.val_get_ref(slot as usize).is_some_and(|v| v.bits() == bits)
+                {
+                    return true;
+                }
+            }
+        }
+        let proven = map.pos(name).and_then(|slot| {
+            let v = map.val_at(slot);
+            (!map.attr_at(slot).accessor
+                && v.is_heap()
+                && matches!(self.heap.get(v.heap_index()), HeapObj::Native(id) if *id == want))
+            .then(|| (slot as u32, v.bits()))
+        });
+        match proven {
+            Some((slot, bits)) => {
+                if let Some(nid) = wm_nid {
+                    self.weakmap_intrinsic_memo[nid] =
+                        Some((self.heap.version_of(proto), slot, bits));
+                }
+                true
+            }
+            None => false,
         }
     }
 
@@ -2227,7 +2255,29 @@ impl<'p> Vm<'p> {
         name: &str,
         kind: u8,
     ) -> bool {
-        if crate::vm::coll_proof_cache_enabled() && self.realm_global_objs.is_empty() {
+        if self.realm_global_objs.nonempty_raw == 0
+            && (self.arr_props.is_empty() || !self.arr_props.contains_key(&idx))
+            && self.proto_of.raw_bits(idx) == 0
+        {
+            let mproto = match (self.heap.get(idx), kind) {
+                (HeapObj::Map { .. }, 4) => self.map_proto,
+                (HeapObj::Set(_), 3) => self.set_proto,
+                _ => return false,
+            };
+            if mproto != 0 {
+                if let Some((ver, pslot, fn_bits)) =
+                    self.coll_intrinsic_memo[(kind == 4) as usize][nid]
+                {
+                    if self.heap.version_of(mproto) == ver {
+                        if let HeapObj::Object(map) = self.heap.get(mproto) {
+                            if map.val_get_ref(pslot as usize).map(|v| v.bits()) == Some(fn_bits) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        } else if crate::vm::coll_proof_cache_enabled() && self.realm_global_objs.is_empty() {
             let cslot = ((idx as usize).wrapping_mul(31) ^ nid) & (COLL_PROOF_SLOTS - 1);
             let (ci, cv, cn, ck) = self.coll_proof_cache[cslot];
             if ci == idx && cv == self.heap.version_of(idx) && cn == nid as u8 && ck == kind {

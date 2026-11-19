@@ -5537,6 +5537,12 @@ pub(crate) extern "win64" fn jit_cross_method_call(
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub use icstats::dump as ic_stats;
 
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+pub(crate) fn icstats_enabled() -> bool {
+    icstats::enabled()
+}
+
 /// `ZIPP_ICSTATS=1` — B82 call/apply splice counters. `call`/`apply` count the
 /// region-call helper serving a `f.call(…)`/`f.apply(…)` TARGET off-frame
 /// (`try_fn_call_apply_inline`); `hasown` counts the older guarded
@@ -6036,10 +6042,10 @@ fn es5_proto_memo_get(vm: &Vm, first_proto: u32, func: u32, name: u32) -> Option
     if vm.es5_proto_memo.is_empty() {
         return None;
     }
+    let packed = ((func as u64) << 32) | name as u64;
     let e = vm.es5_proto_memo[es5_proto_memo_slot(first_proto, func, name)];
     if e.first_proto != first_proto
-        || e.func != func
-        || e.name != name
+        || e.packed != packed
         || e.chain_epoch != vm.heap.chain_epoch
     {
         return None;
@@ -6076,15 +6082,17 @@ fn es5_proto_memo_put(
     }
     if vm.es5_proto_memo.is_empty() {
         vm.es5_proto_memo = vec![crate::vm::Es5ProtoMemo::EMPTY; crate::vm::ES5_PROTO_MEMO_SLOTS];
+        vm.es5_proto_memo_raw = vm.es5_proto_memo.as_ptr() as u64;
     }
+    let packed = ((func as u64) << 32) | name as u64;
     let idx = es5_proto_memo_slot(first_proto, func, name);
     vm.es5_proto_memo[idx] = crate::vm::Es5ProtoMemo {
         first_proto,
-        func,
-        name,
         chain_epoch: vm.heap.chain_epoch,
+        packed,
         vals_ptr,
         slot,
+        _pad: 0,
     };
 }
 
@@ -6107,10 +6115,10 @@ fn dict_prop_memo_get(vm: &Vm, idx: u32, func: u32, name: u32) -> Option<u64> {
     if vm.dict_prop_memo.is_empty() {
         return None;
     }
+    let packed = ((func as u64) << 32) | name as u64;
     let e = vm.dict_prop_memo[dict_prop_memo_slot(idx, func, name)];
     if e.idx != idx
-        || e.func != func
-        || e.name != name
+        || e.packed != packed
         || e.ver != vm.heap.version_of(idx)
     {
         return None;
@@ -6137,15 +6145,50 @@ fn dict_prop_memo_put(
 ) {
     if vm.dict_prop_memo.is_empty() {
         vm.dict_prop_memo = vec![crate::vm::DictPropMemo::EMPTY; crate::vm::DICT_PROP_MEMO_SLOTS];
+        vm.dict_prop_memo_raw = vm.dict_prop_memo.as_ptr() as u64;
     }
+    let packed = ((func as u64) << 32) | name as u64;
     let s = dict_prop_memo_slot(idx, func, name);
     vm.dict_prop_memo[s] = crate::vm::DictPropMemo {
         idx,
-        func,
-        name,
         ver,
+        packed,
         vals_ptr,
         slot,
+        _pad: 0,
+    };
+}
+
+/// Direct-mapped slot index into `Vm::shape_prop_memo` (8192 slots).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline(always)]
+fn shape_prop_memo_slot(shape: u32, func: u32, name: u32) -> usize {
+    let h = shape
+        .wrapping_mul(0x9E37_79B1)
+        ^ func.wrapping_mul(0x85EB_CA77)
+        ^ name.wrapping_mul(0xC2B2_AE35);
+    (h.wrapping_mul(0x27D4_EB2F) >> 19) as usize & (crate::vm::SHAPE_PROP_MEMO_SLOTS - 1)
+}
+
+/// Record a megamorphic `(shape, packed) -> slot` entry for inline x86-64
+/// `mega_get_prop_stub` hits (own data slot, `SHAPE_PROP_ABSENT`, or
+/// `SHAPE_PROP_ES5_PROTO`).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn shape_prop_memo_put(vm: &mut Vm, shape: u32, func: u32, name: u32, slot: u32) {
+    if shape == crate::shape::DICT {
+        return;
+    }
+    if vm.shape_prop_memo.is_empty() {
+        vm.shape_prop_memo = vec![crate::vm::ShapePropMemo::EMPTY; crate::vm::SHAPE_PROP_MEMO_SLOTS];
+        vm.shape_prop_memo_raw = vm.shape_prop_memo.as_ptr() as u64;
+    }
+    let packed = ((func as u64) << 32) | name as u64;
+    let s = shape_prop_memo_slot(shape, func, name);
+    vm.shape_prop_memo[s] = crate::vm::ShapePropMemo {
+        shape,
+        slot,
+        packed,
     };
 }
 
@@ -6646,6 +6689,7 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
         match vm.own_slot_probe(mir.shape, key) {
             crate::vm::ic::OwnSlotProbe::Data(slot) => {
                 if vm.jit.direct_miss_active(site_idx) {
+                    shape_prop_memo_put(vm, mir.shape, func_id, name_idx, slot);
                     if crate::codegen::shape_ways_enabled() {
                         vm.jit.fill_shape_pair(site_idx, mir.shape, slot);
                     }
@@ -6663,6 +6707,18 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
                 let raw_proto = vm.proto_of.raw_bits(idx);
                 if raw_proto == 0 {
                     if vm.obj_proto_lacks_key(key) {
+                        if vm.jit.direct_miss_active(site_idx)
+                            && vm.obj_proto != 0
+                            && vm.heap.version_of(vm.obj_proto) == vm.obj_proto_setup_ver
+                        {
+                            shape_prop_memo_put(
+                                vm,
+                                mir.shape,
+                                func_id,
+                                name_idx,
+                                crate::vm::SHAPE_PROP_ABSENT,
+                            );
+                        }
                         return jit_fill_absent_ic(
                             vm,
                             site_idx,
@@ -6675,6 +6731,15 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
                         );
                     }
                 } else if !Value::from_bits(raw_proto).is_heap() {
+                    if vm.jit.direct_miss_active(site_idx) {
+                        shape_prop_memo_put(
+                            vm,
+                            mir.shape,
+                            func_id,
+                            name_idx,
+                            crate::vm::SHAPE_PROP_ABSENT,
+                        );
+                    }
                     return jit_fill_absent_ic(
                         vm,
                         site_idx,
@@ -6688,6 +6753,15 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
                 } else if idx != vm.global_this && vm.realm_global_objs.is_empty() {
                     let first_proto = Value::from_bits(raw_proto).heap_index();
                     if let Some(bits) = es5_proto_memo_get(vm, first_proto, func_id, name_idx) {
+                        if vm.jit.direct_miss_active(site_idx) {
+                            shape_prop_memo_put(
+                                vm,
+                                mir.shape,
+                                func_id,
+                                name_idx,
+                                crate::vm::SHAPE_PROP_ES5_PROTO,
+                            );
+                        }
                         return bits;
                     }
                 }
@@ -6714,6 +6788,7 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
                 slot: u32,
                 cacheable: bool,
             },
+            UnsettledShaped(u32),
             ClassMiss,
             PlainMiss,
             Str,
@@ -6721,22 +6796,25 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
             Other,
         }
         let dict_read = match vm.heap.get(idx) {
-            HeapObj::Object(map)
-                if map.shape() == crate::shape::DICT && vm.ic_obj_ok(idx) =>
-            {
-                match map.pos(key) {
-                    Some(s) if !map.attr_at(s).accessor => {
-                        let v = map.val_at(s);
-                        DictRead::Hit {
-                            bits: v.bits(),
-                            vals_ptr: map.vals_ptr_raw() as u64,
-                            slot: s as u32,
-                            cacheable: !v.is_uninitialized(),
+            HeapObj::Object(map) if vm.ic_obj_ok(idx) => {
+                let sh = map.shape();
+                if sh != crate::shape::DICT {
+                    DictRead::UnsettledShaped(sh)
+                } else {
+                    match map.pos(key) {
+                        Some(s) if !map.attr_at(s).accessor => {
+                            let v = map.val_at(s);
+                            DictRead::Hit {
+                                bits: v.bits(),
+                                vals_ptr: map.vals_ptr_raw() as u64,
+                                slot: s as u32,
+                                cacheable: !v.is_uninitialized(),
+                            }
                         }
+                        None if map.class.is_some() => DictRead::ClassMiss,
+                        None if !map.is_ctor => DictRead::PlainMiss,
+                        _ => DictRead::Other,
                     }
-                    None if map.class.is_some() => DictRead::ClassMiss,
-                    None if !map.is_ctor => DictRead::PlainMiss,
-                    _ => DictRead::Other,
                 }
             }
             HeapObj::Str(_) | HeapObj::Cons { .. } => DictRead::Str,
@@ -6746,6 +6824,29 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
             _ => DictRead::Other,
         };
         match dict_read {
+            DictRead::UnsettledShaped(sh) => {
+                vm.heap.refresh_mirror(idx);
+                let mir2 = vm.heap.hot_mirror_of(idx);
+                if mir2.shape == sh && crate::heap::fid_mirror_plain(mir2.fid) {
+                    if let crate::vm::ic::OwnSlotProbe::Data(slot) = vm.own_slot_probe(sh, key) {
+                        if vm.jit.direct_miss_active(site_idx) {
+                            shape_prop_memo_put(vm, sh, func_id, name_idx, slot);
+                            if crate::codegen::shape_ways_enabled() {
+                                vm.jit.fill_shape_pair(site_idx, sh, slot);
+                            }
+                            // SAFETY: refreshed mirror shape proves `vals` is live and holds `slot`.
+                            return unsafe { *(mir2.vals as *const Value).add(slot as usize) }.bits();
+                        } else if vm.jit.ic_thrashing(site_idx)
+                            && !vm.jit.direct_miss_gate_ready(site_idx)
+                        {
+                            if crate::codegen::ic_refill_gate_enabled() {
+                                vm.jit.ic_rot_bump(site_idx);
+                            }
+                            return unsafe { *(mir2.vals as *const Value).add(slot as usize) }.bits();
+                        }
+                    }
+                }
+            }
             DictRead::Hit {
                 bits,
                 vals_ptr,

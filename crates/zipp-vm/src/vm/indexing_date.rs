@@ -23,30 +23,33 @@ pub(crate) enum ConcatSetFast {
 pub(crate) const KEYED_SLOT_MEMO_SLOTS: usize = 16384;
 
 /// `KeyedSlotMemo::flags` bits.
-const KSM_IMMUTABLE_KEY: u8 = 1;
+pub(crate) const KSM_IMMUTABLE_KEY: u8 = 1;
 const KSM_WRITABLE_DATA: u8 = 2;
-const KSM_PURE_SHAPE: u8 = 4;
+pub(crate) const KSM_PURE_SHAPE: u8 = 4;
 /// Proved-absent string key on a plain object with default `%Object.prototype%`
 /// (`slot` stores `heap.version_of(obj_proto)` at put time).
-const KSM_ABSENT_DEFAULT_PROTO: u8 = 8;
+pub(crate) const KSM_ABSENT_DEFAULT_PROTO: u8 = 8;
 /// Proved-absent string key on a plain object with explicit `null` prototype.
-const KSM_ABSENT_NULL_PROTO: u8 = 16;
-const KSM_ABSENT_MASK: u8 = KSM_ABSENT_DEFAULT_PROTO | KSM_ABSENT_NULL_PROTO;
+pub(crate) const KSM_ABSENT_NULL_PROTO: u8 = 16;
+pub(crate) const KSM_ABSENT_MASK: u8 = KSM_ABSENT_DEFAULT_PROTO | KSM_ABSENT_NULL_PROTO;
 
 /// One prediction of `Vm::keyed_slot_memo`: an object of shape `owner`
 /// (or, with `by_object`, the dictionary-mode object `owner`) had the flat
 /// string key `key` at `slot`. When `KSM_IMMUTABLE_KEY` is set, `key` was an
 /// immutable non-`"@@"` string (atom or frozen) at `kver`, and `over` is the
 /// object's version at put time so matching versions skip key byte comparison.
+/// `#[repr(C)]`, 32 bytes (power of two) for direct x86-64 JIT probing.
+#[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct KeyedSlotMemo {
-    owner: u32,
-    key: u32,
-    slot: u32,
-    kver: u32,
-    over: u32,
-    by_object: bool,
-    flags: u8,
+    pub(crate) owner: u32,
+    pub(crate) key: u32,
+    pub(crate) slot: u32,
+    pub(crate) kver: u32,
+    pub(crate) over: u32,
+    pub(crate) by_object: bool,
+    pub(crate) flags: u8,
+    pub(crate) _pad: [u8; 10],
 }
 
 impl KeyedSlotMemo {
@@ -58,6 +61,7 @@ impl KeyedSlotMemo {
         over: 0,
         by_object: true,
         flags: 0,
+        _pad: [0; 10],
     };
 }
 
@@ -419,6 +423,10 @@ impl<'p> Vm<'p> {
         };
         if self.keyed_slot_memo.is_empty() {
             self.keyed_slot_memo = vec![KeyedSlotMemo::EMPTY; KEYED_SLOT_MEMO_SLOTS];
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            {
+                self.keyed_slot_memo_raw = self.keyed_slot_memo.as_ptr() as u64;
+            }
         }
         self.keyed_slot_memo[keyed_memo_index(owner, kidx)] = KeyedSlotMemo {
             owner,
@@ -428,6 +436,7 @@ impl<'p> Vm<'p> {
             over,
             by_object,
             flags,
+            _pad: [0; 10],
         };
     }
 
@@ -500,6 +509,10 @@ impl<'p> Vm<'p> {
             | if !by_object { KSM_PURE_SHAPE } else { 0 };
         if self.keyed_slot_memo.is_empty() {
             self.keyed_slot_memo = vec![KeyedSlotMemo::EMPTY; KEYED_SLOT_MEMO_SLOTS];
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            {
+                self.keyed_slot_memo_raw = self.keyed_slot_memo.as_ptr() as u64;
+            }
         }
         self.keyed_slot_memo[keyed_memo_index(owner, kidx)] = KeyedSlotMemo {
             owner,
@@ -509,6 +522,7 @@ impl<'p> Vm<'p> {
             over: self.heap.version_of(oidx),
             by_object,
             flags,
+            _pad: [0; 10],
         };
     }
 

@@ -488,10 +488,12 @@ impl<'p> Vm<'p> {
             }
         }
         Some(
-            Value::heap(
+            Value::heap(if output.is_empty() {
+                crate::heap::INTERN_EMPTY
+            } else {
                 self.heap
-                    .alloc(HeapObj::Str(crate::heap::JsStr::from_ascii(output))),
-            )
+                    .alloc(HeapObj::Str(crate::heap::JsStr::from_ascii(output)))
+            })
             .bits(),
         )
     }
@@ -1881,10 +1883,12 @@ impl<'p> Vm<'p> {
                                 out.extend_from_slice(bb);
                                 out.extend_from_slice(cb);
                                 pairstats::fast_str();
-                                return Ok(Value::heap(
+                                return Ok(Value::heap(if total == 0 {
+                                    crate::heap::INTERN_EMPTY
+                                } else {
                                     self.heap
-                                        .alloc(HeapObj::Str(crate::heap::JsStr::from_ascii(out))),
-                                ));
+                                        .alloc(HeapObj::Str(crate::heap::JsStr::from_ascii(out)))
+                                }));
                             }
                         }
                     }
@@ -2155,6 +2159,9 @@ impl<'p> Vm<'p> {
         let total_bytes = s.len().checked_add(add.len())?;
         if total_units > MAX_STRING_UNITS || total_bytes > MAX_STRING_BYTES {
             return None;
+        }
+        if total_units == 0 {
+            return Some(Value::heap(crate::heap::INTERN_EMPTY));
         }
         crate::heap::wtf8_push(&mut s, &add);
         Some(Value::heap(
@@ -2722,6 +2729,9 @@ impl<'p> Vm<'p> {
                 }
             };
             if not_htmldda {
+                if self.heap.has_non_interned_falsy == 0 && idx != crate::heap::INTERN_EMPTY {
+                    return true;
+                }
                 let mir = self.heap.hot_mirror_of(idx);
                 if mir.shape != crate::shape::DICT
                     || mir.fid != crate::heap::FID_MIRROR_NONE

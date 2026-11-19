@@ -85,66 +85,101 @@ impl InstanceofPairMemo {
     };
 }
 
-/// Slots of `Vm::es5_proto_memo`, direct-mapped by `(first_proto, func, name)`.
+/// Slots of `Vm::es5_proto_memo`, direct-mapped by `(first_proto, packed)`.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const ES5_PROTO_MEMO_SLOTS: usize = 2048;
 
 /// Cached ES5 prototype-chain lookup result (`vals_ptr` + `slot`, or
-/// `slot == u32::MAX` for proved absence) keyed by `(first_proto, func, name)`
-/// and guarded in O(1) by `Heap::chain_epoch`. Serves polymorphic ES5
-/// instances (`new Node()`, `new NodeObject()`, `new NodePath()`, `new Scope()`)
-/// across all receiver shapes without re-walking prototype hops.
+/// `slot == u32::MAX` for proved absence) keyed by `(first_proto, packed)`
+/// (`packed = (func << 32) | name`) and guarded in O(1) by `Heap::chain_epoch`.
+/// `#[repr(C)]`, 32 bytes (power of two) for direct x86-64 JIT probing.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct Es5ProtoMemo {
     pub(crate) first_proto: u32,
-    pub(crate) func: u32,
-    pub(crate) name: u32,
     pub(crate) chain_epoch: u32,
+    pub(crate) packed: u64,
     pub(crate) vals_ptr: u64,
     pub(crate) slot: u32,
+    pub(crate) _pad: u32,
 }
 
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 impl Es5ProtoMemo {
     pub(crate) const EMPTY: Es5ProtoMemo = Es5ProtoMemo {
         first_proto: u32::MAX,
-        func: u32::MAX,
-        name: u32::MAX,
         chain_epoch: 0,
+        packed: u64::MAX,
         vals_ptr: 0,
         slot: u32::MAX,
+        _pad: 0,
     };
 }
 
-/// Slots of `Vm::dict_prop_memo`, direct-mapped by `(idx, func, name)`.
+/// Slots of `Vm::dict_prop_memo`, direct-mapped by `(idx, packed)`.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const DICT_PROP_MEMO_SLOTS: usize = 2048;
 
 /// Cached own DATA property slot for dictionary-mode (`shape::DICT`) objects
 /// (`NodePath`, `Scope`, `Parser`, `Printer`, `File`, `opts`), guarded by
-/// `Heap::version_of(idx)`. Eliminates `Heap::objs` + `Box<ObjMap>` +
-/// `ObjMap::pos` hashing on every direct-mode/thrashing `DICT` `GetProp` miss.
+/// `Heap::version_of(idx)`. `#[repr(C)]`, 32 bytes for direct x86-64 probing.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct DictPropMemo {
     pub(crate) idx: u32,
-    pub(crate) func: u32,
-    pub(crate) name: u32,
     pub(crate) ver: u32,
+    pub(crate) packed: u64,
     pub(crate) vals_ptr: u64,
     pub(crate) slot: u32,
+    pub(crate) _pad: u32,
 }
 
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 impl DictPropMemo {
     pub(crate) const EMPTY: DictPropMemo = DictPropMemo {
         idx: u32::MAX,
-        func: u32::MAX,
-        name: u32::MAX,
         ver: 0,
+        packed: u64::MAX,
         vals_ptr: 0,
         slot: u32::MAX,
+        _pad: 0,
+    };
+}
+
+/// Slots of `Vm::shape_prop_memo`, direct-mapped by `(shape, packed)`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const SHAPE_PROP_MEMO_SLOTS: usize = 8192;
+
+/// Sentinel `ShapePropMemo::slot` for a proved-absent key on a default/null
+/// prototype plain object (`FID_MIRROR_NONE`).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const SHAPE_PROP_ABSENT: u32 = 0x8000_0000;
+
+/// Sentinel `ShapePropMemo::slot` when `shape` lacks the key and `es5_proto_memo`
+/// should be probed next on `proto_of[idx]`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const SHAPE_PROP_ES5_PROTO: u32 = 0x8000_0001;
+
+/// Direct-mapped megamorphic `(shape, (func << 32) | name) -> slot` cache probed
+/// inline from x86-64 `mega_get_prop_stub` before falling back to `jit_get_prop_miss`.
+/// `#[repr(C)]`, 16 bytes (power of two).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct ShapePropMemo {
+    pub(crate) shape: u32,
+    pub(crate) slot: u32,
+    pub(crate) packed: u64,
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+impl ShapePropMemo {
+    pub(crate) const EMPTY: ShapePropMemo = ShapePropMemo {
+        shape: 0,
+        slot: u32::MAX,
+        packed: u64::MAX,
     };
 }
 
@@ -3660,11 +3695,29 @@ pub struct Vm<'p> {
     /// and `jit_get_prop_leaf`), allocated lazily on first ES5 prototype miss.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) es5_proto_memo: Vec<Es5ProtoMemo>,
-    /// Direct-mapped `(idx, func, name) -> (ver, vals_ptr, slot)` memo for
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) es5_proto_memo_raw: u64,
+    /// Direct-mapped `(idx, packed) -> (ver, vals_ptr, slot)` memo for
     /// dictionary-mode (`shape::DICT`) own DATA reads (`jit_get_prop_miss` and
-    /// `jit_get_prop_leaf`), allocated lazily on first DICT miss.
+    /// `mega_get_prop_stub`), allocated lazily on first DICT miss.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) dict_prop_memo: Vec<DictPropMemo>,
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) dict_prop_memo_raw: u64,
+    /// Direct-mapped `(shape, packed) -> slot` memo for megamorphic shaped
+    /// `GetProp` misses (>32 AST shapes), probed inline from `mega_get_prop_stub`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) shape_prop_memo: Vec<ShapePropMemo>,
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) shape_prop_memo_raw: u64,
+    /// Cached raw base of `Vm::keyed_slot_memo` (0 while empty; fixed 16384-slot
+    /// buffer once allocated) for direct x86-64 `keyed_memo_get_stub` probing.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) keyed_slot_memo_raw: u64,
+    /// Write-through non-empty flags for `deferred_ns_state` and
+    /// `module_namespaces` so x86-64 stubs guard them in 1 byte load.
+    pub(crate) deferred_ns_nonempty: u8,
+    pub(crate) mod_ns_nonempty: u8,
     /// Snapshot of pristine `%Function.prototype%` (`shape`, `"call"` slot,
     /// `FN_CALL` native bits) and `Array`/`Array.isArray` bits recorded at the
     /// end of `setup_globals` for native `fn.call` and `Array.isArray` stubs.
@@ -4170,6 +4223,10 @@ pub(crate) use engine::file_url;
 pub(crate) use engine::large_programs_run_jit;
 pub(crate) mod host_api;
 mod indexing_date;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) use indexing_date::{
+    KSM_ABSENT_MASK, KSM_ABSENT_NULL_PROTO, KSM_IMMUTABLE_KEY, KSM_PURE_SHAPE,
+};
 /// Step budget, cooperative abort, and the optional execution trace. Off by
 /// default: the hook it adds to the inner dispatch loop is not something a
 /// `zipp js file.js` run should pay for.

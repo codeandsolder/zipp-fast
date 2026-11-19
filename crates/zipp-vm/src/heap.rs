@@ -7527,6 +7527,11 @@ pub struct Heap {
     /// lets compiled `GetIndex`/`SetIndex` skip the typed-array receiver cache
     /// and `jit_get_index_ta_fill` completely on typed-array-free programs.
     pub(crate) has_typed_array: u8,
+    /// Non-zero if a non-interned empty `Str`, zero-length `Cons`, or `BigInt(0)`
+    /// was ever installed outside `INTERN_EMPTY`; when `0`, every `TAG_HEAP` value
+    /// other than `INTERN_EMPTY` and `IsHTMLDDA` is provably truthy without loading
+    /// `hot_mirror`, `arr_mirror`, or `objs`.
+    pub(crate) has_non_interned_falsy: u8,
     /// One-code-point strings handed out by [`Heap::cp_str`], direct-mapped by
     /// code point: (code point, slot, the slot's version when cached). A slot
     /// freed or reused since has another version, so a stale entry is seen
@@ -8613,6 +8618,7 @@ impl Heap {
             spare: 0,
             chain_epoch: 1,
             has_typed_array: 0,
+            has_non_interned_falsy: 0,
             cp_strs: Vec::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             array_snapshot_epoch: 0,
@@ -9914,6 +9920,10 @@ impl Heap {
             #[cfg(feature = "python")]
             HeapObj::PyAttrs { .. } => no_hot_mirror(),
             HeapObj::Str(s) if s.units() > 0 => str_hot_mirror(),
+            HeapObj::Str(_) | HeapObj::Cons { len: 0, .. } | HeapObj::BigInt(0) => {
+                self.has_non_interned_falsy = 1;
+                clear_hot_mirror()
+            }
             HeapObj::TypedArray { .. } => {
                 self.has_typed_array = 1;
                 clear_hot_mirror()
@@ -12111,6 +12121,16 @@ impl Heap {
         // is re-traced at the next minor (holder-grain — the value set is a
         // full HeapObj, not a single Value).
         self.write_barrier(idx);
+        if matches!(
+            &obj,
+            HeapObj::Str(s) if s.units() == 0
+        ) || matches!(&obj, HeapObj::Cons { len: 0, .. } | HeapObj::BigInt(0))
+        {
+            self.has_non_interned_falsy = 1;
+        }
+        if matches!(&obj, HeapObj::TypedArray { .. }) {
+            self.has_typed_array = 1;
+        }
         #[cfg_attr(feature = "safe-sandbox", allow(unused_variables))]
         let old = std::mem::replace(&mut self.objs[idx as usize], obj);
         // Replacing an Array discards the storage a compiled snapshot may
@@ -12434,8 +12454,10 @@ impl Heap {
                     HotMirror::CLEAR,
                     "free_slot leaves a recycled slot's mirror cleared"
                 );
-                #[cfg(feature = "jit")]
                 let non_empty = js.units() > 0;
+                if !non_empty {
+                    self.has_non_interned_falsy = 1;
+                }
                 self.reuse_slot_begin();
                 self.reuse_slot_write(idx, HeapObj::Str(js));
                 #[cfg(feature = "jit")]
@@ -12467,6 +12489,9 @@ impl Heap {
     /// which stays additive across concatenation.
     #[inline]
     pub fn alloc_cons(&mut self, left: u32, right: u32, len: usize) -> u32 {
+        if len == 0 {
+            return INTERN_EMPTY;
+        }
         self.alloc(HeapObj::Cons { left, right, len })
     }
 
@@ -12477,6 +12502,9 @@ impl Heap {
     /// leaf-by-leaf through `wtf8_push`, so a surrogate pair joining at the
     /// seam canonicalizes exactly as the rope's flatten would.
     pub fn alloc_concat_flat(&mut self, left: u32, right: u32, units: usize) -> u32 {
+        if units == 0 {
+            return INTERN_EMPTY;
+        }
         // Both children flat and well-formed (the overwhelmingly common case):
         // plain byte concat — no seam canonicalization is possible (a
         // well-formed string cannot end/start mid-surrogate) and the cached
@@ -12509,6 +12537,9 @@ impl Heap {
             HeapObj::Str(l) => l.with_ascii_affixes(&[], tail),
             _ => return None,
         };
+        if js.units() == 0 {
+            return Some(INTERN_EMPTY);
+        }
         Some(self.alloc(HeapObj::Str(js)))
     }
 
@@ -12694,6 +12725,9 @@ impl Heap {
             HeapObj::Str(r) => r.with_ascii_affixes(head, &[]),
             _ => return None,
         };
+        if js.units() == 0 {
+            return Some(INTERN_EMPTY);
+        }
         Some(self.alloc(HeapObj::Str(js)))
     }
 

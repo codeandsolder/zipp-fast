@@ -998,6 +998,7 @@ impl<'p> Vm<'p> {
     /// pinned.
     pub(crate) fn register_module_namespace(&mut self, idx: u32, slots: ExportSlots) {
         self.module_namespaces.insert(idx, slots);
+        self.mod_ns_nonempty = 1;
         if let HeapObj::Object(m) = self.heap.get_mut(idx) {
             m.pin_dict();
         }
