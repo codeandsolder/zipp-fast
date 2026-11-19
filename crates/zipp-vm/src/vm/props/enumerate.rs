@@ -1259,6 +1259,7 @@ impl<'p> Vm<'p> {
             // Held here and by every enumeration it serves: no in-place
             // append's own, so no grower may take it for an accumulator.
             self.heap.freeze_shared_str(value.heap_index());
+            self.key_str_fresh.push(value.heap_index());
             self.key_str_cache.insert(k.into_boxed_str(), value);
         }
         value

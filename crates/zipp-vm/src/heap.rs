@@ -1990,7 +1990,7 @@ enum ValStore {
 }
 
 #[cfg(not(feature = "safe-sandbox"))]
-const VAL_SLAB_OWNER_LEN_BITS: usize = 5;
+const VAL_SLAB_OWNER_LEN_BITS: usize = 6;
 #[cfg(not(feature = "safe-sandbox"))]
 const VAL_SLAB_OWNER_LEN_MASK: usize = (1 << VAL_SLAB_OWNER_LEN_BITS) - 1;
 
@@ -2200,14 +2200,16 @@ impl Default for ValStore {
     }
 }
 
-/// Capacity classes for the literal slab: FinalizeObject admits 1..=16 keys.
+/// Capacity classes for the literal/instance slab: covers 1..=32 fields
+/// (including 17-field Babel NodePath/Scope and TypeScript AST nodes).
 #[cfg(not(feature = "safe-sandbox"))]
-const VAL_SLAB_CLASS_COUNT: usize = 5;
+const VAL_SLAB_CLASS_COUNT: usize = 7;
 
-/// Keep the small literal classes close to their actual length. In particular,
-/// five- and six-field literals used to share an eight-slot cell, retaining 16
-/// to 24 unused bytes per object. Dedicated five- and six-slot classes remove
-/// that boundary penalty without changing the allocation/copy path.
+/// Keep the small literal classes close to their actual length, plus 24- and
+/// 32-slot classes so constructor instances with 17..=32 fields (e.g., Babel's
+/// 17-field `NodePath`, `Scope`, TypeScript AST nodes) use contiguous slab
+/// cells, `ready_take`, `ready_recycle`, and `obj_pool` instead of spilling to
+/// per-object `mi_malloc` `Box<ObjMap>` + `Vec<Value>`.
 #[cfg(not(feature = "safe-sandbox"))]
 #[inline]
 pub(crate) fn val_slab_class(count: usize) -> Option<u8> {
@@ -2217,6 +2219,8 @@ pub(crate) fn val_slab_class(count: usize) -> Option<u8> {
         6 => Some(2),
         7..=8 => Some(3),
         9..=16 => Some(4),
+        17..=24 => Some(5),
+        25..=32 => Some(6),
         _ => None,
     }
 }
@@ -2230,6 +2234,8 @@ fn val_slab_class_cap(class: u8) -> usize {
         2 => 6,
         3 => 8,
         4 => 16,
+        5 => 24,
+        6 => 32,
         _ => unreachable!("invalid value-slab class {class}"),
     }
 }
@@ -2239,7 +2245,7 @@ fn val_slab_class_cap(class: u8) -> usize {
 /// Freeing and allocating are a Vec push/pop; chunks are only ever released
 /// wholesale when the heap itself drops.
 #[cfg(not(feature = "safe-sandbox"))]
-#[repr(align(32))]
+#[repr(align(64))]
 struct ValSlabClass {
     chunks: Vec<Box<[Value; VAL_SLAB_CHUNK]>>,
     /// Bases of returned cells, ready for reuse.
@@ -8521,6 +8527,8 @@ impl Heap {
                 ValSlabClass::with_cap(6),
                 ValSlabClass::with_cap(8),
                 ValSlabClass::with_cap(16),
+                ValSlabClass::with_cap(24),
+                ValSlabClass::with_cap(32),
             ]),
             #[cfg(not(feature = "safe-sandbox"))]
             obj_pool: Vec::new(),
@@ -8977,7 +8985,7 @@ impl Heap {
                 let owner = &mut self.val_slab[class as usize];
                 let owner_addr = std::ptr::from_mut(&mut *owner).expose_provenance();
                 debug_assert_eq!(owner_addr & VAL_SLAB_OWNER_LEN_MASK, 0);
-                debug_assert!((1..=16).contains(&vals.len()));
+                debug_assert!((1..=32).contains(&vals.len()) && vals.len() <= cap);
                 let owner_and_len = owner_addr | vals.len();
                 let base = owner.alloc_cell(cap);
                 // SAFETY: the cell has `cap >= vals.len()` slots inside a
@@ -9200,7 +9208,7 @@ impl Heap {
                 let owner = &mut self.val_slab[class as usize];
                 let owner_addr = std::ptr::from_mut(&mut *owner).expose_provenance();
                 debug_assert_eq!(owner_addr & VAL_SLAB_OWNER_LEN_MASK, 0);
-                debug_assert!((1..=16).contains(&vals.len()));
+                debug_assert!((1..=32).contains(&vals.len()) && vals.len() <= cap);
                 let owner_and_len = owner_addr | vals.len();
                 let base = owner.alloc_cell(cap);
                 // SAFETY: as in `alloc_finalized` — a cell of `cap >=
@@ -9419,8 +9427,10 @@ impl Heap {
             // SAFETY: the map is the box in the ready object's slot, which
             // nothing else refers to.
             let m = unsafe { &mut *std::ptr::with_exposed_provenance_mut::<ObjMap>(ready.map) };
-            // An instance's keys are appended one by one, as a new map's are.
-            m.keys = PropKeys::default();
+            // Keep `m.keys` as the empty `PropKeys::Planned` from `ready_reset` /
+            // `ready_keys` so the first `append_data_planned` updates the handle in
+            // place without an `Owned -> Planned` store-forwarding stall, and an
+            // empty instance still qualifies for `ready_reset` and `obj_pool`.
             m.class = class;
             #[cfg(feature = "jit")]
             {
@@ -13635,7 +13645,11 @@ mod tests {
             (8, Some((3, 8))),
             (9, Some((4, 16))),
             (16, Some((4, 16))),
-            (17, None),
+            (17, Some((5, 24))),
+            (24, Some((5, 24))),
+            (25, Some((6, 32))),
+            (32, Some((6, 32))),
+            (33, None),
         ];
         for (count, want) in expected {
             let got = val_slab_class(count).map(|class| (class, val_slab_class_cap(class)));
@@ -13714,7 +13728,7 @@ mod tests {
     fn slab_owner_tag_roundtrips_every_length_and_capacity_class() {
         let mut heap = Heap::new();
         let data = crate::shape::attr_bits(true, true, true, false);
-        for len in 1..=16 {
+        for len in 1..=32 {
             let plan = StaticKeyPlan::new((0..len).map(|i| format!("k{i}")).collect());
             let vals: Vec<Value> = (0..len).map(|i| Value::int(i as i32)).collect();
             let shape = plan.keys().iter().fold(crate::shape::EMPTY, |shape, key| {

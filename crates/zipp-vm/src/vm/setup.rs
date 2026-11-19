@@ -165,6 +165,7 @@ impl<'p> Vm<'p> {
         }
         let p = self.setup_object(map);
         self.prototypes.insert(idx, p);
+        self.prototypes_fresh.push(p);
         if is_class {
             self.class_proto_owner.insert(p, idx);
         }

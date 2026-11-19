@@ -802,7 +802,9 @@ impl<'p> Vm<'p> {
                     // lands exactly where `fn.prototype = v` does.
                     self.fn_proto_override.insert(idx, v);
                     if v.is_heap() {
-                        self.prototypes.insert(idx, v.heap_index());
+                        let p = v.heap_index();
+                        self.prototypes.insert(idx, p);
+                        self.prototypes_fresh.push(p);
                     }
                     self.heap.bump_version(idx);
                 }

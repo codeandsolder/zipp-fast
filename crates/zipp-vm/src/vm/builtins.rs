@@ -2256,7 +2256,7 @@ impl<'p> Vm<'p> {
         kind: u8,
     ) -> bool {
         if self.realm_global_objs.nonempty_raw == 0
-            && (self.arr_props.is_empty() || !self.arr_props.contains_key(&idx))
+            && (self.arr_props.is_empty() || !self.arr_props.has(idx))
             && self.proto_of.raw_bits(idx) == 0
         {
             let mproto = match (self.heap.get(idx), kind) {
@@ -5175,13 +5175,13 @@ impl<'p> Vm<'p> {
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         match name {
             "get" => {
-                let v = self.coll_find(idx, a0).map(|i| match self.heap.get(idx) {
+                let v = self.coll_find_weak(idx, a0).map(|i| match self.heap.get(idx) {
                     HeapObj::WeakMap { vals, .. } => vals[i],
                     _ => Value::UNDEFINED,
                 });
                 Ok(v.unwrap_or(Value::UNDEFINED))
             }
-            "has" => Ok(Value::bool(self.coll_find(idx, a0).is_some())),
+            "has" => Ok(Value::bool(self.coll_find_weak(idx, a0).is_some())),
             "set" => {
                 if !self.can_be_held_weakly(a0) {
                     return Err(Thrown::from_static(
@@ -5189,19 +5189,28 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 let val = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-                let pos = self.coll_find(idx, a0);
+                let pos = self.coll_find_weak(idx, a0);
                 let mut pushed = None;
+                let mut touched_pos = None;
                 // Nursery barrier for the VALUE (the insert barriers the key).
                 self.heap.write_barrier_val(idx, val);
                 if let HeapObj::WeakMap { keys, vals } = self.heap.get_mut(idx) {
                     match pos {
-                        Some(i) => vals[i] = val,
+                        Some(i) => {
+                            vals[i] = val;
+                            touched_pos = Some(i);
+                        }
                         None => {
-                            pushed = Some(keys.len());
+                            let p = keys.len();
+                            pushed = Some(p);
+                            touched_pos = Some(p);
                             keys.push(a0);
                             vals.push(val);
                         }
                     }
+                }
+                if let Some(p) = touched_pos {
+                    self.weak_young_entries.push((idx, p));
                 }
                 if let Some(p) = pushed {
                     self.weak_coll_index_insert(idx, a0, p);
@@ -5223,7 +5232,7 @@ impl<'p> Vm<'p> {
                         "TypeError: the callback argument must be a function",
                     ));
                 }
-                if let Some(i) = self.coll_find(idx, a0) {
+                if let Some(i) = self.coll_find_weak(idx, a0) {
                     if let HeapObj::WeakMap { vals, .. } = self.heap.get(idx) {
                         return Ok(vals[i]);
                     }
@@ -5234,19 +5243,28 @@ impl<'p> Vm<'p> {
                 } else {
                     cb // getOrInsert's `value` argument
                 };
-                let pos = self.coll_find(idx, a0);
+                let pos = self.coll_find_weak(idx, a0);
                 let mut pushed = None;
+                let mut touched_pos = None;
                 // Nursery barrier for the VALUE (the insert barriers the key).
                 self.heap.write_barrier_val(idx, val);
                 if let HeapObj::WeakMap { keys, vals } = self.heap.get_mut(idx) {
                     match pos {
-                        Some(i) => vals[i] = val,
+                        Some(i) => {
+                            vals[i] = val;
+                            touched_pos = Some(i);
+                        }
                         None => {
-                            pushed = Some(keys.len());
+                            let p = keys.len();
+                            pushed = Some(p);
+                            touched_pos = Some(p);
                             keys.push(a0);
                             vals.push(val);
                         }
                     }
+                }
+                if let Some(p) = touched_pos {
+                    self.weak_young_entries.push((idx, p));
                 }
                 if let Some(p) = pushed {
                     self.weak_coll_index_insert(idx, a0, p);
@@ -5254,7 +5272,7 @@ impl<'p> Vm<'p> {
                 Ok(val)
             }
             "delete" => {
-                if let Some(i) = self.coll_find(idx, a0) {
+                if let Some(i) = self.coll_find_weak(idx, a0) {
                     self.weak_coll_delete(idx, i, a0);
                     return Ok(Value::bool(true));
                 }
@@ -5279,25 +5297,26 @@ impl<'p> Vm<'p> {
         let idx = this.heap_index();
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         match name {
-            "has" => Ok(Value::bool(self.coll_find(idx, a0).is_some())),
+            "has" => Ok(Value::bool(self.coll_find_weak(idx, a0).is_some())),
             "add" => {
                 if !self.can_be_held_weakly(a0) {
                     return Err(Thrown::from_static("TypeError: Invalid value used in weak set"));
                 }
-                if self.coll_find(idx, a0).is_none() {
+                if self.coll_find_weak(idx, a0).is_none() {
                     let mut pushed = None;
                     if let HeapObj::WeakSet(items) = self.heap.get_mut(idx) {
                         pushed = Some(items.len());
                         items.push(a0);
                     }
                     if let Some(p) = pushed {
+                        self.weak_young_entries.push((idx, p));
                         self.weak_coll_index_insert(idx, a0, p);
                     }
                 }
                 Ok(this) // chainable
             }
             "delete" => {
-                if let Some(i) = self.coll_find(idx, a0) {
+                if let Some(i) = self.coll_find_weak(idx, a0) {
                     self.weak_coll_delete(idx, i, a0);
                     return Ok(Value::bool(true));
                 }

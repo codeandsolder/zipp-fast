@@ -1915,7 +1915,9 @@ impl<'p> Vm<'p> {
                 }
                 self.fn_proto_override.insert(idx, val);
                 if val.is_heap() {
-                    self.prototypes.insert(idx, val.heap_index());
+                    let p = val.heap_index();
+                    self.prototypes.insert(idx, p);
+                    self.prototypes_fresh.push(p);
                 }
                 // A compiled `new` of this function guards its version
                 // (`NewLanePlan`), with its prototype baked.

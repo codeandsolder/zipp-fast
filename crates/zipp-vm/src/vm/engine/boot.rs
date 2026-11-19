@@ -868,6 +868,8 @@ impl<'p> Vm<'p> {
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_const_strings: Vec::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            jit_const_strings_old: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             mi_cache: Vec::new(),
             // The sentinel version never equals a live object's, so the first
             // use recomputes against the real `%Function.prototype%`.
@@ -895,6 +897,10 @@ impl<'p> Vm<'p> {
             gc_lock: std::rc::Rc::new(std::cell::Cell::new(0)),
             gc_stress: crate::env_var_os("ZIPP_GC_STRESS").is_some(),
             weak_containers: Default::default(),
+            weak_young_entries: Vec::new(),
+            weak_nonmap_containers: Vec::new(),
+            key_str_fresh: Vec::new(),
+            prototypes_fresh: Vec::new(),
             kept_alive: std::collections::HashSet::new(),
             host_result_roots: Vec::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]

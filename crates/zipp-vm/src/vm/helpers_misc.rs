@@ -757,36 +757,57 @@ pub(crate) extern "win64" fn jit_coll_lookup(
         return crate::codegen::SELF_CALL_DEOPT;
     }
     let idx = recv.heap_index();
-    // The same call on a WeakMap / WeakSet (`m.get(k)` cannot know which it
-    // will meet): served through its own intrinsic proof. Declining it bailed
-    // the compiled body to the interpreter on every call, so a function doing
-    // `bridge(wm.get(this))` ran its rest interpreted.
-    if let Some(id) = match (vm.heap.get(idx), op) {
-        (crate::heap::HeapObj::WeakMap { .. }, 0) => Some(crate::vm::native::WM_GET),
-        (crate::heap::HeapObj::WeakMap { .. }, 1) => Some(crate::vm::native::WM_HAS),
-        (crate::heap::HeapObj::WeakSet(_), 2) => Some(crate::vm::native::WS_HAS),
-        _ => None,
-    } {
-        let name = if id == crate::vm::native::WM_GET { "get" } else { "has" };
-        if !vm.weak_collection_method_is_intrinsic(idx, name, id) {
-            return crate::codegen::SELF_CALL_DEOPT;
+    match (vm.heap.get(idx), op) {
+        (crate::heap::HeapObj::WeakMap { .. }, 0) => {
+            if !vm.weak_collection_method_is_intrinsic(idx, "get", crate::vm::native::WM_GET) {
+                return crate::codegen::SELF_CALL_DEOPT;
+            }
+            let key = Value::from_bits(key_bits);
+            if key.is_heap() && key.heap_index() as usize >= vm.heap.len() {
+                return crate::codegen::SELF_CALL_DEOPT;
+            }
+            return vm.weak_lookup_proven_fast(idx, key, 0);
         }
-        return jit_weak_coll(vm as *mut Vm as *mut core::ffi::c_void, recv_bits, key_bits, 0, id);
+        (crate::heap::HeapObj::WeakMap { .. }, 1) => {
+            if !vm.weak_collection_method_is_intrinsic(idx, "has", crate::vm::native::WM_HAS) {
+                return crate::codegen::SELF_CALL_DEOPT;
+            }
+            let key = Value::from_bits(key_bits);
+            if key.is_heap() && key.heap_index() as usize >= vm.heap.len() {
+                return crate::codegen::SELF_CALL_DEOPT;
+            }
+            return vm.weak_lookup_proven_fast(idx, key, 1);
+        }
+        (crate::heap::HeapObj::WeakSet(_), 2) => {
+            if !vm.weak_collection_method_is_intrinsic(idx, "has", crate::vm::native::WS_HAS) {
+                return crate::codegen::SELF_CALL_DEOPT;
+            }
+            let key = Value::from_bits(key_bits);
+            if key.is_heap() && key.heap_index() as usize >= vm.heap.len() {
+                return crate::codegen::SELF_CALL_DEOPT;
+            }
+            return vm.weak_lookup_proven_fast(idx, key, 2);
+        }
+        (crate::heap::HeapObj::Map { .. }, 0) => {
+            if !vm.collection_method_is_intrinsic_id(idx, 0, "get", 4) {
+                return crate::codegen::SELF_CALL_DEOPT;
+            }
+            return coll_lookup_proven(vm, idx, key_bits, 0);
+        }
+        (crate::heap::HeapObj::Map { .. }, 1) => {
+            if !vm.collection_method_is_intrinsic_id(idx, 2, "has", 4) {
+                return crate::codegen::SELF_CALL_DEOPT;
+            }
+            return coll_lookup_proven(vm, idx, key_bits, 1);
+        }
+        (crate::heap::HeapObj::Set(_), 2) => {
+            if !vm.collection_method_is_intrinsic_id(idx, 2, "has", 3) {
+                return crate::codegen::SELF_CALL_DEOPT;
+            }
+            return coll_lookup_proven(vm, idx, key_bits, 2);
+        }
+        _ => crate::codegen::SELF_CALL_DEOPT,
     }
-    let (nid, name, kind) = match op {
-        0 => (0usize, "get", 4),
-        1 => (2, "has", 4),
-        2 => (2, "has", 3),
-        _ => return crate::codegen::SELF_CALL_DEOPT,
-    };
-    // Kind+name dispatch is insufficient: own shadows, custom prototypes and
-    // writable Map/Set prototype slots are observable. Re-read the complete
-    // main-realm intrinsic proof on every call and fail closed to ordinary
-    // Get+Call before performing the lookup.
-    if !vm.collection_method_is_intrinsic_id(idx, nid, name, kind) {
-        return crate::codegen::SELF_CALL_DEOPT;
-    }
-    coll_lookup_proven(vm, idx, key_bits, op)
 }
 
 /// The Map/Set lookups compiled code calls once a captured callee's bits ARE

@@ -71,6 +71,16 @@ pub(crate) fn svz_repr(heap: &Heap, v: Value) -> u64 {
     }
     if v.is_heap() {
         let i = v.heap_index();
+        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+        {
+            let mir = heap.hot_mirror_of(i);
+            if mir.shape != crate::shape::DICT
+                || (mir.fid != crate::heap::FID_MIRROR_NONE
+                    && mir.fid != crate::heap::FID_MIRROR_STR)
+            {
+                return v.bits();
+            }
+        }
         match heap.get(i) {
             HeapObj::Str(s) => {
                 return fnv1a(s.as_bytes());
@@ -485,6 +495,27 @@ impl CollIndex {
                 }
                 i = (i + 1) & self.mask;
             }
+        }
+    }
+
+    /// Fast identity-only lookup for WeakMap / WeakSet keys (which are always
+    /// objects or non-registered symbols and therefore compare strictly by raw
+    /// `Value` bits, never needing `heap.objs[key_idx]` or `svz_eq`).
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    fn find_identity(&self, keys: &[Value], key: Value) -> Option<usize> {
+        let bits = key.bits();
+        let tag = CollIndex::tag(bits);
+        let mut i = tag as usize & self.mask;
+        loop {
+            let (st, sm) = self.table[i];
+            if sm == META_EMPTY {
+                return None;
+            }
+            if st == tag && sm != META_TOMB && keys[sm as usize].bits() == bits {
+                return Some(sm as usize);
+            }
+            i = (i + 1) & self.mask;
         }
     }
 
@@ -904,6 +935,90 @@ impl<'p> Vm<'p> {
         found
     }
 
+    /// Fast WeakMap / WeakSet key lookup: keys can only be heap objects or
+    /// non-registered symbols, so non-heap probes immediately return `None`,
+    /// no rope flattening is needed, and lookups compare raw `Value` bits
+    /// directly without touching `heap.objs[key_idx]`.
+    #[inline]
+    pub(crate) fn coll_find_weak(&mut self, idx: u32, key: Value) -> Option<usize> {
+        if !key.is_heap() {
+            return None;
+        }
+        let heap = &self.heap;
+        let keys: &[Value] = match heap.get(idx) {
+            HeapObj::WeakMap { keys, .. } => keys,
+            HeapObj::WeakSet(items) => items,
+            _ => return None,
+        };
+        let bits = key.bits();
+        if keys.len() <= 8 {
+            return keys.iter().position(|&k| k.bits() == bits);
+        }
+        if let Some(ix) = self.collection_index.get(&idx) {
+            #[cfg(not(feature = "safe-sandbox"))]
+            return ix.find_identity(keys, key);
+            #[cfg(feature = "safe-sandbox")]
+            return ix.find(heap, keys, key);
+        }
+        if keys.len() < INDEX_THRESHOLD {
+            return keys.iter().position(|&k| k.bits() == bits);
+        }
+        let ix = CollIndex::build(heap, keys);
+        #[cfg(not(feature = "safe-sandbox"))]
+        let found = ix.find_identity(keys, key);
+        #[cfg(feature = "safe-sandbox")]
+        let found = ix.find(heap, keys, key);
+        self.collection_index.insert(idx, ix);
+        found
+    }
+
+    /// Fused WeakMap.get / WeakMap.has / WeakSet.has lookup for proven JIT lanes:
+    /// reads `keys` and `vals` in a single `heap.get(idx)` with zero `heap.objs[key_idx]`
+    /// probes. `op`: 0 = WeakMap.get, 1 = WeakMap.has, 2 = WeakSet.has.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub(crate) fn weak_lookup_proven_fast(&mut self, idx: u32, key: Value, op: u64) -> u64 {
+        if !key.is_heap() {
+            return if op == 0 { Value::UNDEFINED.bits() } else { Value::FALSE.bits() };
+        }
+        let heap = &self.heap;
+        let (keys, vals): (&[Value], Option<&[Value]>) = match heap.get(idx) {
+            HeapObj::WeakMap { keys, vals } => (keys.as_slice(), Some(vals.as_slice())),
+            HeapObj::WeakSet(items) => (items.as_slice(), None),
+            _ => return if op == 0 { Value::UNDEFINED.bits() } else { Value::FALSE.bits() },
+        };
+        let bits = key.bits();
+        let found = if keys.len() <= 8 {
+            keys.iter().position(|&k| k.bits() == bits)
+        } else if let Some(ix) = self.collection_index.get(&idx) {
+            #[cfg(not(feature = "safe-sandbox"))]
+            {
+                ix.find_identity(keys, key)
+            }
+            #[cfg(feature = "safe-sandbox")]
+            {
+                ix.find(heap, keys, key)
+            }
+        } else if keys.len() < INDEX_THRESHOLD {
+            keys.iter().position(|&k| k.bits() == bits)
+        } else {
+            let ix = CollIndex::build(heap, keys);
+            #[cfg(not(feature = "safe-sandbox"))]
+            let f = ix.find_identity(keys, key);
+            #[cfg(feature = "safe-sandbox")]
+            let f = ix.find(heap, keys, key);
+            self.collection_index.insert(idx, ix);
+            f
+        };
+        match op {
+            0 => match (found, vals) {
+                (Some(i), Some(vs)) => vs[i].bits(),
+                _ => Value::UNDEFINED.bits(),
+            },
+            _ => Value::bool(found.is_some()).bits(),
+        }
+    }
+
     /// Fused Map.get / Map.has / Set.has lookup for proven JIT collection lanes:
     /// reads `keys` and `vals` in a single `heap.get(idx)` without re-fetching
     /// `HeapObj::Map` after `coll_find`.
@@ -1163,6 +1278,8 @@ impl<'p> Vm<'p> {
                 }
                 _ => {}
             }
+            // Positions shifted; mark container for full scan on the next minor.
+            self.weak_young_entries.push((idx, usize::MAX));
             return;
         }
         match self.heap.get_mut(idx) {
@@ -1215,6 +1332,8 @@ impl<'p> Vm<'p> {
             _ => return,
         };
         self.collection_index.insert(idx, rebuilt);
+        // Compaction shifted surviving positions; request a full scan on the next minor.
+        self.weak_young_entries.push((idx, usize::MAX));
     }
 }
 

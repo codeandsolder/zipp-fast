@@ -3956,6 +3956,9 @@ pub struct Vm<'p> {
     /// number of string constants across compiled regions.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     jit_const_strings: Vec<Value>,
+    /// Prefix of `jit_const_strings` already promoted to OLD by prior GCs.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    jit_const_strings_old: usize,
     /// Method-inlining (MI) eligibility memo, indexed by unified `func_id`:
     /// `i32::MIN` = not yet computed; `-1` = ineligible (the off-frame evaluator
     /// declines this body's SHAPE — fall to the frame call); `≥ 0` = the
@@ -4045,6 +4048,18 @@ pub struct Vm<'p> {
     /// objects. This is an index only, never a root; the weak phase validates
     /// each slot's current variant and prunes dead/reused entries.
     weak_containers: rustc_hash::FxHashSet<u32>,
+    /// WeakMap/WeakSet entries written or updated since the last GC: `(container_idx, pos)`
+    /// where `pos == usize::MAX` requests a full scan of that container on the next minor.
+    /// Entries untouched since the last GC have OLD keys and OLD values, so minor GC
+    /// skips them completely (still scanned in full on major GC).
+    weak_young_entries: Vec<(u32, usize)>,
+    /// Subset of `weak_containers` that are `WeakRef` or `FinalizationRegistry` (typically
+    /// tiny/empty), so minor GC never walks long-lived `WeakMap`s in `weak_containers`.
+    weak_nonmap_containers: Vec<u32>,
+    /// Slots inserted into `key_str_cache` since the last GC (minor-GC delta roots).
+    key_str_fresh: Vec<u32>,
+    /// Prototype object slots inserted into `prototypes` since the last GC (minor-GC delta roots).
+    prototypes_fresh: Vec<u32>,
     /// WeakRef targets kept through the current ECMAScript job by
     /// AddToKeptObjects (constructor and successful deref). Cleared only at a
     /// main-script or microtask boundary.
