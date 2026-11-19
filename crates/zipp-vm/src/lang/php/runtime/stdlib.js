@@ -1747,21 +1747,28 @@
         }
         return out;
     }
+    const _hasPerf = typeof performance === "object" && performance !== null && typeof performance.now === "function";
+    const _epochBaseMs = Date.now();
+    const _perfBaseMs = _hasPerf ? performance.now() : 0;
+    function nowHighResMs() {
+        return _hasPerf ? (_epochBaseMs + (performance.now() - _perfBaseMs)) : Date.now();
+    }
     reg("time", function () { return BigInt(Math.floor(Date.now() / 1000)); });
     reg("microtime", function (asFloat) {
-        const ms = Date.now();
+        const ms = nowHighResMs();
         if (asFloat && rt.truthy(asFloat)) return ms / 1000.0;
         const sec = Math.floor(ms / 1000);
-        const frac = ((ms % 1000) / 1000).toFixed(8);
+        const frac = ((ms - sec * 1000) / 1000).toFixed(8);
         return frac + " " + sec;
     });
     reg("hrtime", function (asNum) {
-        const ms = Date.now();
-        const ns = BigInt(ms) * 1000000n;
+        const ms = _hasPerf ? performance.now() : Date.now();
+        const ns = BigInt(Math.round(ms * 1000000));
         if (asNum && rt.truthy(asNum)) return ns;
         const a = rt.makeArr();
-        rt.arrPushInPlace(a, BigInt(Math.floor(ms / 1000)));
-        rt.arrPushInPlace(a, BigInt((ms % 1000) * 1000000));
+        const secs = Math.floor(ms / 1000);
+        rt.arrPushInPlace(a, BigInt(secs));
+        rt.arrPushInPlace(a, BigInt(Math.round((ms - secs * 1000) * 1000000)));
         return a;
     });
     reg("date", function (fmt, ts) {
@@ -1821,8 +1828,7 @@
             ]
         });
     }
-    makeDateTimeClass("DateTime", false);
-    makeDateTimeClass("DateTimeImmutable", true);
+    rt._makeDateTimeClass = makeDateTimeClass;
 
     // ---- Crypto & Passwords (backed by Rust native `__zipp_php_crypto`) ----
     function cryptoCall(op, a, b, c) {

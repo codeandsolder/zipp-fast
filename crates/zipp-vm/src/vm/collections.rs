@@ -896,6 +896,103 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Single-probe find-or-insert for `Map.prototype.set(key, val)`:
+    /// computes `svz_repr`, looks up `collection_index`, and walks the probe
+    /// chain ONCE instead of twice on every new-key insertion.
+    #[cfg(not(feature = "safe-sandbox"))]
+    pub(crate) fn map_set_fast(&mut self, idx: u32, key: Value, val: Value) {
+        if key.is_heap() {
+            self.heap.flatten(key.heap_index());
+        }
+        // Nursery barrier for the VALUE (both update and insert paths).
+        self.heap.write_barrier_val(idx, val);
+        let indexed_outcome: Option<bool> = {
+            let Vm {
+                heap,
+                collection_index,
+                ..
+            } = self;
+            if let Some(ix) = collection_index.get_mut(&idx) {
+                let tag = ix.key_tag(heap, key);
+                let found_or_slot = {
+                    let HeapObj::Map { keys, .. } = heap.get(idx) else {
+                        return;
+                    };
+                    let mut i = tag as usize & ix.mask;
+                    let mut first_tomb: Option<usize> = None;
+                    loop {
+                        let (st, sm) = ix.table[i];
+                        if sm == META_EMPTY {
+                            break Err(first_tomb.unwrap_or(i));
+                        }
+                        if sm == META_TOMB {
+                            if first_tomb.is_none() {
+                                first_tomb = Some(i);
+                            }
+                        } else if st == tag && svz_eq(heap, keys[sm as usize], key) {
+                            break Ok(sm as usize);
+                        }
+                        i = (i + 1) & ix.mask;
+                    }
+                };
+                match found_or_slot {
+                    Ok(pos) => {
+                        if let HeapObj::Map { vals, .. } = heap.get_mut(idx) {
+                            vals[pos] = val;
+                        }
+                        Some(false)
+                    }
+                    Err(insert_slot) => {
+                        let pos = if let HeapObj::Map { keys, vals } = heap.get_mut(idx) {
+                            let p = keys.len();
+                            keys.push(key);
+                            vals.push(val);
+                            p as u32
+                        } else {
+                            return;
+                        };
+                        if (ix.used + 1) * 2 >= ix.table.len() {
+                            ix.grow();
+                            ix.insert_raw(tag, pos);
+                        } else {
+                            let was_empty = ix.table[insert_slot].1 == META_EMPTY;
+                            ix.table[insert_slot] = (tag, pos);
+                            if was_empty {
+                                ix.used += 1;
+                            }
+                        }
+                        ix.live += 1;
+                        Some(true)
+                    }
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(inserted) = indexed_outcome {
+            if inserted {
+                self.store_barrier(crate::heap::gcoracle::COLL_INSERT, idx, key);
+            }
+            return;
+        }
+        // Small / not-yet-indexed Map: standard path (builds index once threshold crossed).
+        let pos = self.coll_find(idx, key);
+        let mut pushed = None;
+        if let HeapObj::Map { keys, vals } = self.heap.get_mut(idx) {
+            match pos {
+                Some(i) => vals[i] = val,
+                None => {
+                    pushed = Some(keys.len());
+                    keys.push(key);
+                    vals.push(val);
+                }
+            }
+        }
+        if let Some(p) = pushed {
+            self.coll_index_insert(idx, key, p);
+        }
+    }
+
     /// Index maintenance for WeakMap/WeakSet. The key is deliberately not sent
     /// through the ordinary collection insert barrier: recording it as a young
     /// value would turn the weak edge into a strong nursery root for the epoch.

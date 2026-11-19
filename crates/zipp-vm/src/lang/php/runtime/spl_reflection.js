@@ -147,34 +147,44 @@
     defC("STREAM_FILTER_WRITE", 2n);
     defC("STREAM_FILTER_ALL", 3n);
 
-    // ---- Additional SPL / Core Exceptions & Interfaces ----
+    // ---- Additional SPL / Core Exceptions, Interfaces & DateTime (lazily materialized) ----
     function defExc(name, parent) {
         if (!rt.classes.has(name.toLowerCase())) {
             R.defClass({ name: name, kind: "class", extends: parent });
         }
     }
-    defExc("BadFunctionCallException", "LogicException");
-    defExc("BadMethodCallException", "BadFunctionCallException");
-    defExc("LengthException", "LogicException");
-    defExc("OverflowException", "RuntimeException");
-    defExc("RangeException", "RuntimeException");
-    defExc("UnderflowException", "RuntimeException");
-    defExc("ReflectionException", "Exception");
-    defExc("CompileError", "Error");
-    defExc("DateException", "Exception");
-    defExc("DateMalformedStringException", "DateException");
+    rt.registerLazyClass([
+        "badfunctioncallexception", "badmethodcallexception", "lengthexception",
+        "overflowexception", "rangeexception", "underflowexception",
+        "reflectionexception", "compileerror", "serializable",
+        "sessionhandlerinterface", "sessionidinterface"
+    ], function () {
+        defExc("BadFunctionCallException", "LogicException");
+        defExc("BadMethodCallException", "BadFunctionCallException");
+        defExc("LengthException", "LogicException");
+        defExc("OverflowException", "RuntimeException");
+        defExc("RangeException", "RuntimeException");
+        defExc("UnderflowException", "RuntimeException");
+        defExc("ReflectionException", "Exception");
+        defExc("CompileError", "Error");
+        R.defInterface({ name: "Serializable", kind: "interface" });
+        R.defInterface({ name: "SessionHandlerInterface", kind: "interface" });
+        R.defInterface({ name: "SessionIdInterface", kind: "interface" });
+    });
 
-    R.defInterface({ name: "Serializable", kind: "interface" });
-    R.defInterface({ name: "OuterIterator", kind: "interface", extends: ["Iterator"] });
-    R.defInterface({ name: "SeekableIterator", kind: "interface", extends: ["Iterator"] });
-    R.defInterface({ name: "RecursiveIterator", kind: "interface", extends: ["Iterator"] });
-    R.defInterface({ name: "Reflector", kind: "interface", extends: ["Stringable"] });
-    R.defInterface({ name: "DateTimeInterface", kind: "interface" });
-    R.defInterface({ name: "SessionHandlerInterface", kind: "interface" });
-    R.defInterface({ name: "SessionIdInterface", kind: "interface" });
-
-    // Attach DateTimeInterface to DateTime & DateTimeImmutable + extra methods
-    for (const dtn of ["datetime", "datetimeimmutable"]) {
+    rt.registerLazyClass([
+        "datetime", "datetimeimmutable", "datetimeinterface", "datetimezone",
+        "dateinterval", "dateexception", "datemalformedstringexception"
+    ], function () {
+        defExc("DateException", "Exception");
+        defExc("DateMalformedStringException", "DateException");
+        R.defInterface({ name: "DateTimeInterface", kind: "interface" });
+        if (typeof rt._makeDateTimeClass === "function") {
+            rt._makeDateTimeClass("DateTime", false);
+            rt._makeDateTimeClass("DateTimeImmutable", true);
+        }
+        // Attach DateTimeInterface to DateTime & DateTimeImmutable + extra methods
+        for (const dtn of ["datetime", "datetimeimmutable"]) {
         const c = rt.classes.get(dtn);
         if (c) {
             c.allIfaces.add("datetimeinterface");
@@ -295,6 +305,7 @@
             }
         ]
     });
+    });
 
     // ---- Closure::bind and Closure::fromCallable ----
     const ClosureClass = rt.classes.get("closure");
@@ -335,7 +346,15 @@
         });
     }
 
-    // ---- Full Reflection API (powers Laravel Container, Symfony Routing, DI autowiring!) ----
+    // ---- Full Reflection API (lazily materialized on first use!) ----
+    rt.registerLazyClass([
+        "reflector", "reflectionattribute", "reflectionmethod", "reflectionclass",
+        "reflectionobject", "reflectiontype", "reflectionnamedtype",
+        "reflectionuniontype", "reflectionintersectiontype", "reflectionparameter",
+        "reflectionfunctionabstract", "reflectionfunction", "reflectionproperty"
+    ], function () {
+    R.defInterface({ name: "Reflector", kind: "interface", extends: ["Stringable"] });
+    if (typeof rt._initBasicReflection === "function") rt._initBasicReflection();
     const BUILTIN_TYPES = new Set([
         "int", "float", "string", "bool", "array", "object", "callable",
         "iterable", "mixed", "void", "never", "null", "true", "false", "self", "parent", "static"
@@ -992,8 +1011,19 @@
     }
 
     R.defClass({ name: "ReflectionObject", kind: "class", extends: "ReflectionClass" });
+    });
 
-    // ---- SPL Data Structures & Iterators ----
+    // ---- SPL Data Structures & Iterators (lazily materialized on first use!) ----
+    rt.registerLazyClass([
+        "outeriterator", "seekableiterator", "recursiveiterator",
+        "arrayiterator", "arrayobject", "splobjectstorage", "weakmap",
+        "emptyiterator", "iteratoriterator", "filteriterator", "callbackfilteriterator",
+        "norewinditerator", "limititerator", "appenditerator", "cachingiterator",
+        "recursivearrayiterator", "recursiveiteratoriterator", "splfileinfo"
+    ], function () {
+    R.defInterface({ name: "OuterIterator", kind: "interface", extends: ["Iterator"] });
+    R.defInterface({ name: "SeekableIterator", kind: "interface", extends: ["Iterator"] });
+    R.defInterface({ name: "RecursiveIterator", kind: "interface", extends: ["Iterator"] });
     const ArrayIteratorClass = R.defClass({
         name: "ArrayIterator", kind: "class", implements: ["SeekableIterator", "ArrayAccess", "Countable"],
         methods: [
@@ -1426,6 +1456,7 @@
             { name: "__toString", vis: 0, builtin: function () { return this.__path; } },
         ]
     });
+    });
 
     // ---- INI / Runtime / Reflection / Class helper functions ----
     const iniStore = new Map([
@@ -1588,16 +1619,19 @@
         return out;
     });
     reg("get_declared_classes", function () {
+        rt.materializeAllLazyClasses();
         const out = rt.makeArr();
         for (const c of rt.classes.values()) if (c.kind === "class" || c.kind === "enum") rt.arrPushInPlace(out, c.name);
         return out;
     });
     reg("get_declared_interfaces", function () {
+        rt.materializeAllLazyClasses();
         const out = rt.makeArr();
         for (const c of rt.classes.values()) if (c.kind === "interface") rt.arrPushInPlace(out, c.name);
         return out;
     });
     reg("get_declared_traits", function () {
+        rt.materializeAllLazyClasses();
         const out = rt.makeArr();
         for (const c of rt.classes.values()) if (c.kind === "trait") rt.arrPushInPlace(out, c.name);
         return out;
@@ -2490,74 +2524,7 @@
         if (/remove/i.test(spec)) s = s.replace(/[^\x00-\x7f]/g, "");
         return rt.utf8ToBytes(s);
     }
-    const TransliteratorClass = R.defClass({
-        name: "Transliterator", kind: "class",
-        consts: [
-            { name: "FORWARD", vis: 0, val: 0n },
-            { name: "REVERSE", vis: 0, val: 1n },
-        ],
-        props: [{ name: "id", vis: 0, hasDefault: true, defaultVal: "" }],
-        methods: [
-            {
-                name: "create", vis: 0, isStatic: true,
-                builtin: function (id) {
-                    const obj = rt.allocInstance(TransliteratorClass);
-                    obj.props["id"] = rt.toStr(id);
-                    return obj;
-                }
-            },
-            {
-                name: "createFromRules", vis: 0, isStatic: true,
-                builtin: function (rules) {
-                    const obj = rt.allocInstance(TransliteratorClass);
-                    obj.props["id"] = rt.toStr(rules);
-                    return obj;
-                }
-            },
-            {
-                name: "transliterate", vis: 0,
-                builtin: function (str, start, end) {
-                    let s = rt.toStr(str);
-                    const st = start !== undefined ? Number(rt.toInt(start)) : 0;
-                    const en = end !== undefined && Number(rt.toInt(end)) >= 0 ? Number(rt.toInt(end)) : s.length;
-                    return s.slice(0, st) + applyTranslit(this.props["id"] || "", s.slice(st, en)) + s.slice(en);
-                }
-            },
-        ]
-    });
-    reg("transliterator_create", function (id) { return TransliteratorClass.methods.get("create").builtin(id); });
-    reg("transliterator_transliterate", function (translit, str, start, end) {
-        translit = rt.deref(translit);
-        const id = (translit && translit.__php === 2) ? (translit.props["id"] || "") : rt.toStr(translit);
-        let s = rt.toStr(str);
-        const st = start !== undefined ? Number(rt.toInt(start)) : 0;
-        const en = end !== undefined && Number(rt.toInt(end)) >= 0 ? Number(rt.toInt(end)) : s.length;
-        return s.slice(0, st) + applyTranslit(id, s.slice(st, en)) + s.slice(en);
-    });
-
     let curLocale = "en_US";
-    R.defClass({
-        name: "Locale", kind: "class",
-        methods: [
-            { name: "getDefault", vis: 0, isStatic: true, builtin: function () { return curLocale; } },
-            { name: "setDefault", vis: 0, isStatic: true, builtin: function (loc) { curLocale = rt.toStr(loc) || "en_US"; return true; } },
-            { name: "canonicalize", vis: 0, isStatic: true, builtin: function (loc) { return rt.toStr(loc).replace(/-/g, "_"); } },
-            {
-                name: "parseLocale", vis: 0, isStatic: true,
-                builtin: function (loc) {
-                    const parts = rt.toStr(loc).replace(/-/g, "_").split("_");
-                    const a = rt.makeArr();
-                    if (parts[0]) rt.arrSetInPlace(a, "language", parts[0].toLowerCase());
-                    if (parts[1]) rt.arrSetInPlace(a, "region", parts[1].toUpperCase());
-                    return a;
-                }
-            },
-            { name: "getPrimaryLanguage", vis: 0, isStatic: true, builtin: function (loc) { return rt.toStr(loc).replace(/-/g, "_").split("_")[0].toLowerCase(); } },
-            { name: "getRegion", vis: 0, isStatic: true, builtin: function (loc) { const p = rt.toStr(loc).replace(/-/g, "_").split("_"); return p[1] ? p[1].toUpperCase() : ""; } },
-            { name: "acceptFromHttp", vis: 0, isStatic: true, builtin: function (hdr) { const first = rt.toStr(hdr).split(",")[0].split(";")[0].trim(); return first ? first.replace(/-/g, "_") : curLocale; } },
-        ]
-    });
-
     function fmtIcuMessage(pattern, args) {
         const map = new Map();
         if (args && args.__php === 1) {
@@ -2568,16 +2535,86 @@
             return map.has(key) ? map.get(key) : m;
         });
     }
-    const MessageFormatterClass = R.defClass({
-        name: "MessageFormatter", kind: "class",
-        methods: [
-            { name: "__construct", vis: 0, builtin: function (loc, pat) { this.__loc = rt.toStr(loc); this.__pat = rt.toStr(pat); } },
-            { name: "create", vis: 0, isStatic: true, builtin: function (loc, pat) { return R.newObj(MessageFormatterClass, [loc, pat], null, null, null, false); } },
-            { name: "format", vis: 0, builtin: function (args) { return fmtIcuMessage(this.__pat, args); } },
-            { name: "formatMessage", vis: 0, isStatic: true, builtin: function (loc, pat, args) { return fmtIcuMessage(pat, args); } },
-            { name: "getErrorCode", vis: 0, builtin: function () { return 0n; } },
-            { name: "getErrorMessage", vis: 0, builtin: function () { return "U_ZERO_ERROR"; } },
-        ]
+    rt.registerLazyClass(["transliterator", "locale", "messageformatter"], function () {
+        const TransliteratorClass = R.defClass({
+            name: "Transliterator", kind: "class",
+            consts: [
+                { name: "FORWARD", vis: 0, val: 0n },
+                { name: "REVERSE", vis: 0, val: 1n },
+            ],
+            props: [{ name: "id", vis: 0, hasDefault: true, defaultVal: "" }],
+            methods: [
+                {
+                    name: "create", vis: 0, isStatic: true,
+                    builtin: function (id) {
+                        const obj = rt.allocInstance(TransliteratorClass);
+                        obj.props["id"] = rt.toStr(id);
+                        return obj;
+                    }
+                },
+                {
+                    name: "createFromRules", vis: 0, isStatic: true,
+                    builtin: function (rules) {
+                        const obj = rt.allocInstance(TransliteratorClass);
+                        obj.props["id"] = rt.toStr(rules);
+                        return obj;
+                    }
+                },
+                {
+                    name: "transliterate", vis: 0,
+                    builtin: function (str, start, end) {
+                        let s = rt.toStr(str);
+                        const st = start !== undefined ? Number(rt.toInt(start)) : 0;
+                        const en = end !== undefined && Number(rt.toInt(end)) >= 0 ? Number(rt.toInt(end)) : s.length;
+                        return s.slice(0, st) + applyTranslit(this.props["id"] || "", s.slice(st, en)) + s.slice(en);
+                    }
+                },
+            ]
+        });
+        R.defClass({
+            name: "Locale", kind: "class",
+            methods: [
+                { name: "getDefault", vis: 0, isStatic: true, builtin: function () { return curLocale; } },
+                { name: "setDefault", vis: 0, isStatic: true, builtin: function (loc) { curLocale = rt.toStr(loc) || "en_US"; return true; } },
+                { name: "canonicalize", vis: 0, isStatic: true, builtin: function (loc) { return rt.toStr(loc).replace(/-/g, "_"); } },
+                {
+                    name: "parseLocale", vis: 0, isStatic: true,
+                    builtin: function (loc) {
+                        const parts = rt.toStr(loc).replace(/-/g, "_").split("_");
+                        const a = rt.makeArr();
+                        if (parts[0]) rt.arrSetInPlace(a, "language", parts[0].toLowerCase());
+                        if (parts[1]) rt.arrSetInPlace(a, "region", parts[1].toUpperCase());
+                        return a;
+                    }
+                },
+                { name: "getPrimaryLanguage", vis: 0, isStatic: true, builtin: function (loc) { return rt.toStr(loc).replace(/-/g, "_").split("_")[0].toLowerCase(); } },
+                { name: "getRegion", vis: 0, isStatic: true, builtin: function (loc) { const p = rt.toStr(loc).replace(/-/g, "_").split("_"); return p[1] ? p[1].toUpperCase() : ""; } },
+                { name: "acceptFromHttp", vis: 0, isStatic: true, builtin: function (hdr) { const first = rt.toStr(hdr).split(",")[0].split(";")[0].trim(); return first ? first.replace(/-/g, "_") : curLocale; } },
+            ]
+        });
+        const MessageFormatterClass = R.defClass({
+            name: "MessageFormatter", kind: "class",
+            methods: [
+                { name: "__construct", vis: 0, builtin: function (loc, pat) { this.__loc = rt.toStr(loc); this.__pat = rt.toStr(pat); } },
+                { name: "create", vis: 0, isStatic: true, builtin: function (loc, pat) { return R.newObj(MessageFormatterClass, [loc, pat], null, null, null, false); } },
+                { name: "format", vis: 0, builtin: function (args) { return fmtIcuMessage(this.__pat, args); } },
+                { name: "formatMessage", vis: 0, isStatic: true, builtin: function (loc, pat, args) { return fmtIcuMessage(pat, args); } },
+                { name: "getErrorCode", vis: 0, builtin: function () { return 0n; } },
+                { name: "getErrorMessage", vis: 0, builtin: function () { return "U_ZERO_ERROR"; } },
+            ]
+        });
+    });
+    reg("transliterator_create", function (id) {
+        const cls = rt.resolveClass("Transliterator", null, null, false);
+        return cls.methods.get("create").builtin(id);
+    });
+    reg("transliterator_transliterate", function (translit, str, start, end) {
+        translit = rt.deref(translit);
+        const id = (translit && translit.__php === 2) ? (translit.props["id"] || "") : rt.toStr(translit);
+        let s = rt.toStr(str);
+        const st = start !== undefined ? Number(rt.toInt(start)) : 0;
+        const en = end !== undefined && Number(rt.toInt(end)) >= 0 ? Number(rt.toInt(end)) : s.length;
+        return s.slice(0, st) + applyTranslit(id, s.slice(st, en)) + s.slice(en);
     });
     reg("msgfmt_format_message", function (loc, pat, args) { return fmtIcuMessage(pat, args); });
 })(__zipp_php);

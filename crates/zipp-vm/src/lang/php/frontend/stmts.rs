@@ -643,6 +643,7 @@ impl<'a> PhpEmitter<'a> {
     }
 
     // ---- Function / Method / Closure compilation ----
+    #[allow(clippy::too_many_arguments)]
     pub fn compile_php_function(
         &mut self,
         display_name: &str,
@@ -655,6 +656,32 @@ impl<'a> PhpEmitter<'a> {
         promoted_props: &[(String, bool)],
     ) -> R<(u32, bool, bool, bool)> {
         let info = analyse_body(body, params, uses, false);
+        self.compile_php_function_with_info(
+            display_name,
+            params,
+            uses,
+            body,
+            class_name,
+            trait_name,
+            fn_name,
+            promoted_props,
+            &info,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn compile_php_function_with_info(
+        &mut self,
+        display_name: &str,
+        params: &[Param],
+        uses: &[ClosureUse],
+        body: &[Stmt],
+        class_name: Option<String>,
+        trait_name: Option<String>,
+        fn_name: String,
+        promoted_props: &[(String, bool)],
+        info: &super::symtable::FnScopeInfo,
+    ) -> R<(u32, bool, bool, bool)> {
         let is_gen = info.is_generator;
         let has_func_args = info.uses_func_args;
         let is_direct = !info.use_scope_map
@@ -673,7 +700,7 @@ impl<'a> PhpEmitter<'a> {
             class_name,
             trait_name,
             fn_name,
-            &info,
+            info,
             params,
             uses,
             false,
@@ -816,7 +843,8 @@ impl<'a> PhpEmitter<'a> {
 
     fn emit_function_decl(&mut self, decl: &FunctionDecl) -> R<()> {
         let fqn = self.ns.qualify_decl(&decl.name);
-        let (fid, is_gen, has_func_args, is_direct) = self.compile_php_function(
+        let info = analyse_body(&decl.body, &decl.params, &[], false);
+        let (fid, is_gen, has_func_args, is_direct) = self.compile_php_function_with_info(
             &fqn,
             &decl.params,
             &[],
@@ -825,6 +853,7 @@ impl<'a> PhpEmitter<'a> {
             None,
             fqn.clone(),
             &[],
+            &info,
         )?;
         let code = self.alloc()?;
         self.emit(Instr::MakeFunc {
@@ -859,12 +888,12 @@ impl<'a> PhpEmitter<'a> {
             let r = self.string(&s)?;
             self.set_prop(meta, "retType", r)?;
         }
-        let fi_info = analyse_body(&decl.body, &decl.params, &[], false);
         if let Some(fi) = super::fast_int::try_compile_fast_int(
             &fqn,
             &self.ns,
+            self.rt_slot,
             decl,
-            &fi_info,
+            &info,
             self.sink,
         )? {
             let fi_fn = self.alloc()?;
@@ -1075,6 +1104,13 @@ impl<'a> PhpEmitter<'a> {
         let mut const_regs = Vec::new();
         let mut prop_regs = Vec::new();
         let mut method_regs = Vec::new();
+
+        // Detect plain public-int classes eligible for Number-domain LocalObj fast-path (`fastNumSpec` + `m.fnum`)
+        let fast_num_info = detect_fast_num_class(kind, is_abstract, is_readonly, extends, members);
+        let fast_int_prop_set: std::collections::HashSet<String> = fast_num_info
+            .as_ref()
+            .map(|(props, _)| props.iter().map(|(n, _)| n.clone()).collect())
+            .unwrap_or_default();
 
         for m in members {
             match m {
@@ -1384,16 +1420,19 @@ impl<'a> PhpEmitter<'a> {
                         } else {
                             None
                         };
-                        let (fid, is_gen, has_func_args, is_direct) = self.compile_php_function(
-                            &disp,
-                            params,
-                            &[],
-                            mbody,
-                            cls_arg,
-                            tr_arg,
-                            name.clone(),
-                            &promoted,
-                        )?;
+                        let minfo = analyse_body(mbody, params, &[], false);
+                        let (fid, is_gen, has_func_args, is_direct) =
+                            self.compile_php_function_with_info(
+                                &disp,
+                                params,
+                                &[],
+                                mbody,
+                                cls_arg,
+                                tr_arg,
+                                name.clone(),
+                                &promoted,
+                                &minfo,
+                            )?;
                         let code = self.alloc()?;
                         self.emit(Instr::MakeFunc {
                             dst: code,
@@ -1411,6 +1450,39 @@ impl<'a> PhpEmitter<'a> {
                         if is_direct {
                             let dr = self.boolean(true)?;
                             self.set_prop(mo, "direct", dr)?;
+                        }
+                        if !fast_int_prop_set.is_empty()
+                            && *visibility == Visibility::Public
+                            && !*is_static
+                            && !*mab
+                            && !*by_ref
+                            && !name.starts_with("__")
+                        {
+                            if let Some(fm) = super::fast_int::try_compile_fast_method(
+                                fqn,
+                                name,
+                                &self.ns,
+                                self.rt_slot,
+                                params,
+                                return_type,
+                                mbody,
+                                &minfo,
+                                &fast_int_prop_set,
+                                self.sink,
+                            )? {
+                                let fn_r = self.alloc()?;
+                                self.emit(Instr::MakeFunc {
+                                    dst: fn_r,
+                                    func_id: fm.func_id,
+                                })?;
+                                self.set_prop(mo, "fnum", fn_r)?;
+                                let ar_r = self.small_int(fm.arity as i32)?;
+                                self.set_prop(mo, "fnumArity", ar_r)?;
+                                if fm.returns_int {
+                                    let ri_r = self.boolean(true)?;
+                                    self.set_prop(mo, "fnumRetInt", ri_r)?;
+                                }
+                            }
                         }
                     }
                     method_regs.push(mo);
@@ -1448,6 +1520,27 @@ impl<'a> PhpEmitter<'a> {
         if !method_regs.is_empty() {
             let a = self.js_array(&method_regs)?;
             self.set_prop(spec, "methods", a)?;
+        }
+        if let Some((fprops, fparams)) = fast_num_info {
+            let fns = self.new_js_obj()?;
+            let mut pr_regs = Vec::with_capacity(fprops.len());
+            for (pn, def_val) in fprops {
+                let pnr = self.string(&pn)?;
+                let dvr = self.float(def_val as f64)?;
+                pr_regs.push(self.js_array(&[pnr, dvr])?);
+            }
+            let pra = self.js_array(&pr_regs)?;
+            self.set_prop(fns, "props", pra)?;
+            let mut cp_regs = Vec::with_capacity(fparams.len());
+            for (pn, has_def, def_val) in fparams {
+                let pnr = self.string(&pn)?;
+                let hdr = self.boolean(has_def)?;
+                let dvr = self.float(def_val as f64)?;
+                cp_regs.push(self.js_array(&[pnr, hdr, dvr])?);
+            }
+            let cpa = self.js_array(&cp_regs)?;
+            self.set_prop(fns, "params", cpa)?;
+            self.set_prop(spec, "fastNumSpec", fns)?;
         }
 
         Ok(spec)
@@ -1620,6 +1713,211 @@ pub(super) fn peel_index_chain(mut expr: &Expr) -> (&Expr, Vec<Option<&Expr>>) {
     }
     keys.reverse();
     (expr, keys)
+}
+
+/// Check if a class is a plain public-int value class eligible for Number-domain
+/// non-escaping `LocalObj` fast paths (`fastNumSpec` + `m.fnum`).
+/// Returns `Some((props: [(name, default_i64)], ctor_params: [(prop_name, has_default, default_i64)]))`.
+#[allow(clippy::type_complexity)]
+fn detect_fast_num_class(
+    kind: &str,
+    is_abstract: bool,
+    is_readonly: bool,
+    extends: Option<&Name>,
+    members: &[ClassMember],
+) -> Option<(Vec<(String, i64)>, Vec<(String, bool, i64)>)> {
+    if kind != "class" || is_abstract || is_readonly || extends.is_some() {
+        return None;
+    }
+    let is_int_ty = |ty: &Option<TypeHint>| -> bool {
+        matches!(
+            ty,
+            Some(TypeHint::Simple(n)) if n.parts.len() == 1 && n.parts[0].eq_ignore_ascii_case("int")
+        )
+    };
+    let int_lit_in_bound = |e: &Expr| -> Option<i64> {
+        match e.kind {
+            ExprKind::Int(v)
+                if v >= -super::fast_int::TIER_C_BOUND && v <= super::fast_int::TIER_C_BOUND =>
+            {
+                Some(v)
+            }
+            ExprKind::Unary {
+                op: UnaryOp::Neg,
+                expr: ref inner,
+            } => match inner.kind {
+                ExprKind::Int(v)
+                    if -v >= -super::fast_int::TIER_C_BOUND
+                        && -v <= super::fast_int::TIER_C_BOUND =>
+                {
+                    Some(-v)
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+
+    let mut props: Vec<(String, i64)> = Vec::new();
+    let mut prop_has_def: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    let mut ctor: Option<(&[Param], &[Stmt])> = None;
+
+    for m in members {
+        match m {
+            ClassMember::TraitUse { .. } => return None,
+            ClassMember::Property {
+                visibility,
+                set_visibility,
+                is_static,
+                is_readonly: pro,
+                ty,
+                items,
+                hooks,
+                ..
+            } => {
+                if *is_static {
+                    continue;
+                }
+                if *visibility != Visibility::Public
+                    || set_visibility.is_some_and(|sv| sv != Visibility::Public)
+                    || *pro
+                    || !hooks.is_empty()
+                    || !is_int_ty(ty)
+                {
+                    return None;
+                }
+                for (pname, init) in items {
+                    let (has_d, dv) = match init {
+                        Some(ie) => (true, int_lit_in_bound(ie)?),
+                        None => (false, 0),
+                    };
+                    props.push((pname.clone(), dv));
+                    prop_has_def.insert(pname.clone(), has_d);
+                }
+            }
+            ClassMember::Method {
+                visibility,
+                is_static,
+                by_ref,
+                name,
+                params,
+                body,
+                ..
+            } => {
+                let lo = name.to_ascii_lowercase();
+                if matches!(
+                    lo.as_str(),
+                    "__destruct" | "__get" | "__set" | "__isset" | "__unset" | "__call"
+                ) {
+                    return None;
+                }
+                if lo == "__construct" {
+                    if *visibility != Visibility::Public || *is_static || *by_ref {
+                        return None;
+                    }
+                    let Some(mbody) = body.as_deref() else {
+                        return None;
+                    };
+                    ctor = Some((params.as_slice(), mbody));
+                }
+            }
+            ClassMember::Const { .. } => {}
+        }
+    }
+
+    let mut ctor_params: Vec<(String, bool, i64)> = Vec::new();
+    let mut initialized_props: std::collections::HashSet<String> = prop_has_def
+        .iter()
+        .filter(|(_, &has_d)| has_d)
+        .map(|(k, _)| k.clone())
+        .collect();
+
+    if let Some((params, body)) = ctor {
+        if params.len() > 2 {
+            return None;
+        }
+        let mut param_to_prop: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for p in params {
+            if p.by_ref || p.variadic || p.readonly || !is_int_ty(&p.ty) {
+                return None;
+            }
+            let (has_d, dv) = match &p.default {
+                Some(de) => (true, int_lit_in_bound(de)?),
+                None => (false, 0),
+            };
+            if let Some(vis) = p.visibility {
+                if vis != Visibility::Public
+                    || p.set_visibility.is_some_and(|sv| sv != Visibility::Public)
+                {
+                    return None;
+                }
+                props.push((p.name.clone(), dv));
+                initialized_props.insert(p.name.clone());
+                ctor_params.push((p.name.clone(), has_d, dv));
+            } else {
+                let idx = ctor_params.len();
+                param_to_prop.insert(p.name.clone(), idx);
+                ctor_params.push((String::new(), has_d, dv));
+            }
+        }
+        // Check constructor body: allow only empty or simple `$this->prop = $param;` / `$this->prop = int_lit;`
+        for st in body {
+            match &st.kind {
+                StmtKind::Nop => {}
+                StmtKind::Expr(Expr {
+                    kind:
+                        ExprKind::Assign {
+                            op: AssignOp::Assign,
+                            target,
+                            value,
+                        },
+                    ..
+                }) => {
+                    let ExprKind::Prop {
+                        target: pt,
+                        prop: PropName::Ident(pname),
+                        nullsafe: false,
+                    } = &target.kind
+                    else {
+                        return None;
+                    };
+                    if !matches!(&pt.kind, ExprKind::Var(tv) if tv == "this")
+                        || !prop_has_def.contains_key(pname)
+                    {
+                        return None;
+                    }
+                    match &value.kind {
+                        ExprKind::Var(vname) => {
+                            let &pidx = param_to_prop.get(vname)?;
+                            if !ctor_params[pidx].0.is_empty() {
+                                return None;
+                            }
+                            ctor_params[pidx].0 = pname.clone();
+                            initialized_props.insert(pname.clone());
+                        }
+                        _ => {
+                            let dv = int_lit_in_bound(value)?;
+                            if let Some(slot) = props.iter_mut().find(|(n, _)| n == pname) {
+                                slot.1 = dv;
+                            }
+                            initialized_props.insert(pname.clone());
+                        }
+                    }
+                }
+                _ => return None,
+            }
+        }
+        // Every non-promoted constructor param must map to a property
+        if ctor_params.iter().any(|(pn, _, _)| pn.is_empty()) {
+            return None;
+        }
+    }
+
+    if props.is_empty() || props.iter().any(|(n, _)| !initialized_props.contains(n)) {
+        return None;
+    }
+    Some((props, ctor_params))
 }
 
 #[allow(dead_code)]

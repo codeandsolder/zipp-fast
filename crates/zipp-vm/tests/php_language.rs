@@ -803,6 +803,153 @@ echo implode(',', $seen), '|', count($m), "\n";
 }
 
 #[test]
+fn fast_jit_local_map_local_obj_and_lazy_builtins_parity() {
+    check_case(
+        "fast_jit_local_map_obj_lazy_builtins",
+        r#"<?php
+declare(strict_types=1);
+
+// 1. LocalMap + ASCII string interpolation + strlen + count + foreach
+function arrayWorkStr(int $n): int {
+    $map = [];
+    for ($i = 0; $i < $n; $i++) {
+        $map["k$i"] = $i * 3 + 1;
+    }
+    $acc = count($map);
+    foreach ($map as $k => $v) {
+        $acc += $v + strlen($k);
+    }
+    return $acc;
+}
+function arrayWorkInt(int $n): int {
+    $map = [];
+    for ($i = 0; $i < $n; $i++) {
+        $map[$i] = $i * 2;
+    }
+    $acc = 0;
+    foreach ($map as $k => $v) {
+        $acc += $k + $v;
+    }
+    return $acc + $map[3];
+}
+// Numeric string keys must coerce to int keys in PHP (declined by LocalMap non_int_key check!)
+function numericStrKeys(int $n): string {
+    $map = [];
+    $map["0"] = $n;
+    $map["01"] = $n + 1;
+    $map["-5"] = $n + 2;
+    $out = [];
+    foreach ($map as $k => $v) {
+        $out[] = gettype($k) . ':' . $k . '=' . $v;
+    }
+    return implode(',', $out);
+}
+// UTF-8 multi-byte strlen must keep exact byte length (declined by ASCII check!)
+function utf8Len(int $n): int {
+    $s = "café$n";
+    return strlen($s);
+}
+// Overflow past 2^52 inside LocalMap value must bail cleanly to exact BigInt!
+function arrayOverflow(int $base): int {
+    $map = [];
+    $map["k0"] = $base;
+    $acc = 0;
+    foreach ($map as $k => $v) {
+        $acc += $v + $v;
+    }
+    return $acc;
+}
+echo arrayWorkStr(50), '|', arrayWorkInt(10), '|', utf8Len(7), "\n";
+echo numericStrKeys(10), "\n";
+$big = 1 << 52;
+echo arrayOverflow($big), '|', gettype(arrayOverflow($big)), "\n";
+
+// 2. LocalObj + fnum pure-int methods (promoted, regular ctor, void method, overflow bail, subclass!)
+class FastCounter {
+    public function __construct(public int $val = 0) {}
+    public function inc(int $by): int {
+        $this->val += $by;
+        return $this->val;
+    }
+    public function addVoid(int $by): void {
+        $this->val += $by;
+    }
+}
+class SubFastCounter extends FastCounter {
+    public function inc(int $by): int {
+        $this->val += $by * 10;
+        return $this->val;
+    }
+}
+class Point2D {
+    public int $x = 0;
+    public int $y = 0;
+    public function __construct(int $x, int $y = 5) {
+        $this->x = $x;
+        $this->y = $y;
+    }
+    public function shift(int $dx, int $dy): int {
+        $this->x += $dx;
+        $this->y += $dy;
+        return $this->x + $this->y;
+    }
+}
+function runCounter(int $n): int {
+    $c = new FastCounter(0);
+    for ($i = 0; $i < $n; $i++) {
+        $c->inc($i);
+    }
+    $c->addVoid(5);
+    return $c->val;
+}
+function runCounterBig(int $start, int $step): int {
+    $c = new FastCounter($start);
+    $c->inc($step);
+    return $c->val;
+}
+function runSubCounter(int $n): int {
+    $c = new SubFastCounter(1);
+    for ($i = 0; $i < $n; $i++) {
+        $c->inc($i);
+    }
+    return $c->val;
+}
+function runPoint(int $n): int {
+    $p = new Point2D(2);
+    $s = 0;
+    for ($i = 0; $i < $n; $i++) {
+        $s += $p->shift(1, 2);
+    }
+    return $s + $p->x * 100 + $p->y;
+}
+echo runCounter(100), '|', runCounterBig($big, $big), '|', runSubCounter(5), '|', runPoint(10), "\n";
+
+// 3. Lazy builtin classes materialize cleanly on demand (Reflection, SPL, DateTime, Exceptions, Intl)
+$rc = new ReflectionClass(FastCounter::class);
+$it = new ArrayIterator(['x' => 1, 'y' => 2]);
+$pairs = [];
+foreach ($it as $k => $v) $pairs[] = "$k=$v";
+$dt = new DateTimeImmutable('2026-01-02 03:04:05');
+$di = new DateInterval('P2D');
+$tz = new DateTimeZone('UTC');
+$caught = 'none';
+try {
+    throw new BadMethodCallException('boom');
+} catch (LogicException $e) {
+    $caught = get_class($e) . ':' . $e->getMessage();
+}
+$loc = Locale::canonicalize('en-US');
+$fmt = MessageFormatter::formatMessage('en_US', 'hi {name}', ['name' => 'zipp']);
+$declared = get_declared_classes();
+$hasRef = in_array('ReflectionClass', $declared, true) ? '1' : '0';
+$hasSpl = in_array('RecursiveIteratorIterator', $declared, true) ? '1' : '0';
+echo $rc->getShortName(), '|', implode(',', $pairs), '|', $dt->format('Y-m-d'), '|', $di->d, '|', $tz->getName(), '|', $caught, '|', $loc, '|', $fmt, '|', $hasRef, $hasSpl, "\n";
+"#,
+        "3915|141|6\ninteger:0=10,string:01=11,integer:-5=12\n9007199254740992|integer\n4955|9007199254740992|101|1460\nFastCounter|x=1,y=2|2026-01-02|2|UTC|BadMethodCallException:boom|en_US|hi zipp|11\n",
+    );
+}
+
+#[test]
 #[ignore]
 fn compile_external_corpus_dir() {
     let dir = std::env::var("ZIPP_PHP_CORPUS_DIR").expect("set ZIPP_PHP_CORPUS_DIR");

@@ -3050,6 +3050,7 @@ impl<'p> Vm<'p> {
                 (native::PHP_CRYPTO_NAME, native::PHP_CRYPTO),
                 (native::PHP_ENV_NAME, native::PHP_ENV),
                 (native::PHP_SAPI_NAME, native::PHP_SAPI),
+                (native::PHP_MAP_KV_NAME, native::PHP_MAP_KV),
             ] {
                 let slot = self
                     .program

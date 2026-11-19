@@ -5,11 +5,29 @@
     const rt = R.__rt;
 
     const classes = new Map();     // canonical lowercase fqn -> ClassMeta
+    const lazyClasses = new Map(); // canonical lowercase fqn -> init fn () => void
     const autoloaders = [];
     const destructQueue = [];      // tracked objects with __destruct for shutdown
     let nextObjId = 1;
     rt.classes = classes;
+    R.__clsMap = classes;
     rt.autoloaders = autoloaders;
+    rt.registerLazyClass = function (names, initFn) {
+        let ran = false;
+        const runOnce = function () {
+            if (ran) return;
+            ran = true;
+            for (let i = 0; i < names.length; i++) lazyClasses.delete(names[i]);
+            initFn();
+        };
+        for (let i = 0; i < names.length; i++) lazyClasses.set(names[i], runOnce);
+    };
+    rt.materializeAllLazyClasses = function () {
+        while (lazyClasses.size > 0) {
+            const fn = lazyClasses.values().next().value;
+            fn();
+        }
+    };
 
     function canon(name) {
         if (name.startsWith("\\")) name = name.slice(1);
@@ -43,6 +61,12 @@
         }
         let cls = classes.get(lo);
         if (cls) return cls;
+        const lazyInit = lazyClasses.get(lo);
+        if (lazyInit) {
+            lazyInit();
+            cls = classes.get(lo);
+            if (cls) return cls;
+        }
         if (autoload !== false && autoloaders.length > 0) {
             for (let i = 0; i < autoloaders.length; i++) {
                 rt.call(autoloaders[i], [s], null, null, false);
@@ -74,6 +98,7 @@
     rt.isSubtype = isSubtype;
 
     // ---- Class / Interface / Trait / Enum definition ----
+    const EMPTY_ARR = [];
     function makeClassMeta(spec) {
         const name = stripLeading(spec.name);
         const c = canon(name);
@@ -245,15 +270,17 @@
                         getHook: p.getHook || null, getHookDirect: !!p.getHookDirect,
                         setHook: p.setHook || null, setHookDirect: !!p.setHookDirect,
                         setHookIsArrow: !!p.setHookIsArrow,
-                        attrs: p.attrs || []
+                        attrs: p.attrs || EMPTY_ARR
                     });
                 }
             }
         }
         // Own methods
         if (spec.methods) {
+            const isClassLike = meta.kind !== "interface";
             for (const m of spec.methods) {
                 const mk = m.name.toLowerCase();
+                const ps = m.params || EMPTY_ARR;
                 const mObj = {
                     name: m.name,
                     vis: m.vis || 0,
@@ -261,7 +288,7 @@
                     isAbstract: !!m.isAbstract,
                     isFinal: !!m.isFinal,
                     byRef: !!m.byRef,
-                    params: m.params || [],
+                    params: ps,
                     retType: m.retType || null,
                     strict: !!m.strict,
                     isGen: !!m.isGen,
@@ -270,11 +297,17 @@
                     code: m.code || null,
                     builtin: m.builtin || null,
                     refMask: m.refMask || 0,
+                    fnum: m.fnum || null,
+                    fnumArity: m.fnumArity !== undefined ? m.fnumArity : -1,
+                    fnumRetInt: !!m.fnumRetInt,
                     owner: meta,
-                    attrs: m.attrs || [],
+                    attrs: m.attrs || EMPTY_ARR,
                     statics: null,
+                    fastN: -1,
                 };
-                prepFastMeta(mObj);
+                if (isClassLike && mObj.code && !mObj.builtin && !mObj.isGen && !mObj.hasFuncArgs && ps.length <= 2) {
+                    prepFastMeta(mObj);
+                }
                 meta.methods.set(mk, mObj);
             }
         }
@@ -333,22 +366,70 @@
                 });
             }
         }
-        for (const [mk, mv] of meta.methods) meta.mObj[mk] = mv;
-        const propInits = [];
-        for (const [pk, pm] of meta.props) {
-            meta.pObj[pk] = pm;
-            if (pm.readonly) meta.hasReadonly = true;
-            if (pm.getHook || pm.setHook) meta.hasHooks = true;
-            if (pm.hasDefault || (!pm.ty && !pm.getHook)) {
-                propInits.push(pm);
+        if (meta.kind === "class" || meta.kind === "enum") {
+            for (const [mk, mv] of meta.methods) meta.mObj[mk] = mv;
+            const propInits = [];
+            for (const [pk, pm] of meta.props) {
+                meta.pObj[pk] = pm;
+                if (pm.readonly) meta.hasReadonly = true;
+                if (pm.getHook || pm.setHook) meta.hasHooks = true;
+                if (pm.hasDefault || (!pm.ty && !pm.getHook)) {
+                    propInits.push(pm);
+                }
+            }
+            meta.propInits = propInits;
+            meta.hasMagicProps = meta.methods.has("__get") || meta.methods.has("__set")
+                || meta.methods.has("__isset") || meta.methods.has("__unset");
+            meta.hasDestruct = meta.methods.has("__destruct");
+            meta.fastProps = meta.kind === "class" && !meta.hasPrivateProps
+                && !meta.hasHooks && !meta.hasReadonly && !meta.hasMagicProps;
+        } else {
+            meta.propInits = EMPTY_ARR;
+            meta.hasMagicProps = false;
+            meta.hasDestruct = false;
+            meta.fastProps = false;
+        }
+        meta.fastNumCtor = null;
+        meta.fastNumMinArgs = 0;
+        meta.fastNumMaxArgs = 0;
+        meta.fastNumProps = null;
+        if (spec.fastNumSpec && meta.fastProps && !meta.parent && !meta.hasDestruct
+            && !meta.isAbstract && !meta.methods.has("__call") && meta.traits.length === 0) {
+            const fns = spec.fastNumSpec;
+            const ps = fns.props;
+            const cp = fns.params;
+            const pset = Object.create(null);
+            for (let i = 0; i < ps.length; i++) pset[ps[i][0]] = true;
+            meta.fastNumProps = pset;
+            meta.fastNumMaxArgs = cp.length;
+            let minA = 0;
+            for (let i = 0; i < cp.length; i++) if (!cp[i][1]) minA = i + 1;
+            meta.fastNumMinArgs = minA;
+            const fnumEntries = [];
+            for (const [mk, mv] of meta.methods) {
+                if (mv.fnum && mv.vis === 0 && !mv.isStatic) {
+                    fnumEntries.push(["\x01" + mk, mv.fnum]);
+                }
+            }
+            if (ps.length === 1 && cp.length === 1 && ps[0][0] === cp[0][0] && fnumEntries.length === 1) {
+                const pn = ps[0][0], dv = cp[0][2], mk0 = fnumEntries[0][0], mf0 = fnumEntries[0][1];
+                meta.fastNumCtor = function (a0) {
+                    const o = {};
+                    o[pn] = a0 !== undefined ? a0 : dv;
+                    o[mk0] = mf0;
+                    return o;
+                };
+            } else {
+                meta.fastNumCtor = function (a0, a1) {
+                    const o = {};
+                    for (let i = 0; i < ps.length; i++) o[ps[i][0]] = ps[i][1];
+                    if (cp.length >= 1) o[cp[0][0]] = a0 !== undefined ? a0 : cp[0][2];
+                    if (cp.length >= 2) o[cp[1][0]] = a1 !== undefined ? a1 : cp[1][2];
+                    for (let i = 0; i < fnumEntries.length; i++) o[fnumEntries[i][0]] = fnumEntries[i][1];
+                    return o;
+                };
             }
         }
-        meta.propInits = propInits;
-        meta.hasMagicProps = meta.methods.has("__get") || meta.methods.has("__set")
-            || meta.methods.has("__isset") || meta.methods.has("__unset");
-        meta.hasDestruct = meta.methods.has("__destruct");
-        meta.fastProps = meta.kind === "class" && !meta.hasPrivateProps
-            && !meta.hasHooks && !meta.hasReadonly && !meta.hasMagicProps;
         classes.set(c, meta);
         return meta;
     }
@@ -453,7 +534,7 @@
     makeExcClass("ParseError", "Error");
 
     function newBuiltinError(clsName, msg) {
-        const cls = classes.get(clsName.toLowerCase()) || classes.get("error");
+        const cls = resolveClass(clsName, null, null, false) || classes.get("error");
         const obj = allocInstance(cls);
         obj.props["message"] = String(msg);
         try { obj.__stack = (new Error()).stack || ""; } catch (_) {}
@@ -1624,76 +1705,79 @@
         rt.throwError("UnhandledMatchError", "Unhandled match case " + rt.toStr(val));
     };
 
-    // ---- Basic Reflection (ReflectionClass, ReflectionMethod, ReflectionAttribute) ----
-    const RefAttrClass = makeClassMeta({
-        name: "ReflectionAttribute", kind: "class",
-        methods: [
-            { name: "getName", vis: 0, builtin: function () { return this.__meta.name; } },
-            { name: "getArguments", vis: 0, builtin: function () { return rt.cloneArr(this.__meta.args); } },
-            { name: "newInstance", vis: 0, builtin: function () {
-                const args = [], named = {};
-                let hasNamed = false;
-                for (const [k, v] of this.__meta.args.m) {
-                    if (typeof k === "string") { named[k] = v; hasNamed = true; } else args.push(v);
-                }
-                return R.newObj(this.__meta.name, args, hasNamed ? named : null, null, null, false);
-            }},
-        ]
-    });
-    function wrapAttrs(list, filterName) {
-        const out = rt.makeArr();
-        for (const a of (list || [])) {
-            if (filterName && canon(a.name) !== canon(rt.toStr(filterName))) continue;
-            const o = allocInstance(RefAttrClass);
-            o.__meta = a;
-            rt.arrPushInPlace(out, o);
+    // ---- Basic Reflection (lazily materialized on first use via spl_reflection.js) ----
+    rt._initBasicReflection = function () {
+        if (classes.has("reflectionclass")) return;
+        const RefAttrClass = makeClassMeta({
+            name: "ReflectionAttribute", kind: "class",
+            methods: [
+                { name: "getName", vis: 0, builtin: function () { return this.__meta.name; } },
+                { name: "getArguments", vis: 0, builtin: function () { return rt.cloneArr(this.__meta.args); } },
+                { name: "newInstance", vis: 0, builtin: function () {
+                    const args = [], named = {};
+                    let hasNamed = false;
+                    for (const [k, v] of this.__meta.args.m) {
+                        if (typeof k === "string") { named[k] = v; hasNamed = true; } else args.push(v);
+                    }
+                    return R.newObj(this.__meta.name, args, hasNamed ? named : null, null, null, false);
+                }},
+            ]
+        });
+        function wrapAttrs(list, filterName) {
+            const out = rt.makeArr();
+            for (const a of (list || [])) {
+                if (filterName && canon(a.name) !== canon(rt.toStr(filterName))) continue;
+                const o = allocInstance(RefAttrClass);
+                o.__meta = a;
+                rt.arrPushInPlace(out, o);
+            }
+            return out;
         }
-        return out;
-    }
-    const RefMethodClass = makeClassMeta({
-        name: "ReflectionMethod", kind: "class",
-        methods: [
-            { name: "getName", vis: 0, builtin: function () { return this.__meta.name; } },
-            { name: "isPublic", vis: 0, builtin: function () { return this.__meta.vis === 0; } },
-            { name: "isProtected", vis: 0, builtin: function () { return this.__meta.vis === 1; } },
-            { name: "isPrivate", vis: 0, builtin: function () { return this.__meta.vis === 2; } },
-            { name: "isStatic", vis: 0, builtin: function () { return !!this.__meta.isStatic; } },
-            { name: "getAttributes", vis: 0, builtin: function (n) { return wrapAttrs(this.__meta.attrs, n); } },
-            { name: "invoke", vis: 0, builtin: function (obj) {
-                const rest = Array.from(arguments).slice(1);
-                return invokeMethod(rt.deref(obj), this.__meta, rest, null, this.__meta.owner, this.__meta.owner, false);
-            }},
-        ]
-    });
-    makeClassMeta({
-        name: "ReflectionClass", kind: "class",
-        methods: [
-            { name: "__construct", vis: 0, builtin: function (target) { this.__meta = requireClass(target, null, null); } },
-            { name: "getName", vis: 0, builtin: function () { return this.__meta.name; } },
-            { name: "getShortName", vis: 0, builtin: function () { const p = this.__meta.name.split("\\"); return p[p.length - 1]; } },
-            { name: "getNamespaceName", vis: 0, builtin: function () { const i = this.__meta.name.lastIndexOf("\\"); return i >= 0 ? this.__meta.name.slice(0, i) : ""; } },
-            { name: "hasMethod", vis: 0, builtin: function (n) { return this.__meta.methods.has(rt.toStr(n).toLowerCase()); } },
-            { name: "getMethod", vis: 0, builtin: function (n) {
-                const m = this.__meta.methods.get(rt.toStr(n).toLowerCase());
-                if (!m) rt.throwError("ReflectionException", "Method does not exist");
-                const o = allocInstance(RefMethodClass); o.__meta = m; return o;
-            }},
-            { name: "getMethods", vis: 0, builtin: function () {
-                const out = rt.makeArr();
-                for (const m of this.__meta.methods.values()) { const o = allocInstance(RefMethodClass); o.__meta = m; rt.arrPushInPlace(out, o); }
-                return out;
-            }},
-            { name: "getAttributes", vis: 0, builtin: function (n) { return wrapAttrs(this.__meta.attrs, n); } },
-            { name: "newInstanceArgs", vis: 0, builtin: function (arr) {
-                const list = arr ? Array.from(rt.toArray(arr).m.values()).map(rt.deref) : [];
-                return R.newObj(this.__meta, list, null, null, null, false);
-            }},
-            { name: "implementsInterface", vis: 0, builtin: function (n) {
-                const t = resolveClass(n, null, null, true);
-                return !!(t && isSubtype(this.__meta, t));
-            }},
-        ]
-    });
+        const RefMethodClass = makeClassMeta({
+            name: "ReflectionMethod", kind: "class",
+            methods: [
+                { name: "getName", vis: 0, builtin: function () { return this.__meta.name; } },
+                { name: "isPublic", vis: 0, builtin: function () { return this.__meta.vis === 0; } },
+                { name: "isProtected", vis: 0, builtin: function () { return this.__meta.vis === 1; } },
+                { name: "isPrivate", vis: 0, builtin: function () { return this.__meta.vis === 2; } },
+                { name: "isStatic", vis: 0, builtin: function () { return !!this.__meta.isStatic; } },
+                { name: "getAttributes", vis: 0, builtin: function (n) { return wrapAttrs(this.__meta.attrs, n); } },
+                { name: "invoke", vis: 0, builtin: function (obj) {
+                    const rest = Array.from(arguments).slice(1);
+                    return invokeMethod(rt.deref(obj), this.__meta, rest, null, this.__meta.owner, this.__meta.owner, false);
+                }},
+            ]
+        });
+        makeClassMeta({
+            name: "ReflectionClass", kind: "class",
+            methods: [
+                { name: "__construct", vis: 0, builtin: function (target) { this.__meta = requireClass(target, null, null); } },
+                { name: "getName", vis: 0, builtin: function () { return this.__meta.name; } },
+                { name: "getShortName", vis: 0, builtin: function () { const p = this.__meta.name.split("\\"); return p[p.length - 1]; } },
+                { name: "getNamespaceName", vis: 0, builtin: function () { const i = this.__meta.name.lastIndexOf("\\"); return i >= 0 ? this.__meta.name.slice(0, i) : ""; } },
+                { name: "hasMethod", vis: 0, builtin: function (n) { return this.__meta.methods.has(rt.toStr(n).toLowerCase()); } },
+                { name: "getMethod", vis: 0, builtin: function (n) {
+                    const m = this.__meta.methods.get(rt.toStr(n).toLowerCase());
+                    if (!m) rt.throwError("ReflectionException", "Method does not exist");
+                    const o = allocInstance(RefMethodClass); o.__meta = m; return o;
+                }},
+                { name: "getMethods", vis: 0, builtin: function () {
+                    const out = rt.makeArr();
+                    for (const m of this.__meta.methods.values()) { const o = allocInstance(RefMethodClass); o.__meta = m; rt.arrPushInPlace(out, o); }
+                    return out;
+                }},
+                { name: "getAttributes", vis: 0, builtin: function (n) { return wrapAttrs(this.__meta.attrs, n); } },
+                { name: "newInstanceArgs", vis: 0, builtin: function (arr) {
+                    const list = arr ? Array.from(rt.toArray(arr).m.values()).map(rt.deref) : [];
+                    return R.newObj(this.__meta, list, null, null, null, false);
+                }},
+                { name: "implementsInterface", vis: 0, builtin: function (n) {
+                    const t = resolveClass(n, null, null, true);
+                    return !!(t && isSubtype(this.__meta, t));
+                }},
+            ]
+        });
+    };
 
     // ---- Reflection / SPL / OOP built-in functions ----
     const reg = rt.regFn;

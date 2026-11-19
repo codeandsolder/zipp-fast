@@ -43,6 +43,7 @@ impl<'p> Vm<'p> {
             native::PHP_CRYPTO => self.php_crypto_native(arg(0), arg(1), arg(2), arg(3)),
             native::PHP_ENV => self.php_env_native(),
             native::PHP_SAPI => self.php_sapi_native(arg(0)),
+            native::PHP_MAP_KV => self.php_map_kv_native(arg(0)),
             _ => Err(Thrown::from_static("InternalError: unknown PHP native")),
         }
     }
@@ -79,35 +80,79 @@ impl<'p> Vm<'p> {
         let path_str = self.to_js_string(path_val)?;
         let cur_dir = self.to_js_string(cur_dir_val)?;
         let mode = self.to_number_coerce(mode_val)? as i32; // 0=include, 1=once, 2=eval
-
-        let (cache_key, display_path, source) = if mode == 2 {
-            (None, "<eval>".to_owned(), path_str)
-        } else {
-            let Some((key, disp, bytes)) = resolve_php_file(ctx, &path_str, &cur_dir) else {
-                return Ok(Value::NULL);
-            };
-            if mode == 1 && self.php_included.contains(&key) {
-                return Ok(Value::TRUE);
-            }
-            self.php_included.insert(key.clone());
-            let src = String::from_utf8_lossy(&bytes).into_owned();
-            (Some(key), disp, src)
-        };
-
         let base_id = (self.main_func_count + self.eval_funcs.len()) as u32;
-        let protos = (ctx.compile_unit)(
-            cache_key.as_deref(),
-            &display_path,
-            &source,
-            ctx.rt_slot,
-            base_id,
-        )
-        .map_err(|e| Thrown(format!("ParseError: {e}")))?;
+
+        let protos = if mode == 2 {
+            (ctx.compile_unit)(None, "<eval>", &path_str, ctx.rt_slot, base_id, None)
+                .map_err(|e| Thrown(format!("ParseError: {e}")))?
+        } else {
+            // Fast zero-syscall `include_once`/`require_once` check for absolute native paths!
+            #[cfg(not(any(feature = "safe-sandbox", target_arch = "wasm32")))]
+            if mode == 1 && ctx.allow_native_fs && ctx.vfs.is_none() {
+                let p = Path::new(&path_str);
+                if p.is_absolute() {
+                    let clean = normalize_fs_path(p);
+                    let dedup = include_dedup_key(&clean);
+                    if self.php_included.contains(&dedup) {
+                        return Ok(Value::TRUE);
+                    }
+                }
+            }
+            match resolve_php_file_meta(ctx, &path_str, &cur_dir) {
+                None => return Ok(Value::NULL),
+                Some(ResolvedPhpFile::Vfs { key, disp, bytes }) => {
+                    if mode == 1 && self.php_included.contains(&key) {
+                        return Ok(Value::TRUE);
+                    }
+                    self.php_included.insert(key.clone());
+                    let src = String::from_utf8_lossy(&bytes);
+                    (ctx.compile_unit)(Some(&key), &disp, &src, ctx.rt_slot, base_id, None)
+                        .map_err(|e| Thrown(format!("ParseError: {e}")))?
+                }
+                #[cfg(not(any(feature = "safe-sandbox", target_arch = "wasm32")))]
+                Some(ResolvedPhpFile::Native {
+                    dedup_key,
+                    display_path,
+                    disk_path,
+                    mtime_nanos,
+                    file_len,
+                }) => {
+                    if mode == 1 && self.php_included.contains(&dedup_key) {
+                        return Ok(Value::TRUE);
+                    }
+                    self.php_included.insert(dedup_key.clone());
+                    if let Some(hit) = (ctx.lookup_cached_by_stat)(
+                        &dedup_key,
+                        mtime_nanos,
+                        file_len,
+                        base_id,
+                    ) {
+                        hit
+                    } else {
+                        let Ok(bytes) = std::fs::read(&disk_path) else {
+                            return Ok(Value::NULL);
+                        };
+                        let src = String::from_utf8_lossy(&bytes);
+                        (ctx.compile_unit)(
+                            Some(&dedup_key),
+                            &display_path,
+                            &src,
+                            ctx.rt_slot,
+                            base_id,
+                            Some((mtime_nanos, file_len)),
+                        )
+                        .map_err(|e| Thrown(format!("ParseError: {e}")))?
+                    }
+                }
+            }
+        };
 
         if protos.is_empty() {
             return Ok(Value::NULL);
         }
         let count = protos.len() as u32;
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        self.jit.php_functions_installed(base_id as usize, &protos);
         for f in protos {
             let node = self.eval_arena.funcs.push(self.eval_func_tail, f);
             self.eval_func_tail = Some(node);
@@ -117,6 +162,45 @@ impl<'p> Vm<'p> {
         let fn_val = Value::heap(self.heap.alloc(HeapObj::Func(top_id)));
         self.realm_tag_new(fn_val.heap_index());
         Ok(fn_val)
+    }
+
+    /// Extract a JS `Map`'s live `(keys, vals)` directly into `[keysArr, valsArr, hasObj]`
+    /// in Rust without a JS callback per entry (used by `R.iterStart` and JIT `foreach`).
+    fn php_map_kv_native(&mut self, map_val: Value) -> Result<Value, Thrown> {
+        if !map_val.is_heap() {
+            let ks = self.alloc_array_current_realm(Vec::new());
+            let vs = self.alloc_array_current_realm(Vec::new());
+            return Ok(self.alloc_array_current_realm(vec![ks, vs, Value::FALSE]));
+        }
+        let idx = map_val.heap_index();
+        let (out_keys, out_vals, has_obj) = match self.heap.get(idx) {
+            HeapObj::Map { keys, vals } => {
+                let len = keys.len().min(vals.len());
+                let mut ok = Vec::with_capacity(len);
+                let mut ov = Vec::with_capacity(len);
+                let mut any_obj = false;
+                for i in 0..len {
+                    let k = keys[i];
+                    if k.is_hole() {
+                        continue;
+                    }
+                    let v = vals[i];
+                    if !any_obj
+                        && v.is_heap()
+                        && matches!(self.heap.get(v.heap_index()), HeapObj::Object(_))
+                    {
+                        any_obj = true;
+                    }
+                    ok.push(k);
+                    ov.push(v);
+                }
+                (ok, ov, any_obj)
+            }
+            _ => (Vec::new(), Vec::new(), false),
+        };
+        let ks = self.alloc_array_current_realm(out_keys);
+        let vs = self.alloc_array_current_realm(out_vals);
+        Ok(self.alloc_array_current_realm(vec![ks, vs, Value::bool(has_obj)]))
     }
 
     fn php_fs_native(
@@ -392,11 +476,71 @@ fn push_json_escaped(out: &mut String, s: &str) {
     out.push('"');
 }
 
-fn resolve_php_file(
+enum ResolvedPhpFile {
+    Vfs {
+        key: String,
+        disp: String,
+        bytes: Vec<u8>,
+    },
+    #[cfg(not(any(feature = "safe-sandbox", target_arch = "wasm32")))]
+    Native {
+        dedup_key: String,
+        display_path: String,
+        disk_path: PathBuf,
+        mtime_nanos: u128,
+        file_len: u64,
+    },
+}
+
+#[cfg(not(any(feature = "safe-sandbox", target_arch = "wasm32")))]
+fn normalize_fs_path(path: &Path) -> String {
+    let raw = path.to_string_lossy().replace('\\', "/");
+    let stripped = raw.strip_prefix("//?/").unwrap_or(&raw);
+    let mut prefix = String::new();
+    let rest = if stripped.len() >= 2 && stripped.as_bytes()[1] == b':' {
+        // Normalize Windows drive letter to uppercase for consistent keys.
+        prefix.push((stripped.as_bytes()[0] as char).to_ascii_uppercase());
+        prefix.push(':');
+        &stripped[2..]
+    } else if stripped.starts_with('/') {
+        prefix.push('/');
+        stripped
+    } else {
+        stripped
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in rest.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            s => parts.push(s),
+        }
+    }
+    if prefix.ends_with(':') {
+        format!("{prefix}/{}", parts.join("/"))
+    } else if prefix == "/" {
+        format!("/{}", parts.join("/"))
+    } else {
+        parts.join("/")
+    }
+}
+
+#[cfg(not(any(feature = "safe-sandbox", target_arch = "wasm32")))]
+fn include_dedup_key(clean_path: &str) -> String {
+    if cfg!(windows) {
+        clean_path.to_ascii_lowercase()
+    } else {
+        clean_path.to_owned()
+    }
+}
+
+fn resolve_php_file_meta(
     ctx: &crate::bytecode::PhpCtx,
     req_path: &str,
     cur_dir: &str,
-) -> Option<(String, String, Vec<u8>)> {
+) -> Option<ResolvedPhpFile> {
     // 1. Check virtual filesystem first (for sandboxed / WASM / multi-file embedded tests).
     if let Some(vfs) = &ctx.vfs {
         let norm_req = req_path.replace('\\', "/");
@@ -415,19 +559,23 @@ fn resolve_php_file(
         ];
         for cand in candidates {
             if let Some(bytes) = vfs.get(&cand) {
-                return Some((format!("vfs:{cand}"), cand, bytes.clone()));
+                return Some(ResolvedPhpFile::Vfs {
+                    key: format!("vfs:{cand}"),
+                    disp: cand,
+                    bytes: bytes.clone(),
+                });
             }
         }
     }
 
-    // 2. Native filesystem (only when explicitly allowed and outside safe-sandbox/wasm32).
+    // 2. Native filesystem (single `metadata()` syscall, zero `canonicalize()`, zero upfront read!).
     #[cfg(not(any(feature = "safe-sandbox", target_arch = "wasm32")))]
     if ctx.allow_native_fs {
         let p = Path::new(req_path);
         let candidates: Vec<PathBuf> = if p.is_absolute() {
             vec![p.to_path_buf()]
         } else {
-            let mut v = Vec::new();
+            let mut v = Vec::with_capacity(3);
             if !cur_dir.is_empty() {
                 v.push(Path::new(cur_dir).join(p));
             }
@@ -438,12 +586,30 @@ fn resolve_php_file(
             v
         };
         for cand in candidates {
-            if cand.is_file() {
-                if let Ok(bytes) = std::fs::read(&cand) {
-                    let canon = std::fs::canonicalize(&cand).unwrap_or(cand);
-                    let norm = canon.to_string_lossy().replace('\\', "/");
-                    let clean = norm.strip_prefix("//?/").unwrap_or(&norm).to_owned();
-                    return Some((clean.clone(), clean, bytes));
+            if let Ok(meta) = std::fs::metadata(&cand) {
+                if meta.is_file() {
+                    let abs = if cand.is_absolute() {
+                        cand
+                    } else {
+                        std::env::current_dir()
+                            .map(|cwd| cwd.join(&cand))
+                            .unwrap_or(cand)
+                    };
+                    let display_path = normalize_fs_path(&abs);
+                    let dedup_key = include_dedup_key(&display_path);
+                    let mtime_nanos = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0);
+                    return Some(ResolvedPhpFile::Native {
+                        dedup_key,
+                        display_path,
+                        disk_path: abs,
+                        mtime_nanos,
+                        file_len: meta.len(),
+                    });
                 }
             }
         }

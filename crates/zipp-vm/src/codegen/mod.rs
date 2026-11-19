@@ -3848,7 +3848,14 @@ pub struct Jit {
     /// A Python program whose JavaScript runtime stays interpreted: only
     /// Python-emitted bodies compile.
     python_only: bool,
-    /// Per main-program function of a Python program: `INTERP_*` flags
+    /// A PHP program (see `set_php_program`): its JavaScript runtime stays
+    /// interpreted while its pure-JS native-JIT companion functions (`__php_fi_*`)
+    /// compile at full native speed.
+    php_program: bool,
+    /// When true, non-companion PHP/runtime functions stay interpreted.
+    #[cfg_attr(not(feature = "php"), allow(dead_code))]
+    php_only: bool,
+    /// Per main-program function of a Python/PHP program: `INTERP_*` flags
     /// (answered as dead by `fn_state` / `region_dead`). In a JavaScript
     /// program, the `RUNTIME_*` flags of `eval` and `new Function` code
     /// ([`Jit::note_runtime_code`]), read by `record_region` alone.
@@ -3926,12 +3933,57 @@ impl Jit {
         }
     }
 
+    /// Mark this VM as running a PHP program (the PHP frontend's JS runtime
+    /// plus PHP-compiled bodies). Its JS runtime and generic BigInt bodies
+    /// stay interpreted to avoid startup compile overhead on frameworks, while
+    /// pure-JS native-JIT companion functions (`__php_fi_*`) compile natively
+    /// through Tier A and Tier C. `ZIPP_PHP_JIT_RUNTIME=1` compiles all bodies.
+    #[cfg(feature = "php")]
+    pub fn set_php_program<'a>(
+        &mut self,
+        php: bool,
+        functions: impl IntoIterator<Item = &'a FuncProto>,
+    ) {
+        if !php {
+            return;
+        }
+        self.php_program = true;
+        self.php_only = crate::env_var_os("ZIPP_PHP_JIT_RUNTIME").is_none();
+        self.interp_only = functions.into_iter().map(|f| self.php_interp_flags(f)).collect();
+    }
+
+    #[cfg(feature = "php")]
+    fn php_interp_flags(&self, f: &FuncProto) -> u8 {
+        if !self.php_only || f.name.starts_with("__php_fi_") {
+            0
+        } else {
+            INTERP_NO_FN | INTERP_NO_REGIONS
+        }
+    }
+
+    /// Dynamically included PHP functions installed from `first` on: keep
+    /// runtime/generic bodies interpreted while enabling JIT on `__php_fi_*`.
+    #[cfg(feature = "php")]
+    pub fn php_functions_installed(&mut self, first: usize, functions: &[FuncProto]) {
+        if !self.php_program {
+            return;
+        }
+        if self.interp_only.len() < first {
+            self.interp_only.resize(first, 0);
+        }
+        self.interp_only.truncate(first);
+        for f in functions {
+            let flags = self.php_interp_flags(f);
+            self.interp_only.push(flags);
+        }
+    }
+
     /// `eval` or `new Function` code installed as `func_id` in a JavaScript
     /// program: flag it `RUNTIME_CODE`, and `RUNTIME_MANY_LOOPS` past
     /// [`MAX_LOOPS_FOR_REGIONS`] loops; a long one waits its extra calls
     /// ([`RUNTIME_FN_INSTRS_PER_CALL`]).
     pub fn note_runtime_code(&mut self, func_id: u32, code: &[Instr]) {
-        if self.python_program {
+        if self.python_program || self.php_program {
             return;
         }
         let i = func_id as usize;
@@ -3952,6 +4004,9 @@ impl Jit {
     /// interpreter asks at each such back-edge.
     #[inline]
     pub fn tierc_osr_state(&self, func_id: u32) -> u8 {
+        if self.interp_flags(func_id) & INTERP_NO_REGIONS != 0 {
+            return OSR_OFF;
+        }
         self.osr_state.get(func_id as usize).copied().unwrap_or(0)
     }
 
@@ -4035,11 +4090,11 @@ impl Jit {
         true
     }
 
-    /// `func_id`'s `INTERP_*` flags in a Python program (see
-    /// `set_python_program`); 0 in any other.
+    /// `func_id`'s `INTERP_*` flags in a Python or PHP program (see
+    /// `set_python_program` / `set_php_program`); 0 in any other.
     #[inline]
     fn interp_flags(&self, func_id: u32) -> u8 {
-        if !self.python_program {
+        if !self.python_program && !self.php_program {
             return 0;
         }
         self.interp_only.get(func_id as usize).copied().unwrap_or(0)
@@ -5213,8 +5268,8 @@ impl Jit {
             return false;
         }
         // `eval` / `new Function` code (`note_runtime_code`; never flagged in
-        // a Python program, whose `interp_only` holds `INTERP_*` flags).
-        let runtime = if self.python_program || self.threshold_override != 0 {
+        // a Python or PHP program, whose `interp_only` holds `INTERP_*` flags).
+        let runtime = if self.python_program || self.php_program || self.threshold_override != 0 {
             0
         } else {
             self.interp_only.get(func_id as usize).copied().unwrap_or(0)

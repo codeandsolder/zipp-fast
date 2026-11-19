@@ -1,6 +1,8 @@
 //! PHP frontend entry: compiles PHP 8.x source + memoized JS runtime seed into a ZIPP `Program`,
 //! plus OPcache-backed dynamic compilation for `include`/`require`/`eval` and HTTP SAPI configuration.
 
+#[cfg(not(any(target_arch = "wasm32", feature = "wasm-lite")))]
+mod code_cache;
 mod emitter;
 mod exprs;
 mod fast_int;
@@ -13,6 +15,9 @@ use emitter::{FileCtx, FuncSink, PhpEmitter};
 use resolve::NsResolver;
 use std::cell::RefCell;
 use std::collections::HashMap;
+#[cfg(not(any(target_arch = "wasm32", feature = "wasm-lite")))]
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use symtable::FnScopeInfo;
 use zipp_phpparse::{parse, Limits};
@@ -50,9 +55,24 @@ struct RuntimeSeed {
     rt_slot: u32,
 }
 
+static RUNTIME_MEMO: AtomicBool = AtomicBool::new(true);
 static RUNTIME_SEED: OnceLock<Result<RuntimeSeed, String>> = OnceLock::new();
 
+pub(crate) fn set_runtime_memo(enabled: bool) {
+    RUNTIME_MEMO.store(enabled, Ordering::Relaxed);
+}
+
+pub(crate) fn set_runtime_cache(dir: Option<std::path::PathBuf>) {
+    #[cfg(not(any(target_arch = "wasm32", feature = "wasm-lite")))]
+    code_cache::set_dir(dir);
+    #[cfg(any(target_arch = "wasm32", feature = "wasm-lite"))]
+    let _ = dir;
+}
+
 fn build_runtime_seed() -> R<RuntimeSeed> {
+    #[cfg(not(any(target_arch = "wasm32", feature = "wasm-lite")))]
+    let mut program = code_cache::runtime(RUNTIME_JS)?;
+    #[cfg(any(target_arch = "wasm32", feature = "wasm-lite"))]
     let mut program = crate::compile_only(RUNTIME_JS, false)
         .map_err(|e| format!("PHP runtime compile error: {e}"))?;
     program.php_natives = true;
@@ -74,9 +94,10 @@ fn build_runtime_seed() -> R<RuntimeSeed> {
 }
 
 fn runtime_seed() -> R<RuntimeSeed> {
-    RUNTIME_SEED
-        .get_or_init(build_runtime_seed)
-        .clone()
+    if !RUNTIME_MEMO.load(Ordering::Relaxed) {
+        return build_runtime_seed();
+    }
+    RUNTIME_SEED.get_or_init(build_runtime_seed).clone()
 }
 
 /// Configuration for compiling and running a PHP script or HTTP request.
@@ -133,7 +154,11 @@ pub(crate) fn compile_program(source: &str, config: PhpProgramConfig) -> R<Progr
     };
     let stamp = source_stamp(source);
     let cache_key = (config.file.clone(), dir.clone());
-    let cached = if !config.file.is_empty() && config.file != "<php>" && config.file != "test.php" {
+    let use_in_proc_entry_cache = RUNTIME_MEMO.load(Ordering::Relaxed)
+        && !config.file.is_empty()
+        && config.file != "<php>"
+        && config.file != "test.php";
+    let cached = if use_in_proc_entry_cache {
         let cache = entry_cache().lock().unwrap_or_else(|e| e.into_inner());
         cache
             .get(&cache_key)
@@ -142,6 +167,16 @@ pub(crate) fn compile_program(source: &str, config: PhpProgramConfig) -> R<Progr
     } else {
         None
     };
+
+    // Pre-populate the in-process OPcache from the single-file disk pack (if enabled).
+    #[cfg(not(any(target_arch = "wasm32", feature = "wasm-lite")))]
+    if config.allow_native_fs
+        && !config.file.is_empty()
+        && config.file != "<php>"
+        && config.file != "test.php"
+    {
+        preload_opcache_pack(&config.file);
+    }
 
     let (mut program, rt_slot) = if let Some(hit) = cached {
         hit
@@ -186,7 +221,7 @@ pub(crate) fn compile_program(source: &str, config: PhpProgramConfig) -> R<Progr
         let mut program = prog_cell.into_inner();
         program.functions.replace(entry_fn, entry_proto);
         program.php_natives = true;
-        if !config.file.is_empty() && config.file != "<php>" && config.file != "test.php" {
+        if use_in_proc_entry_cache {
             let mut cache = entry_cache().lock().unwrap_or_else(|e| e.into_inner());
             if cache.len() > 256 {
                 cache.clear();
@@ -205,6 +240,7 @@ pub(crate) fn compile_program(source: &str, config: PhpProgramConfig) -> R<Progr
         vfs: config.vfs.map(Arc::new),
         allow_native_fs: config.allow_native_fs,
         stream_stdout: config.stream_stdout,
+        lookup_cached_by_stat: lookup_opcache_by_stat,
         compile_unit: compile_dynamic_unit_cached,
     }));
     Ok(program)
@@ -213,16 +249,113 @@ pub(crate) fn compile_program(source: &str, config: PhpProgramConfig) -> R<Progr
 // ---- In-process OPcache for dynamically included `.php` files ----
 
 #[derive(Clone)]
+enum OpcachePayload {
+    #[cfg(not(any(target_arch = "wasm32", feature = "wasm-lite")))]
+    Encoded(Arc<[u8]>),
+    Decoded(Arc<[FuncProto]>),
+}
+
+#[derive(Clone)]
 struct OpcacheEntry {
+    mtime_nanos: u128,
+    file_len: u64,
     stamp: u64,
-    /// Compiled `FuncProto`s with relative function IDs starting at 0; top-level body is LAST.
-    protos: Arc<[FuncProto]>,
+    payload: OpcachePayload,
 }
 
 static OPCACHE: OnceLock<Mutex<HashMap<String, OpcacheEntry>>> = OnceLock::new();
 
 fn opcache() -> &'static Mutex<HashMap<String, OpcacheEntry>> {
     OPCACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(not(any(target_arch = "wasm32", feature = "wasm-lite")))]
+struct PackTracker {
+    entry_file: Option<String>,
+    keys: HashSet<String>,
+    dirty: bool,
+}
+
+#[cfg(not(any(target_arch = "wasm32", feature = "wasm-lite")))]
+static PACK_TRACKER: OnceLock<Mutex<PackTracker>> = OnceLock::new();
+
+#[cfg(not(any(target_arch = "wasm32", feature = "wasm-lite")))]
+fn pack_tracker() -> &'static Mutex<PackTracker> {
+    PACK_TRACKER.get_or_init(|| {
+        Mutex::new(PackTracker {
+            entry_file: None,
+            keys: HashSet::new(),
+            dirty: false,
+        })
+    })
+}
+
+#[cfg(not(any(target_arch = "wasm32", feature = "wasm-lite")))]
+fn preload_opcache_pack(entry_file: &str) {
+    {
+        let tracker = pack_tracker().lock().unwrap_or_else(|e| e.into_inner());
+        if tracker.entry_file.as_deref() == Some(entry_file) {
+            return;
+        }
+    }
+    let loaded = code_cache::load_opcache_pack(entry_file);
+    let mut keys = HashSet::with_capacity(loaded.len());
+    if !loaded.is_empty() {
+        let mut cache = opcache().lock().unwrap_or_else(|e| e.into_inner());
+        for pe in loaded {
+            keys.insert(pe.file_key.clone());
+            cache.entry(pe.file_key).or_insert_with(|| OpcacheEntry {
+                mtime_nanos: pe.mtime_nanos,
+                file_len: pe.file_len,
+                stamp: pe.stamp,
+                payload: OpcachePayload::Encoded(pe.blob),
+            });
+        }
+    }
+    let mut tracker = pack_tracker().lock().unwrap_or_else(|e| e.into_inner());
+    tracker.entry_file = Some(entry_file.to_owned());
+    tracker.keys = keys;
+    tracker.dirty = false;
+}
+
+/// Persist any newly compiled PHP include files into the single-file disk OPcache pack.
+pub(crate) fn flush_opcache_pack() {
+    #[cfg(not(any(target_arch = "wasm32", feature = "wasm-lite")))]
+    {
+        let (entry_file, keys) = {
+            let mut tracker = pack_tracker().lock().unwrap_or_else(|e| e.into_inner());
+            if !tracker.dirty {
+                return;
+            }
+            tracker.dirty = false;
+            let Some(ef) = tracker.entry_file.clone() else {
+                return;
+            };
+            (ef, tracker.keys.iter().cloned().collect::<Vec<_>>())
+        };
+        let entries: Vec<code_cache::PackEntry> = {
+            let cache = opcache().lock().unwrap_or_else(|e| e.into_inner());
+            keys.into_iter()
+                .filter_map(|k| {
+                    let e = cache.get(&k)?;
+                    let blob: Arc<[u8]> = match &e.payload {
+                        OpcachePayload::Encoded(b) => Arc::clone(b),
+                        OpcachePayload::Decoded(protos) => {
+                            crate::bytecode_codec::encode_functions(protos).into()
+                        }
+                    };
+                    Some(code_cache::PackEntry {
+                        file_key: k,
+                        mtime_nanos: e.mtime_nanos,
+                        file_len: e.file_len,
+                        stamp: e.stamp,
+                        blob,
+                    })
+                })
+                .collect()
+        };
+        code_cache::store_opcache_pack(&entry_file, &entries);
+    }
 }
 
 fn source_stamp(source: &str) -> u64 {
@@ -235,6 +368,44 @@ fn source_stamp(source: &str) -> u64 {
     h
 }
 
+/// Stat-validated OPcache hit without reading the source file from disk.
+/// Decodes an `Encoded` pack blob lazily straight into an owned `Vec<FuncProto>`
+/// and relocates in place with zero `FuncProto` cloning on one-shot CLI runs!
+pub(crate) fn lookup_opcache_by_stat(
+    cache_key: &str,
+    mtime_nanos: u128,
+    file_len: u64,
+    base_func_id: u32,
+) -> Option<Vec<FuncProto>> {
+    if mtime_nanos == 0 {
+        return None;
+    }
+    let payload = {
+        let cache = opcache().lock().unwrap_or_else(|e| e.into_inner());
+        let entry = cache.get(cache_key)?;
+        if entry.mtime_nanos != mtime_nanos || entry.file_len != file_len {
+            return None;
+        }
+        entry.payload.clone()
+    };
+    match payload {
+        #[cfg(not(any(target_arch = "wasm32", feature = "wasm-lite")))]
+        OpcachePayload::Encoded(blob) => {
+            let mut protos = crate::bytecode_codec::decode_functions(&blob).ok()?;
+            if RUNTIME_MEMO.load(Ordering::Relaxed) {
+                let shared: Arc<[FuncProto]> = protos.clone().into();
+                let mut cache = opcache().lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(entry) = cache.get_mut(cache_key) {
+                    entry.payload = OpcachePayload::Decoded(shared);
+                }
+            }
+            relocate_protos_in_place(&mut protos, base_func_id);
+            Some(protos)
+        }
+        OpcachePayload::Decoded(shared) => Some(relocate_protos(&shared, base_func_id)),
+    }
+}
+
 /// Compile a dynamically `include`/`require`/`eval`'d PHP unit into `FuncProto`s shifted
 /// to `base_func_id`. The top-level file body is the LAST proto in the returned `Vec`.
 pub(crate) fn compile_dynamic_unit_cached(
@@ -243,16 +414,39 @@ pub(crate) fn compile_dynamic_unit_cached(
     source: &str,
     rt_slot: u32,
     base_func_id: u32,
+    stat: Option<(u128, u64)>,
 ) -> R<Vec<FuncProto>> {
     if source.len() > MAX_SOURCE {
         return Err("PHP: included file exceeds 4 MiB limit".into());
     }
     let stamp = source_stamp(source);
     if let Some(key) = cache_key {
-        let cache = opcache().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = cache.get(key) {
-            if entry.stamp == stamp {
-                return Ok(relocate_protos(&entry.protos, base_func_id));
+        let hit = {
+            let cache = opcache().lock().unwrap_or_else(|e| e.into_inner());
+            cache
+                .get(key)
+                .filter(|e| e.stamp == stamp)
+                .map(|e| e.payload.clone())
+        };
+        if let Some(payload) = hit {
+            match payload {
+                #[cfg(not(any(target_arch = "wasm32", feature = "wasm-lite")))]
+                OpcachePayload::Encoded(blob) => {
+                    if let Ok(mut protos) = crate::bytecode_codec::decode_functions(&blob) {
+                        if let Some((mt, fl)) = stat {
+                            let mut cache = opcache().lock().unwrap_or_else(|e| e.into_inner());
+                            if let Some(e) = cache.get_mut(key) {
+                                e.mtime_nanos = mt;
+                                e.file_len = fl;
+                            }
+                        }
+                        relocate_protos_in_place(&mut protos, base_func_id);
+                        return Ok(protos);
+                    }
+                }
+                OpcachePayload::Decoded(shared) => {
+                    return Ok(relocate_protos(&shared, base_func_id));
+                }
             }
         }
     }
@@ -295,8 +489,9 @@ pub(crate) fn compile_dynamic_unit_cached(
     let mut protos = protos_cell.into_inner();
     protos.push(top_proto);
 
-    let shared: Arc<[FuncProto]> = protos.into();
+    let (mtime_nanos, file_len) = stat.unwrap_or((0, 0));
     if let Some(key) = cache_key {
+        let shared: Arc<[FuncProto]> = protos.clone().into();
         let mut cache = opcache().lock().unwrap_or_else(|e| e.into_inner());
         if cache.len() > 2048 {
             cache.clear();
@@ -304,21 +499,31 @@ pub(crate) fn compile_dynamic_unit_cached(
         cache.insert(
             key.to_owned(),
             OpcacheEntry {
+                mtime_nanos,
+                file_len,
                 stamp,
-                protos: Arc::clone(&shared),
+                payload: OpcachePayload::Decoded(shared),
             },
         );
+        #[cfg(not(any(target_arch = "wasm32", feature = "wasm-lite")))]
+        {
+            let mut tracker = pack_tracker().lock().unwrap_or_else(|e| e.into_inner());
+            if tracker.entry_file.is_some() {
+                tracker.keys.insert(key.to_owned());
+                tracker.dirty = true;
+            }
+        }
     }
 
-    Ok(relocate_protos(&shared, base_func_id))
+    relocate_protos_in_place(&mut protos, base_func_id);
+    Ok(protos)
 }
 
-fn relocate_protos(protos: &[FuncProto], base_func_id: u32) -> Vec<FuncProto> {
-    let mut out = protos.to_vec();
+fn relocate_protos_in_place(protos: &mut [FuncProto], base_func_id: u32) {
     if base_func_id == 0 {
-        return out;
+        return;
     }
-    for p in &mut out {
+    for p in protos {
         for ins in &mut p.code {
             match ins {
                 Instr::MakeFunc { func_id, .. } | Instr::MakeClosure { func_id, .. } => {
@@ -328,6 +533,11 @@ fn relocate_protos(protos: &[FuncProto], base_func_id: u32) -> Vec<FuncProto> {
             }
         }
     }
+}
+
+fn relocate_protos(protos: &[FuncProto], base_func_id: u32) -> Vec<FuncProto> {
+    let mut out = protos.to_vec();
+    relocate_protos_in_place(&mut out, base_func_id);
     out
 }
 

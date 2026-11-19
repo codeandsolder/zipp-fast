@@ -25,12 +25,15 @@ pub(super) fn try_run(args: &[String]) -> Option<Result<(), String>> {
         return None;
     }
     if first == "php" && args.iter().any(|a| a == "-S" || a == "--worker") {
+        zipp_vm::frontend::set_php_runtime_cache(code_cache_dir());
         return Some(run_php_server_cmd(&args[1..]));
     }
     // One program per process: its compiled runtime is never reused in the
     // process, but compiled code is kept on disk for the next one.
     zipp_vm::frontend::set_python_runtime_memo(false);
     zipp_vm::frontend::set_python_runtime_cache(code_cache_dir());
+    zipp_vm::frontend::set_php_runtime_memo(false);
+    zipp_vm::frontend::set_php_runtime_cache(code_cache_dir());
     Some(run(args))
 }
 
@@ -421,6 +424,7 @@ fn run_php_file(path: &Path, source: &str, program_args: &[String]) -> Result<()
         let _ = io::stdout().lock().write_all(&leftover);
     }
     let _ = io::stdout().flush();
+    zipp_vm::frontend::flush_php_opcache();
     php_exit(state, outcome.map(|_| ()))
 }
 

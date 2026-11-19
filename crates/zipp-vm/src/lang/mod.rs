@@ -275,6 +275,28 @@ pub fn set_python_runtime_cache(dir: Option<std::path::PathBuf>) {
     #[cfg(not(feature = "python"))]
     let _ = dir;
 }
+/// Whether PHP compiles keep the compiled runtime seed in memory for reuse in
+/// the same process. On by default (servers, tests, embedders); one-shot CLI
+/// runs turn it off to avoid cloning the runtime `Program`.
+pub fn set_php_runtime_memo(enabled: bool) {
+    #[cfg(feature = "php")]
+    php::frontend::set_runtime_memo(enabled);
+    #[cfg(not(feature = "php"))]
+    let _ = enabled;
+}
+/// Keep compiled PHP code (runtime seed + per-entry OPcache packs) in `dir`
+/// between processes, or disable disk caching with `None`.
+pub fn set_php_runtime_cache(dir: Option<std::path::PathBuf>) {
+    #[cfg(feature = "php")]
+    php::frontend::set_runtime_cache(dir);
+    #[cfg(not(feature = "php"))]
+    let _ = dir;
+}
+/// Flush any newly compiled PHP include files into the persistent disk OPcache pack.
+pub fn flush_php_opcache() {
+    #[cfg(feature = "php")]
+    php::frontend::flush_opcache_pack();
+}
 /// Get Python ready ahead of the first program: compile the runtime every
 /// Python program starts from (about 0.7 MB of JavaScript) into the
 /// per-process memo ([`set_python_runtime_memo`], on by default), then run

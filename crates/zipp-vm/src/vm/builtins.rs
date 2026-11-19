@@ -4822,24 +4822,31 @@ impl<'p> Vm<'p> {
             "set" => {
                 let key = normalize_zero(a0);
                 let val = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-                let pos = self.coll_find(idx, key);
-                let mut pushed = None;
-                // Nursery barrier for the VALUE (both arms): the insert's
-                // `coll_index_insert` barriers the key, but a young value can
-                // ride an old (or non-heap) key.
-                self.heap.write_barrier_val(idx, val);
-                if let HeapObj::Map { keys, vals } = self.heap.get_mut(idx) {
-                    match pos {
-                        Some(i) => vals[i] = val, // update in place, keep position
-                        None => {
-                            pushed = Some(keys.len());
-                            keys.push(key);
-                            vals.push(val);
+                #[cfg(not(feature = "safe-sandbox"))]
+                {
+                    self.map_set_fast(idx, key, val);
+                }
+                #[cfg(feature = "safe-sandbox")]
+                {
+                    let pos = self.coll_find(idx, key);
+                    let mut pushed = None;
+                    // Nursery barrier for the VALUE (both arms): the insert's
+                    // `coll_index_insert` barriers the key, but a young value can
+                    // ride an old (or non-heap) key.
+                    self.heap.write_barrier_val(idx, val);
+                    if let HeapObj::Map { keys, vals } = self.heap.get_mut(idx) {
+                        match pos {
+                            Some(i) => vals[i] = val, // update in place, keep position
+                            None => {
+                                pushed = Some(keys.len());
+                                keys.push(key);
+                                vals.push(val);
+                            }
                         }
                     }
-                }
-                if let Some(p) = pushed {
-                    self.coll_index_insert(idx, key, p);
+                    if let Some(p) = pushed {
+                        self.coll_index_insert(idx, key, p);
+                    }
                 }
                 Ok(Some(recv)) // chainable
             }

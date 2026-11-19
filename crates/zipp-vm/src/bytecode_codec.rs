@@ -703,9 +703,9 @@ fn decode_import(r: &mut Reader) -> R<ImportEntry> {
     })
 }
 
-/// A list of functions (a Python library module compiled for installation)
+/// A list of functions (a compiled Python library module or PHP OPcache unit)
 /// as bytes.
-#[cfg(feature = "python")]
+#[cfg(any(feature = "python", feature = "php"))]
 pub(crate) fn encode_functions(functions: &[FuncProto]) -> Vec<u8> {
     let mut w = Writer {
         out: Vec::with_capacity(1 << 16),
@@ -721,7 +721,7 @@ pub(crate) fn encode_functions(functions: &[FuncProto]) -> Vec<u8> {
 }
 
 /// The functions `bytes` encode (from [`encode_functions`] of this build).
-#[cfg(feature = "python")]
+#[cfg(any(feature = "python", feature = "php"))]
 pub(crate) fn decode_functions(bytes: &[u8]) -> R<Vec<FuncProto>> {
     let mut r = Reader { data: bytes, at: 0 };
     if r.u32()? != FORMAT || r.u32()? != INSTR_VARIANTS as u32 {

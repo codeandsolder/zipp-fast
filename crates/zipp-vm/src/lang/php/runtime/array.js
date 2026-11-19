@@ -34,6 +34,14 @@
         return { __php: 1, m: new Map(), next: 0n, shared: false, hasRefs: false, pos: 0 };
     }
     rt.makeArr = makeArr;
+    R.__newMap = function () { return new Map(); };
+    R.__mapKv = typeof __zipp_php_map_kv === "function"
+        ? __zipp_php_map_kv
+        : function (m) {
+            const ks = [], vs = [];
+            m.forEach(function (v, k) { ks.push(k); vs.push(v); });
+            return [ks, vs, false];
+        };
 
     function cloneArr(a) {
         const out = makeArr();
@@ -428,9 +436,23 @@
                 const keys = Array.from(a.m.keys());
                 return { kind: 1, arr: a, keys: keys, idx: 0, key: null, val: null };
             }
-            // By-value foreach: mark `v.shared = true` and flatten once via `Map.forEach`
-            // so `foreach` executes in a zero-call bytecode loop with exact snapshot semantics!
+            // By-value foreach: mark `v.shared = true` and flatten once via Rust native
+            // `__zipp_php_map_kv` so `foreach` runs in a zero-call bytecode loop with exact snapshot semantics!
             v.shared = true;
+            if (typeof __zipp_php_map_kv === "function") {
+                const kv = __zipp_php_map_kv(v.m);
+                const keys = kv[0], vals = kv[1];
+                if (kv[2]) {
+                    for (let i = 0, n = vals.length; i < n; i++) {
+                        let val = vals[i];
+                        if (val !== null && typeof val === "object") {
+                            if (val.__php === 5) { val = val.v; vals[i] = val; }
+                            if (val !== null && typeof val === "object" && val.__php === 1) val.shared = true;
+                        }
+                    }
+                }
+                return { kind: 4, keys: keys, vals: vals, len: keys.length, idx: 0, key: null, val: null };
+            }
             const keys = [], vals = [];
             v.m.forEach(function (val, k) {
                 if (val !== null && typeof val === "object") {

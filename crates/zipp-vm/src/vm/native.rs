@@ -381,6 +381,10 @@ pub const PHP_ENV_NAME: &str = "__zipp_php_env";
 pub const PHP_SAPI: u16 = 2205;
 #[cfg_attr(not(feature = "php"), allow(dead_code))]
 pub const PHP_SAPI_NAME: &str = "__zipp_php_sapi";
+#[cfg_attr(not(feature = "php"), allow(dead_code))]
+pub const PHP_MAP_KV: u16 = 2206;
+#[cfg_attr(not(feature = "php"), allow(dead_code))]
+pub const PHP_MAP_KV_NAME: &str = "__zipp_php_map_kv";
 /// The Python runtime's native tensor loops (`vm::py_tensor`), bound to the
 /// reserved global below only in a program the Python frontend built
 /// (`Program::python_natives`): an ordinary JavaScript program never sees it.
@@ -1871,6 +1875,8 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         PHP_ENV => ("", 0),
         #[cfg(feature = "php")]
         PHP_SAPI => ("", 2),
+        #[cfg(feature = "php")]
+        PHP_MAP_KV => ("", 1),
         #[cfg(feature = "python")]
         PY_TENSOR => ("", 0),
         #[cfg(feature = "python")]

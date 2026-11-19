@@ -360,6 +360,7 @@
             // Already included once (`include_once` / `require_once`)
             return true;
         }
+        rt.includedFiles.add(reqPath);
         // `compiled` is a JS function (`FuncProto`) expecting (args, phpThis, calledCls, scopeMap)
         const holder = { code: compiled, statics: null };
         const res = holder.code([], null, null, scopeMap || rt.globalScope);

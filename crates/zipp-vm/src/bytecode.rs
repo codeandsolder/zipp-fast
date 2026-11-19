@@ -5589,9 +5589,17 @@ pub struct PhpCtx {
     pub vfs: Option<std::sync::Arc<std::collections::HashMap<String, Vec<u8>>>>,
     pub allow_native_fs: bool,
     pub stream_stdout: bool,
+    /// Stat-validated OPcache lookup (`(cache_key, mtime_nanos, file_len, base_func_id)`):
+    /// returns `Some(Vec<FuncProto>)` on hit without reading the source file from disk.
+    #[cfg_attr(
+        any(not(feature = "php"), feature = "safe-sandbox", target_arch = "wasm32"),
+        allow(dead_code)
+    )]
+    pub lookup_cached_by_stat: fn(&str, u128, u64, u32) -> Option<Vec<FuncProto>>,
     /// Dynamically compile a PHP file or `eval` source into relocatable `FuncProto`s
     /// starting at `base_func_id` (top-level body last).
-    pub compile_unit: fn(Option<&str>, &str, &str, u32, u32) -> Result<Vec<FuncProto>, String>,
+    pub compile_unit:
+        fn(Option<&str>, &str, &str, u32, u32, Option<(u128, u64)>) -> Result<Vec<FuncProto>, String>,
 }
 
 #[cfg_attr(not(feature = "php"), allow(dead_code))]

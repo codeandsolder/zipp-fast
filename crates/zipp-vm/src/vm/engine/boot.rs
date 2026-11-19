@@ -81,6 +81,7 @@ fn jit_wanted(program: &Program) -> bool {
         return false;
     }
     program.python_natives
+        || program.php_natives
         || program.functions.len() < JIT_LARGE_PROGRAM_FUNCS
         || crate::env_var_os("ZIPP_JIT_LARGE").is_some()
 }
@@ -786,6 +787,8 @@ impl<'p> Vm<'p> {
                 // A Python program compiles only its Python-emitted bodies;
                 // see `Jit::set_python_program`.
                 jit.set_python_program(program.python_natives, &program.functions);
+                #[cfg(feature = "php")]
+                jit.set_php_program(program.php_natives, &program.functions);
                 jit
             },
             #[cfg(all(feature = "jit", target_arch = "aarch64"))]
