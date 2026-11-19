@@ -432,6 +432,26 @@ pub(crate) const JIT_DEFERRED_NS_NONEMPTY_OFFSET: usize =
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_MOD_NS_NONEMPTY_OFFSET: usize =
     core::mem::offset_of!(Vm<'static>, mod_ns_nonempty);
+#[cfg(all(feature = "jit", target_arch = "x86_64", not(feature = "safe-sandbox")))]
+pub(crate) const JIT_INSTANCEOF_PAIR_MEMO_RAW_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, instanceof_pair_memo_raw);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_FN_PROPS_GEN_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, fn_props_gen);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_ARR_PROTO_IDX_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, arr_proto);
+#[cfg(all(feature = "jit", target_arch = "x86_64", not(feature = "safe-sandbox")))]
+const _: () = {
+    use crate::vm::InstanceofPairMemo as I;
+    assert!(core::mem::size_of::<I>() == 32);
+    assert!(core::mem::offset_of!(I, v_key) == 0);
+    assert!(core::mem::offset_of!(I, ci) == 4);
+    assert!(core::mem::offset_of!(I, chain_epoch) == 8);
+    assert!(core::mem::offset_of!(I, fn_props_gen) == 12);
+    assert!(core::mem::offset_of!(I, class_proto_epoch) == 16);
+    assert!(core::mem::offset_of!(I, result) == 20);
+};
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 const _: () = {
     use crate::vm::indexing_date::KeyedSlotMemo as K;

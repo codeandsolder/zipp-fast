@@ -11,6 +11,12 @@ env_off_switch! {
     fn instanceof_memo_enabled() = "ZIPP_NO_INSTANCEOF_MEMO"
 }
 
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+pub(crate) fn instanceof_memo_on() -> bool {
+    instanceof_memo_enabled()
+}
+
 /// Whether a function's own-property side table holds `@@hasInstance`, and
 /// whether it holds `prototype`: the two keys `instanceof` asks of a plain
 /// function. Side tables have no shape for the (shape, key) memo, so each
@@ -426,6 +432,7 @@ impl<'p> Vm<'p> {
                                 fn_props_gen: self.fn_props_gen,
                                 class_proto_epoch: self.class_proto_epoch,
                                 result: answer,
+                                _pad: [0; 11],
                             };
                     }
                     return Some(answer);
@@ -444,6 +451,7 @@ impl<'p> Vm<'p> {
                         fn_props_gen: self.fn_props_gen,
                         class_proto_epoch: self.class_proto_epoch,
                         result: false,
+                        _pad: [0; 11],
                     };
             }
             return Some(false);
@@ -542,6 +550,7 @@ impl<'p> Vm<'p> {
                 fn_props_gen: self.fn_props_gen,
                 class_proto_epoch: self.class_proto_epoch,
                 result,
+                _pad: [0; 11],
             };
     }
 

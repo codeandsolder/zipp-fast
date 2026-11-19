@@ -68,11 +68,15 @@ mod memo {
     use std::cell::RefCell;
 
     pub type Key = (usize, u32, u32, u8);
-    type Entry = Box<[(*const u8, usize)]>;
+    type Slot = (u32, u32);
+    struct Frame {
+        id: u64,
+        map: rustc_hash::FxHashMap<Key, Slot>,
+        arena: Vec<(*const u8, usize)>,
+    }
 
     thread_local! {
-        static STACK: RefCell<Vec<(u64, rustc_hash::FxHashMap<Key, Entry>)>> =
-            const { RefCell::new(Vec::new()) };
+        static STACK: RefCell<Vec<Frame>> = const { RefCell::new(Vec::new()) };
         static NEXT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
 
@@ -86,7 +90,13 @@ mod memo {
                 n.set(id + 1);
                 id
             });
-            STACK.with(|s| s.borrow_mut().push((id, Default::default())));
+            STACK.with(|s| {
+                s.borrow_mut().push(Frame {
+                    id,
+                    map: Default::default(),
+                    arena: Vec::new(),
+                });
+            });
             Session(id)
         }
 
@@ -96,10 +106,10 @@ mod memo {
         pub fn activate(&self) {
             STACK.with(|s| {
                 let mut s = s.borrow_mut();
-                if s.last().is_some_and(|(id, _)| *id == self.0) {
+                if s.last().is_some_and(|f| f.id == self.0) {
                     return;
                 }
-                if let Some(i) = s.iter().position(|(id, _)| *id == self.0) {
+                if let Some(i) = s.iter().position(|f| f.id == self.0) {
                     let entry = s.remove(i);
                     s.push(entry);
                 }
@@ -109,7 +119,7 @@ mod memo {
 
     impl Drop for Session {
         fn drop(&mut self) {
-            STACK.with(|s| s.borrow_mut().retain(|(id, _)| *id != self.0));
+            STACK.with(|s| s.borrow_mut().retain(|f| f.id != self.0));
         }
     }
 
@@ -124,11 +134,15 @@ mod memo {
     pub unsafe fn get<'a>(key: Key, out: &mut super::Names<'a>) -> bool {
         STACK.with(|s| {
             let s = s.borrow();
-            let Some(e) = s.last().and_then(|(_, m)| m.get(&key)) else {
+            let Some(frame) = s.last() else {
                 return false;
             };
-            out.reserve(e.len());
-            for &(p, n) in e.iter() {
+            let Some(&(start, len)) = frame.map.get(&key) else {
+                return false;
+            };
+            let slice = &frame.arena[start as usize..(start + len) as usize];
+            out.reserve(slice.len());
+            for &(p, n) in slice {
                 // SAFETY: the caller's contract; the bytes were a `&str`.
                 out.insert(unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(p, n)) });
             }
@@ -145,10 +159,14 @@ mod memo {
     pub unsafe fn for_each(key: Key, mut f: impl FnMut(&str) -> bool) -> bool {
         STACK.with(|s| {
             let s = s.borrow();
-            let Some(e) = s.last().and_then(|(_, m)| m.get(&key)) else {
+            let Some(frame) = s.last() else {
                 return false;
             };
-            for &(p, n) in e.iter() {
+            let Some(&(start, len)) = frame.map.get(&key) else {
+                return false;
+            };
+            let slice = &frame.arena[start as usize..(start + len) as usize];
+            for &(p, n) in slice {
                 // SAFETY: the caller's contract; the bytes were a `&str`.
                 if !f(unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(p, n)) }) {
                     break;
@@ -163,8 +181,16 @@ mod memo {
             return;
         }
         STACK.with(|s| {
-            if let Some((_, m)) = s.borrow_mut().last_mut() {
-                m.insert(key, names.iter().map(|n| (n.as_ptr(), n.len())).collect());
+            if let Some(frame) = s.borrow_mut().last_mut() {
+                if let (Ok(start), Ok(len)) = (u32::try_from(frame.arena.len()), u32::try_from(names.len())) {
+                    if start.checked_add(len).is_some() {
+                        frame.arena.reserve(names.len());
+                        for n in names {
+                            frame.arena.push((n.as_ptr(), n.len()));
+                        }
+                        frame.map.insert(key, (start, len));
+                    }
+                }
             }
         });
     }
@@ -643,6 +669,9 @@ pub fn captured_locals(
 ) -> HashSet<String> {
     let mut bound: Names<'_> = params.iter().map(String::as_str).collect();
     collect_bound_in_body(body, &mut bound);
+    if bound.is_empty() {
+        return HashSet::default();
+    }
 
     // Union of free vars of each directly-nested function.
     let mut nested_free = Names::default();
@@ -728,7 +757,7 @@ pub fn copy_box_names(
     body: &[Stmt],
     captured: &HashSet<String>,
 ) -> HashSet<String> {
-    if !params_ast.is_some_and(|p| p.simple) {
+    if !params_ast.is_some_and(|p| p.simple) || body.len() > 128 {
         return HashSet::default();
     }
     let mut targets: Vec<&str> = Vec::new();
@@ -2629,13 +2658,18 @@ fn fn_node_free<'a>(f: &'a Function, out: &mut Names<'a>) {
     let mut own = free_vars_in(&param_names, &f.body.stmts);
     params_free(&f.params, &param_names, &mut own);
     memo::put(key, &own);
-    out.extend(own);
+    if out.is_empty() {
+        *out = own;
+    } else {
+        out.extend(own);
+    }
 }
 
 /// The names function `f` takes from outside itself: what its body and its
 /// parameter defaults reference (nested functions' free names included) and
 /// it does not bind, sorted. What a deferred compile of `f` must find among
 /// its upvalues (`compile::lazy`).
+#[allow(dead_code)]
 pub(crate) fn function_free_names(f: &Function) -> Vec<String> {
     let mut out = Names::default();
     fn_node_free(f, &mut out);
@@ -2644,11 +2678,60 @@ pub(crate) fn function_free_names(f: &Function) -> Vec<String> {
     v
 }
 
+/// Like [`function_free_names`], but keeps only names matching `keep`: avoids
+/// allocating `FxHashSet` or `String`s for the ~98% of free identifiers that
+/// resolve to globals when the function is already memoized.
+pub(crate) fn function_free_matching(f: &Function, mut keep: impl FnMut(&str) -> bool) -> Vec<String> {
+    let mut v = Vec::new();
+    if memo_for_each(f, (f.span.start, f.span.end), 0, |n| {
+        if keep(n) {
+            v.push(n.to_string());
+        }
+        true
+    }) {
+        crate::cold_sort::sort(&mut v);
+        return v;
+    }
+    let mut out = Names::default();
+    fn_node_free(f, &mut out);
+    for n in out {
+        if keep(n) {
+            v.push(n.to_string());
+        }
+    }
+    crate::cold_sort::sort(&mut v);
+    v
+}
+
 /// [`function_free_names`] for an arrow.
+#[allow(dead_code)]
 pub(crate) fn arrow_free_names(a: &Arrow) -> Vec<String> {
     let mut out = Names::default();
     arrow_free(a, &mut out);
     let mut v: Vec<String> = out.into_iter().map(str::to_string).collect();
+    crate::cold_sort::sort(&mut v);
+    v
+}
+
+/// Like [`arrow_free_names`], keeping only names matching `keep`.
+pub(crate) fn arrow_free_matching(a: &Arrow, mut keep: impl FnMut(&str) -> bool) -> Vec<String> {
+    let mut v = Vec::new();
+    if memo_for_each(a, (a.span.start, a.span.end), 1, |n| {
+        if keep(n) {
+            v.push(n.to_string());
+        }
+        true
+    }) {
+        crate::cold_sort::sort(&mut v);
+        return v;
+    }
+    let mut out = Names::default();
+    arrow_free(a, &mut out);
+    for n in out {
+        if keep(n) {
+            v.push(n.to_string());
+        }
+    }
     crate::cold_sort::sort(&mut v);
     v
 }
@@ -2662,7 +2745,11 @@ fn arrow_free<'a>(a: &'a Arrow, out: &mut Names<'a>) {
     let mut own = free_vars_arrow_in(&param_names, &a.body);
     params_free(&a.params, &param_names, &mut own);
     memo::put(key, &own);
-    out.extend(own);
+    if out.is_empty() {
+        *out = own;
+    } else {
+        out.extend(own);
+    }
 }
 
 /// Names a class body references from OUTSIDE a method's own scope: each

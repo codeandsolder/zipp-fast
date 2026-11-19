@@ -16,3 +16,5 @@ mod modules_dispose;
 pub(crate) use iterate::{GenNextProof, IterProtoProof};
 #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
 pub(crate) use iterate::ArrayIterWitness;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) use inherit::instanceof_memo_on;

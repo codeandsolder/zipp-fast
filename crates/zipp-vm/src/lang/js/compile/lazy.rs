@@ -173,7 +173,6 @@ pub(super) struct LazyJob {
     /// The function node's source range: how the body is found again.
     span: (u32, u32),
     kind: LazyKind,
-    captured: HashSet<String>,
     enclosing: Vec<EnclosingFn>,
     /// Its upvalues, resolved at the deferral point.
     seed: Vec<(String, UpvalSource)>,
@@ -346,7 +345,6 @@ impl FnCompiler<'_> {
         is_arrow: bool,
         params: &ast::Params,
         own_strict: bool,
-        captured: &HashSet<String>,
         enclosing: &[EnclosingFn],
     ) -> Option<FuncProto> {
         let mode = self.cx.lazy_mode;
@@ -429,7 +427,6 @@ impl FnCompiler<'_> {
             reserved,
             span,
             kind,
-            captured: captured.clone(),
             enclosing: enclosing.to_vec(),
             seed,
             cx: SavedCx::of(self.cx),
@@ -474,7 +471,9 @@ impl Compiler {
     pub(super) fn lazy_scan_arrow(&mut self, a: &ast::Arrow) -> Option<u32> {
         let facts = self.scan_facts(FnNode::Arrow(a));
         // An arrow's own `arguments` is its enclosing function's.
-        let own = facts.ok && facts.reads_arguments && capture::arrow_free_names(a).iter().any(|n| n == "arguments");
+        let own = facts.ok
+            && facts.reads_arguments
+            && !capture::arrow_free_matching(a, |n| n == "arguments").is_empty();
         note_eager(if own { Some("arguments") } else { facts.why }, a.span.end - a.span.start);
         (facts.ok && !own).then_some(facts.nested)
     }
@@ -663,7 +662,7 @@ impl Compiler {
         job.cx.restore(self);
         self.lazy_seed = Some(job.seed);
         self.lazy_freeze = true;
-        let r = self.compile_job_body(job.kind, job.span, job.captured, job.enclosing, node);
+        let r = self.compile_job_body(job.kind, job.span, job.enclosing, node);
         self.lazy_freeze = false;
         // Taken by the body's `FnCompiler::new`, unless the compile failed first.
         self.lazy_seed = None;
@@ -674,13 +673,19 @@ impl Compiler {
         &mut self,
         kind: LazyKind,
         span: (u32, u32),
-        captured: HashSet<String>,
         enclosing: Vec<EnclosingFn>,
         node: FnNode<'_>,
     ) -> R<(FuncProto, u32)> {
         Ok(match (kind, node) {
             (LazyKind::FuncExpr { name, self_name }, FnNode::Function(f)) => {
                 let (params, rest, body) = function_parts(f)?;
+                let mut names = with_rest(&params, &rest);
+                names.extend(param_pattern_leaves(&f.params));
+                if let Some(sn) = &self_name {
+                    names.push(sn.clone());
+                }
+                names.extend(hoisted_var_names(body));
+                let captured = capture::captured_locals(&names, Some(&f.params), body);
                 let p = self.compile_function_body(
                     name.as_deref(),
                     self_name.as_deref(),
@@ -699,6 +704,10 @@ impl Compiler {
             }
             (LazyKind::FuncDecl { name }, FnNode::Function(f)) => {
                 let (params, rest, body) = function_parts(f)?;
+                let mut names = with_rest(&params, &rest);
+                names.extend(param_pattern_leaves(&f.params));
+                names.extend(hoisted_var_names(body));
+                let captured = capture::captured_locals(&names, Some(&f.params), body);
                 let p = self.compile_function_body(
                     name.as_deref(),
                     None,
@@ -718,6 +727,12 @@ impl Compiler {
             (LazyKind::Arrow, FnNode::Arrow(a)) => {
                 let params = param_slot_names(&a.params)?;
                 let rest = rest_name(&a.params)?;
+                let mut names = with_rest(&params, &rest);
+                names.extend(param_pattern_leaves(&a.params));
+                if let ast::ArrowBody::Block(b) = &a.body {
+                    names.extend(hoisted_var_names(&b.stmts));
+                }
+                let captured = capture::captured_locals_arrow(&names, &a.params, &a.body);
                 let p = self.compile_arrow_body(
                     &params,
                     rest.as_deref(),

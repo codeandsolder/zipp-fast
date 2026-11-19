@@ -103,6 +103,7 @@ pub enum NumKind {
 /// Which reserved-word-ish identifier this is, if any. Classification only —
 /// whether it is actually reserved depends on context the parser owns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum Keyword {
     /// Not any known keyword.
     None,
@@ -167,6 +168,70 @@ pub enum Keyword {
 }
 
 impl Keyword {
+    pub(crate) const COUNT: usize = Keyword::Accessor as usize + 1;
+
+    pub(crate) fn as_str(self) -> &'static str {
+        use Keyword::*;
+        match self {
+            None => "",
+            Break => "break",
+            Case => "case",
+            Catch => "catch",
+            Class => "class",
+            Const => "const",
+            Continue => "continue",
+            Debugger => "debugger",
+            Default => "default",
+            Delete => "delete",
+            Do => "do",
+            Else => "else",
+            Enum => "enum",
+            Export => "export",
+            Extends => "extends",
+            False => "false",
+            Finally => "finally",
+            For => "for",
+            Function => "function",
+            If => "if",
+            Import => "import",
+            In => "in",
+            Instanceof => "instanceof",
+            New => "new",
+            Null => "null",
+            Return => "return",
+            Super => "super",
+            Switch => "switch",
+            This => "this",
+            Throw => "throw",
+            True => "true",
+            Try => "try",
+            Typeof => "typeof",
+            Var => "var",
+            Void => "void",
+            While => "while",
+            With => "with",
+            Implements => "implements",
+            Interface => "interface",
+            Let => "let",
+            Package => "package",
+            Private => "private",
+            Protected => "protected",
+            Public => "public",
+            Static => "static",
+            Yield => "yield",
+            Async => "async",
+            Await => "await",
+            As => "as",
+            From => "from",
+            Get => "get",
+            Of => "of",
+            Set => "set",
+            Target => "target",
+            Meta => "meta",
+            Accessor => "accessor",
+        }
+    }
+
     /// Classify an identifier spelling. Called once per identifier token, so it
     /// is a match on length then bytes rather than a hash lookup.
     pub fn classify(s: &str) -> Keyword {

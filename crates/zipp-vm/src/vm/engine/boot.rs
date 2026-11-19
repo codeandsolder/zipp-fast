@@ -309,7 +309,8 @@ impl<'p> Vm<'p> {
                 crate::bytecode::STATIC_KEY_PLAN_VM_MAX_SITES,
                 crate::bytecode::STATIC_KEY_PLAN_MAX_RETAINED_BYTES,
             ));
-        Vm {
+        #[allow(unused_mut)]
+        let mut vm = Vm {
             program,
             eval_funcs: Vec::new(),
             funcs: program.functions.iter().collect(),
@@ -733,11 +734,16 @@ impl<'p> Vm<'p> {
             fn_proto_override: rustc_hash::FxHashMap::default(),
             instanceof_memo: vec![crate::vm::InstanceofMemo::EMPTY; crate::vm::INSTANCEOF_MEMO_SLOTS].into_boxed_slice(),
             #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
-            instanceof_pair_memo: vec![
-                crate::vm::InstanceofPairMemo::EMPTY;
-                crate::vm::INSTANCEOF_PAIR_SLOTS
-            ]
-            .into_boxed_slice(),
+            instanceof_pair_memo: {
+                let b = vec![
+                    crate::vm::InstanceofPairMemo::EMPTY;
+                    crate::vm::INSTANCEOF_PAIR_SLOTS
+                ]
+                .into_boxed_slice();
+                b
+            },
+            #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+            instanceof_pair_memo_raw: 0,
             fn_props_gen: 0,
             fn_props_has_call: 0,
             fn_props_has_apply: 0,
@@ -932,7 +938,12 @@ impl<'p> Vm<'p> {
             #[cfg(feature = "webassembly")]
             wasm_layer: Value::UNDEFINED,
             uncaught_timer_throw: None,
+        };
+        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+        {
+            vm.instanceof_pair_memo_raw = vm.instanceof_pair_memo.as_ptr() as u64;
         }
+        vm
     }
 
     /// Whether the fused array kernels and the off-frame method inliner may

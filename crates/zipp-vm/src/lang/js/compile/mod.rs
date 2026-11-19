@@ -405,6 +405,20 @@ struct Compiler {
 /// grandparent — and the source is `ParentUpval(parent's upvalue index)`. This
 /// is the standard Lua "find/create upvalue" walk, threading a capture through
 /// every intermediate level. `None` if no enclosing function binds `name`.
+/// Pure read-only check: whether `capture_source(chain, name)` would succeed,
+/// without mutating any ancestor's `upvalues`. Used to filter free names in
+/// place without allocating `String`s for globals.
+fn enclosing_can_capture(chain: &[EnclosingFn], name: &str) -> bool {
+    for parent in chain.iter().rev() {
+        if parent.cell_locals.get(name).is_some()
+            || parent.upvalues.borrow().iter().any(|(n, _)| n == name)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn capture_source(chain: &[EnclosingFn], name: &str) -> Option<UpvalSource> {
     let (parent, outer) = chain.split_last()?;
     // Direct parent holds the cell as a local. Scanned BACKWARDS: `cell_locals`

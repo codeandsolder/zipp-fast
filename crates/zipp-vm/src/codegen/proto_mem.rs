@@ -3921,7 +3921,7 @@ pub(crate) fn compile_proto_mem(
     let deferred_bails = super::emit_misc::DeferredBails::begin();
     // Shared per-function out-of-line stubs and deferred property miss/slow
     // tails emitted after the epilogue, keeping the hot bytecode stream compact
-    // in L1i (~3-5x higher hot-path code density).
+    // in L1i (~3-5x higher hot-path code density) with direct 5-byte `call rel32`.
     let mut eq_stub: Option<dynasmrt::DynamicLabel> = None;
     let mut truthy_stub: Option<dynasmrt::DynamicLabel> = None;
     let mut loose_eq_stub: Option<dynasmrt::DynamicLabel> = None;
@@ -3930,6 +3930,8 @@ pub(crate) fn compile_proto_mem(
     let mut is_array_stub: Option<dynasmrt::DynamicLabel> = None;
     let mut keyed_get_stub: Option<dynasmrt::DynamicLabel> = None;
     let mut mega_prop_stubs: Option<(dynasmrt::DynamicLabel, dynasmrt::DynamicLabel)> = None;
+    #[cfg(not(feature = "safe-sandbox"))]
+    let mut instanceof_pair_stub: Option<dynasmrt::DynamicLabel> = None;
     let mut deferred_prop_cold: Vec<DeferredPropCold> = Vec::new();
     let use_mega_prop = meter.is_none() && !crate::vm::icstats_enabled();
     let can_cross3_dyn = meter.is_none()
@@ -7002,7 +7004,7 @@ pub(crate) fn compile_proto_mem(
                 callee,
                 this_v,
             } => {
-                // `Array.isArray(v)` → Bool bits via shared per-function inline
+                // `Array.isArray(v)` → Bool bits via per-function inline
                 // mirror stub (handles primitives, dense Arrays, shaped Objects,
                 // Strings, Functions, Class instances with zero FFI call; falls
                 // back to `heap.is_array` for Proxies / non-dense Arrays / DICT).
@@ -8648,10 +8650,57 @@ pub(crate) fn compile_proto_mem(
                 );
             }
             Instr::InstanceOfDyn { dst, val, ctor } => {
-                // `v instanceof c` through `jit_instanceof_ic`; see the
-                // region arm.
+                // `v instanceof c`: probe `Vm::instanceof_pair_memo` inline via
+                // the process-wide shared stub (zero FFI call on hit); fall
+                // through to `jit_instanceof_ic` on miss (populates memo or
+                // dispatches custom `@@hasInstance`).
                 let packed_fip = ((func_id as u64) << 32) | ip as u64;
                 let packed_args = ((ctor as u64) << 16) | val as u64;
+                #[cfg(not(feature = "safe-sandbox"))]
+                if meter.is_none() && crate::vm::instanceof_memo_enabled() {
+                    let io_done = ops.new_dynamic_label();
+                    let stub = *instanceof_pair_stub.get_or_insert_with(|| ops.new_dynamic_label());
+                    dynasm!(ops
+                        ; mov rdx, [rbx + dreg(val)]
+                        ; mov r8, [rbx + dreg(ctor)]
+                        ; call => stub
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je > io_miss
+                        ; mov [rbx + dreg(dst)], rax
+                        ; jmp => io_done
+                        ; io_miss:
+                    );
+                    emit_region_call_ic(
+                        &mut ops,
+                        ip,
+                        bail,
+                        epilogue,
+                        crate::vm::jit_instanceof_ic as *const () as usize,
+                        packed_fip,
+                        packed_args,
+                        0,
+                        dst,
+                        refetch,
+                        None,
+                    );
+                    dynasm!(ops ; => io_done);
+                } else {
+                    emit_region_call_ic(
+                        &mut ops,
+                        ip,
+                        bail,
+                        epilogue,
+                        crate::vm::jit_instanceof_ic as *const () as usize,
+                        packed_fip,
+                        packed_args,
+                        0,
+                        dst,
+                        refetch,
+                        None,
+                    );
+                }
+                #[cfg(feature = "safe-sandbox")]
                 emit_region_call_ic(
                     &mut ops,
                     ip,
@@ -9546,6 +9595,10 @@ pub(crate) fn compile_proto_mem(
     if let Some((full_lbl, dict_lbl)) = mega_prop_stubs {
         emit_mega_get_prop_stub(&mut ops, full_lbl, dict_lbl, heap.get_prop_miss);
     }
+    #[cfg(not(feature = "safe-sandbox"))]
+    if let Some(lbl) = instanceof_pair_stub {
+        emit_instanceof_pair_stub(&mut ops, lbl);
+    }
     if let Some(lbl) = fn_call_dyn_stub {
         let dyn_target = cross3_dyn_stub.expect("fn_call_dyn_stub requires cross3_dyn_stub");
         emit_fn_call_dyn_stub(&mut ops, lbl, dyn_target);
@@ -10016,11 +10069,143 @@ enum DeferredPropCold {
     },
 }
 
+/// Shared per-function inline `Vm::instanceof_pair_memo` probe for `Instr::InstanceOfDyn`.
+/// Input: `rdx = val_bits`, `r8 = ctor_bits`, `rdi = vm`.
+/// Output: `rax = Value::bool(...).bits()` on memo hit, or `SELF_CALL_DEOPT` on miss.
+#[cfg(not(feature = "safe-sandbox"))]
+pub(crate) fn emit_instanceof_pair_stub(
+    ops: &mut crate::codegen::X64Asm,
+    stub: dynasmrt::DynamicLabel,
+) {
+    use crate::vm::host_api::{
+        JIT_ARR_MIRROR_LEN_OFFSET, JIT_ARR_MIRROR_RAW_OFFSET, JIT_ARR_PROTO_IDX_OFFSET,
+        JIT_CHAIN_EPOCH_OFFSET, JIT_CLASS_PROTO_EPOCH_OFFSET, JIT_FN_PROPS_GEN_OFFSET,
+        JIT_HOT_FID_OFF, JIT_HOT_MIRROR_LEN_OFFSET, JIT_HOT_MIRROR_RAW_OFFSET,
+        JIT_INSTANCEOF_PAIR_MEMO_RAW_OFFSET, JIT_OBJ_PROTO_IDX_OFFSET, JIT_PROTO_LEN_OFFSET,
+        JIT_PROTO_RAW_OFFSET,
+    };
+    const _: () = assert!(crate::vm::INSTANCEOF_PAIR_SLOTS == 4096);
+    let v_is_heap = ops.new_dynamic_label();
+    let not_str = ops.new_dynamic_label();
+    let proto_loaded = ops.new_dynamic_label();
+    let check_shaped = ops.new_dynamic_label();
+    let check_arr = ops.new_dynamic_label();
+    let use_proto_bits = ops.new_dynamic_label();
+    let probe = ops.new_dynamic_label();
+    let miss = ops.new_dynamic_label();
+    dynasm!(ops
+        ; => stub
+        // 1. Check rhs (`c` in r8) is TAG_HEAP; ci in r9d.
+        ; mov r9, r8
+        ; shr r9, 48
+        ; cmp r9d, TAG_HEAP_HI as i32
+        ; jne => miss
+        ; mov r9d, r8d
+        // 2. Compute `v_key` in ecx matching `Vm::instanceof_v_key(v)`.
+        ; mov rax, rdx
+        ; shr rax, 48
+        ; cmp eax, TAG_HEAP_HI as i32
+        ; je => v_is_heap
+        ; mov ecx, crate::heap::FID_MIRROR_STR as i32
+        ; jmp => probe
+        ; => v_is_heap
+        ; mov r10d, edx
+        ; cmp r10d, DWORD [rdi + JIT_HOT_MIRROR_LEN_OFFSET as i32]
+        ; jae => miss
+        ; mov r11, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
+        ; lea r11, [r11 + r10 * 8]
+        ; mov eax, DWORD [r11 + r10 * 8 + JIT_HOT_FID_OFF as i32]
+        ; cmp eax, crate::heap::FID_MIRROR_STR as i32
+        ; jne => not_str
+        ; mov ecx, eax
+        ; jmp => probe
+        ; => not_str
+        ; mov r8d, DWORD [r11 + r10 * 8]
+        // Load p_bits = proto_of[vi] into r11 (0 if absent / OOB).
+        ; xor r11d, r11d
+        ; cmp r10, [rdi + JIT_PROTO_LEN_OFFSET as i32]
+        ; jae => proto_loaded
+        ; mov rcx, [rdi + JIT_PROTO_RAW_OFFSET as i32]
+        ; mov r11, [rcx + r10 * 8]
+        ; => proto_loaded
+        // Case A: class instance (fid >= FID_MIRROR_CLASS && fid != FID_MIRROR_NONE).
+        ; cmp eax, crate::heap::FID_MIRROR_CLASS as i32
+        ; jb => check_shaped
+        ; cmp eax, crate::heap::FID_MIRROR_NONE as i32
+        ; je => check_shaped
+        ; test r11, r11
+        ; jnz => use_proto_bits
+        ; mov ecx, eax
+        ; jmp => probe
+        // Case B: shaped plain object (shape != 0 && fid == FID_MIRROR_NONE).
+        ; => check_shaped
+        ; test r8d, r8d
+        ; jz => check_arr
+        ; cmp eax, crate::heap::FID_MIRROR_NONE as i32
+        ; jne => miss
+        ; test r11, r11
+        ; jnz => use_proto_bits
+        ; mov ecx, DWORD [rdi + JIT_OBJ_PROTO_IDX_OFFSET as i32]
+        ; jmp => probe
+        // Case C: dense Array (`arr_mirror_live(vi)`).
+        ; => check_arr
+        ; cmp r10d, DWORD [rdi + JIT_ARR_MIRROR_LEN_OFFSET as i32]
+        ; jae => miss
+        ; mov rcx, [rdi + JIT_ARR_MIRROR_RAW_OFFSET as i32]
+        ; shl r10, 4
+        ; cmp QWORD [rcx + r10], 0
+        ; je => miss
+        ; test r11, r11
+        ; jnz => use_proto_bits
+        ; mov ecx, DWORD [rdi + JIT_ARR_PROTO_IDX_OFFSET as i32]
+        ; jmp => probe
+        ; => use_proto_bits
+        ; mov rax, r11
+        ; shr rax, 48
+        ; cmp eax, TAG_HEAP_HI as i32
+        ; jne => miss
+        ; mov ecx, r11d
+        // 3. Direct-mapped 4096-slot `instanceof_pair_memo` probe (32B stride).
+        ; => probe
+        ; test ecx, ecx
+        ; jz => miss
+        ; mov eax, ecx
+        ; imul eax, eax, 0x9E37_79B1u32 as i32
+        ; mov r10d, r9d
+        ; imul r10d, r10d, 0x85EB_CA77u32 as i32
+        ; xor eax, r10d
+        ; imul eax, eax, 0x27D4_EB2Fu32 as i32
+        ; shr eax, 20
+        ; shl rax, 5
+        ; add rax, [rdi + JIT_INSTANCEOF_PAIR_MEMO_RAW_OFFSET as i32]
+        ; cmp DWORD [rax], ecx
+        ; jne => miss
+        ; cmp DWORD [rax + 4], r9d
+        ; jne => miss
+        ; mov r10d, DWORD [rdi + JIT_CHAIN_EPOCH_OFFSET as i32]
+        ; cmp DWORD [rax + 8], r10d
+        ; jne => miss
+        ; mov r10d, DWORD [rdi + JIT_FN_PROPS_GEN_OFFSET as i32]
+        ; cmp DWORD [rax + 12], r10d
+        ; jne => miss
+        ; mov r10d, DWORD [rdi + JIT_CLASS_PROTO_EPOCH_OFFSET as i32]
+        ; cmp DWORD [rax + 16], r10d
+        ; jne => miss
+        ; movzx eax, BYTE [rax + 20]
+        ; mov rcx, QWORD BOOL_TAG as i64
+        ; or rax, rcx
+        ; ret
+        ; => miss
+        ; mov rax, QWORD SELF_CALL_DEOPT as i64
+        ; ret
+    );
+}
+
 /// Shared per-function `===` slow stub (called via near `call` from `Instr::Eq`
 /// and `Instr::Ne` when either operand is a double or both are distinct Heap
 /// values). Input: `rax = a_bits`, `rcx = b_bits`, `rdi = vm`. Output: `eax = 1`
 /// iff `a === b`, `0` otherwise. Preserves callee-saved registers.
-fn emit_strict_eq_stub(
+pub(crate) fn emit_strict_eq_stub(
     ops: &mut crate::codegen::X64Asm,
     stub: dynasmrt::DynamicLabel,
     strict_eq_helper: usize,
@@ -10148,7 +10333,7 @@ fn emit_strict_eq_stub(
 /// Shared per-function truthiness stub for Heap / Double / SmallBigInt values.
 /// Input: `rax = val_bits`, `r10d = (rax >> 48) as u32`, `rdi = vm`.
 /// Output: `eax = 0` or `1`. Preserves callee-saved registers.
-fn emit_truthy_stub(
+pub(crate) fn emit_truthy_stub(
     ops: &mut crate::codegen::X64Asm,
     stub: dynasmrt::DynamicLabel,
     truthy_helper: usize,
@@ -10209,7 +10394,7 @@ fn emit_truthy_stub(
 /// Input: `rdx = a_bits`, `r8 = b_bits`, `r9d = is_ne` (0/1), `rdi = vm`.
 /// Output: `rax = Value::bool(...).bits()` or `SELF_CALL_DEOPT`.
 /// Leaves `rdx`, `r8`, `r9` untouched so the slow path calls `jit_loose_eq` directly.
-fn emit_loose_eq_stub(ops: &mut crate::codegen::X64Asm, stub: dynasmrt::DynamicLabel) {
+pub(crate) fn emit_loose_eq_stub(ops: &mut crate::codegen::X64Asm, stub: dynasmrt::DynamicLabel) {
     use crate::vm::host_api::{JIT_HTMLDDA_IDX_OFFSET, JIT_HTMLDDA_SCALAR_ENABLED_OFFSET};
     let helper = crate::vm::jit_loose_eq as *const () as usize;
     let not_both_int = ops.new_dynamic_label();
@@ -10283,7 +10468,7 @@ fn emit_loose_eq_stub(ops: &mut crate::codegen::X64Asm, stub: dynasmrt::DynamicL
 /// Shared per-function `Array.isArray(v)` stub.
 /// Input: `rdx = v_bits`, `r8 = callee_bits`, `r9 = this_v_bits`, `rdi = vm`.
 /// Output: `rax = Value::bool(...).bits()` or `SELF_CALL_DEOPT`.
-fn emit_is_array_stub(
+pub(crate) fn emit_is_array_stub(
     ops: &mut crate::codegen::X64Asm,
     stub: dynasmrt::DynamicLabel,
     is_array_helper: usize,
@@ -10344,7 +10529,7 @@ fn emit_is_array_stub(
 /// (`o[k]` with a string key on a shaped or DICT plain object). Tail-jumps to
 /// `jit_get_index` on any miss without allocating an extra stack frame.
 /// Input: `rdx = obj_bits`, `r8 = key_bits`, `rdi = vm`. Output: `rax = val_bits`.
-fn emit_keyed_memo_get_stub(
+pub(crate) fn emit_keyed_memo_get_stub(
     ops: &mut crate::codegen::X64Asm,
     stub: dynasmrt::DynamicLabel,
     get_index_helper: usize,
@@ -10536,7 +10721,7 @@ fn emit_keyed_memo_get_stub(
 ///   for settled DICT objects (leaving shaped misses untouched for
 ///   `direct_miss_gate`), then tail-jumps to `jit_get_prop_miss`.
 /// Input: `rdx = obj_bits`, `r8d = site_idx`, `r9 = (func_id<<32)|name_idx`, `rdi = vm`.
-fn emit_mega_get_prop_stub(
+pub(crate) fn emit_mega_get_prop_stub(
     ops: &mut crate::codegen::X64Asm,
     full_lbl: dynasmrt::DynamicLabel,
     dict_lbl: dynasmrt::DynamicLabel,

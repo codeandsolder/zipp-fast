@@ -63,6 +63,7 @@ pub(crate) const INSTANCEOF_PAIR_SLOTS: usize = 4096;
 /// (`Heap::chain_epoch`, `Vm::fn_props_gen`, `Vm::class_proto_epoch`) is
 /// unchanged.
 #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+#[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct InstanceofPairMemo {
     pub(crate) v_key: u32,
@@ -71,6 +72,7 @@ pub(crate) struct InstanceofPairMemo {
     pub(crate) fn_props_gen: u32,
     pub(crate) class_proto_epoch: u32,
     pub(crate) result: bool,
+    pub(crate) _pad: [u8; 11],
 }
 
 #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
@@ -82,6 +84,7 @@ impl InstanceofPairMemo {
         fn_props_gen: 0,
         class_proto_epoch: 0,
         result: false,
+        _pad: [0; 11],
     };
 }
 
@@ -3680,6 +3683,8 @@ pub struct Vm<'p> {
     /// `class_proto_epoch`.
     #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
     instanceof_pair_memo: Box<[InstanceofPairMemo]>,
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    pub(crate) instanceof_pair_memo_raw: u64,
     /// Moved by every write to `fn_props`, which keeps a function's own
     /// properties without bumping its version (`instanceof_memo`).
     fn_props_gen: u32,
@@ -4238,6 +4243,8 @@ pub(crate) use engine::file_url;
 pub(crate) use engine::large_programs_run_jit;
 pub(crate) mod host_api;
 mod indexing_date;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) use construct::instanceof_memo_on as instanceof_memo_enabled;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) use indexing_date::{
     KSM_ABSENT_MASK, KSM_ABSENT_NULL_PROTO, KSM_IMMUTABLE_KEY, KSM_PURE_SHAPE,
