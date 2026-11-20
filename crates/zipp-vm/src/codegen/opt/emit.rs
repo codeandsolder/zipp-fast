@@ -1278,9 +1278,13 @@ impl Em<'_> {
                     ; ja => falsy
                     ; jmp => truthy
                     ; => null_or_big
-                    ; mov rax, QWORD TAG_NULL as i64
-                    ; cmp Rq(ra), rax
-                    ; je => falsy
+                    // Both `null` (`0x7FFB_0000_0000_0000`) and `SmallBigInt(0)`
+                    // (`0x7FFB_8000_0000_0000`) have all 47 payload bits zero;
+                    // every non-zero `SmallBigInt` has a non-zero 47-bit payload.
+                    ; mov rax, Rq(ra)
+                    ; shl rax, 17
+                    ; jz => falsy
+                    ; jmp => truthy
                     // A heap value (an empty string, a zero BigInt and the
                     // [[IsHTMLDDA]] object are falsy): fast zero-DRAM check
                     // first (no register saves or call!), else `truthy_stub`
