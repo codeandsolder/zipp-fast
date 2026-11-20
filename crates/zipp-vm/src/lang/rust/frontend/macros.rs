@@ -94,7 +94,7 @@ impl<'a> RsEmitter<'a> {
                 let ok = match s.trim() {
                     "test" => self.file.is_test_mode,
                     "debug_assertions" => false,
-                    "unix" => cfg!(unix),
+                    "unix" => cfg!(any(unix, target_arch = "wasm32")),
                     "windows" => cfg!(windows),
                     _ => true,
                 };

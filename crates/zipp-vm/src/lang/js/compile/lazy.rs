@@ -935,6 +935,7 @@ pub(crate) struct LazySession<'a> {
     jobs: rustc_hash::FxHashMap<u32, LazyJob>,
     main_globals: u32,
     #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    #[allow(dead_code)]
     has_skipped_bodies: bool,
 }
 
@@ -979,11 +980,13 @@ impl<'a> LazySession<'a> {
     }
 
     #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    #[allow(dead_code)]
     pub(crate) fn source_len(&self) -> usize {
         self.cx.source.len()
     }
 
     #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    #[allow(dead_code)]
     pub(crate) fn has_skipped_bodies(&self) -> bool {
         self.has_skipped_bodies
     }

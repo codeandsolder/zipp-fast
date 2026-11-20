@@ -5593,6 +5593,7 @@ pub struct RustCtx {
     pub base_dir: String,
     pub argv: Vec<String>,
     pub vfs: Option<std::sync::Arc<std::collections::HashMap<String, Vec<u8>>>>,
+    pub allow_vfs_write: bool,
     pub allow_native_fs: bool,
     pub allow_net: bool,
     pub stream_stdout: bool,
@@ -5613,6 +5614,17 @@ impl std::fmt::Debug for RustCtx {
     }
 }
 
+/// Mutable in-memory VFS overlay shared across sandboxed PHP requests (for compiled
+/// templates, sessions, runtime writes, `mkdir`, `unlink`, etc. in WASM/sandbox).
+#[derive(Default, Debug)]
+#[cfg_attr(not(feature = "php"), allow(dead_code))]
+pub struct PhpVfsOverlay {
+    pub writes: std::collections::HashMap<String, Vec<u8>>,
+    pub deleted: std::collections::HashSet<String>,
+    pub dirs: std::collections::HashSet<String>,
+    pub total_bytes: usize,
+}
+
 /// Runtime context owned by a compiled PHP [`Program`].
 #[derive(Clone)]
 #[cfg_attr(not(feature = "php"), allow(dead_code))]
@@ -5621,8 +5633,10 @@ pub struct PhpCtx {
     pub base_dir: String,
     pub rt_slot: u32,
     pub argv: Vec<String>,
+    pub env: Vec<(String, String)>,
     pub sapi_request_json: Option<String>,
     pub vfs: Option<std::sync::Arc<std::collections::HashMap<String, Vec<u8>>>>,
+    pub vfs_overlay: Option<std::sync::Arc<std::sync::Mutex<PhpVfsOverlay>>>,
     pub allow_native_fs: bool,
     pub stream_stdout: bool,
     /// Stat-validated OPcache lookup (`(cache_key, mtime_nanos, file_len, base_func_id)`):

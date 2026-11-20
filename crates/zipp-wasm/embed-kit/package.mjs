@@ -43,6 +43,8 @@ export const VARIANTS = {
   "javascript-typescript": "javascript-typescript",
   "javascript-python": "javascript-python",
   "javascript-python-base": "javascript-python-base",
+  "javascript-php": "javascript-php",
+  "javascript-rust": "javascript-rust",
   "torch-package": "torch-package",
 };
 export const assetName = (version, variant) => `zipp-${version}-${VARIANTS[variant]}.wasm`;
@@ -163,6 +165,8 @@ async function embed(variant, gluePath, input, outDir) {
     "javascript-typescript": ["javascript", "typescript"],
     "javascript-python": ["javascript", "python"],
     "javascript-python-base": ["javascript", "python"],
+    "javascript-php": ["javascript", "php"],
+    "javascript-rust": ["javascript", "rust"],
   }[variant];
   if (JSON.stringify(profile.languages) !== JSON.stringify(wantLanguages)) {
     throw new Error(`module is not the ${variant} variant (languages ${JSON.stringify(profile.languages)})`);

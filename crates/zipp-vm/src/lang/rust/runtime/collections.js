@@ -28,9 +28,12 @@
         const e = m.map.get(mapKeyOf(k));
         return e ? e[1] : undefined;
     }
+    function typedNone(valType) {
+        return valType ? { __rs: 2, __enum: "Option", __var: "None", __data: [], __defaultType: valType } : None;
+    }
     function mapGetOpt(m, k) {
         const e = m.map.get(mapKeyOf(k));
-        return e ? Some(e[1]) : None;
+        return e ? Some(e[1]) : typedNone(m.valType);
     }
     function mapSetRaw(m, k, v) {
         const mk = mapKeyOf(k);
@@ -988,6 +991,7 @@
                 return { __rs: 7, items: rt.strToUtf8Bytes(s) };
             case "as_os_str":
             case "to_string_lossy":
+            case "into_owned":
                 return R.mkString(s);
             case "encode_wide": {
                 const codes = [];
@@ -1186,7 +1190,7 @@
                 return inner;
             case "unwrap_or": return isSome ? inner : args[0];
             case "unwrap_or_else": return isSome ? inner : args[0]();
-            case "unwrap_or_default": return isSome ? inner : rt.defaultOf(typeArgs && typeArgs[0] ? typeArgs[0] : "");
+            case "unwrap_or_default": return isSome ? inner : rt.defaultOf((typeArgs && typeArgs[0]) || opt.__defaultType || "");
             case "map": return isSome ? Some(args[0](inner)) : None;
             case "map_or": return isSome ? args[1](inner) : args[0];
             case "map_or_else": return isSome ? args[1](inner) : args[0]();
@@ -1554,7 +1558,7 @@
             case "get": return mapGetOpt(m, args[0]);
             case "get_mut": {
                 const mk = mapKeyOf(args[0]);
-                if (!m.map.has(mk)) return None;
+                if (!m.map.has(mk)) return typedNone(m.valType);
                 return Some({
                     __rs: 6,
                     get: function () { return m.map.get(mk)[1]; },
@@ -1564,7 +1568,7 @@
             case "remove": {
                 const mk = mapKeyOf(args[0]);
                 const prev = m.map.get(mk);
-                if (!prev) return None;
+                if (!prev) return typedNone(m.valType);
                 m.map.delete(mk);
                 return Some(prev[1]);
             }
@@ -1905,6 +1909,8 @@
                     }
                     if (name === "clone") return cloneVal(v);
                     if (name === "to_string") return R.mkString(rt.fmtDisplay(v));
+                    if (name === "into") return R.convertInto(v, typeArgs && typeArgs[0]);
+                    if (name === "as_ref") return v;
                     if (name === "into_response" && rt.intoResponse) return rt.intoResponse(v);
                     if (name === "eq") return eq(v, args[0]);
                     if (name === "cmp") return rt.mkOrdering(cmpVal(v, args[0]));
@@ -1914,6 +1920,8 @@
                         return callIterMethod(intoIter(rawRecv), name, args, typeArgs);
                     }
                     // Also allow calling a closure field `(obj.cb)(args)` if field is a function
+                    if (name === "into") return R.convertInto(v, typeArgs && typeArgs[0]);
+                    if (name === "as_ref") return v;
                     if (typeof v[name] === "function") return v[name].apply(null, args);
                     R.panic("no method `" + name + "` found for struct `" + v.__type + "`");
                 }
@@ -1936,6 +1944,8 @@
                     }
                     if (name === "clone") return cloneVal(v);
                     if (name === "to_string") return R.mkString(rt.fmtDisplay(v));
+                    if (name === "into") return R.convertInto(v, typeArgs && typeArgs[0]);
+                    if (name === "as_ref") return v;
                     if (name === "into_response" && rt.intoResponse) return rt.intoResponse(v);
                     if (name === "eq") return eq(v, args[0]);
                     if (rt.lookupUserMethod(v.__enum, "next")) {
@@ -1945,6 +1955,8 @@
                 }
                 case 3:
                     if (name === "clone") return cloneVal(v);
+                    if (name === "into") return R.convertInto(v, typeArgs && typeArgs[0]);
+                    if (name === "as_ref") return v;
                     if (name === "into_response" && rt.intoResponse) return rt.intoResponse(v);
                     break;
                 case 4: return callStrMethod(v, name, args, typeArgs);

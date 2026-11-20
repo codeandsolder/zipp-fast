@@ -385,6 +385,10 @@ pub const PHP_SAPI_NAME: &str = "__zipp_php_sapi";
 pub const PHP_MAP_KV: u16 = 2206;
 #[cfg_attr(not(feature = "php"), allow(dead_code))]
 pub const PHP_MAP_KV_NAME: &str = "__zipp_php_map_kv";
+#[cfg_attr(not(feature = "php"), allow(dead_code))]
+pub const PHP_SQL: u16 = 2207;
+#[cfg_attr(not(feature = "php"), allow(dead_code))]
+pub const PHP_SQL_NAME: &str = "__zipp_php_sql";
 
 // Rust frontend private natives (`Program::rust_natives`). Bound by slot ONLY in
 // programs built by `lang::rust`, so JavaScript/Python/PHP programs never see them.
@@ -1921,6 +1925,8 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         PHP_SAPI => ("", 2),
         #[cfg(feature = "php")]
         PHP_MAP_KV => ("", 1),
+        #[cfg(feature = "php")]
+        PHP_SQL => ("", 4),
         #[cfg(feature = "rust")]
         RS_IO => ("", 2),
         #[cfg(feature = "rust")]

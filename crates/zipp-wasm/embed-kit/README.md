@@ -16,6 +16,8 @@ Pick an engine; each is one file from the release:
 | `zipp-{{VERSION}}-javascript-typescript.wasm` | JavaScript and TypeScript (`language: "typescript"`; types read and dropped) |
 | `zipp-{{VERSION}}-javascript-python.wasm` | JavaScript and Python, torch built in |
 | `zipp-{{VERSION}}-javascript-python-base.wasm` | JavaScript and Python, without torch (smaller) |
+| `zipp-{{VERSION}}-javascript-php.wasm` | JavaScript and PHP 8.x, with `PhpApp` SAPI and SQL bridge support |
+| `zipp-{{VERSION}}-javascript-rust.wasm` | JavaScript and Rust, with Axum/SQLx worker-boot support |
 | `zipp-{{VERSION}}-torch-package.wasm` | torch, added to the `-python-base` engine when you need it |
 
 Each also comes compressed with Brotli as `.wasm.br`, about a quarter of the

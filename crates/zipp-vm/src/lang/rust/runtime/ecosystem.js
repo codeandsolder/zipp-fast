@@ -57,24 +57,56 @@
         return strVal(v);
     }
 
-    // ---- Cooperative Timer Queue (used by tokio::time::sleep / interval / axum::serve) ----
+    // ---- Cooperative Timer Queue & Spawn Resource Tracking ----
     const timers = [];
+    const recentSpawnResources = [];
+    let spawnClearScheduled = false;
+    function trackSpawnResource(res) {
+        recentSpawnResources.push(res);
+        if (!spawnClearScheduled) {
+            spawnClearScheduled = true;
+            Promise.resolve().then(function () {
+                spawnClearScheduled = false;
+                recentSpawnResources.length = 0;
+            });
+        }
+    }
     function scheduleTimer(ms) {
         const delay = Math.max(0, Number(ms) || 0);
         const deadline = Date.now() + delay;
-        return new Promise(function (resolve) {
-            timers.push({ deadline: deadline, resolve: resolve });
+        let entry = null;
+        const p = new Promise(function (resolve) {
+            entry = { deadline: deadline, resolve: resolve, cancelled: false };
+            timers.push(entry);
         });
+        p.__cancel = function () {
+            if (!entry || entry.cancelled) return;
+            entry.cancelled = true;
+            const idx = timers.indexOf(entry);
+            if (idx >= 0) timers.splice(idx, 1);
+        };
+        return p;
     }
     function pollTimers() {
-        if (timers.length === 0) return;
+        if (timers.length === 0) return 0;
         const now = Date.now();
-        for (let i = timers.length - 1; i >= 0; i--) {
+        let fired = 0;
+        // Collect due timers first (FIFO order) so callbacks that re-schedule don't disturb iteration.
+        const due = [];
+        for (let i = 0; i < timers.length; ) {
             if (timers[i].deadline <= now) {
-                const t = timers.splice(i, 1)[0];
-                t.resolve(undefined);
+                due.push(timers.splice(i, 1)[0]);
+            } else {
+                i++;
             }
         }
+        for (let i = 0; i < due.length; i++) {
+            if (!due[i].cancelled) {
+                fired++;
+                due[i].resolve(undefined);
+            }
+        }
+        return fired;
     }
     function nextTimerMs() {
         if (timers.length === 0) return null;
@@ -88,6 +120,148 @@
     }
     rt.pollTimers = pollTimers;
     rt.nextTimerMs = nextTimerMs;
+
+    // ---- Virtual Axum WebSockets ----
+    const wsSockets = new Map();
+    const wsOutbox = [];
+
+    function pushWsFrame(wsId, frame) {
+        wsOutbox.push(Object.assign({ wsId: String(wsId) }, frame));
+    }
+
+    function sendWsMessage(ws, msgVal) {
+        if (!ws || ws.closed) {
+            return Promise.resolve(Err(R.mkString("websocket closed")));
+        }
+        const m = deref(msgVal);
+        if (m && m.__rs === 2) {
+            const variant = m.__var;
+            const d0 = m.__data ? m.__data[0] : undefined;
+            if (variant === "Text") {
+                pushWsFrame(ws.id, { type: "text", data: strVal(d0) });
+                return Promise.resolve(Ok(undefined));
+            }
+            if (variant === "Binary") {
+                pushWsFrame(ws.id, { type: "binary", data: bytesToHex(d0) });
+                return Promise.resolve(Ok(undefined));
+            }
+            if (variant === "Ping") {
+                pushWsFrame(ws.id, { type: "ping", data: bytesToHex(d0) });
+                return Promise.resolve(Ok(undefined));
+            }
+            if (variant === "Pong") {
+                pushWsFrame(ws.id, { type: "pong", data: bytesToHex(d0) });
+                return Promise.resolve(Ok(undefined));
+            }
+            if (variant === "Close") {
+                let code = 1000;
+                let reason = "";
+                const opt = deref(d0);
+                if (opt && opt.__rs === 2 && opt.__var === "Some") {
+                    const cf = deref(opt.__data[0]);
+                    if (cf && typeof cf === "object") {
+                        if (cf.code !== undefined) code = Number(deref(cf.code)) | 0;
+                        if (cf.reason !== undefined) reason = strVal(cf.reason);
+                    }
+                }
+                closeWsInternal(ws, code, reason, true);
+                return Promise.resolve(Ok(undefined));
+            }
+        }
+        pushWsFrame(ws.id, { type: "text", data: strVal(m) });
+        return Promise.resolve(Ok(undefined));
+    }
+
+    function closeWsInternal(ws, code, reason, notifyClient) {
+        if (!ws || ws.closed) return;
+        ws.closed = true;
+        wsSockets.delete(String(ws.id));
+        const waiters = ws.inWaiters.splice(0);
+        for (let i = 0; i < waiters.length; i++) {
+            waiters[i](None);
+        }
+        if (notifyClient) {
+            pushWsFrame(ws.id, { type: "close", code: code || 1000, reason: reason || "" });
+        }
+    }
+
+    function recvWsMessage(ws) {
+        if (!ws) return Promise.resolve(None);
+        if (ws.inQueue.length > 0) {
+            return Promise.resolve(ws.inQueue.shift());
+        }
+        if (ws.closed) {
+            return Promise.resolve(None);
+        }
+        trackSpawnResource({ kind: "ws_receiver", ws: ws });
+        let waiter = null;
+        const p = new Promise(function (resolve) {
+            waiter = resolve;
+            ws.inWaiters.push(waiter);
+        });
+        p.__cancel = function () {
+            const idx = ws.inWaiters.indexOf(waiter);
+            if (idx >= 0) ws.inWaiters.splice(idx, 1);
+        };
+        return p;
+    }
+
+    rt.wsStartUpgrade = function (ws) {
+        if (!ws || !ws.onUpgradeFn) return;
+        wsSockets.set(String(ws.id), ws);
+        const socketObj = { __rs: 15, kind: "ws_socket", ws: ws };
+        Promise.resolve().then(function () {
+            return ws.onUpgradeFn(socketObj);
+        }).then(
+            function () {
+                closeWsInternal(ws, 1000, "", true);
+            },
+            function (err) {
+                if (typeof rt.writeStderr === "function") {
+                    const msg = err && err.isRsPanic ? err.message : String(err);
+                    rt.writeStderr("[axum ws] " + msg + "\n");
+                }
+                closeWsInternal(ws, 1011, "internal error", true);
+            }
+        );
+    };
+
+    rt.wsReceiveFromClient = function (wsId, data, binary) {
+        const ws = wsSockets.get(String(wsId));
+        if (!ws || ws.closed) return false;
+        const msg = binary
+            ? R.mkEnumTuple("Message", "Binary", [{ __rs: 7, items: hexToBytes(String(data || "")) }])
+            : R.mkEnumTuple("Message", "Text", [R.mkString(String(data === undefined ? "" : data))]);
+        const item = Some(Ok(msg));
+        if (ws.inWaiters.length > 0) {
+            ws.inWaiters.shift()(item);
+        } else {
+            ws.inQueue.push(item);
+        }
+        return true;
+    };
+
+    rt.wsCloseFromClient = function (wsId, code, reason) {
+        const ws = wsSockets.get(String(wsId));
+        if (!ws) return false;
+        if (!ws.closed) {
+            const cf = R.mkStruct("CloseFrame", { code: Number(code) || 1000, reason: R.mkString(String(reason || "")) });
+            const msg = R.mkEnumTuple("Message", "Close", [Some(cf)]);
+            const item = Some(Ok(msg));
+            if (ws.inWaiters.length > 0) {
+                ws.inWaiters.shift()(item);
+            } else {
+                ws.inQueue.push(item);
+            }
+            closeWsInternal(ws, code || 1000, reason || "", false);
+        }
+        return true;
+    };
+
+    rt.wsDrainOutbox = function () {
+        if (wsOutbox.length === 0) return [];
+        return wsOutbox.splice(0);
+    };
 
     // ---- std::net::IpAddr & SocketAddr ----
     function mkIpAddr(ip) {
@@ -589,6 +763,15 @@
     };
 
     async function runAxumServe(serveObj) {
+        if (rt.__inWorkerBoot || (serveObj.listener && serveObj.listener.virtual)) {
+            rt.setRouter(serveObj.router);
+            rt.__workerBootReady = true;
+            if (serveObj.shutdownFut && typeof serveObj.shutdownFut.then === "function") {
+                await serveObj.shutdownFut;
+                return Ok(undefined);
+            }
+            return new Promise(function () {});
+        }
         const lid = serveObj.listener.id;
         rt.netCall("set_nonblocking", String(lid), "1");
         let stopped = false;
@@ -997,7 +1180,40 @@
                 }
                 break;
             case "join_handle":
-                if (name === "abort") { obj.aborted = true; return undefined; }
+                if (name === "abort") {
+                    obj.aborted = true;
+                    if (obj.resources && obj.resources.length > 0) {
+                        for (let i = 0; i < obj.resources.length; i++) {
+                            const r = obj.resources[i];
+                            if (!r) continue;
+                            if (r.kind === "tokio_interval") {
+                                r.aborted = true;
+                                if (r.pendingTimer && typeof r.pendingTimer.__cancel === "function") {
+                                    r.pendingTimer.__cancel();
+                                    r.pendingTimer = null;
+                                }
+                            } else if (r.kind === "broadcast_rx" && r.sub) {
+                                r.sub.closed = true;
+                                if (r.bus && r.bus.subs) {
+                                    const bi = r.bus.subs.indexOf(r.sub);
+                                    if (bi >= 0) r.bus.subs.splice(bi, 1);
+                                }
+                                const ws = r.sub.waiters.splice(0);
+                                for (let j = 0; j < ws.length; j++) {
+                                    ws[j](Err(R.mkEnumUnit("RecvError", "Closed", null)));
+                                }
+                            } else if (r.kind === "mpsc_rx" && r.ch) {
+                                r.ch.closed = true;
+                                const ws = r.ch.waiters.splice(0);
+                                for (let j = 0; j < ws.length; j++) ws[j](None);
+                            } else if (r.kind === "ws_receiver" && r.ws) {
+                                closeWsInternal(r.ws, 1000, "", true);
+                            }
+                        }
+                        obj.resources.length = 0;
+                    }
+                    return undefined;
+                }
                 if (name === "is_finished") return !!obj.finished;
                 break;
             case "watch_tx":
@@ -1034,12 +1250,19 @@
                         obj.seen = obj.cell.version;
                         return Promise.resolve(Ok(undefined));
                     }
-                    return new Promise(function (resolve) {
-                        obj.cell.waiters.push(function (res) {
+                    let waiter = null;
+                    const p = new Promise(function (resolve) {
+                        waiter = function (res) {
                             obj.seen = obj.cell.version;
                             resolve(res);
-                        });
+                        };
+                        obj.cell.waiters.push(waiter);
                     });
+                    p.__cancel = function () {
+                        const idx = obj.cell.waiters.indexOf(waiter);
+                        if (idx >= 0) obj.cell.waiters.splice(idx, 1);
+                    };
+                    return p;
                 }
                 if (name === "clone") return { __rs: 15, kind: "watch_rx", cell: obj.cell, seen: obj.seen };
                 break;
@@ -1074,6 +1297,7 @@
             case "broadcast_rx":
                 if (name === "recv") {
                     const sub = obj.sub;
+                    trackSpawnResource(obj);
                     if (sub.lagged > 0) {
                         const n = sub.lagged;
                         sub.lagged = 0;
@@ -1081,12 +1305,24 @@
                     }
                     if (sub.queue.length > 0) return Promise.resolve(Ok(sub.queue.shift()));
                     if (sub.closed) return Promise.resolve(Err(R.mkEnumUnit("RecvError", "Closed", null)));
-                    return new Promise(function (resolve) { sub.waiters.push(resolve); });
+                    let waiter = null;
+                    const p = new Promise(function (resolve) {
+                        waiter = resolve;
+                        sub.waiters.push(waiter);
+                    });
+                    p.__cancel = function () {
+                        const idx = sub.waiters.indexOf(waiter);
+                        if (idx >= 0) sub.waiters.splice(idx, 1);
+                    };
+                    return p;
                 }
                 break;
             case "mpsc_tx":
                 if (name === "send" || name === "try_send") {
                     const ch = obj.ch;
+                    if (ch.closed) {
+                        return name === "send" ? Promise.resolve(Err(R.mkString("channel closed"))) : Err(R.mkString("channel closed"));
+                    }
                     if (ch.waiters.length > 0) ch.waiters.shift()(Some(args[0]));
                     else ch.queue.push(args[0]);
                     return name === "send" ? Promise.resolve(Ok(undefined)) : Ok(undefined);
@@ -1096,8 +1332,19 @@
             case "mpsc_rx":
                 if (name === "recv") {
                     const ch = obj.ch;
+                    trackSpawnResource(obj);
                     if (ch.queue.length > 0) return Promise.resolve(Some(ch.queue.shift()));
-                    return new Promise(function (resolve) { ch.waiters.push(resolve); });
+                    if (ch.closed) return Promise.resolve(None);
+                    let waiter = null;
+                    const p = new Promise(function (resolve) {
+                        waiter = resolve;
+                        ch.waiters.push(waiter);
+                    });
+                    p.__cancel = function () {
+                        const idx = ch.waiters.indexOf(waiter);
+                        if (idx >= 0) ch.waiters.splice(idx, 1);
+                    };
+                    return p;
                 }
                 if (name === "try_recv") {
                     const ch = obj.ch;
@@ -1106,8 +1353,19 @@
                 break;
             case "tokio_interval":
                 if (name === "tick") {
+                    if (obj.aborted) {
+                        return new Promise(function () {});
+                    }
                     if (obj.first) { obj.first = false; return Promise.resolve({ __rs: 15, kind: "instant", ns: rt.timeCall("mono") }); }
-                    return scheduleTimer(obj.ms).then(function () { return { __rs: 15, kind: "instant", ns: rt.timeCall("mono") }; });
+                    const tp = scheduleTimer(obj.ms);
+                    obj.pendingTimer = tp;
+                    const p = tp.then(function () {
+                        if (obj.pendingTimer === tp) obj.pendingTimer = null;
+                        if (obj.aborted) return new Promise(function () {});
+                        return { __rs: 15, kind: "instant", ns: rt.timeCall("mono") };
+                    });
+                    p.__cancel = tp.__cancel;
+                    return p;
                 }
                 if (name === "set_missed_tick_behavior") return undefined;
                 break;
@@ -1232,7 +1490,53 @@
                 if (name === "spawn") return Ok({ __rs: 15, kind: "join_handle", finished: true, aborted: false });
                 break;
             case "ws_upgrade":
-                if (name === "on_upgrade") return rt.mkResponse(501, "WebSocket upgrade not supported in HTTP/1.1 mode", "text/plain");
+                if (name === "on_upgrade") {
+                    const cb = args[0];
+                    if (obj.req && obj.req.__wsId) {
+                        const ws = {
+                            id: String(obj.req.__wsId),
+                            closed: false,
+                            inQueue: [],
+                            inWaiters: [],
+                            onUpgradeFn: cb
+                        };
+                        const resp = rt.mkResponse(101, "", null);
+                        resp.__wsUpgraded = ws;
+                        return resp;
+                    }
+                    return rt.mkResponse(426, "WebSocket upgrade required", "text/plain");
+                }
+                if (name === "max_message_size" || name === "max_frame_size" || name === "protocols"
+                    || name === "write_buffer_size" || name === "max_write_buffer_size"
+                    || name === "accept_unmasked_frames" || name === "on_failed_upgrade") {
+                    return obj;
+                }
+                break;
+            case "ws_socket":
+                if (name === "split") {
+                    return R.mkTuple([
+                        { __rs: 15, kind: "ws_sender", ws: obj.ws },
+                        { __rs: 15, kind: "ws_receiver", ws: obj.ws }
+                    ]);
+                }
+                if (name === "send") return sendWsMessage(obj.ws, args[0]);
+                if (name === "recv" || name === "next") return recvWsMessage(obj.ws);
+                if (name === "close") {
+                    closeWsInternal(obj.ws, 1000, "", true);
+                    return Promise.resolve(Ok(undefined));
+                }
+                if (name === "protocol") return None;
+                break;
+            case "ws_sender":
+                if (name === "send") return sendWsMessage(obj.ws, args[0]);
+                if (name === "close") {
+                    closeWsInternal(obj.ws, 1000, "", true);
+                    return Promise.resolve(Ok(undefined));
+                }
+                if (name === "flush") return Promise.resolve(Ok(undefined));
+                break;
+            case "ws_receiver":
+                if (name === "next" || name === "recv") return recvWsMessage(obj.ws);
                 break;
             case "duration":
                 if (name === "whole_seconds") return Number(obj.ns / 1000000000n);
@@ -1272,7 +1576,8 @@
     }
 
     function mkJoinHandle(promise) {
-        const obj = { __rs: 15, kind: "join_handle", finished: false, aborted: false };
+        const resources = recentSpawnResources.splice(0);
+        const obj = { __rs: 15, kind: "join_handle", finished: false, aborted: false, resources: resources };
         const p = Promise.resolve(promise).then(
             function (v) { obj.finished = true; return Ok(v); },
             function (e) { obj.finished = true; return Err(R.mkString(String(e))); }
@@ -1359,6 +1664,9 @@
             if (last === "patch") return { __rs: 15, kind: "method_router", entries: [["PATCH", args[0]]] };
             if (last === "delete") return { __rs: 15, kind: "method_router", entries: [["DELETE", args[0]]] };
             if (last === "any") return { __rs: 15, kind: "method_router", entries: [["ANY", args[0]]] };
+        }
+        if (parent === "Message" && (last === "Text" || last === "Binary" || last === "Ping" || last === "Pong" || last === "Close")) {
+            return R.mkEnumTuple("Message", last, args);
         }
         if (last === "Json" && (pathParts.length === 1 || parent === "axum" || parent === "extract" || parent === "response")) {
             return R.mkTupleStruct("Json", [args[0]]);
@@ -1473,6 +1781,9 @@
         }
         if (root === "tokio" && parent === "TcpListener" && last === "bind") {
             const addr = strVal(args[0]);
+            if (rt.__inWorkerBoot || (typeof __zipp_rs_io === "function" && __zipp_rs_io("mode", "") === "worker_boot")) {
+                return Promise.resolve(Ok({ __rs: 15, kind: "tcp_listener", id: 0, virtual: true, addr: addr }));
+            }
             const id = rt.netCall("bind", addr);
             return Promise.resolve(
                 (typeof id === "number" && id >= 0)
@@ -1521,7 +1832,9 @@
             if (last === "interval") {
                 const dur = deref(args[0]);
                 const ms = dur && dur.kind === "duration" ? Number(dur.ns / 1000000n) : Number(dur);
-                return { __rs: 15, kind: "tokio_interval", ms: Math.max(1, ms), first: true };
+                const iv = { __rs: 15, kind: "tokio_interval", ms: Math.max(1, ms), first: true, aborted: false, pendingTimer: null };
+                trackSpawnResource(iv);
+                return iv;
             }
         }
         if (parent === "signal" && last === "ctrl_c") {

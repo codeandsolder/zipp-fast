@@ -354,9 +354,18 @@
         const queryStr = qidx >= 0 ? uri.slice(qidx + 1) : "";
         const headers = rt.mkMap(false);
         if (headersObj) {
-            const ks = Object.keys(headersObj);
-            for (let i = 0; i < ks.length; i++) {
-                rt.mapSetRaw(headers, R.mkString(ks[i].toLowerCase()), R.mkString(headersObj[ks[i]]));
+            if (Array.isArray(headersObj)) {
+                for (let i = 0; i < headersObj.length; i++) {
+                    const pair = headersObj[i];
+                    if (Array.isArray(pair) && pair.length >= 2) {
+                        rt.mapSetRaw(headers, R.mkString(String(pair[0]).toLowerCase()), R.mkString(String(pair[1])));
+                    }
+                }
+            } else {
+                const ks = Object.keys(headersObj);
+                for (let i = 0; i < ks.length; i++) {
+                    rt.mapSetRaw(headers, R.mkString(ks[i].toLowerCase()), R.mkString(headersObj[ks[i]]));
+                }
             }
         }
         const params = rt.mkMap(false);
@@ -916,6 +925,17 @@
                 }
                 if (name === "write_all" || name === "write") {
                     const data = deref(args[0]);
+                    if (data && data.__rs === 7) {
+                        let hx = "";
+                        for (let i = 0; i < data.items.length; i++) hx += (Number(data.items[i]) & 0xFF).toString(16).padStart(2, "0");
+                        const opHex = obj.append ? "append_bytes_hex" : "write_bytes_hex";
+                        const okHex = fsCall(opHex, obj.path, hx);
+                        if (okHex === true) {
+                            obj.append = true;
+                            return name === "write" ? Ok(data.items.length) : Ok(undefined);
+                        }
+                        if (okHex === false) return Err(mkIoErr("PermissionDenied", "failed to write " + obj.path));
+                    }
                     const s = (data && data.__rs === 7) ? rt.utf8BytesToStr(data.items) : strVal(data);
                     const op = obj.append ? "append" : "write";
                     const ok = fsCall(op, obj.path, s);
@@ -927,8 +947,12 @@
                 break;
             }
             case "open_options": {
-                if (name === "read" || name === "write" || name === "append" || name === "create" || name === "truncate") {
+                if (name === "read" || name === "write" || name === "append" || name === "create" || name === "create_new" || name === "truncate") {
                     obj[name] = !!deref(args[0]);
+                    return obj;
+                }
+                if (name === "mode" || name === "custom_flags") {
+                    obj[name] = deref(args[0]);
                     return obj;
                 }
                 if (name === "open") {
@@ -1000,6 +1024,12 @@
             }
             case "tcp_listener": {
                 if (name === "local_addr") {
+                    if (obj.virtual) {
+                        const s = obj.addr || "127.0.0.1:0";
+                        return typeof rt.mkSocketAddr === "function"
+                            ? Ok(rt.mkSocketAddr(s.split(":")[0] || "127.0.0.1", Number(s.split(":")[1] || 0)))
+                            : Ok(R.mkString(s));
+                    }
                     const addr = netCall("local_addr", String(obj.id));
                     return typeof addr === "string" ? Ok(R.mkString(addr)) : Err(mkIoErr("Other", "closed listener"));
                 }
@@ -1757,13 +1787,37 @@
                 if (last === "exists") return Ok(fsCall("exists", strVal(args[0])) === true);
                 if (last === "create_dir") return fsCall("mkdir", strVal(args[0])) ? Ok(undefined) : Err(mkIoErr("Other", "mkdir failed"));
                 if (last === "create_dir_all") return fsCall("mkdir_all", strVal(args[0])) ? Ok(undefined) : Err(mkIoErr("Other", "mkdir_all failed"));
-                if (last === "remove_file") return fsCall("remove_file", strVal(args[0])) ? Ok(undefined) : Err(mkIoErr("NotFound", "remove_file failed"));
+                if (last === "remove_file") {
+                    const p = strVal(args[0]);
+                    const fsOk = fsCall("remove_file", p) === true;
+                    let sqlOk = false;
+                    if (typeof __zipp_rs_sqlite === "function" && /\.(?:db|sqlite3?|db-wal|db-shm)$/i.test(p)) {
+                        try {
+                            const raw = __zipp_rs_sqlite("remove", p, "", "");
+                            const parsed = typeof raw === "string" ? JSON.parse(raw) : null;
+                            if (parsed && !parsed.error && parsed.removed) sqlOk = true;
+                        } catch (_) {}
+                    }
+                    return (fsOk || sqlOk) ? Ok(undefined) : Err(mkIoErr("NotFound", "remove_file failed"));
+                }
                 if (last === "remove_dir") return fsCall("remove_dir", strVal(args[0])) ? Ok(undefined) : Err(mkIoErr("Other", "remove_dir failed"));
                 if (last === "remove_dir_all") return fsCall("remove_dir_all", strVal(args[0])) ? Ok(undefined) : Err(mkIoErr("Other", "remove_dir_all failed"));
                 if (last === "rename") return fsCall("rename", strVal(args[0]), strVal(args[1])) ? Ok(undefined) : Err(mkIoErr("Other", "rename failed"));
                 if (last === "copy") {
-                    const n = fsCall("copy", strVal(args[0]), strVal(args[1]));
-                    return typeof n === "number" ? Ok(n) : Err(mkIoErr("Other", "copy failed"));
+                    const from = strVal(args[0]);
+                    const to = strVal(args[1]);
+                    const n = fsCall("copy", from, to);
+                    if (typeof n === "number") return Ok(n);
+                    if (typeof __zipp_rs_sqlite === "function" && (/\.(?:db|sqlite3?)$/i.test(from) || /\.(?:db|sqlite3?)$/i.test(to))) {
+                        try {
+                            const raw = __zipp_rs_sqlite("copy", from, to, "");
+                            const parsed = typeof raw === "string" ? JSON.parse(raw) : null;
+                            if (parsed && !parsed.error && typeof parsed.bytes === "number") {
+                                return Ok(parsed.bytes);
+                            }
+                        } catch (_) {}
+                    }
+                    return Err(mkIoErr("Other", "copy failed"));
                 }
                 if (last === "canonicalize") {
                     const c = fsCall("canonicalize", strVal(args[0]));

@@ -339,7 +339,10 @@ fn eval_cfg_tokens(toks: &[zipp_rsparse::token::Token], is_test_mode: bool) -> b
             return match id.as_str() {
                 "test" => is_test_mode,
                 "windows" => cfg!(windows),
-                "unix" => cfg!(unix),
+                // Inside WASM sandboxes, expose POSIX/unix virtual FS semantics so server crates
+                // with `#[cfg(unix)]` / `#[cfg(windows)]` pairs select the POSIX branch instead of
+                // dropping both implementations.
+                "unix" => cfg!(any(unix, target_arch = "wasm32")),
                 "debug_assertions" => false,
                 _ => true,
             };
@@ -358,7 +361,7 @@ fn eval_cfg_tokens(toks: &[zipp_rsparse::token::Token], is_test_mode: bool) -> b
                 },
                 "target_family" => match v.as_str() {
                     "windows" => cfg!(target_family = "windows"),
-                    "unix" => cfg!(target_family = "unix"),
+                    "unix" => cfg!(any(target_family = "unix", target_arch = "wasm32")),
                     "wasm" => cfg!(target_family = "wasm"),
                     _ => false,
                 },

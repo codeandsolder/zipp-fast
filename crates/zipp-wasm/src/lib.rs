@@ -454,7 +454,7 @@ fn module_name_of_path(path: &str) -> Option<String> {
 }
 
 /// A host value rendered as an argument string.
-#[cfg(feature = "python")]
+#[cfg(any(feature = "python", feature = "php", feature = "rust"))]
 fn host_value_text(value: &HostValue) -> String {
     match value {
         HostValue::String(s) => s.clone(),
@@ -471,7 +471,7 @@ fn host_value_text(value: &HostValue) -> String {
 }
 
 /// Standard base64 (with or without padding) to bytes.
-#[cfg(feature = "python")]
+#[cfg(any(feature = "python", feature = "php", feature = "rust"))]
 fn base64_decode(text: &str) -> Result<Vec<u8>, String> {
     let mut out = Vec::with_capacity(text.len() * 3 / 4);
     let mut acc: u32 = 0;
@@ -494,6 +494,146 @@ fn base64_decode(text: &str) -> Result<Vec<u8>, String> {
         }
     }
     Ok(out)
+}
+
+/// Standard base64 encoder (pure safe Rust, zero JS imports).
+#[cfg(any(feature = "php", feature = "rust"))]
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    let mut i = 0;
+    while i + 3 <= bytes.len() {
+        let n = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8) | (bytes[i + 2] as u32);
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        out.push(TABLE[((n >> 6) & 63) as usize] as char);
+        out.push(TABLE[(n & 63) as usize] as char);
+        i += 3;
+    }
+    let rem = bytes.len() - i;
+    if rem == 1 {
+        let n = (bytes[i] as u32) << 16;
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        out.push('=');
+        out.push('=');
+    } else if rem == 2 {
+        let n = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8);
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        out.push(TABLE[((n >> 6) & 63) as usize] as char);
+        out.push('=');
+    }
+    out
+}
+
+#[cfg(any(feature = "php", feature = "rust"))]
+const MAX_PROJECT_VFS_BYTES: usize = 64 * 1024 * 1024;
+
+#[cfg(any(feature = "php", feature = "rust"))]
+fn normalize_vfs_key(path: &str) -> String {
+    let replaced = path.replace('\\', "/");
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in replaced.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            s => parts.push(s),
+        }
+    }
+    parts.join("/")
+}
+
+#[cfg(any(feature = "php", feature = "rust"))]
+fn parse_vfs_files_map(
+    files: &JsValue,
+    dest: &mut HashMap<String, Vec<u8>>,
+    running_bytes: &mut usize,
+) -> Result<(), String> {
+    let mut budget = HostValueBudget::new(262_144, MAX_PROJECT_VFS_BYTES.saturating_mul(2));
+    let seen = js_sys::WeakSet::<js_sys::Object>::new_typed();
+    let entries = match from_js_bounded(files, 0, &seen, &mut budget)? {
+        HostValue::Object(entries) => entries,
+        _ => return Err("TypeError: files must be a plain object mapping paths to string or {base64}".into()),
+    };
+    for (name, contents) in entries {
+        let key = normalize_vfs_key(&name);
+        if key.is_empty() {
+            continue;
+        }
+        let bytes: Vec<u8> = match contents {
+            HostValue::String(s) => s.into_bytes(),
+            HostValue::Object(fields) => {
+                let mut decoded = None;
+                for (k, v) in fields {
+                    if k == "base64" {
+                        if let HostValue::String(b64) = v {
+                            decoded = Some(
+                                base64_decode(&b64)
+                                    .map_err(|e| format!("TypeError: file {name:?}: {e}"))?,
+                            );
+                        }
+                    }
+                }
+                decoded.ok_or_else(|| {
+                    format!("TypeError: file {name:?} must be a string or {{base64: ...}}")
+                })?
+            }
+            _ => {
+                return Err(format!(
+                    "TypeError: file {name:?} must be a string or {{base64: ...}}"
+                ))
+            }
+        };
+        let prev = dest.get(&key).map(|v| v.len()).unwrap_or(0);
+        let next_total = running_bytes
+            .saturating_sub(prev)
+            .saturating_add(bytes.len());
+        if next_total > MAX_PROJECT_VFS_BYTES {
+            return Err(format!(
+                "RangeError: project VFS exceeds the {MAX_PROJECT_VFS_BYTES}-byte limit"
+            ));
+        }
+        *running_bytes = next_total;
+        dest.insert(key, bytes);
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "php", feature = "rust"))]
+fn parse_env_pairs(val: &HostValue) -> Result<Vec<(String, String)>, String> {
+    match val {
+        HostValue::Undefined | HostValue::Null => Ok(Vec::new()),
+        HostValue::Object(entries) => Ok(entries
+            .iter()
+            .map(|(k, v)| (k.clone(), host_value_text(v)))
+            .collect()),
+        _ => Err("TypeError: env must be a plain object mapping variable names to strings".into()),
+    }
+}
+
+#[cfg(any(feature = "php", feature = "rust"))]
+fn parse_string_list(val: &HostValue, label: &str) -> Result<Vec<String>, String> {
+    match val {
+        HostValue::Undefined | HostValue::Null => Ok(Vec::new()),
+        HostValue::Array(items) => Ok(items.iter().map(host_value_text).collect()),
+        _ => Err(format!("TypeError: {label} must be an array of strings")),
+    }
+}
+
+#[cfg(feature = "rust")]
+#[derive(Clone, Copy)]
+struct RustHooks {
+    worker_request: Option<u32>,
+}
+
+#[cfg(feature = "php")]
+#[derive(Clone, Copy)]
+struct PhpHooks {
+    worker_request: Option<u32>,
+    take_response: Option<u32>,
 }
 
 /// Global slots of the Python runtime's host hooks (see `runtime.js`).
@@ -523,6 +663,10 @@ pub struct Engine {
     /// JavaScript state or before initialization.
     #[cfg(feature = "python")]
     python_hooks: Option<PythonHooks>,
+    #[cfg(feature = "rust")]
+    rust_hooks: Option<RustHooks>,
+    #[cfg(feature = "php")]
+    php_hooks: Option<PhpHooks>,
     /// Script symbol name → global slot. Preamble names are excluded.
     slots: Vec<(String, u32, SymbolScope)>,
     helpers: Helpers,
@@ -583,6 +727,10 @@ impl Engine {
             source_language: zipp_vm::frontend::LanguageId::JavaScript,
             #[cfg(feature = "python")]
             python_hooks: None,
+            #[cfg(feature = "rust")]
+            rust_hooks: None,
+            #[cfg(feature = "php")]
+            php_hooks: None,
             failed_init_console: Vec::new(),
             slots: Vec::new(),
             helpers: Helpers::default(),
@@ -957,6 +1105,348 @@ impl Engine {
         })
     }
 
+    /// Initialize a multi-file Rust project (e.g. an Axum + SQLx backend) on a
+    /// sandboxed virtual filesystem. `files` maps project-relative paths to
+    /// UTF-8 strings or `{ base64: "..." }` binary payloads; `entry` is the
+    /// entry `.rs` path (e.g. `"src/main.rs"`). `options` is an optional plain
+    /// object: `{ mode?: "run" | "test" | "worker_boot", baseDir?: string,
+    /// argv?: string[], env?: Record<string, string>, writableVfs?: boolean }`.
+    #[cfg(feature = "rust")]
+    #[wasm_bindgen(js_name = initRustProject)]
+    pub fn init_rust_project(
+        &mut self,
+        files: JsValue,
+        entry: &str,
+        options: JsValue,
+    ) -> Result<JsValue, JsValue> {
+        let mut vfs: HashMap<String, Vec<u8>> = HashMap::new();
+        let mut vfs_bytes: usize = 0;
+        parse_vfs_files_map(&files, &mut vfs, &mut vfs_bytes)
+            .map_err(|e| self.to_js_error(e))?;
+        let entry_key = normalize_vfs_key(entry);
+        let entry_source = vfs
+            .get(&entry_key)
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .ok_or_else(|| {
+                self.usage_error(&format!(
+                    "Error: Rust entry file '{entry_key}' not found in project files"
+                ))
+            })?;
+
+        let mut mode = String::from("run");
+        let mut base_dir = String::new();
+        let mut argv: Vec<String> = Vec::new();
+        let mut env: Vec<(String, String)> = Vec::new();
+        let mut writable_vfs = false;
+
+        if !options.is_undefined() && !options.is_null() {
+            let parsed = from_js(&options).map_err(|e| self.to_js_error(e))?;
+            let HostValue::Object(entries) = parsed else {
+                return Err(self.usage_error("TypeError: options must be a plain object"));
+            };
+            for (k, v) in entries {
+                match k.as_str() {
+                    "mode" => {
+                        let s = host_value_text(&v);
+                        if !s.is_empty() {
+                            mode = s;
+                        }
+                    }
+                    "baseDir" => base_dir = host_value_text(&v),
+                    "argv" => argv = parse_string_list(&v, "argv").map_err(|e| self.usage_error(&e))?,
+                    "env" => env = parse_env_pairs(&v).map_err(|e| self.usage_error(&e))?,
+                    "writableVfs" => {
+                        writable_vfs = matches!(v, HostValue::Bool(true));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if base_dir.is_empty() {
+            base_dir = match entry_key.rsplit_once('/') {
+                Some((parent, _)) if !parent.is_empty() => parent.to_owned(),
+                _ => ".".to_owned(),
+            };
+        }
+        let source_len = entry_source.len();
+        let config = zipp_vm::frontend::RustProgramConfig {
+            file: entry_key,
+            base_dir,
+            argv,
+            env,
+            vfs: Some(vfs),
+            allow_vfs_write: writable_vfs,
+            allow_native_fs: false,
+            allow_net: false,
+            stream_stdout: false,
+            mode,
+        };
+        self.initialize(zipp_vm::frontend::LanguageId::Rust, source_len, move || {
+            zipp_vm::frontend::compile_rust_program(&entry_source, config)
+                .map(|compiled| compiled.into_state())
+        })
+    }
+
+    /// Dispatch a single HTTP request JSON (`{ method, uri, headers, body }`) to
+    /// a Rust Axum backend booted with `{ mode: "worker_boot" }`. Returns the
+    /// response JSON (`{ status, headers, body }`).
+    #[cfg(feature = "rust")]
+    #[wasm_bindgen(js_name = rustDispatchRequest)]
+    pub fn rust_dispatch_request(&mut self, req_json: &str) -> Result<String, JsValue> {
+        self.ensure_live()?;
+        if self.source_language != zipp_vm::frontend::LanguageId::Rust {
+            return Err(self.usage_error("zipp: engine was not initialized as Rust"));
+        }
+        let Some(slot) = self.rust_hooks.and_then(|h| h.worker_request) else {
+            return Err(self.usage_error("zipp: Rust worker dispatch hook is unavailable"));
+        };
+        let Some(st) = self.state.as_mut() else {
+            return Err(self.usage_error("zipp: not initialized"));
+        };
+        let mut budget = HostValueBudget::new(65_536, 32 * 1024 * 1024);
+        let (result, kind) = classify_host_call_result(st.call_slot_bounded(
+            slot,
+            &[HostValue::String(req_json.to_owned())],
+            &mut budget,
+        ));
+        let value = self.finish_classified_execution(result, kind)?;
+        match value {
+            HostValue::String(s) => Ok(s),
+            _ => Err(self.usage_error("zipp: Rust worker returned non-string response")),
+        }
+    }
+
+    /// Drain buffered stdout produced by a Rust program (`println!`, `print!`).
+    #[cfg(feature = "rust")]
+    #[wasm_bindgen(js_name = takeRustOutput)]
+    pub fn take_rust_output(&mut self) -> Result<String, JsValue> {
+        self.ensure_live()?;
+        let bytes = self
+            .state
+            .as_mut()
+            .map(ScriptState::take_rust_output)
+            .unwrap_or_default();
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// Drain buffered stderr produced by a Rust program (`eprintln!`, panics).
+    #[cfg(feature = "rust")]
+    #[wasm_bindgen(js_name = takeRustStderr)]
+    pub fn take_rust_stderr(&mut self) -> Result<String, JsValue> {
+        self.ensure_live()?;
+        let bytes = self
+            .state
+            .as_mut()
+            .map(ScriptState::take_rust_stderr)
+            .unwrap_or_default();
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// Export the mutable Rust VFS overlay (writes, deleted, dirs) as JSON so
+    /// hosts can persist runtime-generated files (such as `.pit.secret`) across reloads.
+    #[cfg(feature = "rust")]
+    #[wasm_bindgen(js_name = exportRustOverlayJson)]
+    pub fn export_rust_overlay_json(&mut self) -> Result<String, JsValue> {
+        self.ensure_live()?;
+        let (writes, deleted, dirs) = self
+            .state
+            .as_mut()
+            .map(ScriptState::snapshot_rust_vfs_overlay)
+            .unwrap_or_default();
+        let mut out = String::from("{\"writes\":{");
+        for (i, (k, bytes)) in writes.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            write_json_string(k, &mut out);
+            out.push(':');
+            write_json_string(&base64_encode(bytes), &mut out);
+        }
+        out.push_str("},\"deleted\":[");
+        for (i, k) in deleted.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            write_json_string(k, &mut out);
+        }
+        out.push_str("],\"dirs\":[");
+        for (i, k) in dirs.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            write_json_string(k, &mut out);
+        }
+        out.push_str("]}");
+        Ok(out)
+    }
+
+    /// Initialize a multi-file PHP project (script or Worker Mode via
+    /// `zipp_handle_requests(...)`) on a sandboxed VFS. For standard
+    /// shared-nothing multi-request PHP apps, prefer [`PhpApp`].
+    #[cfg(feature = "php")]
+    #[wasm_bindgen(js_name = initPhpProject)]
+    pub fn init_php_project(
+        &mut self,
+        files: JsValue,
+        entry: &str,
+        options: JsValue,
+    ) -> Result<JsValue, JsValue> {
+        let mut vfs: HashMap<String, Vec<u8>> = HashMap::new();
+        let mut vfs_bytes: usize = 0;
+        parse_vfs_files_map(&files, &mut vfs, &mut vfs_bytes)
+            .map_err(|e| self.to_js_error(e))?;
+        let entry_key = normalize_vfs_key(entry);
+        let entry_source = vfs
+            .get(&entry_key)
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .ok_or_else(|| {
+                self.usage_error(&format!(
+                    "Error: PHP entry file '{entry_key}' not found in project files"
+                ))
+            })?;
+
+        let mut base_dir = String::new();
+        let mut argv: Vec<String> = Vec::new();
+        let mut env: Vec<(String, String)> = Vec::new();
+        let mut sapi_request_json: Option<String> = None;
+
+        if !options.is_undefined() && !options.is_null() {
+            let parsed = from_js(&options).map_err(|e| self.to_js_error(e))?;
+            let HostValue::Object(entries) = parsed else {
+                return Err(self.usage_error("TypeError: options must be a plain object"));
+            };
+            for (k, v) in entries {
+                match k.as_str() {
+                    "baseDir" => base_dir = host_value_text(&v),
+                    "argv" => argv = parse_string_list(&v, "argv").map_err(|e| self.usage_error(&e))?,
+                    "env" => env = parse_env_pairs(&v).map_err(|e| self.usage_error(&e))?,
+                    "sapiRequestJson" => {
+                        let s = host_value_text(&v);
+                        if !s.is_empty() {
+                            sapi_request_json = Some(s);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if base_dir.is_empty() {
+            base_dir = match entry_key.rsplit_once('/') {
+                Some((parent, _)) if !parent.is_empty() => format!("/{parent}"),
+                _ => "/".to_owned(),
+            };
+        }
+        let source_len = entry_source.len();
+        let overlay = std::sync::Arc::new(std::sync::Mutex::new(
+            zipp_vm::frontend::PhpVfsOverlay::default(),
+        ));
+        let config = zipp_vm::frontend::PhpProgramConfig {
+            file: format!("/{entry_key}"),
+            base_dir,
+            argv,
+            env,
+            sapi_request_json,
+            vfs: Some(vfs),
+            vfs_arc: None,
+            vfs_overlay: Some(overlay),
+            allow_native_fs: false,
+            stream_stdout: false,
+        };
+        self.initialize(zipp_vm::frontend::LanguageId::Php, source_len, move || {
+            zipp_vm::frontend::compile_php_program(&entry_source, config)
+                .map(|compiled| compiled.into_state())
+        })
+    }
+
+    /// Dispatch a single HTTP SAPI request JSON to a warm PHP Worker Mode script
+    /// (`zipp_handle_requests(...)`). Returns `{ metaJson, bodyBase64 }`.
+    #[cfg(feature = "php")]
+    #[wasm_bindgen(js_name = phpDispatchRequest)]
+    pub fn php_dispatch_request(&mut self, req_json: &str) -> Result<JsValue, JsValue> {
+        self.ensure_live()?;
+        if self.source_language != zipp_vm::frontend::LanguageId::Php {
+            return Err(self.usage_error("zipp: engine was not initialized as PHP"));
+        }
+        let Some(slot) = self.php_hooks.and_then(|h| h.worker_request) else {
+            return Err(self.usage_error("zipp: PHP worker dispatch hook is unavailable"));
+        };
+        let Some(st) = self.state.as_mut() else {
+            return Err(self.usage_error("zipp: not initialized"));
+        };
+        let mut budget = HostValueBudget::new(65_536, 32 * 1024 * 1024);
+        let (result, kind) = classify_host_call_result(st.call_slot_bounded(
+            slot,
+            &[HostValue::String(req_json.to_owned())],
+            &mut budget,
+        ));
+        let value = self.finish_classified_execution(result, kind)?;
+        let meta_json = match value {
+            HostValue::String(s) => s,
+            _ => "{\"status\":200,\"headers\":[],\"body\":\"\"}".to_owned(),
+        };
+        let raw_bytes = self
+            .state
+            .as_mut()
+            .map(ScriptState::take_php_output)
+            .unwrap_or_default();
+        let body_b64 = base64_encode(&raw_bytes);
+        let mut out_budget = HostValueBudget::new(64, body_b64.len() + meta_json.len() + 1024);
+        to_js_bounded(
+            &HostValue::Object(vec![
+                ("metaJson".into(), HostValue::String(meta_json)),
+                ("bodyBase64".into(), HostValue::String(body_b64)),
+            ]),
+            &mut out_budget,
+        )
+        .map_err(|e| self.to_js_error(e))
+    }
+
+    /// Read the SAPI response metadata JSON (`{ status, headers, body }`) from a
+    /// PHP engine after initialization.
+    #[cfg(feature = "php")]
+    #[wasm_bindgen(js_name = phpTakeResponse)]
+    pub fn php_take_response(&mut self) -> Result<String, JsValue> {
+        self.ensure_live()?;
+        let Some(slot) = self.php_hooks.and_then(|h| h.take_response) else {
+            return Ok("{\"status\":200,\"headers\":[],\"body\":\"\"}".to_owned());
+        };
+        let Some(st) = self.state.as_mut() else {
+            return Err(self.usage_error("zipp: not initialized"));
+        };
+        let mut budget = HostValueBudget::new(65_536, 32 * 1024 * 1024);
+        let (result, kind) = classify_host_call_result(st.call_slot_bounded(slot, &[], &mut budget));
+        match self.finish_classified_execution(result, kind)? {
+            HostValue::String(s) => Ok(s),
+            _ => Ok("{\"status\":200,\"headers\":[],\"body\":\"\"}".to_owned()),
+        }
+    }
+
+    /// Drain raw PHP byte output (`echo`, `print`, inline HTML) as UTF-8 text.
+    #[cfg(feature = "php")]
+    #[wasm_bindgen(js_name = takePhpOutput)]
+    pub fn take_php_output(&mut self) -> Result<String, JsValue> {
+        self.ensure_live()?;
+        let bytes = self
+            .state
+            .as_mut()
+            .map(ScriptState::take_php_output)
+            .unwrap_or_default();
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// Drain raw PHP byte output (`echo`, `print`, binary responses) as base64.
+    #[cfg(feature = "php")]
+    #[wasm_bindgen(js_name = takePhpOutputBase64)]
+    pub fn take_php_output_base64(&mut self) -> Result<String, JsValue> {
+        self.ensure_live()?;
+        let bytes = self
+            .state
+            .as_mut()
+            .map(ScriptState::take_php_output)
+            .unwrap_or_default();
+        Ok(base64_encode(&bytes))
+    }
+
     /// The shared initialization path: one program, whichever frontend
     /// compiled it. `source_len` is what the initial-source ceiling is charged
     /// against; `compile` runs only after the checks that precede compilation.
@@ -1046,9 +1536,14 @@ impl Engine {
             let mut slots = Vec::new();
             let mut exposed = Vec::new();
             for s in st.symbols() {
-                // A Python state's only JS bindings are the private runtime
+                // Non-JS frontends' only JS bindings are the private runtime
                 // bootstrap; never expose them as user globals.
-                if language == zipp_vm::frontend::LanguageId::Python {
+                if matches!(
+                    language,
+                    zipp_vm::frontend::LanguageId::Python
+                        | zipp_vm::frontend::LanguageId::Php
+                        | zipp_vm::frontend::LanguageId::Rust
+                ) {
                     continue;
                 }
                 // Preamble names are engine plumbing, with one exception: the host
@@ -1098,6 +1593,27 @@ impl Engine {
                         take_ui: find("__zipp_py_take_ui"),
                         take_host: find("__zipp_py_take_host"),
                         set_input: find("__zipp_py_set_input"),
+                    })
+                } else {
+                    None
+                };
+            }
+            #[cfg(feature = "rust")]
+            {
+                self.rust_hooks = if language == zipp_vm::frontend::LanguageId::Rust {
+                    Some(RustHooks {
+                        worker_request: find("__zipp_rs_worker_request"),
+                    })
+                } else {
+                    None
+                };
+            }
+            #[cfg(feature = "php")]
+            {
+                self.php_hooks = if language == zipp_vm::frontend::LanguageId::Php {
+                    Some(PhpHooks {
+                        worker_request: find("__zipp_php_worker_request"),
+                        take_response: find("__zipp_php_take_response"),
                     })
                 } else {
                     None
@@ -2437,6 +2953,14 @@ impl Engine {
         {
             self.python_hooks = None;
         }
+        #[cfg(feature = "rust")]
+        {
+            self.rust_hooks = None;
+        }
+        #[cfg(feature = "php")]
+        {
+            self.php_hooks = None;
+        }
         // Add this engine's figures to the instance totals before the state
         // that knows them is dropped. Every engine is disposed once, whether
         // or not it ever initialized.
@@ -2458,6 +2982,435 @@ impl Engine {
         self.deferred_drain_error = None;
         *self.bridges.borrow_mut() = Bridges::default();
         self.disposed = true;
+    }
+}
+
+/// Persistent multi-file PHP 8.x application runner for sandboxed browser/WASM
+/// hosting (shared-nothing SAPI per request, shared read-only VFS + shared
+/// mutable VFS overlay for sessions/uploads/compiled templates + OPcache).
+#[cfg(feature = "php")]
+#[wasm_bindgen]
+pub struct PhpApp {
+    vfs: HashMap<String, Vec<u8>>,
+    vfs_arc_cache: Option<std::sync::Arc<HashMap<String, Vec<u8>>>>,
+    vfs_bytes: usize,
+    vfs_overlay: std::sync::Arc<std::sync::Mutex<zipp_vm::frontend::PhpVfsOverlay>>,
+    base_dir: String,
+    env: Vec<(String, String)>,
+    bridges: Rc<RefCell<Bridges>>,
+    instruction_budget: u64,
+    disposed: bool,
+}
+
+#[cfg(feature = "php")]
+#[wasm_bindgen]
+impl PhpApp {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> PhpApp {
+        PhpApp {
+            vfs: HashMap::new(),
+            vfs_arc_cache: None,
+            vfs_bytes: 0,
+            vfs_overlay: std::sync::Arc::new(std::sync::Mutex::new(
+                zipp_vm::frontend::PhpVfsOverlay::default(),
+            )),
+            base_dir: "/".to_owned(),
+            env: Vec::new(),
+            bridges: Rc::new(RefCell::new(Bridges::default())),
+            instruction_budget: MAX_LIFETIME_STEPS,
+            disposed: false,
+        }
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn disposed(&self) -> bool {
+        self.disposed
+    }
+
+    #[wasm_bindgen(js_name = setBaseDir)]
+    pub fn set_base_dir(&mut self, dir: &str) -> Result<(), JsValue> {
+        self.ensure_live()?;
+        self.base_dir = if dir.is_empty() { "/".to_owned() } else { dir.to_owned() };
+        Ok(())
+    }
+
+    #[wasm_bindgen(js_name = setEnv)]
+    pub fn set_env(&mut self, env_obj: JsValue) -> Result<(), JsValue> {
+        self.ensure_live()?;
+        let parsed = from_js(&env_obj).map_err(to_js_error)?;
+        self.env = parse_env_pairs(&parsed).map_err(to_js_error)?;
+        Ok(())
+    }
+
+    #[wasm_bindgen(js_name = setInstructionBudget)]
+    pub fn set_instruction_budget(&mut self, steps: f64) -> bool {
+        if self.disposed {
+            return false;
+        }
+        self.instruction_budget = if steps.is_finite() {
+            (steps.max(1.0).min(MAX_INSTRUCTION_BUDGET_STEPS as f64)) as u64
+        } else {
+            MAX_LIFETIME_STEPS
+        };
+        true
+    }
+
+    #[wasm_bindgen(js_name = setAppBridge)]
+    pub fn set_app_bridge(&mut self, bridge: JsValue) -> Result<(), JsValue> {
+        self.ensure_live()?;
+        self.bridges.borrow_mut().app = Some(require_bridge(bridge, "app")?);
+        Ok(())
+    }
+
+    #[wasm_bindgen(js_name = addAppBridge)]
+    pub fn add_app_bridge(&mut self, namespace: &str, bridge: JsValue) -> Result<(), JsValue> {
+        self.ensure_live()?;
+        if !is_app_namespace(namespace) {
+            return Err(JsValue::from_str(&format!(
+                "TypeError: invalid app bridge namespace '{namespace}'"
+            )));
+        }
+        let obj = require_bridge(bridge, "app")?;
+        self.bridges
+            .borrow_mut()
+            .app_namespaces
+            .insert(namespace.to_owned(), obj);
+        Ok(())
+    }
+
+    #[wasm_bindgen(js_name = setSyncHostCapabilities)]
+    pub fn set_sync_host_capabilities(&mut self, operations: JsValue) -> Result<(), JsValue> {
+        self.ensure_live()?;
+        if !checked_is_array(&operations, "synchronous host capabilities").map_err(to_js_error)? {
+            return Err(JsValue::from_str(
+                "TypeError: synchronous host capabilities must be an array",
+            ));
+        }
+        let len = checked_array_length(&operations, "synchronous host capabilities")
+            .map_err(to_js_error)?;
+        if len > MAX_SYNC_CAPABILITY_ENTRIES {
+            return Err(JsValue::from_str(
+                "RangeError: too many synchronous host capability entries",
+            ));
+        }
+        let mut allowed = HashSet::with_capacity(len as usize);
+        for index in 0..len {
+            let op = checked_array_get(&operations, index, "synchronous host capabilities")
+                .map_err(to_js_error)?;
+            let Some(op) = op.as_string() else {
+                return Err(JsValue::from_str(
+                    "TypeError: synchronous host capability names must be strings",
+                ));
+            };
+            if !is_allowed_sync_host_call(&op) {
+                return Err(JsValue::from_str(&format!(
+                    "TypeError: unknown synchronous host capability '{op}'"
+                )));
+            }
+            allowed.insert(op);
+        }
+        self.bridges.borrow_mut().allowed_sync_operations = allowed;
+        Ok(())
+    }
+
+    /// Mount a map of `{ path: string | { base64: string } }` into the app's
+    /// virtual filesystem. May be called multiple times (e.g. in chunks).
+    #[wasm_bindgen(js_name = mountFiles)]
+    pub fn mount_files(&mut self, files: JsValue) -> Result<(), JsValue> {
+        self.ensure_live()?;
+        parse_vfs_files_map(&files, &mut self.vfs, &mut self.vfs_bytes).map_err(to_js_error)?;
+        self.vfs_arc_cache = None;
+        Ok(())
+    }
+
+    #[wasm_bindgen(js_name = mountFile)]
+    pub fn mount_file(&mut self, path: &str, content: &str) -> Result<(), JsValue> {
+        self.ensure_live()?;
+        self.insert_vfs_bytes(path, content.as_bytes().to_vec())
+    }
+
+    #[wasm_bindgen(js_name = mountFileBase64)]
+    pub fn mount_file_base64(&mut self, path: &str, base64: &str) -> Result<(), JsValue> {
+        self.ensure_live()?;
+        let bytes = base64_decode(base64).map_err(to_js_error)?;
+        self.insert_vfs_bytes(path, bytes)
+    }
+
+    /// Execute one shared-nothing HTTP SAPI request against `scriptPath` (e.g.
+    /// `"index.php"` or `"modules/sign.php"`). Returns `{ metaJson, bodyBase64, error }`.
+    #[wasm_bindgen(js_name = handleRequest)]
+    pub fn handle_request(&mut self, script_path: &str, req_json: &str) -> Result<JsValue, JsValue> {
+        self.ensure_live()?;
+        let script_key = normalize_vfs_key(script_path);
+        let entry_bytes: Option<Vec<u8>> = {
+            let ov = self.vfs_overlay.lock().unwrap_or_else(|e| e.into_inner());
+            if ov.deleted.contains(&script_key) {
+                None
+            } else if let Some(b) = ov.writes.get(&script_key) {
+                Some(b.clone())
+            } else {
+                self.vfs.get(&script_key).cloned()
+            }
+        };
+        let Some(entry_bytes) = entry_bytes else {
+            return Err(JsValue::from_str(&format!(
+                "Error: PHP script '{script_key}' not found in VFS"
+            )));
+        };
+        let entry_source = String::from_utf8_lossy(&entry_bytes).into_owned();
+        let vfs_arc = match &self.vfs_arc_cache {
+            Some(arc) => std::sync::Arc::clone(arc),
+            None => {
+                let arc = std::sync::Arc::new(self.vfs.clone());
+                self.vfs_arc_cache = Some(std::sync::Arc::clone(&arc));
+                arc
+            }
+        };
+        let req_base_dir = match script_key.rsplit_once('/') {
+            Some((parent, _)) if !parent.is_empty() => format!("/{parent}"),
+            _ => self.base_dir.clone(),
+        };
+        let config = zipp_vm::frontend::PhpProgramConfig {
+            file: format!("/{script_key}"),
+            base_dir: req_base_dir,
+            argv: Vec::new(),
+            env: self.env.clone(),
+            sapi_request_json: Some(req_json.to_owned()),
+            vfs: None,
+            vfs_arc: Some(vfs_arc),
+            vfs_overlay: Some(std::sync::Arc::clone(&self.vfs_overlay)),
+            allow_native_fs: false,
+            stream_stdout: false,
+        };
+        let mut st = match zipp_vm::frontend::compile_php_program(&entry_source, config) {
+            Ok(compiled) => compiled.into_state(),
+            Err(err) => {
+                let body = err.as_bytes().to_vec();
+                return self.build_php_result(
+                    "{\"status\":500,\"headers\":[[\"Content-Type\",\"text/plain; charset=UTF-8\"]],\"body\":\"\"}".to_owned(),
+                    &body,
+                    Some(err),
+                );
+            }
+        };
+
+        st.set_limits(self.instruction_budget, None);
+        st.set_dynamic_code_limits(
+            MAX_DYNAMIC_CODE_SOURCE_BYTES,
+            MAX_DYNAMIC_CODE_RETAINED_SOURCE_BYTES,
+            MAX_DYNAMIC_CODE_CALLS,
+            MAX_DYNAMIC_CODE_FUNCTIONS,
+            MAX_DYNAMIC_CODE_CLASSES,
+        );
+        st.set_heap_limit(MAX_APPROX_HEAP_BYTES);
+        st.set_output_limit(MAX_LIFETIME_OUTPUT_BYTES);
+        st.disable_vm_jit();
+
+        let bridges = Rc::clone(&self.bridges);
+        st.set_host_call_ctx(Box::new(move |ctx, kind, args| {
+            host_dispatch_ctx(&bridges, ctx, kind, args)
+        }));
+
+        let init_res = st.run_init();
+        let resource_err = st.resource_limit_error().map(|s| s.to_owned());
+        let raw_bytes = st.take_php_output();
+
+        let take_resp_slot = st
+            .symbols()
+            .into_iter()
+            .find(|s| s.name == "__zipp_php_take_response")
+            .map(|s| s.index);
+
+        let mut meta_json =
+            "{\"status\":200,\"headers\":[[\"Content-Type\",\"text/html; charset=UTF-8\"]],\"body\":\"\"}"
+                .to_owned();
+        if resource_err.is_none() {
+            if let Some(slot) = take_resp_slot {
+                let mut budget = HostValueBudget::new(65_536, 32 * 1024 * 1024);
+                if let Ok(HostValue::String(s)) = st.call_slot_bounded(slot, &[], &mut budget) {
+                    meta_json = s;
+                }
+            }
+        }
+        account_disposed(&st);
+
+        if let Some(err) = resource_err {
+            let body = if raw_bytes.is_empty() { err.as_bytes().to_vec() } else { raw_bytes };
+            return self.build_php_result(
+                "{\"status\":500,\"headers\":[[\"Content-Type\",\"text/plain; charset=UTF-8\"]],\"body\":\"\"}".to_owned(),
+                &body,
+                Some(err),
+            );
+        }
+        if let Err(err) = init_res {
+            let body = if raw_bytes.is_empty() { err.as_bytes().to_vec() } else { raw_bytes };
+            return self.build_php_result(
+                "{\"status\":500,\"headers\":[[\"Content-Type\",\"text/plain; charset=UTF-8\"]],\"body\":\"\"}".to_owned(),
+                &body,
+                Some(err),
+            );
+        }
+        self.build_php_result(meta_json, &raw_bytes, None)
+    }
+
+    /// Export the mutable VFS overlay (writes, dirs, deleted) as JSON so the
+    /// host can persist PHP sessions, uploads, and compiled templates.
+    #[wasm_bindgen(js_name = exportOverlayJson)]
+    pub fn export_overlay_json(&self) -> Result<String, JsValue> {
+        self.ensure_live()?;
+        let ov = self.vfs_overlay.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = String::from("{\"writes\":{");
+        for (i, (k, bytes)) in ov.writes.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            write_json_string(k, &mut out);
+            out.push(':');
+            write_json_string(&base64_encode(bytes), &mut out);
+        }
+        out.push_str("},\"deleted\":[");
+        for (i, k) in ov.deleted.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            write_json_string(k, &mut out);
+        }
+        out.push_str("],\"dirs\":[");
+        for (i, k) in ov.dirs.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            write_json_string(k, &mut out);
+        }
+        out.push_str("]}");
+        Ok(out)
+    }
+
+    /// Restore a previously exported mutable VFS overlay JSON snapshot.
+    #[wasm_bindgen(js_name = importOverlayJson)]
+    pub fn import_overlay_json(&mut self, json: &str) -> Result<(), JsValue> {
+        self.ensure_live()?;
+        let parsed = js_sys::JSON::parse(json)
+            .map_err(|_| JsValue::from_str("SyntaxError: invalid overlay JSON"))?;
+        let mut budget = HostValueBudget::new(262_144, MAX_PROJECT_VFS_BYTES.saturating_mul(2));
+        let seen = js_sys::WeakSet::<js_sys::Object>::new_typed();
+        let val = from_js_bounded(&parsed, 0, &seen, &mut budget).map_err(to_js_error)?;
+        let HostValue::Object(entries) = val else {
+            return Err(JsValue::from_str("TypeError: overlay JSON must be an object"));
+        };
+        let mut next = zipp_vm::frontend::PhpVfsOverlay::default();
+        for (k, v) in entries {
+            match k.as_str() {
+                "writes" => {
+                    if let HostValue::Object(w_entries) = v {
+                        for (path, b64_val) in w_entries {
+                            if let HostValue::String(b64) = b64_val {
+                                let bytes = base64_decode(&b64).map_err(to_js_error)?;
+                                let next_total = next.total_bytes.saturating_add(bytes.len());
+                                if next_total > MAX_PROJECT_VFS_BYTES {
+                                    return Err(JsValue::from_str(
+                                        "RangeError: overlay exceeds 64 MiB limit",
+                                    ));
+                                }
+                                next.total_bytes = next_total;
+                                next.writes.insert(normalize_vfs_key(&path), bytes);
+                            }
+                        }
+                    }
+                }
+                "deleted" => {
+                    if let HostValue::Array(items) = v {
+                        for item in items {
+                            if let HostValue::String(s) = item {
+                                next.deleted.insert(normalize_vfs_key(&s));
+                            }
+                        }
+                    }
+                }
+                "dirs" => {
+                    if let HostValue::Array(items) = v {
+                        for item in items {
+                            if let HostValue::String(s) = item {
+                                next.dirs.insert(normalize_vfs_key(&s));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        *self.vfs_overlay.lock().unwrap_or_else(|e| e.into_inner()) = next;
+        Ok(())
+    }
+
+    #[wasm_bindgen]
+    pub fn dispose(&mut self) {
+        self.vfs.clear();
+        self.vfs_arc_cache = None;
+        self.vfs_bytes = 0;
+        *self.vfs_overlay.lock().unwrap_or_else(|e| e.into_inner()) =
+            zipp_vm::frontend::PhpVfsOverlay::default();
+        *self.bridges.borrow_mut() = Bridges::default();
+        self.disposed = true;
+    }
+}
+
+#[cfg(feature = "php")]
+impl Default for PhpApp {
+    fn default() -> Self {
+        PhpApp::new()
+    }
+}
+
+#[cfg(feature = "php")]
+impl PhpApp {
+    fn ensure_live(&self) -> Result<(), JsValue> {
+        if self.disposed {
+            Err(JsValue::from_str("zipp: PhpApp is disposed"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn insert_vfs_bytes(&mut self, path: &str, bytes: Vec<u8>) -> Result<(), JsValue> {
+        let key = normalize_vfs_key(path);
+        if key.is_empty() {
+            return Ok(());
+        }
+        let prev = self.vfs.get(&key).map(|v| v.len()).unwrap_or(0);
+        let next_total = self.vfs_bytes.saturating_sub(prev).saturating_add(bytes.len());
+        if next_total > MAX_PROJECT_VFS_BYTES {
+            return Err(JsValue::from_str(&format!(
+                "RangeError: project VFS exceeds the {MAX_PROJECT_VFS_BYTES}-byte limit"
+            )));
+        }
+        self.vfs_bytes = next_total;
+        self.vfs.insert(key, bytes);
+        self.vfs_arc_cache = None;
+        Ok(())
+    }
+
+    fn build_php_result(
+        &self,
+        meta_json: String,
+        body_bytes: &[u8],
+        error: Option<String>,
+    ) -> Result<JsValue, JsValue> {
+        let body_b64 = base64_encode(body_bytes);
+        let err_val = match error {
+            Some(e) => HostValue::String(e),
+            None => HostValue::Null,
+        };
+        let mut budget = HostValueBudget::new(64, meta_json.len() + body_b64.len() + 4096);
+        to_js_bounded(
+            &HostValue::Object(vec![
+                ("metaJson".into(), HostValue::String(meta_json)),
+                ("bodyBase64".into(), HostValue::String(body_b64)),
+                ("error".into(), err_val),
+            ]),
+            &mut budget,
+        )
+        .map_err(to_js_error)
     }
 }
 
@@ -2925,6 +3878,10 @@ const LANGUAGES: &[&str] = &[
     "\"typescript\"",
     #[cfg(feature = "python")]
     "\"python\"",
+    #[cfg(feature = "php")]
+    "\"php\"",
+    #[cfg(feature = "rust")]
+    "\"rust\"",
 ];
 
 /// The limits and semantics this artifact was built with, as JSON.

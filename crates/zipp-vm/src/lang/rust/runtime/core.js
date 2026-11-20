@@ -125,7 +125,7 @@ var __zipp_rs = (function () {
                 const b2 = bytes[i++] & 0x3F;
                 const b3 = bytes[i++] & 0x3F;
                 const cp = ((b0 & 0x07) << 18) | (b1 << 12) | (b2 << 6) | b3;
-                out += String.fromCodePoint(cp);
+                out += (cp <= 0x10FFFF && (cp < 0xD800 || cp > 0xDFFF)) ? String.fromCodePoint(cp) : "\uFFFD";
             } else {
                 out += "\uFFFD";
             }
@@ -360,10 +360,12 @@ var __zipp_rs = (function () {
         );
         if (typeof __zipp_rs_io === "function") {
             let spins = 0;
-            while (!done && spins++ < 256) {
+            while (!done && spins++ < 4096) {
+                if (rt.__inWorkerBoot && rt.__workerBootReady) break;
                 if (typeof rt.pollTimers === "function") rt.pollTimers();
                 __zipp_rs_io("drain_microtasks", "");
-                if (!done && typeof rt.nextTimerMs === "function") {
+                if (done || (rt.__inWorkerBoot && rt.__workerBootReady)) break;
+                if (typeof rt.nextTimerMs === "function") {
                     const wait = rt.nextTimerMs();
                     if (wait !== null && wait <= 5000 && typeof __zipp_rs_time === "function") {
                         if (wait > 0) __zipp_rs_time("sleep_ms", Math.min(wait, 50));
@@ -379,11 +381,43 @@ var __zipp_rs = (function () {
 
     R.selectRace = function (branches) {
         if (!branches || branches.length === 0) return Promise.resolve(undefined);
-        const wrapped = branches.map(function (b, idx) {
-            return Promise.resolve(b[0]).then(function (val) { return [idx, val]; });
+        const isCallbackForm = Array.isArray(branches[0]) && branches[0].length === 2 && typeof branches[0][1] === "function";
+        const futs = branches.map(function (b) {
+            return deref(isCallbackForm ? b[0] : b);
         });
-        return Promise.race(wrapped).then(function (pair) {
-            return branches[pair[0]][1](pair[1]);
+        return new Promise(function (resolve, reject) {
+            let settled = false;
+            function cancelOthers(winIdx) {
+                for (let i = 0; i < futs.length; i++) {
+                    if (i === winIdx) continue;
+                    const f = futs[i];
+                    if (f && typeof f.__cancel === "function") {
+                        try { f.__cancel(); } catch (_) {}
+                    }
+                }
+            }
+            for (let idx = 0; idx < futs.length; idx++) {
+                (function (i, f) {
+                    Promise.resolve(f).then(
+                        function (val) {
+                            if (settled) return;
+                            settled = true;
+                            cancelOthers(i);
+                            if (isCallbackForm) {
+                                try { resolve(branches[i][1](val)); } catch (e) { reject(e); }
+                            } else {
+                                resolve([i, val]);
+                            }
+                        },
+                        function (err) {
+                            if (settled) return;
+                            settled = true;
+                            cancelOthers(i);
+                            reject(err);
+                        }
+                    );
+                })(idx, futs[idx]);
+            }
         });
     };
 
@@ -1073,8 +1107,27 @@ var __zipp_rs = (function () {
             case "str": case "&str": return "";
             case "Option": return NONE;
             case "Vec": return { __rs: 7, items: [] };
-            case "HashMap": return rt.mkMap(false);
-            case "BTreeMap": return rt.mkMap(true);
+            case "HashMap":
+            case "BTreeMap": {
+                const m = rt.mkMap(shortBase === "BTreeMap");
+                const lt = raw.indexOf("<");
+                if (lt >= 0) {
+                    let depth = 0, comma = -1, end = raw.length;
+                    for (let j = lt + 1; j < raw.length; j++) {
+                        const ch = raw[j];
+                        if (ch === "<" || ch === "(" || ch === "[") depth++;
+                        else if (ch === ">" || ch === ")" || ch === "]") {
+                            if (ch === ">" && depth === 0) { end = j; break; }
+                            if (depth > 0) depth--;
+                        } else if (ch === "," && depth === 0 && comma < 0) comma = j;
+                    }
+                    if (comma >= 0) {
+                        const vt = raw.slice(comma + 1, end).trim();
+                        if (vt) m.valType = vt;
+                    }
+                }
+                return m;
+            }
             case "HashSet": return rt.mkSet(false);
             case "BTreeSet": return rt.mkSet(true);
             case "VecDeque": return { __rs: 12, items: [] };

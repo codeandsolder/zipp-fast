@@ -23,6 +23,8 @@ mod rust;
 pub(crate) mod ts;
 
 #[cfg(feature = "php")]
+pub use crate::bytecode::PhpVfsOverlay;
+#[cfg(feature = "php")]
 pub use php::frontend::PhpProgramConfig;
 #[cfg(feature = "rust")]
 pub use rust::frontend::RustProgramConfig;

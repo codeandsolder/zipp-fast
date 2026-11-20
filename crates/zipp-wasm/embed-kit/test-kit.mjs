@@ -78,7 +78,7 @@ ok(`modules.json names ${manifest.modules.length} modules of ${manifest.version}
   if (packed.length) ok(`${packed.length} .wasm.br files decompress to their modules, and ${js ? js.file + ".br loads" : "none is an engine"}`);
 }
 
-const engines = ["javascript", "lite", "javascript-typescript", "javascript-python", "javascript-python-base"]
+const engines = ["javascript", "lite", "javascript-typescript", "javascript-python", "javascript-python-base", "javascript-php", "javascript-rust"]
   .filter(v => byVariant.has(v) && (only.length === 0 || only.includes(v)));
 assert.ok(engines.length, "no engine module to check");
 const outputs = {};
@@ -168,6 +168,28 @@ for (const variant of engines) {
     }
   } else {
     assert.throws(() => zipp.run("print(1)", { language: "python" }));
+  }
+
+  if (zipp.languages.includes("php")) {
+    const pe = new zipp.Engine();
+    try {
+      pe.initSource('<?php echo "php " . (6 * 7);', "php");
+      assert.equal(pe.takePhpOutput(), "php 42");
+      assert.equal(typeof zipp.bindings.PhpApp, "function");
+    } finally {
+      pe.dispose();
+      pe.free();
+    }
+  }
+  if (zipp.languages.includes("rust")) {
+    const re = new zipp.Engine();
+    try {
+      re.initSource('fn main() { println!("rust {}", 6 * 7); }', "rust");
+      assert.equal(re.takeRustOutput(), "rust 42\n");
+    } finally {
+      re.dispose();
+      re.free();
+    }
   }
   ok(`${variant}: ${m.file} (${zipp.languages.join(", ")})`);
 }

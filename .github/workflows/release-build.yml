@@ -310,6 +310,22 @@ jobs:
             optimize_flags: ""
             stack_bytes: 16777216
             languages: '["javascript","python"]'
+          # JavaScript and PHP 8.x (with PhpApp SAPI & XDB/SQL bridge support).
+          - variant: javascript-php
+            suffix: web-php
+            features: "--features php"
+            profile: release
+            optimize_flags: ""
+            stack_bytes: 16777216
+            languages: '["javascript","php"]'
+          # JavaScript and Rust (with Axum/SQLx backend & worker-boot support).
+          - variant: javascript-rust
+            suffix: web-rust
+            features: "--features rust"
+            profile: release
+            optimize_flags: ""
+            stack_bytes: 16777216
+            languages: '["javascript","rust"]'
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     defaults:

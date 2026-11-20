@@ -43,6 +43,8 @@ const RUNTIME_JS: &str = concat!(
     "\n",
     phpsrc!("runtime/sapi.js"),
     "\n",
+    phpsrc!("runtime/db.js"),
+    "\n",
     phpsrc!("runtime/entry.js"),
 );
 
@@ -109,10 +111,16 @@ pub struct PhpProgramConfig {
     pub base_dir: String,
     /// Optional CLI arguments (`argv`, with `argv[0]` = script path).
     pub argv: Vec<String>,
+    /// Host-provided environment variables visible to `$_ENV` / `getenv()` (safe in WASM/sandbox).
+    pub env: Vec<(String, String)>,
     /// Optional HTTP SAPI request JSON (`{ sapi, server, query, cookies, contentType, body, post, files }`).
     pub sapi_request_json: Option<String>,
     /// Optional virtual filesystem map (used in sandboxed / WASM / embedded runs).
     pub vfs: Option<HashMap<String, Vec<u8>>>,
+    /// Optional shared read-only VFS (avoids copying multi-file projects per SAPI request).
+    pub vfs_arc: Option<Arc<HashMap<String, Vec<u8>>>>,
+    /// Optional shared mutable VFS overlay for sandboxed writes (`file_put_contents`, `mkdir`, compiled templates).
+    pub vfs_overlay: Option<Arc<Mutex<crate::bytecode::PhpVfsOverlay>>>,
     /// Whether real host filesystem access is allowed (true in CLI/server, false in sandbox/WASM).
     pub allow_native_fs: bool,
     /// Whether raw PHP output writes directly to OS stdout (true in CLI script mode; false in HTTP SAPI / tests).
@@ -236,8 +244,10 @@ pub(crate) fn compile_program(source: &str, config: PhpProgramConfig) -> R<Progr
         base_dir: dir,
         rt_slot,
         argv: config.argv,
+        env: config.env,
         sapi_request_json: config.sapi_request_json,
-        vfs: config.vfs.map(Arc::new),
+        vfs: config.vfs_arc.or_else(|| config.vfs.map(Arc::new)),
+        vfs_overlay: config.vfs_overlay,
         allow_native_fs: config.allow_native_fs,
         stream_stdout: config.stream_stdout,
         lookup_cached_by_stat: lookup_opcache_by_stat,

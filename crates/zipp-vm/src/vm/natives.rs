@@ -4977,7 +4977,7 @@ impl<'p> Vm<'p> {
             #[cfg(feature = "node")]
             NODE_HOST_WRITE..=NODE_HOST_TIMER => self.node_host_native(id, args)?,
             #[cfg(feature = "php")]
-            PHP_OUTPUT..=PHP_MAP_KV => self.php_native_call(id, args)?,
+            PHP_OUTPUT..=PHP_SQL => self.php_native_call(id, args)?,
             #[cfg(feature = "rust")]
             RS_IO..=RS_SQLITE => self.rust_native_call(id, args)?,
             #[cfg(feature = "webassembly")]

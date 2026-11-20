@@ -103,8 +103,12 @@ pub struct RustProgramConfig {
     pub base_dir: String,
     /// Command-line arguments (`std::env::args()`, with `argv[0]` = script path).
     pub argv: Vec<String>,
+    /// Host-provided environment variables visible to `std::env::var` / `vars` (safe in WASM/sandbox).
+    pub env: Vec<(String, String)>,
     /// Optional virtual filesystem map (used in sandboxed / WASM / embedded runs).
     pub vfs: Option<HashMap<String, Vec<u8>>>,
+    /// Whether sandboxed in-memory VFS writes (`std::fs::write`, `mkdir_all`, etc.) are allowed.
+    pub allow_vfs_write: bool,
     /// Whether real host filesystem & env access is permitted (true in CLI/server, false in sandbox/WASM).
     pub allow_native_fs: bool,
     /// Whether real host TCP networking (`std::net`, `http::Router::serve`, `http::Client`) is permitted.
@@ -121,7 +125,9 @@ impl Default for RustProgramConfig {
             file: "<rust>".to_owned(),
             base_dir: ".".to_owned(),
             argv: Vec::new(),
+            env: Vec::new(),
             vfs: None,
+            allow_vfs_write: false,
             allow_native_fs: false,
             allow_net: false,
             stream_stdout: false,
@@ -199,6 +205,15 @@ pub(crate) fn compile_program(source: &str, config: RustProgramConfig) -> R<Prog
         }
     }
 
+    // Merge caller-provided environment variables after Cargo manifest defaults (caller overrides).
+    for (k, v) in config.env {
+        if let Some(existing) = pkg_env.iter_mut().find(|(ek, _)| ek == &k) {
+            existing.1 = v;
+        } else {
+            pkg_env.push((k, v));
+        }
+    }
+
     // Resolve external `mod foo;` declarations from VFS or native disk
     resolve_external_mods(
         &mut krate.items,
@@ -232,6 +247,12 @@ pub(crate) fn compile_program(source: &str, config: RustProgramConfig) -> R<Prog
         if let Some(vfs) = vfs_ref {
             if let Some(bytes) = vfs.get(&norm) {
                 return Ok(String::from_utf8_lossy(bytes).into_owned());
+            }
+            if !dir.is_empty() && dir != "." {
+                let with_dir = format!("{}/{norm}", dir.trim_end_matches('/'));
+                if let Some(bytes) = vfs.get(&with_dir) {
+                    return Ok(String::from_utf8_lossy(bytes).into_owned());
+                }
             }
         }
         #[cfg(not(any(feature = "safe-sandbox", target_arch = "wasm32")))]
@@ -279,6 +300,7 @@ pub(crate) fn compile_program(source: &str, config: RustProgramConfig) -> R<Prog
         base_dir: runtime_base_dir,
         argv: config.argv,
         vfs: config.vfs.map(Arc::new),
+        allow_vfs_write: config.allow_vfs_write,
         allow_native_fs: config.allow_native_fs,
         allow_net: config.allow_net,
         stream_stdout: config.stream_stdout,
@@ -301,9 +323,33 @@ fn discover_cargo_manifest(
     allow_native_fs: bool,
 ) -> Option<CargoManifest> {
     if let Some(vfs) = vfs {
-        if let Some(bytes) = vfs.get("Cargo.toml") {
-            let text = String::from_utf8_lossy(bytes);
-            return parse_cargo_toml(&text, ".");
+        let mut keys: Vec<(String, String)> = Vec::new();
+        for cand_dir in [Some(src_dir), src_dir.parent()] {
+            if let Some(d) = cand_dir {
+                let clean = d
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .trim_start_matches("./")
+                    .trim_matches('.')
+                    .trim_matches('/')
+                    .to_owned();
+                let key = if clean.is_empty() {
+                    "Cargo.toml".to_owned()
+                } else {
+                    format!("{clean}/Cargo.toml")
+                };
+                let manifest_dir = if clean.is_empty() { ".".to_owned() } else { clean };
+                keys.push((key, manifest_dir));
+            }
+        }
+        keys.push(("Cargo.toml".to_owned(), ".".to_owned()));
+        for (key, manifest_dir) in keys {
+            if let Some(bytes) = vfs.get(&key) {
+                let text = String::from_utf8_lossy(bytes);
+                if let Some(m) = parse_cargo_toml(&text, &manifest_dir) {
+                    return Some(m);
+                }
+            }
         }
     }
     #[cfg(not(any(feature = "safe-sandbox", target_arch = "wasm32")))]
@@ -372,10 +418,23 @@ fn load_sibling_lib_rs(
     allow_native_fs: bool,
 ) -> Option<(String, String, PathBuf)> {
     if let Some(vfs) = vfs {
-        for key in ["src/lib.rs", "lib.rs"] {
-            if let Some(bytes) = vfs.get(key) {
-                let d = Path::new(key).parent().unwrap_or(Path::new("")).to_path_buf();
-                return Some((String::from_utf8_lossy(bytes).into_owned(), key.to_owned(), d));
+        let dir_prefix = src_dir
+            .to_string_lossy()
+            .replace('\\', "/")
+            .trim_start_matches("./")
+            .trim_matches('.')
+            .trim_matches('/')
+            .to_owned();
+        let mut candidates = Vec::new();
+        if !dir_prefix.is_empty() {
+            candidates.push(format!("{dir_prefix}/lib.rs"));
+        }
+        candidates.push("src/lib.rs".to_owned());
+        candidates.push("lib.rs".to_owned());
+        for key in candidates {
+            if let Some(bytes) = vfs.get(&key) {
+                let d = Path::new(&key).parent().unwrap_or(Path::new("")).to_path_buf();
+                return Some((String::from_utf8_lossy(bytes).into_owned(), key, d));
             }
         }
     }

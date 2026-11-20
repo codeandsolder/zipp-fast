@@ -157,7 +157,7 @@
         "badfunctioncallexception", "badmethodcallexception", "lengthexception",
         "overflowexception", "rangeexception", "underflowexception",
         "reflectionexception", "compileerror", "serializable",
-        "sessionhandlerinterface", "sessionidinterface"
+        "sessionhandlerinterface", "sessionidinterface", "sessionupdatetimestamphandlerinterface", "sessionhandler"
     ], function () {
         defExc("BadFunctionCallException", "LogicException");
         defExc("BadMethodCallException", "BadFunctionCallException");
@@ -170,6 +170,21 @@
         R.defInterface({ name: "Serializable", kind: "interface" });
         R.defInterface({ name: "SessionHandlerInterface", kind: "interface" });
         R.defInterface({ name: "SessionIdInterface", kind: "interface" });
+        R.defInterface({ name: "SessionUpdateTimestampHandlerInterface", kind: "interface" });
+        R.defClass({
+            name: "SessionHandler",
+            kind: "class",
+            implements: ["SessionHandlerInterface", "SessionIdInterface"],
+            methods: [
+                { name: "open", vis: 0, builtin: function () { return true; } },
+                { name: "close", vis: 0, builtin: function () { return true; } },
+                { name: "read", vis: 0, builtin: function () { return ""; } },
+                { name: "write", vis: 0, builtin: function () { return true; } },
+                { name: "destroy", vis: 0, builtin: function () { return true; } },
+                { name: "gc", vis: 0, builtin: function () { return 0n; } },
+                { name: "create_sid", vis: 0, builtin: function () { return rt.funcs.get("bin2hex").builtin(rt.funcs.get("random_bytes").builtin(16n)); } },
+            ],
+        });
     });
 
     rt.registerLazyClass([
@@ -1481,7 +1496,8 @@
     let lastError = null;
     const loadedExts = new Set([
         "core", "standard", "date", "json", "pcre", "hash", "spl",
-        "reflection", "session", "filter", "ctype", "mbstring", "random", "tokenizer"
+        "reflection", "session", "filter", "ctype", "mbstring", "random", "tokenizer",
+        "pdo", "pdo_sqlite", "pdo_mysql", "sqlite3", "mysqli", "openssl", "fileinfo"
     ]);
 
     reg("ini_get", function (k) {

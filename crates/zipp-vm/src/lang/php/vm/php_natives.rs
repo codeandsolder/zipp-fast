@@ -7,7 +7,11 @@
 use super::*;
 use crate::heap::{HeapObj, ObjMap, PropAttr};
 use crate::value::Value;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+
+/// Maximum bytes retained in a sandboxed PHP VM's in-memory writable VFS overlay.
+const MAX_PHP_VFS_OVERLAY_BYTES: usize = 64 * 1024 * 1024;
 
 /// Convert a PHP byte-string (Latin-1 code units U+0000..=U+00FF) to raw bytes.
 fn js_bstr_to_bytes(s: &str) -> Vec<u8> {
@@ -44,6 +48,7 @@ impl<'p> Vm<'p> {
             native::PHP_ENV => self.php_env_native(),
             native::PHP_SAPI => self.php_sapi_native(arg(0)),
             native::PHP_MAP_KV => self.php_map_kv_native(arg(0)),
+            native::PHP_SQL => self.php_sql_native(arg(0), arg(1), arg(2), arg(3)),
             _ => Err(Thrown::from_static("InternalError: unknown PHP native")),
         }
     }
@@ -214,32 +219,289 @@ impl<'p> Vm<'p> {
         let a = self.to_js_string(a_v)?;
         let b = self.to_js_string(b_v)?;
         let ctx = self.program.php_ctx.as_deref();
+        let allow_native = ctx.is_some_and(|c| c.allow_native_fs);
+        let vfs_opt = ctx.and_then(|c| c.vfs.clone());
+        let overlay_opt = ctx.and_then(|c| c.vfs_overlay.clone());
 
-        // Check VFS first (used in sandbox / WASM / embedded tests).
-        if let Some(vfs) = ctx.and_then(|c| c.vfs.as_ref()) {
-            let norm = a.replace('\\', "/").trim_start_matches("./").to_owned();
+        // Check VFS + optional writable overlay first (used in sandbox / WASM / embedded runs).
+        if vfs_opt.is_some() || overlay_opt.is_some() {
+            let base_dir = ctx.map(|c| c.base_dir.as_str()).unwrap_or("");
+            let resolve_vfs_path = |raw: &str| -> String {
+                if !raw.is_empty()
+                    && !raw.starts_with('/')
+                    && !raw.starts_with('\\')
+                    && !base_dir.is_empty()
+                    && base_dir != "."
+                    && base_dir != "/"
+                {
+                    normalize_rel(&format!("{base_dir}/{raw}"))
+                } else {
+                    normalize_rel(raw)
+                }
+            };
+            let norm = resolve_vfs_path(&a);
+            let read_vfs = |key: &str| -> Option<Vec<u8>> {
+                if let Some(ref ov_arc) = overlay_opt {
+                    let ov = ov_arc.lock().unwrap_or_else(|e| e.into_inner());
+                    if ov.deleted.contains(key) {
+                        return None;
+                    }
+                    if let Some(bytes) = ov.writes.get(key) {
+                        return Some(bytes.clone());
+                    }
+                }
+                vfs_opt.as_deref().and_then(|v| v.get(key).cloned())
+            };
+            let is_vfs_dir = |dir: &str| -> bool {
+                if dir.is_empty() || dir == "tmp" {
+                    return true;
+                }
+                let prefix = format!("{dir}/");
+                let deleted_has = |k: &str| -> bool {
+                    overlay_opt.as_ref().is_some_and(|ov_arc| {
+                        ov_arc.lock().unwrap_or_else(|e| e.into_inner()).deleted.contains(k)
+                    })
+                };
+                if let Some(ref ov_arc) = overlay_opt {
+                    let ov = ov_arc.lock().unwrap_or_else(|e| e.into_inner());
+                    if ov.dirs.contains(dir) {
+                        return true;
+                    }
+                    if ov.writes.keys().any(|k| k.starts_with(&prefix) && !ov.deleted.contains(k)) {
+                        return true;
+                    }
+                }
+                if let Some(v) = vfs_opt.as_deref() {
+                    if v.keys().any(|k| k.starts_with(&prefix) && !deleted_has(k)) {
+                        return true;
+                    }
+                }
+                false
+            };
             match op.as_str() {
                 "read" => {
-                    if let Some(bytes) = vfs.get(&norm) {
-                        return Ok(self.alloc_str(bytes_to_js_bstr(bytes)));
+                    if let Some(bytes) = read_vfs(&norm) {
+                        return Ok(self.alloc_str(bytes_to_js_bstr(&bytes)));
                     }
-                    if !ctx.is_some_and(|c| c.allow_native_fs) {
+                    if !allow_native {
                         return Ok(Value::NULL);
                     }
                 }
-                "exists" | "is_file" => {
-                    if vfs.contains_key(&norm) {
+                "exists" => {
+                    if read_vfs(&norm).is_some() || is_vfs_dir(&norm) {
                         return Ok(Value::TRUE);
                     }
-                    if !ctx.is_some_and(|c| c.allow_native_fs) {
+                    if !allow_native {
                         return Ok(Value::FALSE);
                     }
                 }
-                _ => {
-                    if !ctx.is_some_and(|c| c.allow_native_fs) {
+                "is_file" => {
+                    if read_vfs(&norm).is_some() {
+                        return Ok(Value::TRUE);
+                    }
+                    if !allow_native {
+                        return Ok(Value::FALSE);
+                    }
+                }
+                "is_dir" => {
+                    if is_vfs_dir(&norm) {
+                        return Ok(Value::TRUE);
+                    }
+                    if !allow_native {
+                        return Ok(Value::FALSE);
+                    }
+                }
+                "size" => {
+                    if let Some(bytes) = read_vfs(&norm) {
+                        return Ok(Value::num(bytes.len() as f64));
+                    }
+                    if !allow_native {
                         return Ok(Value::NULL);
                     }
                 }
+                "mtime" => {
+                    if read_vfs(&norm).is_some() || is_vfs_dir(&norm) {
+                        let secs = (crate::vm::clock::now_epoch_ms() / 1000.0).floor();
+                        return Ok(Value::num(secs));
+                    }
+                    if !allow_native {
+                        return Ok(Value::NULL);
+                    }
+                }
+                "realpath" => {
+                    if read_vfs(&norm).is_some() || is_vfs_dir(&norm) {
+                        return Ok(self.alloc_str(if norm.is_empty() { "/".to_owned() } else { format!("/{norm}") }));
+                    }
+                    if !allow_native {
+                        return Ok(Value::NULL);
+                    }
+                }
+                "cwd" if !allow_native => {
+                    let base = ctx.map(|c| c.base_dir.as_str()).unwrap_or(".");
+                    return Ok(self.alloc_str(if base.is_empty() || base == "." { "/".to_owned() } else { base.to_owned() }));
+                }
+                "tmpdir" if !allow_native => {
+                    return Ok(self.alloc_str("/tmp".to_owned()));
+                }
+                "scandir" => {
+                    if is_vfs_dir(&norm) {
+                        let prefix = if norm.is_empty() { String::new() } else { format!("{norm}/") };
+                        let mut seen: HashSet<String> = HashSet::new();
+                        let mut collect_key = |k: &str| {
+                            if let Some(rest) = k.strip_prefix(&prefix) {
+                                if let Some(first) = rest.split('/').next() {
+                                    if !first.is_empty() {
+                                        seen.insert(first.to_owned());
+                                    }
+                                }
+                            }
+                        };
+                        if let Some(ref ov_arc) = overlay_opt {
+                            let ov = ov_arc.lock().unwrap_or_else(|e| e.into_inner());
+                            if let Some(v) = vfs_opt.as_deref() {
+                                for k in v.keys() {
+                                    if !ov.deleted.contains(k) {
+                                        collect_key(k);
+                                    }
+                                }
+                            }
+                            for k in ov.writes.keys() {
+                                if !ov.deleted.contains(k) {
+                                    collect_key(k);
+                                }
+                            }
+                            for d in &ov.dirs {
+                                collect_key(d);
+                            }
+                        } else if let Some(v) = vfs_opt.as_deref() {
+                            for k in v.keys() {
+                                collect_key(k);
+                            }
+                        }
+                        let mut names: Vec<String> = vec![".".to_owned(), "..".to_owned()];
+                        let mut extra: Vec<String> = seen.into_iter().collect();
+                        extra.sort();
+                        names.extend(extra);
+                        let vals: Vec<Value> = names.into_iter().map(|s| self.alloc_str(s)).collect();
+                        return Ok(self.alloc_array_current_realm(vals));
+                    }
+                    if !allow_native {
+                        return Ok(Value::NULL);
+                    }
+                }
+                "write" | "append" if !allow_native => {
+                    let Some(ref ov_arc) = overlay_opt else {
+                        return Ok(Value::FALSE);
+                    };
+                    let bytes = js_bstr_to_bytes(&b);
+                    let mut next = if op == "append" {
+                        read_vfs(&norm).unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    next.extend_from_slice(&bytes);
+                    let mut ov = ov_arc.lock().unwrap_or_else(|e| e.into_inner());
+                    let prev_len = ov.writes.get(&norm).map(|v| v.len()).unwrap_or(0);
+                    let new_total = ov.total_bytes.saturating_sub(prev_len).saturating_add(next.len());
+                    if new_total > MAX_PHP_VFS_OVERLAY_BYTES {
+                        return Ok(Value::FALSE);
+                    }
+                    ov.total_bytes = new_total;
+                    ov.deleted.remove(&norm);
+                    let mut cur = norm.as_str();
+                    while let Some((parent, _)) = cur.rsplit_once('/') {
+                        if parent.is_empty() {
+                            break;
+                        }
+                        ov.dirs.insert(parent.to_owned());
+                        cur = parent;
+                    }
+                    ov.writes.insert(norm, next);
+                    return Ok(Value::TRUE);
+                }
+                "mkdir" if !allow_native => {
+                    let Some(ref ov_arc) = overlay_opt else {
+                        return Ok(Value::FALSE);
+                    };
+                    let mut ov = ov_arc.lock().unwrap_or_else(|e| e.into_inner());
+                    if !norm.is_empty() {
+                        let mut acc = String::new();
+                        for seg in norm.split('/') {
+                            if !acc.is_empty() {
+                                acc.push('/');
+                            }
+                            acc.push_str(seg);
+                            ov.dirs.insert(acc.clone());
+                        }
+                    }
+                    return Ok(Value::TRUE);
+                }
+                "rmdir" if !allow_native => {
+                    let Some(ref ov_arc) = overlay_opt else {
+                        return Ok(Value::FALSE);
+                    };
+                    let mut ov = ov_arc.lock().unwrap_or_else(|e| e.into_inner());
+                    ov.dirs.remove(&norm);
+                    return Ok(Value::TRUE);
+                }
+                "unlink" if !allow_native => {
+                    let Some(ref ov_arc) = overlay_opt else {
+                        return Ok(Value::FALSE);
+                    };
+                    let existed = read_vfs(&norm).is_some();
+                    if existed {
+                        let mut ov = ov_arc.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(old) = ov.writes.remove(&norm) {
+                            ov.total_bytes = ov.total_bytes.saturating_sub(old.len());
+                        }
+                        ov.deleted.insert(norm);
+                    }
+                    return Ok(Value::bool(existed));
+                }
+                "rename" if !allow_native => {
+                    let Some(ref ov_arc) = overlay_opt else {
+                        return Ok(Value::FALSE);
+                    };
+                    let dst = normalize_rel(&b);
+                    let Some(bytes) = read_vfs(&norm) else {
+                        return Ok(Value::FALSE);
+                    };
+                    let mut ov = ov_arc.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(old) = ov.writes.remove(&norm) {
+                        ov.total_bytes = ov.total_bytes.saturating_sub(old.len());
+                    }
+                    ov.deleted.insert(norm);
+                    let prev_dst = ov.writes.get(&dst).map(|v| v.len()).unwrap_or(0);
+                    let new_total = ov.total_bytes.saturating_sub(prev_dst).saturating_add(bytes.len());
+                    if new_total > MAX_PHP_VFS_OVERLAY_BYTES {
+                        return Ok(Value::FALSE);
+                    }
+                    ov.total_bytes = new_total;
+                    ov.deleted.remove(&dst);
+                    ov.writes.insert(dst, bytes);
+                    return Ok(Value::TRUE);
+                }
+                "copy" if !allow_native => {
+                    let Some(ref ov_arc) = overlay_opt else {
+                        return Ok(Value::FALSE);
+                    };
+                    let dst = normalize_rel(&b);
+                    let Some(bytes) = read_vfs(&norm) else {
+                        return Ok(Value::FALSE);
+                    };
+                    let mut ov = ov_arc.lock().unwrap_or_else(|e| e.into_inner());
+                    let prev_dst = ov.writes.get(&dst).map(|v| v.len()).unwrap_or(0);
+                    let new_total = ov.total_bytes.saturating_sub(prev_dst).saturating_add(bytes.len());
+                    if new_total > MAX_PHP_VFS_OVERLAY_BYTES {
+                        return Ok(Value::FALSE);
+                    }
+                    ov.total_bytes = new_total;
+                    ov.deleted.remove(&dst);
+                    ov.writes.insert(dst, bytes);
+                    return Ok(Value::TRUE);
+                }
+                _ if !allow_native => return Ok(Value::NULL),
+                _ => {}
             }
         }
 
@@ -412,7 +674,6 @@ impl<'p> Vm<'p> {
     }
 
     fn php_env_native(&mut self) -> Result<Value, Thrown> {
-        #[cfg_attr(any(feature = "safe-sandbox", target_arch = "wasm32"), allow(unused_mut))]
         let mut m = ObjMap::new();
         #[cfg(not(any(feature = "safe-sandbox", target_arch = "wasm32")))]
         if self.program.php_ctx.as_deref().is_some_and(|c| c.allow_native_fs) {
@@ -423,7 +684,67 @@ impl<'p> Vm<'p> {
                 }
             }
         }
+        let env_pairs = self
+            .program
+            .php_ctx
+            .as_deref()
+            .map(|c| c.env.clone())
+            .unwrap_or_default();
+        for (k, v) in env_pairs {
+            let sv = self.alloc_str(v);
+            m.define(&k, sv, PropAttr::data());
+        }
         Ok(self.alloc_object_current_realm(m))
+    }
+
+    fn php_sql_native(
+        &mut self,
+        op_v: Value,
+        a_v: Value,
+        b_v: Value,
+        c_v: Value,
+    ) -> Result<Value, Thrown> {
+        let op = self.to_js_string(op_v)?;
+        let a = self.to_js_string(a_v)?;
+        let b = self.to_js_string(b_v)?;
+        let c = self.to_js_string(c_v)?;
+
+        if self.host_ctx.is_some() || self.host.is_some() {
+            let kind = format!("app.sql.{op}");
+            let req_args = [a, b, c];
+            let reply = if let Some(mut host) = self.host_ctx.take() {
+                let r = host(self, &kind, &req_args);
+                self.host_ctx = Some(host);
+                r
+            } else if let Some(mut host) = self.host.take() {
+                let r = host(&kind, &req_args);
+                self.host = Some(host);
+                r
+            } else {
+                unreachable!()
+            };
+            #[cfg(feature = "instrument")]
+            if let Some(msg) = self.host_terminal_error() {
+                return Err(Thrown(msg.to_owned()));
+            }
+            return match reply {
+                Ok(s) => {
+                    self.preflight_guest_string_size(s.len())?;
+                    Ok(self.alloc_str(s))
+                }
+                Err(e) => {
+                    let mut out = String::from("{\"error\":");
+                    push_json_escaped(&mut out, &e);
+                    out.push('}');
+                    self.preflight_guest_string_size(out.len())?;
+                    Ok(self.alloc_str(out))
+                }
+            };
+        }
+
+        Ok(self.alloc_str(
+            r#"{"error":"SQL driver not attached: install a sandboxed SQL host plugin (app.sql.*)"}"#.to_owned(),
+        ))
     }
 
     fn php_sapi_native(&mut self, kind_v: Value) -> Result<Value, Thrown> {
@@ -541,29 +862,46 @@ fn resolve_php_file_meta(
     req_path: &str,
     cur_dir: &str,
 ) -> Option<ResolvedPhpFile> {
-    // 1. Check virtual filesystem first (for sandboxed / WASM / multi-file embedded tests).
-    if let Some(vfs) = &ctx.vfs {
+    // 1. Check virtual filesystem + writable overlay first (for sandboxed / WASM / multi-file embedded runs).
+    if ctx.vfs.is_some() || ctx.vfs_overlay.is_some() {
         let norm_req = req_path.replace('\\', "/");
-        let candidates = [
-            norm_req.trim_start_matches("./").to_owned(),
-            if cur_dir.is_empty() || cur_dir == "." {
-                norm_req.trim_start_matches("./").to_owned()
-            } else {
-                normalize_rel(&format!("{cur_dir}/{norm_req}"))
-            },
-            if ctx.base_dir.is_empty() || ctx.base_dir == "." {
-                norm_req.trim_start_matches("./").to_owned()
-            } else {
-                normalize_rel(&format!("{}/{norm_req}", ctx.base_dir))
-            },
-        ];
+        let is_abs = norm_req.starts_with('/');
+        let mut candidates: Vec<String> = Vec::with_capacity(3);
+        if is_abs {
+            candidates.push(normalize_rel(&norm_req));
+        } else {
+            if !cur_dir.is_empty() && cur_dir != "." && cur_dir != "/" {
+                candidates.push(normalize_rel(&format!("{cur_dir}/{norm_req}")));
+            }
+            if !ctx.base_dir.is_empty() && ctx.base_dir != "." && ctx.base_dir != "/" {
+                candidates.push(normalize_rel(&format!("{}/{norm_req}", ctx.base_dir)));
+            }
+            candidates.push(normalize_rel(&norm_req));
+        }
         for cand in candidates {
-            if let Some(bytes) = vfs.get(&cand) {
-                return Some(ResolvedPhpFile::Vfs {
-                    key: format!("vfs:{cand}"),
-                    disp: cand,
-                    bytes: bytes.clone(),
-                });
+            if let Some(ref ov_arc) = ctx.vfs_overlay {
+                let ov = ov_arc.lock().unwrap_or_else(|e| e.into_inner());
+                if ov.deleted.contains(&cand) {
+                    continue;
+                }
+                if let Some(bytes) = ov.writes.get(&cand) {
+                    let disp = format!("/{cand}");
+                    return Some(ResolvedPhpFile::Vfs {
+                        key: format!("vfsw:{cand}:{}", bytes.len()),
+                        disp,
+                        bytes: bytes.clone(),
+                    });
+                }
+            }
+            if let Some(vfs) = &ctx.vfs {
+                if let Some(bytes) = vfs.get(&cand) {
+                    let disp = format!("/{cand}");
+                    return Some(ResolvedPhpFile::Vfs {
+                        key: format!("vfs:{cand}"),
+                        disp,
+                        bytes: bytes.clone(),
+                    });
+                }
             }
         }
     }

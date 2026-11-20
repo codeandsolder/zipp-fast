@@ -322,7 +322,7 @@ impl<'a> RsEmitter<'a> {
                             }
                             let a_arr = self.js_array(&a_regs)?;
                             if method == "unwrap_or_default" {
-                                let t_reg = self.string(base_target)?;
+                                let t_reg = self.string(target)?;
                                 let t_arr = self.js_array(&[t_reg])?;
                                 return self.helper("callMethod", &[recv, mname, a_arr, t_arr]);
                             }
@@ -368,7 +368,7 @@ impl<'a> RsEmitter<'a> {
                                 let p2 = self.string("default")?;
                                 let p_arr = self.js_array(&[p1, p2])?;
                                 let empty_args = self.js_array(&[])?;
-                                let t_reg = self.string(base_target)?;
+                                let t_reg = self.string(target)?;
                                 let t_arr = self.js_array(&[t_reg])?;
                                 return self.helper("callAssoc", &[p_arr, empty_args, t_arr]);
                             }

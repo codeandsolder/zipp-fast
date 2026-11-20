@@ -789,6 +789,32 @@ impl ScriptState {
             .unwrap_or_default()
     }
 
+    /// Snapshot the mutable Rust VFS overlay (`writes`, `deleted`, `dirs`) so
+    /// hosts can persist generated files (e.g. JWT keyfiles, local uploads)
+    /// across reloads.
+    #[cfg(feature = "rust")]
+    pub fn snapshot_rust_vfs_overlay(
+        &mut self,
+    ) -> (Vec<(String, Vec<u8>)>, Vec<String>, Vec<String>) {
+        self.with_vm(|vm| {
+            let Some(st) = vm.rust_state.as_deref() else {
+                return (Vec::new(), Vec::new(), Vec::new());
+            };
+            let mut writes: Vec<(String, Vec<u8>)> = st
+                .vfs_writes
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            writes.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut deleted: Vec<String> = st.vfs_deleted.iter().cloned().collect();
+            deleted.sort();
+            let mut dirs: Vec<String> = st.vfs_dirs.iter().cloned().collect();
+            dirs.sort();
+            (writes, deleted, dirs)
+        })
+        .unwrap_or_default()
+    }
+
     /// Take the `console.error`/`console.warn` lines produced so far.
     pub fn take_errput(&mut self) -> Vec<String> {
         self.with_vm(|vm| {

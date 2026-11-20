@@ -304,12 +304,16 @@ jobs:
             "zipp-$v-javascript-typescript.wasm" \
             "zipp-$v-javascript-python.wasm" \
             "zipp-$v-javascript-python-base.wasm" \
+            "zipp-$v-javascript-php.wasm" \
+            "zipp-$v-javascript-rust.wasm" \
             "zipp-$v-torch-package.wasm" \
             "zipp-$v-javascript.wasm.br" \
             "zipp-$v-javascript-lite.wasm.br" \
             "zipp-$v-javascript-typescript.wasm.br" \
             "zipp-$v-javascript-python.wasm.br" \
             "zipp-$v-javascript-python-base.wasm.br" \
+            "zipp-$v-javascript-php.wasm.br" \
+            "zipp-$v-javascript-rust.wasm.br" \
             "zipp-$v-torch-package.wasm.br" \
             "zipp-$v-wasm-embed-kit.zip" > expected-assets.txt
           mapfile -t expected < expected-assets.txt

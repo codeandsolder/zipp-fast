@@ -48,12 +48,19 @@ function __zipp_rs_worker_request(reqJson) { return __zipp_rs.__rt.dispatchWorke
             }
             if (mode === "worker_boot") {
                 // In worker boot mode, user can either expose `fn router() -> Router` (sync or async!) or run `main()`!
-                if (typeof R.getConst("__rs_fn_router") === "function") {
-                    const r = R.blockOn(R.getConst("__rs_fn_router")());
-                    if (r && r.__rs === 15 && r.kind === "router") rt.setRouter(r);
-                } else if (mainFn) {
-                    const r = R.blockOn(mainFn());
-                    if (r && r.__rs === 15 && r.kind === "router") rt.setRouter(r);
+                rt.__inWorkerBoot = true;
+                rt.__workerBootReady = false;
+                try {
+                    if (typeof R.getConst("__rs_fn_router") === "function") {
+                        const r = R.blockOn(R.getConst("__rs_fn_router")());
+                        if (r && r.__rs === 15 && r.kind === "router") rt.setRouter(r);
+                    } else if (mainFn) {
+                        const r = R.blockOn(mainFn());
+                        if (r && r.__rs === 15 && r.kind === "router") rt.setRouter(r);
+                        else handleMainResult(r);
+                    }
+                } finally {
+                    rt.__inWorkerBoot = false;
                 }
                 return null;
             }
@@ -120,6 +127,14 @@ function __zipp_rs_worker_request(reqJson) { return __zipp_rs.__rt.dispatchWorke
         return failed === 0;
     };
 
+    function pumpTasks() {
+        for (let i = 0; i < 8; i++) {
+            const fired = typeof rt.pollTimers === "function" ? rt.pollTimers() : 0;
+            if (typeof __zipp_rs_io === "function") __zipp_rs_io("drain_microtasks", "");
+            if (!fired) break;
+        }
+    }
+
     rt.dispatchWorkerRequest = function (reqJson) {
         const router = rt.getRouter();
         if (!router) {
@@ -132,9 +147,96 @@ function __zipp_rs_worker_request(reqJson) { return __zipp_rs.__rt.dispatchWorke
         let parsed = {};
         try { parsed = JSON.parse(reqJson); } catch (_) {}
         try {
+            if (parsed && typeof parsed.__control === "string") {
+                const ctrl = parsed.__control;
+                if (ctrl === "poll_timers") {
+                    pumpTasks();
+                    return JSON.stringify({
+                        ok: true,
+                        wsFrames: typeof rt.wsDrainOutbox === "function" ? rt.wsDrainOutbox() : [],
+                        nextTimerMs: typeof rt.nextTimerMs === "function" ? rt.nextTimerMs() : null
+                    });
+                }
+                if (ctrl === "ws_open") {
+                    const wsId = String(parsed.wsId || "");
+                    const hdrs = Array.isArray(parsed.headers) ? parsed.headers.slice() : [];
+                    hdrs.push(["Upgrade", "websocket"]);
+                    hdrs.push(["Connection", "Upgrade"]);
+                    const req = rt.mkRequest("GET", parsed.uri || "/", hdrs, "", null);
+                    req.__wsId = wsId;
+                    if (typeof rt.mkSocketAddr === "function") {
+                        req.peerAddr = rt.mkSocketAddr("127.0.0.1", 0);
+                    }
+                    const resp = rt.routerDispatch(router, req);
+                    if (resp && resp.__wsUpgraded && typeof rt.wsStartUpgrade === "function") {
+                        rt.wsStartUpgrade(resp.__wsUpgraded);
+                        pumpTasks();
+                        return JSON.stringify({
+                            ok: true,
+                            accepted: true,
+                            status: 101,
+                            wsFrames: typeof rt.wsDrainOutbox === "function" ? rt.wsDrainOutbox() : [],
+                            nextTimerMs: typeof rt.nextTimerMs === "function" ? rt.nextTimerMs() : null
+                        });
+                    }
+                    pumpTasks();
+                    return JSON.stringify({
+                        ok: false,
+                        accepted: false,
+                        status: resp ? resp.status : 501,
+                        body: resp ? (resp.body || "") : "WebSocket upgrade rejected",
+                        wsFrames: typeof rt.wsDrainOutbox === "function" ? rt.wsDrainOutbox() : [],
+                        nextTimerMs: typeof rt.nextTimerMs === "function" ? rt.nextTimerMs() : null
+                    });
+                }
+                if (ctrl === "ws_send") {
+                    const delivered = typeof rt.wsReceiveFromClient === "function"
+                        ? rt.wsReceiveFromClient(parsed.wsId, parsed.data, !!parsed.binary)
+                        : false;
+                    pumpTasks();
+                    return JSON.stringify({
+                        ok: delivered,
+                        wsFrames: typeof rt.wsDrainOutbox === "function" ? rt.wsDrainOutbox() : [],
+                        nextTimerMs: typeof rt.nextTimerMs === "function" ? rt.nextTimerMs() : null
+                    });
+                }
+                if (ctrl === "ws_close") {
+                    const closed = typeof rt.wsCloseFromClient === "function"
+                        ? rt.wsCloseFromClient(parsed.wsId, parsed.code, parsed.reason)
+                        : false;
+                    pumpTasks();
+                    return JSON.stringify({
+                        ok: closed,
+                        wsFrames: typeof rt.wsDrainOutbox === "function" ? rt.wsDrainOutbox() : [],
+                        nextTimerMs: typeof rt.nextTimerMs === "function" ? rt.nextTimerMs() : null
+                    });
+                }
+            }
+            if (typeof rt.pollTimers === "function") rt.pollTimers();
             const req = rt.mkRequest(parsed.method, parsed.uri, parsed.headers, parsed.body, null);
+            if (typeof rt.mkSocketAddr === "function") {
+                req.peerAddr = rt.mkSocketAddr("127.0.0.1", 0);
+            }
             const resp = rt.routerDispatch(router, req);
-            return rt.responseToJson(resp);
+            pumpTasks();
+            const wsFrames = typeof rt.wsDrainOutbox === "function" ? rt.wsDrainOutbox() : [];
+            const nextTimerMs = typeof rt.nextTimerMs === "function" ? rt.nextTimerMs() : null;
+            if (wsFrames.length === 0 && nextTimerMs === null) {
+                return rt.responseToJson(resp);
+            }
+            const hdrs = [];
+            const entries = rt.mapEntries(resp.headers);
+            for (let i = 0; i < entries.length; i++) {
+                hdrs.push([rt.strVal(entries[i][0]), rt.strVal(entries[i][1])]);
+            }
+            const out = {
+                status: resp.status,
+                headers: hdrs,
+                body: resp.body
+            };
+            if (wsFrames.length > 0) out.wsFrames = wsFrames;
+            if (nextTimerMs !== null) out.nextTimerMs = nextTimerMs;
+            return JSON.stringify(out);
         } catch (e) {
             const msg = e && e.isRsPanic ? ("Rust panic: " + e.message) : String(e);
             return JSON.stringify({

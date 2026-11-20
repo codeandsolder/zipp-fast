@@ -6,8 +6,11 @@
 
 use super::*;
 use crate::value::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+
+/// Maximum bytes retained in a sandboxed Rust VM's in-memory writable VFS overlay.
+const MAX_RUST_VFS_OVERLAY_BYTES: usize = 64 * 1024 * 1024;
 
 #[cfg(not(any(feature = "safe-sandbox", target_arch = "wasm32")))]
 use std::io::{BufRead, BufReader, Read, Write};
@@ -17,8 +20,15 @@ use std::net::{TcpListener, TcpStream};
 /// Per-VM state for Rust networking, monotonic clock epoch, and thread-safe env overrides.
 pub(crate) struct RustVmState {
     pub env_overrides: HashMap<String, Option<String>>,
+    /// In-memory writable VFS overlay used in sandbox / WASM mode when host FS is disabled.
+    pub vfs_writes: HashMap<String, Vec<u8>>,
+    pub vfs_deleted: HashSet<String>,
+    pub vfs_dirs: HashSet<String>,
+    pub vfs_write_bytes: usize,
     #[cfg(not(target_arch = "wasm32"))]
     pub epoch: std::time::Instant,
+    #[cfg(target_arch = "wasm32")]
+    pub epoch_mono_ms: f64,
     #[cfg(not(any(feature = "safe-sandbox", target_arch = "wasm32")))]
     pub next_handle: u32,
     #[cfg(not(any(feature = "safe-sandbox", target_arch = "wasm32")))]
@@ -41,11 +51,23 @@ impl Default for RustVmState {
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0x9E37_79B9_7F4A_7C15);
         #[cfg(target_arch = "wasm32")]
-        let seed = 0x9E37_79B9_7F4A_7C15u64;
+        let seed = {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static WASM_RNG_CTR: AtomicU64 = AtomicU64::new(1);
+            let t = crate::vm::clock::now_epoch_ns() as u64;
+            let c = WASM_RNG_CTR.fetch_add(1, Ordering::Relaxed);
+            t ^ c.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        };
         Self {
             env_overrides: HashMap::new(),
+            vfs_writes: HashMap::new(),
+            vfs_deleted: HashSet::new(),
+            vfs_dirs: HashSet::new(),
+            vfs_write_bytes: 0,
             #[cfg(not(target_arch = "wasm32"))]
             epoch: std::time::Instant::now(),
+            #[cfg(target_arch = "wasm32")]
+            epoch_mono_ms: crate::vm::clock::now_mono_ms(),
             #[cfg(not(any(feature = "safe-sandbox", target_arch = "wasm32")))]
             next_handle: 1,
             #[cfg(not(any(feature = "safe-sandbox", target_arch = "wasm32")))]
@@ -176,26 +198,297 @@ impl<'p> Vm<'p> {
         let b = self.to_js_string(b_v)?;
         let ctx = self.program.rust_ctx.as_deref();
         let allow_native = ctx.is_some_and(|c| c.allow_native_fs);
+        let allow_vfs_write = ctx.is_some_and(|c| c.allow_vfs_write);
+        let vfs_opt = ctx.and_then(|c| c.vfs.clone());
 
-        // VFS lookup first (works in sandbox, WASM, and embedded tests).
-        if let Some(vfs) = ctx.and_then(|c| c.vfs.as_ref()) {
-            let norm = a.replace('\\', "/").trim_start_matches("./").to_owned();
+        // VFS / writable in-memory overlay lookup (works in sandbox, WASM, and embedded tests).
+        if vfs_opt.is_some() || allow_vfs_write {
+            let norm_path = |raw: &str| -> String {
+                let replaced = raw.replace('\\', "/");
+                let mut parts: Vec<&str> = Vec::new();
+                for seg in replaced.split('/') {
+                    match seg {
+                        "" | "." => {}
+                        ".." => {
+                            parts.pop();
+                        }
+                        s => parts.push(s),
+                    }
+                }
+                parts.join("/")
+            };
+            let norm = norm_path(&a);
+            let read_vfs = |st: Option<&RustVmState>, key: &str| -> Option<Vec<u8>> {
+                if let Some(st) = st {
+                    if st.vfs_deleted.contains(key) {
+                        return None;
+                    }
+                    if let Some(bytes) = st.vfs_writes.get(key) {
+                        return Some(bytes.clone());
+                    }
+                }
+                vfs_opt.as_deref().and_then(|v| v.get(key).cloned())
+            };
+            let is_vfs_dir = |st: Option<&RustVmState>, dir: &str| -> bool {
+                if dir.is_empty() {
+                    return true;
+                }
+                let prefix = format!("{dir}/");
+                if let Some(st) = st {
+                    if st.vfs_dirs.contains(dir) {
+                        return true;
+                    }
+                    if st.vfs_writes.keys().any(|k| k.starts_with(&prefix) && !st.vfs_deleted.contains(k)) {
+                        return true;
+                    }
+                }
+                if let Some(v) = vfs_opt.as_deref() {
+                    if v.keys().any(|k| k.starts_with(&prefix) && !st.is_some_and(|s| s.vfs_deleted.contains(k))) {
+                        return true;
+                    }
+                }
+                false
+            };
             match op.as_str() {
                 "read" => {
-                    if let Some(bytes) = vfs.get(&norm) {
-                        return Ok(self.alloc_str(String::from_utf8_lossy(bytes).into_owned()));
+                    if let Some(bytes) = read_vfs(self.rust_state.as_deref(), &norm) {
+                        return Ok(self.alloc_str(String::from_utf8_lossy(&bytes).into_owned()));
                     }
                     if !allow_native {
                         return Ok(Value::NULL);
                     }
                 }
-                "exists" | "is_file" => {
-                    if vfs.contains_key(&norm) {
+                "read_bytes_hex" => {
+                    if let Some(bytes) = read_vfs(self.rust_state.as_deref(), &norm) {
+                        return Ok(self.alloc_str(hex_encode(&bytes)));
+                    }
+                    if !allow_native {
+                        return Ok(Value::NULL);
+                    }
+                }
+                "exists" => {
+                    if read_vfs(self.rust_state.as_deref(), &norm).is_some()
+                        || is_vfs_dir(self.rust_state.as_deref(), &norm)
+                    {
                         return Ok(Value::TRUE);
                     }
                     if !allow_native {
                         return Ok(Value::FALSE);
                     }
+                }
+                "is_file" => {
+                    if read_vfs(self.rust_state.as_deref(), &norm).is_some() {
+                        return Ok(Value::TRUE);
+                    }
+                    if !allow_native {
+                        return Ok(Value::FALSE);
+                    }
+                }
+                "is_dir" => {
+                    if is_vfs_dir(self.rust_state.as_deref(), &norm) {
+                        return Ok(Value::TRUE);
+                    }
+                    if !allow_native {
+                        return Ok(Value::FALSE);
+                    }
+                }
+                "metadata" => {
+                    if let Some(bytes) = read_vfs(self.rust_state.as_deref(), &norm) {
+                        let json = format!(
+                            "{{\"len\":{},\"is_file\":true,\"is_dir\":false}}",
+                            bytes.len()
+                        );
+                        return Ok(self.alloc_str(json));
+                    }
+                    if is_vfs_dir(self.rust_state.as_deref(), &norm) {
+                        return Ok(self.alloc_str(
+                            r#"{"len":0,"is_file":false,"is_dir":true}"#.to_owned(),
+                        ));
+                    }
+                    if !allow_native {
+                        return Ok(Value::NULL);
+                    }
+                }
+                "canonicalize" => {
+                    if read_vfs(self.rust_state.as_deref(), &norm).is_some()
+                        || is_vfs_dir(self.rust_state.as_deref(), &norm)
+                    {
+                        return Ok(self.alloc_str(format!("/{norm}")));
+                    }
+                    if !allow_native {
+                        return Ok(Value::NULL);
+                    }
+                }
+                "read_dir" => {
+                    if is_vfs_dir(self.rust_state.as_deref(), &norm) {
+                        let prefix = if norm.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{norm}/")
+                        };
+                        let mut seen: HashSet<String> = HashSet::new();
+                        let mut collect_key = |k: &str| {
+                            if let Some(rest) = k.strip_prefix(&prefix) {
+                                if let Some(first) = rest.split('/').next() {
+                                    if !first.is_empty() {
+                                        seen.insert(first.to_owned());
+                                    }
+                                }
+                            }
+                        };
+                        if let Some(v) = vfs_opt.as_deref() {
+                            for k in v.keys() {
+                                if !self.rust_state.as_deref().is_some_and(|s| s.vfs_deleted.contains(k)) {
+                                    collect_key(k);
+                                }
+                            }
+                        }
+                        if let Some(st) = self.rust_state.as_deref() {
+                            for k in st.vfs_writes.keys() {
+                                if !st.vfs_deleted.contains(k) {
+                                    collect_key(k);
+                                }
+                            }
+                            for d in &st.vfs_dirs {
+                                collect_key(d);
+                            }
+                        }
+                        let mut names: Vec<String> = seen.into_iter().collect();
+                        names.sort();
+                        let mut out = String::from("[");
+                        for (i, name) in names.iter().enumerate() {
+                            if i > 0 {
+                                out.push(',');
+                            }
+                            let ep = format!("{prefix}{name}");
+                            out.push_str("{\"name\":");
+                            push_json_str(&mut out, name);
+                            out.push_str(",\"path\":");
+                            push_json_str(&mut out, &ep);
+                            out.push('}');
+                        }
+                        out.push(']');
+                        return Ok(self.alloc_str(out));
+                    }
+                    if !allow_native {
+                        return Ok(Value::NULL);
+                    }
+                }
+                "write" | "write_bytes_hex" | "append" | "append_bytes_hex" if allow_vfs_write && !allow_native => {
+                    let bytes = if op == "write_bytes_hex" || op == "append_bytes_hex" {
+                        hex_decode(&b)
+                    } else {
+                        b.as_bytes().to_vec()
+                    };
+                    let existing_append = if op == "append" || op == "append_bytes_hex" {
+                        read_vfs(self.rust_state.as_deref(), &norm).unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    let mut next = existing_append;
+                    next.extend_from_slice(&bytes);
+                    let st = self.ensure_rust_state();
+                    let prev_len = st.vfs_writes.get(&norm).map(|v| v.len()).unwrap_or(0);
+                    let new_total = st.vfs_write_bytes.saturating_sub(prev_len).saturating_add(next.len());
+                    if new_total > MAX_RUST_VFS_OVERLAY_BYTES {
+                        return Ok(Value::FALSE);
+                    }
+                    st.vfs_write_bytes = new_total;
+                    st.vfs_deleted.remove(&norm);
+                    // Ensure parent directories exist in overlay
+                    let mut cur = norm.as_str();
+                    while let Some((parent, _)) = cur.rsplit_once('/') {
+                        if parent.is_empty() {
+                            break;
+                        }
+                        st.vfs_dirs.insert(parent.to_owned());
+                        cur = parent;
+                    }
+                    st.vfs_writes.insert(norm, next);
+                    return Ok(Value::TRUE);
+                }
+                "mkdir" | "mkdir_all" if allow_vfs_write && !allow_native => {
+                    let st = self.ensure_rust_state();
+                    if !norm.is_empty() {
+                        let mut acc = String::new();
+                        for seg in norm.split('/') {
+                            if !acc.is_empty() {
+                                acc.push('/');
+                            }
+                            acc.push_str(seg);
+                            st.vfs_dirs.insert(acc.clone());
+                        }
+                    }
+                    return Ok(Value::TRUE);
+                }
+                "remove_file" if allow_vfs_write && !allow_native => {
+                    let existed = read_vfs(self.rust_state.as_deref(), &norm).is_some();
+                    if existed {
+                        let st = self.ensure_rust_state();
+                        if let Some(old) = st.vfs_writes.remove(&norm) {
+                            st.vfs_write_bytes = st.vfs_write_bytes.saturating_sub(old.len());
+                        }
+                        st.vfs_deleted.insert(norm);
+                    }
+                    return Ok(Value::bool(existed));
+                }
+                "remove_dir" | "remove_dir_all" if allow_vfs_write && !allow_native => {
+                    let st = self.ensure_rust_state();
+                    st.vfs_dirs.remove(&norm);
+                    if op == "remove_dir_all" && !norm.is_empty() {
+                        let prefix = format!("{norm}/");
+                        st.vfs_dirs.retain(|d| !d.starts_with(&prefix));
+                        let to_del: Vec<String> = st
+                            .vfs_writes
+                            .keys()
+                            .filter(|k| k.starts_with(&prefix))
+                            .cloned()
+                            .collect();
+                        for k in to_del {
+                            if let Some(old) = st.vfs_writes.remove(&k) {
+                                st.vfs_write_bytes = st.vfs_write_bytes.saturating_sub(old.len());
+                            }
+                            st.vfs_deleted.insert(k);
+                        }
+                    }
+                    return Ok(Value::TRUE);
+                }
+                "rename" if allow_vfs_write && !allow_native => {
+                    let dst = norm_path(&b);
+                    if let Some(bytes) = read_vfs(self.rust_state.as_deref(), &norm) {
+                        let st = self.ensure_rust_state();
+                        if let Some(old) = st.vfs_writes.remove(&norm) {
+                            st.vfs_write_bytes = st.vfs_write_bytes.saturating_sub(old.len());
+                        }
+                        st.vfs_deleted.insert(norm);
+                        let prev_dst = st.vfs_writes.get(&dst).map(|v| v.len()).unwrap_or(0);
+                        let new_total = st.vfs_write_bytes.saturating_sub(prev_dst).saturating_add(bytes.len());
+                        if new_total > MAX_RUST_VFS_OVERLAY_BYTES {
+                            return Ok(Value::FALSE);
+                        }
+                        st.vfs_write_bytes = new_total;
+                        st.vfs_deleted.remove(&dst);
+                        st.vfs_writes.insert(dst, bytes);
+                        return Ok(Value::TRUE);
+                    }
+                    return Ok(Value::FALSE);
+                }
+                "copy" if allow_vfs_write && !allow_native => {
+                    let dst = norm_path(&b);
+                    if let Some(bytes) = read_vfs(self.rust_state.as_deref(), &norm) {
+                        let len = bytes.len();
+                        let st = self.ensure_rust_state();
+                        let prev_dst = st.vfs_writes.get(&dst).map(|v| v.len()).unwrap_or(0);
+                        let new_total = st.vfs_write_bytes.saturating_sub(prev_dst).saturating_add(len);
+                        if new_total > MAX_RUST_VFS_OVERLAY_BYTES {
+                            return Ok(Value::NULL);
+                        }
+                        st.vfs_write_bytes = new_total;
+                        st.vfs_deleted.remove(&dst);
+                        st.vfs_writes.insert(dst, bytes);
+                        return Ok(Value::num(len as f64));
+                    }
+                    return Ok(Value::NULL);
                 }
                 _ if !allow_native => return Ok(Value::NULL),
                 _ => {}
@@ -243,6 +536,16 @@ impl<'p> Vm<'p> {
                         .append(true)
                         .open(&p)
                         .and_then(|mut f| f.write_all(b.as_bytes()))
+                        .is_ok();
+                    Ok(Value::bool(ok))
+                }
+                "append_bytes_hex" => {
+                    let bytes = hex_decode(&b);
+                    let ok = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&p)
+                        .and_then(|mut f| f.write_all(&bytes))
                         .is_ok();
                     Ok(Value::bool(ok))
                 }
@@ -370,6 +673,11 @@ impl<'p> Vm<'p> {
                         map.insert(k, v);
                     }
                 }
+                if let Some(ctx) = self.program.rust_ctx.as_deref() {
+                    for (k, v) in &ctx.pkg_env {
+                        map.insert(k.clone(), v.clone());
+                    }
+                }
                 if let Some(st) = self.rust_state.as_deref() {
                     for (k, v) in &st.env_overrides {
                         match v {
@@ -439,7 +747,11 @@ impl<'p> Vm<'p> {
                     return Ok(self.make_bigint(ns));
                 }
                 #[cfg(target_arch = "wasm32")]
-                return Ok(self.make_bigint(0));
+                {
+                    let start = self.ensure_rust_state().epoch_mono_ms;
+                    let delta_ms = (crate::vm::clock::now_mono_ms() - start).max(0.0);
+                    return Ok(self.make_bigint((delta_ms * 1_000_000.0) as i128));
+                }
             }
             "unix" => {
                 #[cfg(not(target_arch = "wasm32"))]
@@ -451,7 +763,10 @@ impl<'p> Vm<'p> {
                     return Ok(self.make_bigint(ns));
                 }
                 #[cfg(target_arch = "wasm32")]
-                return Ok(self.make_bigint(0));
+                {
+                    let ns = crate::vm::clock::now_epoch_ns();
+                    return Ok(self.make_bigint(ns));
+                }
             }
             "sleep_ms" => {
                 #[cfg(not(any(feature = "safe-sandbox", target_arch = "wasm32")))]
