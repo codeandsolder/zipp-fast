@@ -449,24 +449,41 @@ impl<'p> Vm<'p> {
             return false;
         }
         let idx = recv.heap_index();
-        if !matches!(
-            self.heap.get(idx),
-            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Native(_) | HeapObj::Bound { .. }
-        ) {
-            return false;
-        }
-        if self
-            .fn_props
-            .get(&idx)
-            .is_some_and(|m| m.pos(name).is_some())
+        let callable_via_mirror = {
+            #[cfg(feature = "jit")]
+            {
+                self.heap.hot_mirror_of(idx).fid < crate::heap::FID_MIRROR_STR
+            }
+            #[cfg(not(feature = "jit"))]
+            {
+                false
+            }
+        };
+        if !callable_via_mirror
+            && !matches!(
+                self.heap.get(idx),
+                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Native(_) | HeapObj::Bound { .. }
+            )
         {
             return false;
         }
-        if self
-            .proto_of
-            .get(&idx)
-            .is_some_and(|&p| p != Value::heap(self.fn_proto))
+        let skip_fn_props = match name {
+            "call" => self.fn_props_has_call == 0,
+            "apply" => self.fn_props_has_apply == 0,
+            "bind" => self.fn_props_has_bind == 0,
+            _ => false,
+        };
+        if !skip_fn_props
+            && !self.fn_props.is_empty()
+            && self
+                .fn_props
+                .get(&idx)
+                .is_some_and(|m| m.pos(name).is_some())
         {
+            return false;
+        }
+        let raw_proto = self.proto_of.raw_bits(idx);
+        if raw_proto != 0 && raw_proto != Value::heap(self.fn_proto).bits() {
             return false;
         }
         let want = match name {
@@ -474,18 +491,90 @@ impl<'p> Vm<'p> {
             "bind" => FN_BIND,
             _ => FN_CALL,
         };
-        // `own_pos`: %Function.prototype%'s shape answers `call`/`bind`
-        // from the (shape, key) memo, not a hash of the name per call.
+        // Fast path: reuse `ci_pristine`'s cached `%Function.prototype%` slot
+        // index and pristine native `Value` bits when its version matches,
+        // avoiding both `own_pos` hash lookup and the second `Heap::objs` load.
         match self.heap.get(self.fn_proto) {
-            HeapObj::Object(m) => self.own_pos(m, name).is_some_and(|slot| {
-                !m.attr_at(slot).accessor
-                    && m.val_at(slot).is_heap()
-                    && matches!(
-                        self.heap.get(m.val_at(slot).heap_index()),
-                        HeapObj::Native(id) if *id == want
-                    )
-            }),
+            HeapObj::Object(m) => {
+                #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                if self.ci_pristine.ver == self.heap.version_of(self.fn_proto) {
+                    let (slot, want_bits) = match want {
+                        FN_CALL => (self.ci_pristine.call_slot, self.ci_pristine.call_bits),
+                        FN_APPLY => (self.ci_pristine.apply_slot, self.ci_pristine.apply_bits),
+                        FN_BIND => (self.ci_pristine.bind_slot, self.ci_pristine.bind_bits),
+                        _ => (u32::MAX, 0),
+                    };
+                    if slot != u32::MAX && want_bits != 0 {
+                        return m.val_at(slot as usize).bits() == want_bits;
+                    }
+                }
+                let slot = self.own_pos(m, name);
+                slot.is_some_and(|slot| {
+                    !m.attr_at(slot).accessor
+                        && m.val_at(slot).is_heap()
+                        && matches!(
+                            self.heap.get(m.val_at(slot).heap_index()),
+                            HeapObj::Native(id) if *id == want
+                        )
+                })
+            }
             _ => false,
+        }
+    }
+
+    /// Populate `ci_pristine` for the current `%Function.prototype%` version so
+    /// `fn_call_apply_pristine` and `try_fn_call_apply_inline` resolve `"call"`,
+    /// `"apply"`, and `"bind"` in O(1) without per-call hash or `Heap::objs` lookups.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub(crate) fn refresh_ci_pristine(&mut self) {
+        use crate::vm::native::{FN_APPLY, FN_BIND, FN_CALL};
+        if self.fn_proto == 0 {
+            return;
+        }
+        let fp_ver = self.heap.version_of(self.fn_proto);
+        if self.ci_pristine.ver != fp_ver {
+            self.ci_pristine = match self.heap.get(self.fn_proto) {
+                HeapObj::Object(m) => {
+                    let probe = |name: &str, want: u16| -> (u32, u64) {
+                        let Some(s) = m.pos(name) else {
+                            return (u32::MAX, 0);
+                        };
+                        let bits = if !m.attr_at(s).accessor {
+                            let v = m.val_at(s);
+                            if v.is_heap()
+                                && matches!(
+                                    self.heap.get(v.heap_index()),
+                                    HeapObj::Native(id) if *id == want
+                                )
+                            {
+                                v.bits()
+                            } else {
+                                0
+                            }
+                        } else {
+                            0
+                        };
+                        (s as u32, bits)
+                    };
+                    let (call_slot, call_bits) = probe("call", FN_CALL);
+                    let (apply_slot, apply_bits) = probe("apply", FN_APPLY);
+                    let (bind_slot, bind_bits) = probe("bind", FN_BIND);
+                    crate::vm::CiPristine {
+                        ver: fp_ver,
+                        call_slot,
+                        apply_slot,
+                        bind_slot,
+                        call_bits,
+                        apply_bits,
+                        bind_bits,
+                    }
+                }
+                _ => crate::vm::CiPristine {
+                    ver: fp_ver,
+                    ..crate::vm::CiPristine::EMPTY
+                },
+            };
         }
     }
 
@@ -540,6 +629,8 @@ impl<'p> Vm<'p> {
         arg_base: u16,
         argc: u16,
     ) -> Option<Value> {
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        self.refresh_ci_pristine();
         if !bind_fast_enabled()
             || !recv.is_heap()
             || !self.realm_global_objs.is_empty()
@@ -1148,6 +1239,12 @@ impl<'p> Vm<'p> {
             | HeapObj::CombinatorResolver { .. } => self.fn_data_read(o, key),
             HeapObj::Iterator { proto, .. } => {
                 let proto = *proto;
+                #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                if key == "next" && proto == self.array_iter_proto && proto != 0 {
+                    if let Some(v) = self.arr_iter_next_fast(o.heap_index(), proto) {
+                        return Some(v);
+                    }
+                }
                 self.iterator_data_read(o, proto, key)
             }
             // `m.size`, as the member walk's collection arm answers it
@@ -1219,6 +1316,38 @@ impl<'p> Vm<'p> {
     /// the member walk's iterator arm, which has no own storage beyond
     /// `arr_props` and starts at a `proto_of` override, else the iterator's
     /// own prototype.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn arr_iter_next_fast(&mut self, idx: u32, proto: u32) -> Option<Value> {
+        if self.realm_global_objs.nonempty_raw != 0
+            || self.active_realm.is_some()
+            || !self.deferred_ns_state.is_empty()
+            || (!self.arr_props.is_empty() && self.arr_props.has(idx))
+            || self.proto_of.raw_bits(idx) != 0
+        {
+            return None;
+        }
+        let ver = self.heap.version_of(proto);
+        let HeapObj::Object(m) = self.heap.get(proto) else {
+            return None;
+        };
+        let (mver, mslot) = self.arr_iter_next_memo;
+        if mver == ver && mslot != u32::MAX {
+            let v = m.val_at(mslot as usize);
+            return (!v.is_uninitialized()).then_some(v);
+        }
+        if let Some(i) = self.own_pos(m, "next") {
+            if !m.attr_at(i).accessor {
+                let v = m.val_at(i);
+                if !v.is_uninitialized() {
+                    self.arr_iter_next_memo = (ver, i as u32);
+                    return Some(v);
+                }
+            }
+        }
+        None
+    }
+
     #[inline(never)]
     fn iterator_data_read(&self, o: Value, proto: u32, key: &str) -> Option<Value> {
         if !self.callable_member_lane_ok(key) {
@@ -1472,20 +1601,32 @@ impl<'p> Vm<'p> {
         name: &str,
         want: u16,
     ) -> bool {
-        let proto = match self.heap.get(idx) {
-            HeapObj::WeakMap { .. } => self.weakmap_proto,
-            HeapObj::WeakSet(_) => self.weakset_proto,
+        let (proto, wm_nid) = match self.heap.get(idx) {
+            HeapObj::WeakMap { .. } => (
+                self.weakmap_proto,
+                match want {
+                    crate::vm::native::WM_GET => Some(0usize),
+                    crate::vm::native::WM_SET => Some(1),
+                    crate::vm::native::WM_HAS => Some(2),
+                    crate::vm::native::WM_DELETE => Some(3),
+                    _ => None,
+                },
+            ),
+            HeapObj::WeakSet(_) => (
+                self.weakset_proto,
+                (want == crate::vm::native::WS_HAS).then_some(4usize),
+            ),
             _ => return false,
         };
         if proto == 0
-            || !self.realm_global_objs.is_empty()
-            || self.active_realm_proto(proto) != proto
+            || self.realm_global_objs.nonempty_raw != 0
             || (!self.arr_props.is_empty()
+                && self.arr_props.has(idx)
                 && self
                     .arr_props
                     .get(&idx)
                     .is_some_and(|props| props.pos(name).is_some()))
-            || (!self.proto_of.is_empty()
+            || (self.proto_of.raw_bits(idx) != 0
                 && self
                     .proto_of
                     .get(&idx)
@@ -1493,14 +1634,34 @@ impl<'p> Vm<'p> {
         {
             return false;
         }
-        match self.heap.get(proto) {
-            HeapObj::Object(map) => map.pos(name).is_some_and(|slot| {
-                let v = map.val_at(slot);
-                !map.attr_at(slot).accessor
-                    && v.is_heap()
-                    && matches!(self.heap.get(v.heap_index()), HeapObj::Native(id) if *id == want)
-            }),
-            _ => false,
+        let HeapObj::Object(map) = self.heap.get(proto) else {
+            return false;
+        };
+        if let Some(nid) = wm_nid {
+            if let Some((ver, slot, bits)) = self.weakmap_intrinsic_memo[nid] {
+                if self.heap.version_of(proto) == ver
+                    && map.val_get_ref(slot as usize).is_some_and(|v| v.bits() == bits)
+                {
+                    return true;
+                }
+            }
+        }
+        let proven = map.pos(name).and_then(|slot| {
+            let v = map.val_at(slot);
+            (!map.attr_at(slot).accessor
+                && v.is_heap()
+                && matches!(self.heap.get(v.heap_index()), HeapObj::Native(id) if *id == want))
+            .then(|| (slot as u32, v.bits()))
+        });
+        match proven {
+            Some((slot, bits)) => {
+                if let Some(nid) = wm_nid {
+                    self.weakmap_intrinsic_memo[nid] =
+                        Some((self.heap.version_of(proto), slot, bits));
+                }
+                true
+            }
+            None => false,
         }
     }
 
@@ -2128,24 +2289,67 @@ impl<'p> Vm<'p> {
         }
     }
 
+    #[inline]
+    pub(crate) fn collection_method_is_intrinsic_id(
+        &mut self,
+        idx: u32,
+        nid: usize,
+        name: &str,
+        kind: u8,
+    ) -> bool {
+        if self.realm_global_objs.nonempty_raw == 0
+            && (self.arr_props.is_empty() || !self.arr_props.has(idx))
+            && self.proto_of.raw_bits(idx) == 0
+        {
+            let mproto = match (self.heap.get(idx), kind) {
+                (HeapObj::Map { .. }, 4) => self.map_proto,
+                (HeapObj::Set(_), 3) => self.set_proto,
+                _ => return false,
+            };
+            if mproto != 0 {
+                if let Some((ver, pslot, fn_bits)) =
+                    self.coll_intrinsic_memo[(kind == 4) as usize][nid]
+                {
+                    if self.heap.version_of(mproto) == ver {
+                        if let HeapObj::Object(map) = self.heap.get(mproto) {
+                            if map.val_get_ref(pslot as usize).map(|v| v.bits()) == Some(fn_bits) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        } else if crate::vm::coll_proof_cache_enabled() && self.realm_global_objs.is_empty() {
+            let cslot = ((idx as usize).wrapping_mul(31) ^ nid) & (COLL_PROOF_SLOTS - 1);
+            let (ci, cv, cn, ck) = self.coll_proof_cache[cslot];
+            if ci == idx && cv == self.heap.version_of(idx) && cn == nid as u8 && ck == kind {
+                let mproto = if kind == 4 {
+                    self.map_proto
+                } else {
+                    self.set_proto
+                };
+                if let Some((ver, pslot, fn_bits)) =
+                    self.coll_intrinsic_memo[(kind == 4) as usize][nid]
+                {
+                    if self.heap.version_of(mproto) == ver {
+                        if let HeapObj::Object(map) = self.heap.get(mproto) {
+                            if map.val_get_ref(pslot as usize).map(|v| v.bits()) == Some(fn_bits) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.collection_method_is_intrinsic_slow(idx, Some(nid), name, kind)
+    }
+
     pub(crate) fn collection_method_is_intrinsic(
         &mut self,
         idx: u32,
         name: &str,
         kind: u8,
     ) -> bool {
-        // B215: the RECEIVER half of this proof, cached per (idx, method)
-        // under the receiver's heap version. Every install that could change
-        // the answer bumps `versions[idx]`: an own-shadow ADD (the named-prop
-        // store bumps on add), defineProperty (bumps unconditionally),
-        // setPrototypeOf (bumps by documented design), and slot reuse (free
-        // bumps). A shadow DELETE only widens validity, and this cache holds
-        // proven-true entries only, so its missing bump is harmless. The
-        // PROTOTYPE half deliberately stays live below - an in-place value
-        // overwrite need not bump an ObjMap version (see
-        // `string_regexp_method_is_intrinsic`), so the B183 memo's
-        // version+bits pair remains the authority there. Root realm only:
-        // the multi-realm dance keeps the full proof.
         let early_nid = match name {
             "get" => Some(0usize),
             "set" => Some(1),
@@ -2156,31 +2360,19 @@ impl<'p> Vm<'p> {
             _ => None,
         };
         if let Some(nid) = early_nid {
-            if crate::vm::coll_proof_cache_enabled() && self.realm_global_objs.is_empty() {
-                let cslot = ((idx as usize).wrapping_mul(31) ^ nid) & (COLL_PROOF_SLOTS - 1);
-                let (ci, cv, cn, ck) = self.coll_proof_cache[cslot];
-                if ci == idx && cv == self.heap.version_of(idx) && cn == nid as u8 && ck == kind {
-                    let mproto = if kind == 4 {
-                        self.map_proto
-                    } else {
-                        self.set_proto
-                    };
-                    if let Some((ver, pslot, fn_bits)) =
-                        self.coll_intrinsic_memo[(kind == 4) as usize][nid]
-                    {
-                        if self.heap.version_of(mproto) == ver {
-                            if let HeapObj::Object(map) = self.heap.get(mproto) {
-                                if map.val_get_ref(pslot as usize).map(|v| v.bits())
-                                    == Some(fn_bits)
-                                {
-                                    return true;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            return self.collection_method_is_intrinsic_id(idx, nid, name, kind);
         }
+        self.collection_method_is_intrinsic_slow(idx, None, name, kind)
+    }
+
+    #[cold]
+    fn collection_method_is_intrinsic_slow(
+        &mut self,
+        idx: u32,
+        early_nid: Option<usize>,
+        name: &str,
+        kind: u8,
+    ) -> bool {
         let proto = match (self.heap.get(idx), kind) {
             (HeapObj::Set(_), 3) => self.set_proto,
             (HeapObj::Map { .. }, 4) => self.map_proto,
@@ -4822,24 +5014,31 @@ impl<'p> Vm<'p> {
             "set" => {
                 let key = normalize_zero(a0);
                 let val = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-                let pos = self.coll_find(idx, key);
-                let mut pushed = None;
-                // Nursery barrier for the VALUE (both arms): the insert's
-                // `coll_index_insert` barriers the key, but a young value can
-                // ride an old (or non-heap) key.
-                self.heap.write_barrier_val(idx, val);
-                if let HeapObj::Map { keys, vals } = self.heap.get_mut(idx) {
-                    match pos {
-                        Some(i) => vals[i] = val, // update in place, keep position
-                        None => {
-                            pushed = Some(keys.len());
-                            keys.push(key);
-                            vals.push(val);
+                #[cfg(not(feature = "safe-sandbox"))]
+                {
+                    self.map_set_fast(idx, key, val);
+                }
+                #[cfg(feature = "safe-sandbox")]
+                {
+                    let pos = self.coll_find(idx, key);
+                    let mut pushed = None;
+                    // Nursery barrier for the VALUE (both arms): the insert's
+                    // `coll_index_insert` barriers the key, but a young value can
+                    // ride an old (or non-heap) key.
+                    self.heap.write_barrier_val(idx, val);
+                    if let HeapObj::Map { keys, vals } = self.heap.get_mut(idx) {
+                        match pos {
+                            Some(i) => vals[i] = val, // update in place, keep position
+                            None => {
+                                pushed = Some(keys.len());
+                                keys.push(key);
+                                vals.push(val);
+                            }
                         }
                     }
-                }
-                if let Some(p) = pushed {
-                    self.coll_index_insert(idx, key, p);
+                    if let Some(p) = pushed {
+                        self.coll_index_insert(idx, key, p);
+                    }
                 }
                 Ok(Some(recv)) // chainable
             }
@@ -5018,13 +5217,13 @@ impl<'p> Vm<'p> {
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         match name {
             "get" => {
-                let v = self.coll_find(idx, a0).map(|i| match self.heap.get(idx) {
+                let v = self.coll_find_weak(idx, a0).map(|i| match self.heap.get(idx) {
                     HeapObj::WeakMap { vals, .. } => vals[i],
                     _ => Value::UNDEFINED,
                 });
                 Ok(v.unwrap_or(Value::UNDEFINED))
             }
-            "has" => Ok(Value::bool(self.coll_find(idx, a0).is_some())),
+            "has" => Ok(Value::bool(self.coll_find_weak(idx, a0).is_some())),
             "set" => {
                 if !self.can_be_held_weakly(a0) {
                     return Err(Thrown::from_static(
@@ -5032,19 +5231,28 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 let val = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-                let pos = self.coll_find(idx, a0);
+                let pos = self.coll_find_weak(idx, a0);
                 let mut pushed = None;
+                let mut touched_pos = None;
                 // Nursery barrier for the VALUE (the insert barriers the key).
                 self.heap.write_barrier_val(idx, val);
                 if let HeapObj::WeakMap { keys, vals } = self.heap.get_mut(idx) {
                     match pos {
-                        Some(i) => vals[i] = val,
+                        Some(i) => {
+                            vals[i] = val;
+                            touched_pos = Some(i);
+                        }
                         None => {
-                            pushed = Some(keys.len());
+                            let p = keys.len();
+                            pushed = Some(p);
+                            touched_pos = Some(p);
                             keys.push(a0);
                             vals.push(val);
                         }
                     }
+                }
+                if let Some(p) = touched_pos {
+                    self.weak_young_entries.push((idx, p));
                 }
                 if let Some(p) = pushed {
                     self.weak_coll_index_insert(idx, a0, p);
@@ -5066,7 +5274,7 @@ impl<'p> Vm<'p> {
                         "TypeError: the callback argument must be a function",
                     ));
                 }
-                if let Some(i) = self.coll_find(idx, a0) {
+                if let Some(i) = self.coll_find_weak(idx, a0) {
                     if let HeapObj::WeakMap { vals, .. } = self.heap.get(idx) {
                         return Ok(vals[i]);
                     }
@@ -5077,19 +5285,28 @@ impl<'p> Vm<'p> {
                 } else {
                     cb // getOrInsert's `value` argument
                 };
-                let pos = self.coll_find(idx, a0);
+                let pos = self.coll_find_weak(idx, a0);
                 let mut pushed = None;
+                let mut touched_pos = None;
                 // Nursery barrier for the VALUE (the insert barriers the key).
                 self.heap.write_barrier_val(idx, val);
                 if let HeapObj::WeakMap { keys, vals } = self.heap.get_mut(idx) {
                     match pos {
-                        Some(i) => vals[i] = val,
+                        Some(i) => {
+                            vals[i] = val;
+                            touched_pos = Some(i);
+                        }
                         None => {
-                            pushed = Some(keys.len());
+                            let p = keys.len();
+                            pushed = Some(p);
+                            touched_pos = Some(p);
                             keys.push(a0);
                             vals.push(val);
                         }
                     }
+                }
+                if let Some(p) = touched_pos {
+                    self.weak_young_entries.push((idx, p));
                 }
                 if let Some(p) = pushed {
                     self.weak_coll_index_insert(idx, a0, p);
@@ -5097,7 +5314,7 @@ impl<'p> Vm<'p> {
                 Ok(val)
             }
             "delete" => {
-                if let Some(i) = self.coll_find(idx, a0) {
+                if let Some(i) = self.coll_find_weak(idx, a0) {
                     self.weak_coll_delete(idx, i, a0);
                     return Ok(Value::bool(true));
                 }
@@ -5122,25 +5339,26 @@ impl<'p> Vm<'p> {
         let idx = this.heap_index();
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         match name {
-            "has" => Ok(Value::bool(self.coll_find(idx, a0).is_some())),
+            "has" => Ok(Value::bool(self.coll_find_weak(idx, a0).is_some())),
             "add" => {
                 if !self.can_be_held_weakly(a0) {
                     return Err(Thrown::from_static("TypeError: Invalid value used in weak set"));
                 }
-                if self.coll_find(idx, a0).is_none() {
+                if self.coll_find_weak(idx, a0).is_none() {
                     let mut pushed = None;
                     if let HeapObj::WeakSet(items) = self.heap.get_mut(idx) {
                         pushed = Some(items.len());
                         items.push(a0);
                     }
                     if let Some(p) = pushed {
+                        self.weak_young_entries.push((idx, p));
                         self.weak_coll_index_insert(idx, a0, p);
                     }
                 }
                 Ok(this) // chainable
             }
             "delete" => {
-                if let Some(i) = self.coll_find(idx, a0) {
+                if let Some(i) = self.coll_find_weak(idx, a0) {
                     self.weak_coll_delete(idx, i, a0);
                     return Ok(Value::bool(true));
                 }

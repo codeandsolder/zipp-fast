@@ -39,7 +39,7 @@ impl<'p> Vm<'p> {
     fn jit_native_like_callee(&self, cv: Value) -> bool {
         cv.is_heap()
             && match self.heap.get(cv.heap_index()) {
-                HeapObj::Native(_) => true,
+                HeapObj::Native(_) | HeapObj::Bound { .. } => true,
                 HeapObj::Object(m) => m.is_ctor && jit_ctor_call_enabled(),
                 _ => false,
             }
@@ -989,6 +989,16 @@ impl<'p> Vm<'p> {
         if !recv.is_heap() {
             return SELF_CALL_DEOPT;
         }
+        // A `Func`/`Closure` receiver (e.g. `fn.apply`, `fn.bind`, or a
+        // declined `fn.call`) is never an `ObjMap` object — decline immediately
+        // before probing method ICs (`ic_call_method_mirror`/`ic_call_method`).
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            let rmir = self.heap.hot_mirror_of(recv.heap_index());
+            if rmir.fid < crate::heap::FID_MIRROR_STR {
+                return SELF_CALL_DEOPT;
+            }
+        }
         // The class method this site last resolved, under the cache's own
         // guards: ahead of decoding the instruction and walking the cache's
         // tables, which took the lookup to over 300 instructions a call.
@@ -1000,9 +1010,27 @@ impl<'p> Vm<'p> {
                 return m.callee;
             }
         }
+        // Fast mirror lookup for both ClassMethod and stamped/multi-way ProtoData
+        // before decoding the instruction or touching `Heap::objs`.
+        #[cfg(not(feature = "safe-sandbox"))]
+        if let Some((_fid, _closure, callee)) = self.ic_call_method_mirror(func_id, ip, recv) {
+            if let Some(Instr::CallMethod { name, .. }) =
+                self.func(func_id as usize).code.get(ip).copied()
+            {
+                if let Some(key) = self
+                    .func(func_id as usize)
+                    .string_constants
+                    .get(name as usize)
+                {
+                    let key = key.as_str();
+                    crate::vm::helpers_misc::warm_mega_method_memo(self, recv, func_id, name, key);
+                }
+            }
+            return callee.bits();
+        }
         // `func()` borrows for the program's lifetime (as in
         // `jit_cross_method_call_impl`).
-        let key = {
+        let (name, key) = {
             let proto = self.func(func_id as usize);
             let Some(Instr::CallMethod { name, .. }) = proto.code.get(ip).copied() else {
                 return SELF_CALL_DEOPT;
@@ -1010,11 +1038,13 @@ impl<'p> Vm<'p> {
             let Some(key) = proto.string_constants.get(name as usize) else {
                 return SELF_CALL_DEOPT;
             };
-            key.as_str()
+            (name, key.as_str())
         };
         let Some((_fid, _closure, callee)) = self.ic_call_method(func_id, ip, recv, key) else {
-            return SELF_CALL_DEOPT;
+            return crate::vm::helpers_misc::warm_mega_method_memo(self, recv, func_id, name, key)
+                .map_or(SELF_CALL_DEOPT, Value::bits);
         };
+        crate::vm::helpers_misc::warm_mega_method_memo(self, recv, func_id, name, key);
         if crate::vm::method_memo_enabled() {
             if let Some((recv_shape, class, ver, epoch)) = self.ic_class_method_guards(func_id, ip, recv, callee) {
                 if self.jit_method_memo.is_empty() {
@@ -1049,6 +1079,16 @@ impl<'p> Vm<'p> {
         let recv = Value::from_bits(recv_bits);
         if !recv.is_heap() {
             return SELF_CALL_DEOPT;
+        }
+        // A `Func`/`Closure` receiver (e.g. `fn.apply`, `fn.bind`, or a
+        // declined `fn.call`) is never an `ObjMap` object — decline immediately
+        // before probing method ICs (`ic_call_method_mirror`/`ic_call_method`).
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            let rmir = self.heap.hot_mirror_of(recv.heap_index());
+            if rmir.fid < crate::heap::FID_MIRROR_STR {
+                return SELF_CALL_DEOPT;
+            }
         }
         let way = crate::vm::method_memo_way(packed_fip);
         if let Some(m) = self.jit_method_memo.get(way) {
@@ -1136,6 +1176,16 @@ impl<'p> Vm<'p> {
         if !recv.is_heap() {
             return SELF_CALL_DEOPT;
         }
+        // A `Func`/`Closure` receiver (e.g. `fn.apply`, `fn.bind`, or a
+        // declined `fn.call`) is never an `ObjMap` object — decline immediately
+        // before probing method ICs (`ic_call_method_mirror`/`ic_call_method`).
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            let rmir = self.heap.hot_mirror_of(recv.heap_index());
+            if rmir.fid < crate::heap::FID_MIRROR_STR {
+                return SELF_CALL_DEOPT;
+            }
+        }
         // A class value's static data method (`Probe.make(s)`,
         // `Entity.isEntity(o)`): the method cache keeps no way for a class
         // receiver (`ic_recv_map` wants an object), so these declined to the
@@ -1144,7 +1194,16 @@ impl<'p> Vm<'p> {
         // The interpreter's own lane (`class_static_data_read`) resolves it
         // where it lies; a getter, a non-function or an excluded key keeps
         // the old path.
-        let callee = if crate::vm::helpers_misc::is_private_key(key) {
+        #[cfg(not(feature = "safe-sandbox"))]
+        let mirror_hit = self.ic_call_method_mirror(func_id, ip, recv);
+        #[cfg(feature = "safe-sandbox")]
+        let mirror_hit: Option<(u32, u32, Value)> = None;
+        let callee = if let Some((fid, _closure, callee)) = mirror_hit {
+            if self.jit.cross_dyn_ok(fid) {
+                crate::vm::helpers_misc::warm_mega_method_memo(self, recv, func_id, name, key);
+            }
+            callee
+        } else if crate::vm::helpers_misc::is_private_key(key) {
             // `recv.#m(...)`: the private method, brand-checked, as the
             // interpreter resolves it (`jit_private_method_callee`); anything
             // else the private call can be keeps the generic helper.
@@ -1157,11 +1216,15 @@ impl<'p> Vm<'p> {
                 Some(f) => f,
                 None => return SELF_CALL_DEOPT,
             }
-        } else {
-            let Some((_fid, _closure, callee)) = self.ic_call_method(func_id, ip, recv, key) else {
-                return SELF_CALL_DEOPT;
-            };
+        } else if let Some((_fid, _closure, callee)) = self.ic_call_method(func_id, ip, recv, key) {
+            crate::vm::helpers_misc::warm_mega_method_memo(self, recv, func_id, name, key);
             callee
+        } else if let Some(callee) =
+            crate::vm::helpers_misc::warm_mega_method_memo(self, recv, func_id, name, key)
+        {
+            callee
+        } else {
+            return SELF_CALL_DEOPT;
         };
         let packed = argc as u64 | ((caller_regs as u64) << 16);
         self.jit_cross_call_impl::<false>(caller_base_ptr, args, packed, callee.bits(), Some(recv))
@@ -1298,6 +1361,16 @@ impl<'p> Vm<'p> {
         let key = self.get(base, key_reg);
         if !recv.is_heap() {
             return SELF_CALL_DEOPT;
+        }
+        // A `Func`/`Closure` receiver (e.g. `fn.apply`, `fn.bind`, or a
+        // declined `fn.call`) is never an `ObjMap` object — decline immediately
+        // before probing method ICs (`ic_call_method_mirror`/`ic_call_method`).
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            let rmir = self.heap.hot_mirror_of(recv.heap_index());
+            if rmir.fid < crate::heap::FID_MIRROR_STR {
+                return SELF_CALL_DEOPT;
+            }
         }
         let Some(index) = array_index(key) else {
             return SELF_CALL_DEOPT;
@@ -1643,6 +1716,7 @@ impl<'p> Vm<'p> {
                         if let HeapObj::Object(m) = self.heap.get_mut(oi) {
                             m.define(key, v, crate::heap::PropAttr::data());
                         }
+                        self.heap.bump_version(oi);
                         Ok(())
                     } else if o.is_heap() {
                         let k = key.to_string();
@@ -2274,6 +2348,9 @@ impl<'p> Vm<'p> {
         let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
         let c = self.get(base, ((packed_args >> 16) & 0xFFFF) as u16);
         let v = self.get(base, (packed_args & 0xFFFF) as u16);
+        if let Some(b) = self.instanceof_fast(c, v) {
+            return Value::bool(b).bits();
+        }
         // A class with its own static `[Symbol.hasInstance]` method: what
         // `instance_of_op` calls (with `c` as `this` and `v` its argument,
         // the result made a boolean), called native to native from this
@@ -2589,6 +2666,124 @@ impl<'p> Vm<'p> {
             if let Some((fid, closure, m)) = private {
                 (fid, closure, recv, m)
             } else {
+                // Fast callable-receiver lanes (matching interpreter order):
+                // 1. `fn.call` / `fn.bind` / `fn.apply` on Func/Closure/Native/Bound
+                //    (skipping `ic_call_method` which never caches non-Object receivers,
+                //    and serving `_createForOfIteratorHelperLoose`'s `it.call(r)` and
+                //    `it.next.bind(it)` without touching `try_builtin_method`).
+                // 2. Class static methods & function own methods (`NodePath.get(...)`).
+                let mut callable_method: Option<(u32, u32, Value)> = None;
+                if recv.is_heap() {
+                    match self.heap.get(recv.heap_index()) {
+                        HeapObj::Func(_)
+                        | HeapObj::Closure { .. }
+                        | HeapObj::Native(_)
+                        | HeapObj::Bound { .. } => {
+                            if key == "call" {
+                                if let Some(bits) = self.try_fn_call_apply_inline(
+                                    caller_base_ptr,
+                                    func_id,
+                                    ip,
+                                    recv,
+                                    false,
+                                    base,
+                                    arg_base,
+                                    argc,
+                                ) {
+                                    return bits;
+                                }
+                                self.refresh_ci_pristine();
+                                if let Some(id) = self.fn_call_native_target(recv) {
+                                    let (this_v, args_at, n) = if argc == 0 {
+                                        (Value::UNDEFINED, arg_base, 0)
+                                    } else {
+                                        (self.get(base, arg_base), arg_base + 1, argc - 1)
+                                    };
+                                    if let Some(it) = self.interp_array_values_call(id, this_v) {
+                                        return it.bits();
+                                    }
+                                    let called = self.with_argv(base, args_at, n, |vm, argv| {
+                                        vm.call_native(id, this_v, argv)
+                                    });
+                                    return match called {
+                                        Ok(v) => v.bits(),
+                                        Err(t) => self.jit_thrown_to_sentinel(t),
+                                    };
+                                }
+                            } else if key == "bind" {
+                                self.refresh_ci_pristine();
+                                if let Some(b) =
+                                    self.interp_fn_bind_fast(recv, base, arg_base, argc)
+                                {
+                                    return b.bits();
+                                }
+                            } else if key == "apply" {
+                                if let Some(bits) = self.try_fn_call_apply_inline(
+                                    caller_base_ptr,
+                                    func_id,
+                                    ip,
+                                    recv,
+                                    true,
+                                    base,
+                                    arg_base,
+                                    argc,
+                                ) {
+                                    return bits;
+                                }
+                                self.refresh_ci_pristine();
+                                if let Some(id) = self.fn_apply_native_target(recv) {
+                                    let this_v = if argc == 0 {
+                                        Value::UNDEFINED
+                                    } else {
+                                        self.get(base, arg_base)
+                                    };
+                                    let list = if argc < 2 {
+                                        Value::UNDEFINED
+                                    } else {
+                                        self.get(base, arg_base + 1)
+                                    };
+                                    if let Some(args) = self.interp_apply_list(list) {
+                                        return match self.call_native(id, this_v, &args) {
+                                            Ok(v) => v.bits(),
+                                            Err(t) => self.jit_thrown_to_sentinel(t),
+                                        };
+                                    }
+                                }
+                            }
+                            if !crate::vm::helpers_misc::is_private_key(key) {
+                                if let Some(f) = self.fn_own_data_read(recv, key) {
+                                    if let Some((fid, closure)) = self.plain_fn_entry(f) {
+                                        callable_method = Some((fid, closure, f));
+                                    }
+                                }
+                            }
+                        }
+                        HeapObj::Class(_) => {
+                            // Private static methods (`this.#m()`) require a
+                            // brand check; never bypass it via `class_static_data_read`.
+                            if !crate::vm::helpers_misc::is_private_key(key) {
+                                if let Some(f) = self.class_static_data_read(recv, key) {
+                                    if let Some((fid, closure)) = self.plain_fn_entry(f) {
+                                        callable_method = Some((fid, closure, f));
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some((fid, closure, callee)) = callable_method {
+                    if self.func(fid as usize).lexical_this {
+                        let called = self.with_argv(base, arg_base, argc, |vm, argv| {
+                            vm.call_value(callee, recv, argv)
+                        });
+                        return match called {
+                            Ok(v) => v.bits(),
+                            Err(t) => self.jit_thrown_to_sentinel(t),
+                        };
+                    }
+                    (fid, closure, recv, callee)
+                } else {
             match self.ic_call_method(func_id, ip, recv, key) {
                 // An ARROW binds `this` LEXICALLY: reg 0 is its captured
                 // `this_val`, and the receiver is ignored entirely. This arm
@@ -2607,6 +2802,7 @@ impl<'p> Vm<'p> {
                     // interpreter, and a mid-body deopt would replay a
                     // cross-caller's already-run effects (the B181 class).
                     let _ = fid;
+                    crate::vm::helpers_misc::warm_mega_method_memo(self, recv, func_id, name, key);
                     let called = self.with_argv(base, arg_base, argc, |vm, argv| {
                         vm.call_value(callee, recv, argv)
                     });
@@ -2615,8 +2811,39 @@ impl<'p> Vm<'p> {
                         Err(t) => self.jit_thrown_to_sentinel(t),
                     };
                 }
-                Some((fid, closure, callee)) => (fid, closure, recv, callee),
+                Some((fid, closure, callee)) => {
+                    crate::vm::helpers_misc::warm_mega_method_memo(self, recv, func_id, name, key);
+                    (fid, closure, recv, callee)
+                }
                 None => {
+                    if let Some(callee) = crate::vm::helpers_misc::warm_mega_method_memo(
+                        self, recv, func_id, name, key,
+                    ) {
+                        if let Some((fid, closure)) = self.ic_plain_fn(callee) {
+                            if self.func(fid as usize).lexical_this {
+                                let called = self.with_argv(base, arg_base, argc, |vm, argv| {
+                                    vm.call_value(callee, recv, argv)
+                                });
+                                return match called {
+                                    Ok(v) => v.bits(),
+                                    Err(t) => self.jit_thrown_to_sentinel(t),
+                                };
+                            }
+                            let packed = argc as u64 | ((self.func(func_id as usize).reg_count.max(1) as u64) << 16);
+                            let args_ptr = unsafe { caller_base_ptr.add(arg_base as usize) };
+                            let fast = self.jit_cross_call_impl::<false>(
+                                caller_base_ptr,
+                                args_ptr,
+                                packed,
+                                callee.bits(),
+                                Some(recv),
+                            );
+                            if fast != SELF_CALL_DEOPT {
+                                return fast;
+                            }
+                            let _ = (fid, closure);
+                        }
+                    }
                     if jit_call_log() {
                         eprintln!("[call] METHOD MISS fn{func_id}@{ip} key={key}");
                     }
@@ -2641,26 +2868,6 @@ impl<'p> Vm<'p> {
                             Err(t) => return self.jit_thrown_to_sentinel(t),
                         }
                     }
-                    // B82: a `f.call(…)`/`f.apply(…)` site whose receiver is a
-                    // plain user function and whose `call`/`apply` resolves to
-                    // the PRISTINE `%Function.prototype%` native — splice the
-                    // TARGET call off-frame (the this/args shuffle done here,
-                    // the body run by the method inliner's evaluator), skipping
-                    // `call_value`'s frames.push + nested run_loop. Every guard
-                    // is re-checked per call, so a monkey-patched `.call`, an
-                    // own `f.call` shadow, a swapped [[Prototype]], or a bound/
-                    // exotic target declines to the unchanged fallback below.
-                    if matches!(key, "call" | "apply") {
-                        if let Some(bits) = self.try_fn_call_apply_inline(
-                            recv,
-                            key == "apply",
-                            base,
-                            arg_base,
-                            argc,
-                        ) {
-                            return bits;
-                        }
-                    }
                     // Builtin fallback: the EXACT paths the interpreter runs
                     // next for this op (`try_builtin_method`, then a
                     // ctor-object native like `Math.floor`) — run to
@@ -2669,6 +2876,7 @@ impl<'p> Vm<'p> {
                         .jit_method_builtin_fallback(func_id, recv, key, base, arg_base, argc);
                 }
             }
+                }
             }
         } else {
             let callee_reg = ((packed_args >> 16) & 0xFFFF) as u16;
@@ -2679,6 +2887,24 @@ impl<'p> Vm<'p> {
             } else {
                 Value::UNDEFINED
             };
+            // Fast lane for loose for-of `_step = _iterator()` on a bound
+            // array-iterator `next`: bypass `ic_call` (which never caches
+            // `Bound` callees) so every loop iteration hits `bound_step_call`
+            // directly.
+            if !has_explicit_this
+                && argc == 0
+                && cv.is_heap()
+                && matches!(self.heap.get(cv.heap_index()), HeapObj::Bound { .. })
+            {
+                if let Instr::Call { dst, .. } = self.func(func_id as usize).code[ip] {
+                    if let Some(res) = self.bound_step_call(func_id, ip, base, dst, cv) {
+                        return match res {
+                            Ok(v) => v.bits(),
+                            Err(t) => self.jit_thrown_to_sentinel(t),
+                        };
+                    }
+                }
+            }
             // CallWithThis already carries the exact callable Value. It does
             // not need (and the interpreter path does not populate) a separate
             // per-site Call IC: validate the live Func/Closure discriminant
@@ -2711,6 +2937,25 @@ impl<'p> Vm<'p> {
                             // call_value with this=undefined, exactly like the
                             // interpreter's Call op. Everything else deopts.
                             if self.jit_native_like_callee(cv) {
+                                // Loose for-of `_step = _iterator()` on a bound
+                                // array-iterator `next`: reuse the step register's
+                                // `{ value, done }` object in place just like the
+                                // interpreter (`Vm::bound_step_call`) instead of
+                                // allocating millions of short-lived result objects.
+                                if !has_explicit_this && argc == 0 {
+                                    if let Instr::Call { dst, .. } =
+                                        self.func(func_id as usize).code[ip]
+                                    {
+                                        if let Some(res) =
+                                            self.bound_step_call(func_id, ip, base, dst, cv)
+                                        {
+                                            return match res {
+                                                Ok(v) => v.bits(),
+                                                Err(t) => self.jit_thrown_to_sentinel(t),
+                                            };
+                                        }
+                                    }
+                                }
                                 // A captured boot intrinsic takes the fused
                                 // `CallMethod` builtin lanes, as it does in the
                                 // interpreter's `CallWithThis` arm (B289): the
@@ -3030,8 +3275,12 @@ impl<'p> Vm<'p> {
     ///   any per-execution surprise before any side effect — so the fallback
     ///   frame call never double-runs anything.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_fn_call_apply_inline(
         &mut self,
+        caller_base_ptr: *const u64,
+        func_id: u32,
+        ip: usize,
         recv: Value,
         is_apply: bool,
         base: usize,
@@ -3041,97 +3290,136 @@ impl<'p> Vm<'p> {
         if !crate::codegen::call_inline_enabled() {
             return None;
         }
-        // Arity subset: `.call` with 0-3 forwarded args, `.apply(this[, arr])`.
-        if if is_apply { argc > 2 } else { argc > 4 } {
+        // `.apply(this[, arr])` takes at most 2 arguments.
+        if is_apply && argc > 2 {
             return None;
         }
-        let (fid, _closure) = self.ic_plain_fn(recv)?;
-        if self.func(fid as usize).lexical_this {
-            return None;
-        }
+        let (fid, closure) = self.ic_plain_fn(recv)?;
+        let (is_arrow, is_strict) = {
+            let f = self.func(fid as usize);
+            (f.lexical_this, f.is_strict)
+        };
         if !self.realm_global_objs.is_empty() && self.get_function_realm(recv) != 0 {
             return None;
         }
         let idx = recv.heap_index();
         let name = if is_apply { "apply" } else { "call" };
-        if self
-            .fn_props
-            .get(&idx)
-            .is_some_and(|m| m.pos(name).is_some())
+        let skip_fn_props = if is_apply {
+            self.fn_props_has_apply == 0
+        } else {
+            self.fn_props_has_call == 0
+        };
+        if !skip_fn_props
+            && !self.fn_props.is_empty()
+            && self
+                .fn_props
+                .get(&idx)
+                .is_some_and(|m| m.pos(name).is_some())
         {
             return None;
         }
-        if self
-            .proto_of
-            .get(&idx)
-            .is_some_and(|&p| p != Value::heap(self.fn_proto))
-        {
+        let raw_proto = self.proto_of.raw_bits(idx);
+        if raw_proto != 0 && raw_proto != Value::heap(self.fn_proto).bits() {
             return None;
         }
-        // Pristine `%Function.prototype%.call`/`.apply`: the own SLOT index is
-        // memoized behind the object's version (a key add/remove/descriptor
-        // change bumps it); the slot VALUE is re-read every call, because an
-        // in-place overwrite (`Function.prototype.call = g`) bumps nothing —
-        // the fn-bits re-read precedent.
-        let fp_ver = self.heap.version_of(self.fn_proto);
-        if self.ci_pristine.0 != fp_ver {
-            self.ci_pristine = match self.heap.get(self.fn_proto) {
-                HeapObj::Object(m) => (
-                    fp_ver,
-                    m.pos("call").map_or(u32::MAX, |s| s as u32),
-                    m.pos("apply").map_or(u32::MAX, |s| s as u32),
-                ),
-                _ => (fp_ver, u32::MAX, u32::MAX),
-            };
-        }
-        let slot = if is_apply {
-            self.ci_pristine.2
+        // Pristine `%Function.prototype%.call`/`.apply`: the own SLOT index and
+        // expected native bits are memoized behind `version_of(fn_proto)`; the
+        // slot VALUE is still re-read every call so an in-place overwrite
+        // (`Function.prototype.call = g`) falls back immediately.
+        self.refresh_ci_pristine();
+        let (slot, want_bits) = if is_apply {
+            (self.ci_pristine.apply_slot, self.ci_pristine.apply_bits)
         } else {
-            self.ci_pristine.1
+            (self.ci_pristine.call_slot, self.ci_pristine.call_bits)
         };
-        if slot == u32::MAX {
+        if slot == u32::MAX || want_bits == 0 {
             return None;
         }
-        let want = if is_apply {
-            crate::vm::native::FN_APPLY
-        } else {
-            crate::vm::native::FN_CALL
-        };
         let pristine = match self.heap.get(self.fn_proto) {
-            HeapObj::Object(m) => {
-                let s = slot as usize;
-                !m.attr_at(s).accessor
-                    && m.val_at(s).is_heap()
-                    && matches!(
-                        self.heap.get(m.val_at(s).heap_index()),
-                        HeapObj::Native(id) if *id == want
-                    )
-            }
+            HeapObj::Object(m) => m.val_at(slot as usize).bits() == want_bits,
             _ => false,
         };
         if !pristine {
             return None;
         }
-        // OrdinaryCallBindThis, applied before the body runs: strict targets
-        // take `thisArg` raw; sloppy targets with a nullish/primitive `thisArg`
-        // decline (global substitution / boxing stays on the frame call).
-        let this_v = if argc >= 1 {
+        // OrdinaryCallBindThis, applied before the body runs: arrow targets use
+        // their lexical `this_val`, strict targets take `thisArg` raw, and
+        // sloppy targets substitute `globalThis` for nullish `thisArg` while
+        // declining non-nullish primitives (boxing stays on the frame call).
+        let raw_this = if argc >= 1 {
             self.get(base, arg_base)
         } else {
             Value::UNDEFINED
         };
-        if !self.func(fid as usize).is_strict
-            && (this_v.is_nullish() || !self.is_object_value(this_v))
-        {
+        let this_v = if is_arrow {
+            match self.heap.get(idx) {
+                HeapObj::Closure { this_val, .. } => *this_val,
+                _ => Value::UNDEFINED,
+            }
+        } else if is_strict {
+            raw_this
+        } else if raw_this.is_nullish() {
+            if self.global_this == 0 {
+                Value::UNDEFINED
+            } else {
+                Value::heap(self.global_this)
+            }
+        } else if self.is_object_value(raw_this) {
+            raw_this
+        } else {
             return None;
-        }
+        };
         if !is_apply {
-            // Forwarded args are contiguous at `arg_base + 1` — the method
+            let args_at = if argc == 0 { arg_base } else { arg_base + 1 };
+            let nargs = argc.saturating_sub(1);
+            // Forwarded args are contiguous at `args_at` — the method
             // inliner's caller-window entry reads them in place.
-            let bits =
-                self.try_method_inline(fid, this_v, base, arg_base + 1, argc.saturating_sub(1))?;
-            crate::vm::helpers_misc::callstats::inline_hit(false);
-            return Some(bits);
+            if nargs <= 3 {
+                if let Some(bits) = self.try_method_inline(fid, this_v, base, args_at, nargs) {
+                    crate::vm::helpers_misc::callstats::inline_hit(false);
+                    return Some(bits);
+                }
+            }
+            // Compiled target: dispatch straight into its windowed native entry,
+            // skipping `jit_method_builtin_fallback`, `fn_call_apply_pristine`,
+            // `call_native`, Vec arg allocation, and `call_value_plain`.
+            if self.jit.fn_state(fid) == crate::codegen::FN_COMPILED {
+                let at = base + args_at as usize;
+                self.jit_call_depth += 1;
+                let res = self.call_compiled_windowed(
+                    recv,
+                    this_v,
+                    WinArgs::Regs { at, argc: nargs },
+                    fid,
+                    closure,
+                );
+                self.jit_call_depth -= 1;
+                if let Some(res) = res {
+                    return Some(match res {
+                        Ok(v) => v.bits(),
+                        Err(t) => self.jit_thrown_to_sentinel(t),
+                    });
+                }
+                if self.jit.cross_needs_frame(fid) || self.jit.cross_lazy_ff(fid) {
+                    let caller_regs = self.func(func_id as usize).reg_count.max(1);
+                    let packed = nargs as u64 | (u64::from(caller_regs) << 16);
+                    // SAFETY: the forwarded argument window lies in the caller's window.
+                    let args = unsafe { caller_base_ptr.add(args_at as usize) };
+                    let r = self.jit_cross_call_impl::<false>(
+                        caller_base_ptr,
+                        args,
+                        packed,
+                        recv.bits(),
+                        Some(this_v),
+                    );
+                    if r != crate::codegen::SELF_CALL_DEOPT {
+                        return Some(r);
+                    }
+                }
+            }
+            // Warm non-compiled or frame-backed plain JS function: push its
+            // frame directly, skipping `try_builtin_method` + `FN_CALL` + `Vec`.
+            return Some(self.jit_frame_call(fid, closure, this_v, base, args_at, nargs, ip, recv));
         }
         // `.apply`: materialize the forwarded args from the argArray.
         let arr = if argc >= 2 {
@@ -3140,8 +3428,8 @@ impl<'p> Vm<'p> {
             Value::UNDEFINED
         };
         let mut buf = [Value::UNDEFINED; Self::MI_MAX_REGS];
-        let nargs = if arr.is_nullish() {
-            0
+        let (nargs, truncated) = if arr.is_nullish() {
+            (0, false)
         } else {
             if !arr.is_heap() || self.array_proto_has_index {
                 return None;
@@ -3162,14 +3450,33 @@ impl<'p> Vm<'p> {
                     }
                     let n = items.len().min(Self::MI_MAX_REGS);
                     buf[..n].copy_from_slice(&items[..n]);
-                    n
+                    (n, items.len() > Self::MI_MAX_REGS)
                 }
                 _ => return None,
             }
         };
-        let bits = self.try_call_inline_argv(fid, this_v, &buf[..nargs])?;
-        crate::vm::helpers_misc::callstats::inline_hit(true);
-        Some(bits)
+        if let Some(bits) = self.try_call_inline_argv(fid, this_v, &buf[..nargs]) {
+            crate::vm::helpers_misc::callstats::inline_hit(true);
+            return Some(bits);
+        }
+        if !truncated && self.jit.fn_state(fid) == crate::codegen::FN_COMPILED {
+            self.jit_call_depth += 1;
+            let res = self.call_compiled_windowed(
+                recv,
+                this_v,
+                WinArgs::Slice(&buf[..nargs]),
+                fid,
+                closure,
+            );
+            self.jit_call_depth -= 1;
+            if let Some(res) = res {
+                return Some(match res {
+                    Ok(v) => v.bits(),
+                    Err(t) => self.jit_thrown_to_sentinel(t),
+                });
+            }
+        }
+        None
     }
 
     /// Materialize a `Thrown` from a region-helper-run operation exactly like

@@ -24,6 +24,48 @@ fn prop_name(key: &PropKey) -> Option<&str> {
     }
 }
 
+#[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+fn is_skip_restricted_name(n: &str) -> bool {
+    matches!(
+        n,
+        "eval"
+            | "arguments"
+            | "implements"
+            | "interface"
+            | "let"
+            | "package"
+            | "private"
+            | "protected"
+            | "public"
+            | "static"
+            | "yield"
+            | "await"
+    )
+}
+
+#[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+fn skip_params_ok(params: &Params) -> bool {
+    if !params.simple || params.items.len() >= 0xFF {
+        return false;
+    }
+    for (i, item) in params.items.iter().enumerate() {
+        let Pattern::Ident(n) = item else {
+            return false;
+        };
+        if is_skip_restricted_name(n) {
+            return false;
+        }
+        for prev in &params.items[..i] {
+            if let Pattern::Ident(p) = prev {
+                if p == n {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 impl<'s> Parser<'s> {
     /// A function after its `function` keyword has been consumed. `start` is the
     /// offset of `function` (or of `async`, for an async function) so the span
@@ -70,7 +112,13 @@ impl<'s> Parser<'s> {
         if self.ts() && self.at(Punct::Lt) {
             self.ts_type_params()?;
         }
-        let (params, body) = self.parse_fn_tail(is_async, is_generator, false)?;
+        #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+        let allow_skip = !is_async
+            && !is_generator
+            && name.as_deref().is_none_or(|n| !is_skip_restricted_name(n));
+        #[cfg(any(feature = "meter-only", feature = "safe-sandbox"))]
+        let allow_skip = false;
+        let (params, body) = self.parse_fn_tail(is_async, is_generator, false, allow_skip)?;
         Ok(Function {
             name,
             params,
@@ -92,6 +140,7 @@ impl<'s> Parser<'s> {
         is_async: bool,
         is_generator: bool,
         unique: bool,
+        allow_skip: bool,
     ) -> PResult<(Params, FnBody)> {
         let saved = self.ctx;
         let saved_labels = std::mem::take(&mut self.labels);
@@ -115,7 +164,7 @@ impl<'s> Parser<'s> {
         let body = if self.ts() {
             self.ts_fn_body(&params)?
         } else {
-            self.parse_fn_body_with_params(Some(&params))?
+            self.parse_fn_body_with_params_opt(Some(&params), allow_skip)?
         };
 
         self.leave_fn_code(fn_code);
@@ -185,7 +234,7 @@ impl<'s> Parser<'s> {
         let saved_super = self.ctx.super_prop;
         // A method — object literal or class — may use `super.x`.
         self.ctx.super_prop = true;
-        let (params, body) = self.parse_fn_tail(is_async, is_generator, true)?;
+        let (params, body) = self.parse_fn_tail(is_async, is_generator, true, false)?;
         self.ctx.super_prop = saved_super;
         Ok(Function {
             name: None,
@@ -284,28 +333,436 @@ impl<'s> Parser<'s> {
     /// a body-level `function a(){}`). Recording them in `Scope::var` is exactly
     /// that asymmetry, and it is why they are recorded as var-like bindings.
     pub(crate) fn parse_fn_body_with_params(&mut self, params: Option<&Params>) -> PResult<FnBody> {
+        self.parse_fn_body_with_params_opt(params, false)
+    }
+
+    pub(crate) fn parse_fn_body_with_params_opt(
+        &mut self,
+        params: Option<&Params>,
+        allow_skip: bool,
+    ) -> PResult<FnBody> {
+        #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+        if allow_skip
+            && self.skip_fn_bodies
+            && self.fn_depth >= 1
+            && !self.ts()
+            && self.jsx.is_none()
+            && self.at(Punct::LBrace)
+            && params.is_some_and(skip_params_ok)
+        {
+            if let Some((start, end)) = self.try_skip_fn_body() {
+                self.resume_at(end, false)?;
+                return Ok(FnBody {
+                    directives: Vec::new(),
+                    stmts: Vec::new(),
+                    lazy_span: Some((start, end)),
+                });
+            }
+        }
+        #[cfg(any(feature = "meter-only", feature = "safe-sandbox"))]
+        let _ = allow_skip;
+
         self.expect(Punct::LBrace, true)?;
+        #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+        let saved_fn_depth = {
+            let d = self.fn_depth;
+            self.fn_depth = d.saturating_add(1);
+            d
+        };
         let saved_strict = self.ctx.strict;
-        let (directives, strict) = self.directive_prologue()?;
-        if strict {
-            self.ctx.strict = true;
-        }
-        self.scopes.push(ScopeKind::Function);
-        if let Some(p) = params {
-            let mut names = Vec::new();
-            for item in &p.items {
-                super::stmt::collect_pattern_names(item, &mut names);
+        let res = (|| -> PResult<FnBody> {
+            let (directives, strict) = self.directive_prologue()?;
+            if strict {
+                self.ctx.strict = true;
             }
-            for n in names {
-                self.scopes.declare_param(&n);
+            self.scopes.push(ScopeKind::Function);
+            if let Some(p) = params {
+                let mut names = Vec::new();
+                for item in &p.items {
+                    super::stmt::collect_pattern_names(item, &mut names);
+                }
+                for n in names {
+                    self.scopes.declare_param(&n);
+                }
             }
-        }
-        let stmts = self.parse_stmt_items(|p| !p.at(Punct::RBrace) && !p.at_eof())?;
-        self.scopes.pop()?;
-        self.expect(Punct::RBrace, false)?;
-        let out = FnBody { directives, stmts };
+            let stmts = self.parse_stmt_items(|p| !p.at(Punct::RBrace) && !p.at_eof())?;
+            self.scopes.pop()?;
+            self.expect(Punct::RBrace, false)?;
+            Ok(FnBody::new(directives, stmts))
+        })();
         self.ctx.strict = saved_strict;
-        Ok(out)
+        #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+        {
+            self.fn_depth = saved_fn_depth;
+        }
+        res
+    }
+
+    /// Single-pass fail-closed ASCII scanner that finds the closing `}` of a
+    /// nested function body without constructing an AST. Returns `None` (falling
+    /// back to normal parsing) on any directive prologue, regex/ambiguous `/`,
+    /// non-ASCII byte, unicode escape, private field, decorator, or construct
+    /// that cannot be lazily compiled (`eval`, `arguments`, `class`, `with`,
+    /// `super`, `async`, `function*`, `yield`, `await`, `import`, `export`,
+    /// `delete`, `new.target`, strict reserved words).
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    fn try_skip_fn_body(&self) -> Option<(u32, u32)> {
+        let bytes = self.source().as_bytes();
+        let lbrace = self.cur().span.start as usize;
+        let n = bytes.len();
+        if bytes.get(lbrace) != Some(&b'{') {
+            return None;
+        }
+        let mut i = lbrace + 1;
+        // Skip leading whitespace/comments to detect any directive prologue.
+        while i < n {
+            let b = bytes[i];
+            if b >= 0x80 {
+                return None;
+            }
+            if matches!(b, b' ' | b'\t' | b'\r' | b'\n' | 0x0B | 0x0C) {
+                i += 1;
+            } else if b == b'/' && i + 1 < n && bytes[i + 1] == b'/' {
+                i += 2;
+                while i < n && bytes[i] != b'\n' && bytes[i] != b'\r' {
+                    if bytes[i] >= 0x80 {
+                        return None;
+                    }
+                    i += 1;
+                }
+            } else if b == b'/' && i + 1 < n && bytes[i + 1] == b'*' {
+                i += 2;
+                while i + 1 < n && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    if bytes[i] >= 0x80 {
+                        return None;
+                    }
+                    i += 1;
+                }
+                if i + 1 >= n {
+                    return None;
+                }
+                i += 2;
+            } else {
+                break;
+            }
+        }
+        if i < n && (bytes[i] == b'\'' || bytes[i] == b'"') {
+            return None;
+        }
+
+        fn scan_tpl(
+            bytes: &[u8],
+            i: &mut usize,
+            depth: &mut u32,
+            tpl_stack: &mut Vec<u32>,
+        ) -> bool {
+            let n = bytes.len();
+            while *i < n {
+                let ch = bytes[*i];
+                if ch >= 0x80 {
+                    return false;
+                }
+                if ch == b'\\' {
+                    if *i + 1 >= n || bytes[*i + 1] >= 0x80 {
+                        return false;
+                    }
+                    *i += 2;
+                } else if ch == b'`' {
+                    *i += 1;
+                    return true;
+                } else if ch == b'$' && *i + 1 < n && bytes[*i + 1] == b'{' {
+                    tpl_stack.push(*depth);
+                    *depth += 1;
+                    *i += 2;
+                    return true;
+                } else {
+                    *i += 1;
+                }
+            }
+            false
+        }
+
+        let mut depth: u32 = 1;
+        let mut tpl_stack: Vec<u32> = Vec::new();
+        let mut prev_expr_end = false;
+        let mut prev_dot = false;
+        let mut prev_new = false;
+
+        while i < n {
+            let b = bytes[i];
+            if b >= 0x80 {
+                return None;
+            }
+            if matches!(b, b' ' | b'\t' | b'\r' | b'\n' | 0x0B | 0x0C) {
+                i += 1;
+                continue;
+            }
+            match b {
+                b'\'' | b'"' => {
+                    let q = b;
+                    i += 1;
+                    loop {
+                        if i >= n {
+                            return None;
+                        }
+                        let ch = bytes[i];
+                        if ch >= 0x80 || ch == b'\r' || ch == b'\n' {
+                            return None;
+                        }
+                        if ch == b'\\' {
+                            if i + 1 >= n || bytes[i + 1] >= 0x80 {
+                                return None;
+                            }
+                            i += 2;
+                        } else if ch == q {
+                            i += 1;
+                            break;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    prev_expr_end = false;
+                    prev_dot = false;
+                    prev_new = false;
+                }
+                b'`' => {
+                    i += 1;
+                    if !scan_tpl(bytes, &mut i, &mut depth, &mut tpl_stack) {
+                        return None;
+                    }
+                    prev_expr_end = false;
+                    prev_dot = false;
+                    prev_new = false;
+                }
+                b'/' => {
+                    if i + 1 < n && bytes[i + 1] == b'/' {
+                        i += 2;
+                        while i < n && bytes[i] != b'\n' && bytes[i] != b'\r' {
+                            if bytes[i] >= 0x80 {
+                                return None;
+                            }
+                            i += 1;
+                        }
+                    } else if i + 1 < n && bytes[i + 1] == b'*' {
+                        i += 2;
+                        while i + 1 < n && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                            if bytes[i] >= 0x80 {
+                                return None;
+                            }
+                            i += 1;
+                        }
+                        if i + 1 >= n {
+                            return None;
+                        }
+                        i += 2;
+                    } else if prev_expr_end {
+                        i += 1;
+                        if i < n && bytes[i] == b'=' {
+                            i += 1;
+                        }
+                        prev_expr_end = false;
+                        prev_dot = false;
+                        prev_new = false;
+                    } else {
+                        return None;
+                    }
+                }
+                b'{' => {
+                    depth += 1;
+                    i += 1;
+                    prev_expr_end = false;
+                    prev_dot = false;
+                    prev_new = false;
+                }
+                b'}' => {
+                    depth -= 1;
+                    i += 1;
+                    if tpl_stack.last() == Some(&depth) {
+                        tpl_stack.pop();
+                        if !scan_tpl(bytes, &mut i, &mut depth, &mut tpl_stack) {
+                            return None;
+                        }
+                        prev_expr_end = false;
+                        prev_dot = false;
+                        prev_new = false;
+                    } else if depth == 0 {
+                        return Some((lbrace as u32, i as u32));
+                    } else {
+                        prev_expr_end = false;
+                        prev_dot = false;
+                        prev_new = false;
+                    }
+                }
+                b']' => {
+                    i += 1;
+                    prev_expr_end = true;
+                    prev_dot = false;
+                    prev_new = false;
+                }
+                b'.' => {
+                    if i + 1 < n && bytes[i + 1] == b'.' {
+                        while i < n && bytes[i] == b'.' {
+                            i += 1;
+                        }
+                        prev_expr_end = false;
+                        prev_dot = false;
+                        prev_new = false;
+                    } else if i + 1 < n && bytes[i + 1].is_ascii_digit() {
+                        i += 1;
+                        while i < n {
+                            let c = bytes[i];
+                            if (c == b'e' || c == b'E')
+                                && i + 1 < n
+                                && (bytes[i + 1] == b'+' || bytes[i + 1] == b'-')
+                            {
+                                i += 2;
+                            } else if c.is_ascii_alphanumeric() || c == b'_' || c == b'.' {
+                                i += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        prev_expr_end = true;
+                        prev_dot = false;
+                        prev_new = false;
+                    } else {
+                        i += 1;
+                        prev_expr_end = false;
+                        prev_dot = true;
+                    }
+                }
+                b'0'..=b'9' => {
+                    i += 1;
+                    while i < n {
+                        let c = bytes[i];
+                        if (c == b'e' || c == b'E')
+                            && i + 1 < n
+                            && (bytes[i + 1] == b'+' || bytes[i + 1] == b'-')
+                        {
+                            i += 2;
+                        } else if c.is_ascii_alphanumeric() || c == b'_' || c == b'.' {
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    prev_expr_end = true;
+                    prev_dot = false;
+                    prev_new = false;
+                }
+                b'a'..=b'z' | b'A'..=b'Z' | b'_' | b'$' => {
+                    const ID_CONT: [u8; 256] = {
+                        let mut t = [0u8; 256];
+                        let mut j = 0usize;
+                        while j < 128 {
+                            let c = j as u8;
+                            if c.is_ascii_alphanumeric() || c == b'_' || c == b'$' {
+                                t[j] = 1;
+                            }
+                            j += 1;
+                        }
+                        t
+                    };
+                    let start = i;
+                    i += 1;
+                    while i < n && ID_CONT[bytes[i] as usize] != 0 {
+                        i += 1;
+                    }
+                    if i < n && (bytes[i] == b'\\' || bytes[i] >= 0x80) {
+                        return None;
+                    }
+                    let word = &bytes[start..i];
+                    if prev_dot {
+                        if prev_new && word == b"target" {
+                            return None;
+                        }
+                        prev_expr_end = true;
+                        prev_dot = false;
+                        prev_new = false;
+                    } else {
+                        let wlen = word.len();
+                        if wlen >= 3 && wlen <= 10 {
+                            let banned = match word[0] {
+                                b'a' => matches!(word, b"arguments" | b"async" | b"await"),
+                                b'c' => word == b"class",
+                                b'd' => word == b"delete",
+                                b'e' => matches!(word, b"eval" | b"export"),
+                                b'i' => matches!(word, b"import" | b"implements" | b"interface"),
+                                b'p' => matches!(word, b"package" | b"private" | b"protected" | b"public"),
+                                b's' => matches!(word, b"super" | b"static"),
+                                b'w' => word == b"with",
+                                b'y' => word == b"yield",
+                                _ => false,
+                            };
+                            if banned {
+                                return None;
+                            }
+                        }
+                        if word == b"function" {
+                            let mut k = i;
+                            while k < n
+                                && matches!(bytes[k], b' ' | b'\t' | b'\r' | b'\n' | 0x0B | 0x0C)
+                            {
+                                k += 1;
+                            }
+                            if k < n && bytes[k] == b'*' {
+                                return None;
+                            }
+                        } else if word == b"let" {
+                            let mut k = i;
+                            while k < n && (bytes[k] == b' ' || bytes[k] == b'\t') {
+                                k += 1;
+                            }
+                            if k == i || k >= n {
+                                return None;
+                            }
+                            let nb = bytes[k];
+                            if nb == b'{' || nb == b'[' {
+                                // `let {` / `let [` declaration
+                            } else if nb.is_ascii_alphabetic() || nb == b'_' || nb == b'$' {
+                                let ns = k;
+                                while k < n && ID_CONT[bytes[k] as usize] != 0 {
+                                    k += 1;
+                                }
+                                if matches!(&bytes[ns..k], b"in" | b"instanceof") {
+                                    return None;
+                                }
+                            } else {
+                                return None;
+                            }
+                        }
+                        prev_new = word == b"new";
+                        prev_expr_end = if !(2..=10).contains(&wlen) {
+                            true
+                        } else {
+                            !match word[0] {
+                                b'c' => word == b"case",
+                                b'd' => word == b"do",
+                                b'e' => word == b"else",
+                                b'i' => matches!(word, b"in" | b"instanceof"),
+                                b'n' => word == b"new",
+                                b'o' => word == b"of",
+                                b'r' => word == b"return",
+                                b't' => matches!(word, b"throw" | b"typeof"),
+                                b'v' => word == b"void",
+                                _ => false,
+                            }
+                        };
+                        prev_dot = false;
+                    }
+                }
+                b'#' | b'\\' | b'@' => return None,
+                b'<' if i + 3 < n && &bytes[i..i + 4] == b"<!--" => return None,
+                b'-' if i + 2 < n && &bytes[i..i + 3] == b"-->" => return None,
+                _ => {
+                    i += 1;
+                    prev_expr_end = false;
+                    prev_dot = false;
+                    prev_new = false;
+                }
+            }
+        }
+        None
     }
 
     // ---- binding patterns --------------------------------------------------
@@ -1040,10 +1497,7 @@ impl<'s> Parser<'s> {
                 optional: false,
             }))
         };
-        let body = |stmts: Vec<Stmt>| FnBody {
-            directives: Vec::new(),
-            stmts,
-        };
+        let body = |stmts: Vec<Stmt>| FnBody::new(Vec::new(), stmts);
         let getter = Function {
             name: None,
             params: Params {

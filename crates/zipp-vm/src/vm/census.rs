@@ -115,13 +115,13 @@ impl<'p> Vm<'p> {
         for table in self.site_ics.iter().flatten() {
             tables += 1;
             table_slots += table.len();
-            for site in table.iter().filter_map(|c| c.site.as_deref()) {
+            for site in table.as_slice().iter().filter_map(super::ic::SiteCell::site_ref) {
                 sites += 1;
                 ways[usize::from(site.n).min(super::ic::IC_WAYS)] += 1;
             }
         }
         put("ic.function_slots", self.site_ics.capacity());
-        put("ic.function_slot_bytes", self.site_ics.capacity() * size_of::<Option<Box<[super::ic::SiteCell]>>>());
+        put("ic.function_slot_bytes", self.site_ics.capacity() * size_of::<Option<super::ic::IcTable>>());
         put("ic.site_tables", tables);
         put("ic.site_table_slots", table_slots);
         put("ic.site_table_bytes", table_slots * size_of::<super::ic::SiteCell>());

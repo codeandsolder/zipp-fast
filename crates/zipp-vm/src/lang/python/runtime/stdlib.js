@@ -1863,8 +1863,57 @@
         fn(g, "abs", 1, (a) => call(rt.builtins.get("abs"), [a[0]], null));
     });
     mod("abc", (g) => {
-        const ABC = rt.newType("ABC", [], new Map(), "abc"); ABC.isABC = true; g.set("ABC", ABC);
-        g.set("ABCMeta", rt.TypeType);
+        const ABCMeta = rt.newType("ABCMeta", [rt.TypeType], new Map(), "abc");
+        const abcNew = builtin("__new__", -1, (a) => {
+            const kw = a[a.length - 1] instanceof Map ? a.pop() : null;
+            const cls = rt.makeClass(a[0], a[1], a[2], a[3], kw);
+            cls.isABC = true;
+            cls._abc_registry = new Set();
+            return cls;
+        });
+        abcNew.kwnames = true;
+        ABCMeta.dict.set("__new__", { cls: T.staticmethod, func: abcNew });
+        ABCMeta.dict.set("register", builtin("register", 2, (a) => {
+            const cls = a[0], sub = a[1];
+            if (!isType(sub)) fail(E.TypeError, "Can only register classes");
+            if (rt.isSubclass(sub, cls)) return sub;
+            if (rt.isSubclass(cls, sub)) fail(E.RuntimeError, "Refusing to create an inheritance cycle");
+            if (cls._abc_registry === undefined) cls._abc_registry = new Set();
+            cls._abc_registry.add(sub);
+            return sub;
+        }));
+        const abcIsSub = (sub, cls, seen) => {
+            if (!isType(sub)) fail(E.TypeError, "issubclass() arg 1 must be a class");
+            if (rt.isSubclass(sub, cls)) return true;
+            if (seen.has(cls)) return false;
+            seen.add(cls);
+            const hook = cls.dict.get("__subclasshook__");
+            if (hook !== undefined) {
+                const ok = call(descrGet(hook, null, cls), [sub], null);
+                if (ok !== NOTIMPL) return truth(ok);
+            }
+            if (cls._abc_registry !== undefined) {
+                for (const r of cls._abc_registry) if (abcIsSub(sub, r, new Set())) return true;
+            }
+            if (cls.subclasses !== undefined) {
+                for (let i = 0; i < cls.subclasses.length; i++) {
+                    const s = cls.subclasses[i].deref();
+                    if (s !== undefined && s !== cls && abcIsSub(sub, s, seen)) return true;
+                }
+            }
+            return false;
+        };
+        ABCMeta.dict.set("__subclasscheck__", builtin("__subclasscheck__", 2, (a) => abcIsSub(a[1], a[0], new Set())));
+        ABCMeta.dict.set("__instancecheck__", builtin("__instancecheck__", 2, (a) => {
+            const cls = a[0], t = typeOf(a[1]);
+            return rt.isSubclass(t, cls) || abcIsSub(t, cls, new Set());
+        }));
+        const ABC = rt.newType("ABC", [], new Map(), "abc");
+        ABC.cls = ABCMeta;
+        ABC.isABC = true;
+        ABC._abc_registry = new Set();
+        g.set("ABC", ABC);
+        g.set("ABCMeta", ABCMeta);
         fn(g, "abstractmethod", 1, (a) => { const f = a[0]; if (f !== null && typeof f === "object") f.isabstract = true; return f; });
         fn(g, "abstractproperty", 1, (a) => a[0]);
     });
@@ -1877,6 +1926,13 @@
             __call__: (a) => a[1] === undefined ? null : a[1], __or__: (a) => a[0], __ror__: (a) => a[0] });
         for (const n of ["Any", "List", "Dict", "Set", "FrozenSet", "Tuple", "Optional", "Union", "Callable", "Iterable", "Iterator", "Generator", "Sequence", "Mapping", "MutableMapping", "Type", "TypeVar", "Generic", "Protocol", "ClassVar", "Final", "Literal", "NoReturn", "Hashable", "Sized", "Collection", "Awaitable", "Coroutine", "AsyncIterator", "Deque", "DefaultDict", "OrderedDict", "Counter", "ChainMap", "Text", "IO", "TextIO", "BinaryIO", "Pattern", "Match", "SupportsInt", "SupportsFloat", "Annotated", "Self", "TypeAlias", "ParamSpec", "Concatenate", "TypeGuard", "Never", "LiteralString", "Required", "NotRequired", "Unpack", "TypedDict", "NamedTuple"]) { const o = { cls: any, dict: new Map([["name", n]]) }; g.set(n, o); }
         g.set("TYPE_CHECKING", false);
+        g.set("TypeVar", rt.TypeVar);
+        g.set("ParamSpec", rt.ParamSpec);
+        g.set("TypeVarTuple", rt.TypeVarTuple);
+        g.set("TypeAliasType", rt.TypeAliasType);
+        g.set("Generic", rt.Generic);
+        g.set("NoDefault", rt.NoDefault);
+        g.set("Unpack", rt.Unpack);
         fn(g, "cast", 2, (a) => a[1]); fn(g, "overload", 1, (a) => a[0]); fn(g, "final", 1, (a) => a[0]); fn(g, "no_type_check", 1, (a) => a[0]);
         fn(g, "get_type_hints", -1, () => dict()); fn(g, "runtime_checkable", 1, (a) => a[0]);
         // typing.NamedTuple: the functional form is collections.namedtuple;
@@ -1944,7 +2000,22 @@
         fn(g, "starmap", 2, (a) => { const it = iter(a[1]); return gen(() => { const v = fornext(it); return v === STOP ? STOP : call(a[0], drain(v), null); }); });
         fn(g, "tee", 2, (a) => { const items = drain(a[0]); const n = a[1] === undefined ? 2 : Number(needInt(a[1])); return tuple(Array.from({ length: n }, () => iter(list(items)))); }, 1);
         fn(g, "pairwise", 1, (a) => { const items = drain(a[0]); let i = 0; return gen(() => i + 1 < items.length ? tuple([items[i], items[++i]]) : STOP); });
-        fn(g, "batched", 2, (a) => { const items = drain(a[0]); const n = Number(needInt(a[1])); let i = 0; return gen(() => { if (i >= items.length) return STOP; const b = items.slice(i, i + n); i += n; return tuple(b); }); });
+        fnkw(g, "batched", (a) => {
+            const kw = kwOf(a, ["strict"]);
+            if (a.length !== 2) fail(E.TypeError, "batched expected 2 positional arguments, got " + a.length);
+            const items = drain(a[0]);
+            const n = Number(needInt(a[1]));
+            if (n < 1) fail(E.ValueError, "n must be at least one");
+            const strict = truth(kwget(kw, "strict", false));
+            let i = 0;
+            return gen(() => {
+                if (i >= items.length) return STOP;
+                const b = items.slice(i, i + n);
+                i += n;
+                if (strict && b.length < n) fail(E.ValueError, "batched(): incomplete batch");
+                return tuple(b);
+            });
+        });
     });
     // ---- _zipp_gpu: the transport behind zipp_gpu.Graph.submit and Graph.prepare -------------
     // The host-request kinds a program may raise. Anything else never leaves
@@ -2311,10 +2382,102 @@
         fn(g, "lru_cache", -1, (a) => { const kw = kwOf(a, ["maxsize", "typed"]); if (a.length === 1 && a[0] !== null && typeof a[0] === "object" && (a[0].cls === T.function || a[0].cls === T.builtin_function_or_method)) return cache(a[0], 128n); let maxsize = a.length ? a[0] : kwget(kw, "maxsize", 128n); if (maxsize !== null) maxsize = needInt(maxsize); return builtin("lru_cache", 1, (b) => cache(b[0], maxsize)); });
         g.get("lru_cache").kwnames = true;
         fn(g, "cache", 1, (a) => cache(a[0], null));
-        fn(g, "cached_property", 1, (a) => { const f = a[0]; return { cls: T.property, fget: builtin("cached", 1, (b) => { const key = "__cached_" + f.name; const o = b[0]; if (o.dict.has(key)) return o.dict.get(key); const v = call(f, [o], null); o.dict.set(key, v); return v; }), fset: null, fdel: null, doc: f.doc }; });
+        // Non-data descriptor: computes once, caches in instance.__dict__[attrname],
+        // and allows overriding or `del obj.prop` to recompute.
+        const CachedProp = rt.newType("cached_property", [rt.ObjectType], new Map(), "functools");
+        rt.constructors.set(CachedProp, (a) => {
+            if (a.length !== 1) fail(E.TypeError, "cached_property() takes 1 positional argument");
+            const f = a[0];
+            return { cls: CachedProp, dict: new Map([["func", f], ["attrname", null], ["__doc__", f !== null && typeof f === "object" && f.doc !== undefined ? f.doc : null]]) };
+        });
+        CachedProp.dict.set("__set_name__", builtin("__set_name__", 3, (a) => {
+            const self = a[0], name = a[2];
+            const prev = self.dict.get("attrname");
+            if (prev === null) self.dict.set("attrname", name);
+            else if (prev !== name) fail(E.TypeError, "Cannot assign the same cached_property to two different names (" + repr(prev) + " and " + repr(name) + ").");
+            return null;
+        }));
+        CachedProp.dict.set("__get__", builtin("__get__", 3, (a) => {
+            const self = a[0], inst = a[1];
+            if (inst === null) return self;
+            const name = self.dict.get("attrname");
+            if (name === null) fail(E.TypeError, "Cannot use cached_property instance without calling __set_name__ on it.");
+            if (inst.dict === undefined || inst.dict === null) fail(E.TypeError, "No '__dict__' attribute on '" + typeOf(inst).name + "' instance to cache '" + name + "' property.");
+            if (inst.dict.has(name)) return inst.dict.get(name);
+            const v = call(self.dict.get("func"), [inst], null);
+            inst.dict.set(name, v);
+            return v;
+        }, 2));
+        g.set("cached_property", CachedProp);
         fn(g, "total_ordering", 1, (a) => { const c = a[0]; rt.bumpEpoch(); const has = (n) => c.dict.has(n); const lt = (x, y) => truth(call(rt.getattr(x, "__lt__"), [y], null)); if (has("__lt__")) { if (!has("__gt__")) c.dict.set("__gt__", builtin("__gt__", 2, (b) => !lt(b[0], b[1]) && !eq(b[0], b[1]))); if (!has("__le__")) c.dict.set("__le__", builtin("__le__", 2, (b) => lt(b[0], b[1]) || eq(b[0], b[1]))); if (!has("__ge__")) c.dict.set("__ge__", builtin("__ge__", 2, (b) => !lt(b[0], b[1]))); } return c; });
         fn(g, "cmp_to_key", 1, (a) => { const K = pyClass("K", "functools", { __init__: (b) => { b[0].dict.set("obj", b[1]); return null; }, __lt__: (b) => asInt(call(a[0], [b[0].dict.get("obj"), b[1].dict.get("obj")], null)) < 0n, __eq__: (b) => asInt(call(a[0], [b[0].dict.get("obj"), b[1].dict.get("obj")], null)) === 0n }); return K; });
-        fn(g, "singledispatch", 1, (a) => a[0]);
+        fn(g, "singledispatch", 1, (a) => {
+            const base = a[0];
+            const reg = new Map([[rt.ObjectType, base]]);
+            const dispatch = (cls) => {
+                for (const c of cls.mro) {
+                    const hit = reg.get(c);
+                    if (hit !== undefined) return hit;
+                }
+                for (const [k, impl] of reg) {
+                    if (k !== rt.ObjectType && isType(k) && rt.isSubclass(cls, k)) return impl;
+                }
+                return base;
+            };
+            const registerImpl = (cls, func) => {
+                if (cls !== null && typeof cls === "object" && cls.cls === rt.UnionType) {
+                    for (const t of cls.dict.get("__args__").items) reg.set(t === null ? T.NoneType : t, func);
+                } else {
+                    reg.set(cls, func);
+                }
+                return func;
+            };
+            const register = builtin("register", -1, (b) => {
+                if (b.length === 1) {
+                    const first = b[0];
+                    if (isType(first) || (first !== null && typeof first === "object" && first.cls === rt.UnionType)) {
+                        return builtin("register", 1, (c) => registerImpl(first, c[0]));
+                    }
+                    // @fn.register on a function with a type annotation on its first parameter.
+                    const ann = first !== null && typeof first === "object" ? first.annotations : undefined;
+                    if (ann instanceof Map && first.argnames && first.argnames.length > 0) {
+                        const t = ann.get(first.argnames[0]);
+                        if (t !== undefined) return registerImpl(t, first);
+                    }
+                    fail(E.TypeError, "Invalid first argument to `register()`. " + repr(first) + " is not a class or union type.");
+                }
+                if (b.length === 2) return registerImpl(b[0], b[1]);
+                fail(E.TypeError, "register() takes 1 or 2 arguments");
+            });
+            const wrapper = builtin(base.name || "singledispatch", -1, (b) => {
+                const kw = b[b.length - 1] instanceof Map ? b.pop() : null;
+                if (!b.length) fail(E.TypeError, (base.name || "wrapper") + " requires at least 1 positional argument");
+                return call(dispatch(typeOf(b[0])), b, kw);
+            });
+            wrapper.kwnames = true;
+            wrapper.dict = new Map([
+                ["register", register],
+                ["dispatch", builtin("dispatch", 1, (b) => dispatch(b[0]))],
+                ["registry", { cls: T.property, fget: builtin("registry", 1, () => { const d = dict(); for (const [k, v] of reg) dictSet(d, k, v); return rt.mappingProxy(d); }), fset: null, fdel: null, doc: null }],
+                ["__wrapped__", base],
+            ]);
+            // Expose registry directly as a mapping proxy (functions don't run property descriptors on their own dict).
+            wrapper.dict.set("registry", (() => {
+                const proxy = { cls: rt.ObjectType, dict: new Map() };
+                // Live view backed by `reg`.
+                const View = pyClass("mappingproxy", "types", {
+                    __getitem__: (c) => { const v = reg.get(c[1]); if (v === undefined) throw rt.makeExc(E.KeyError, [c[1]]); return v; },
+                    __contains__: (c) => reg.has(c[1]),
+                    __len__: () => BigInt(reg.size),
+                    __iter__: () => iter(list(Array.from(reg.keys()))),
+                    keys: () => list(Array.from(reg.keys())),
+                    items: () => list(Array.from(reg.entries()).map((e) => tuple(e))),
+                    get: (c) => { const v = reg.get(c[1]); return v === undefined ? (c[2] === undefined ? null : c[2]) : v; },
+                });
+                return { cls: View, dict: new Map() };
+            })());
+            return wrapper;
+        });
     });
     mod("collections", (g) => {
         const DefaultDict = rt.newType("defaultdict", [T.dict], new Map(), "collections");
@@ -2381,6 +2544,8 @@
         rt.allocators.set(Deque, (cls) => ({ cls: cls, items: [], maxlen: null }));
         Deque.dict.set("maxlen", { cls: T.property, fget: builtin("maxlen", 1, (a) => a[0].maxlen === null ? null : BigInt(a[0].maxlen)), fset: null, fdel: null, doc: null });
         g.set("deque", Deque);
+        const cgCol = { cls: T.classmethod, func: builtin("__class_getitem__", 2, (a) => rt.makeGenericAlias(a[0], a[1])) };
+        for (const ct of [DefaultDict, OrderedDict, Deque]) ct.dict.set("__class_getitem__", cgCol);
         fnkw(g, "namedtuple", (a) => {
             const kw = kwOf(a, ["defaults", "rename", "module"]);
             const name = needStr(a[0]);
@@ -2936,20 +3101,29 @@
             const cls = a[0];
             const members = [], named = [];
             // auto(): one past the largest int value so far; for a Flag, the
-            // next power of two above every value so far.
+            // next power of two above every value so far; for StrEnum, lowercased name.
             const isFlag = rt.isSubclass(cls, Flag);
+            const isIntMixin = rt.isSubclass(cls, T.int);
+            const isStrMixin = rt.isSubclass(cls, T.str);
+            const isFloatMixin = rt.isSubclass(cls, T.float);
             let high = 0n;
             for (const [k, v] of Array.from(cls.dict)) {
                 if (k.startsWith("_") || (v !== null && typeof v === "object" && (v.cls === T.function || v.cls === T.property || v.cls === T.staticmethod || v.cls === T.classmethod || v.cls === T.builtin_function_or_method))) continue;
                 let value = v;
                 if (v !== null && typeof v === "object" && v.isAuto) {
-                    if (isFlag) { value = 1n; while (value <= high) value <<= 1n; }
+                    if (isStrMixin) value = k.toLowerCase();
+                    else if (isFlag) { value = 1n; while (value <= high) value <<= 1n; }
                     else value = members.length || high > 0n ? high + 1n : 1n;
                 }
+                if (isIntMixin && !isInt(value)) value = needInt(value);
+                else if (isStrMixin && typeof value !== "string") value = str(value);
                 if (isInt(value) && (members.length === 0 || asInt(value) > high)) high = asInt(value);
                 const existing = members.find((m) => eq(m.dict.get("value"), value));
                 if (existing) { cls.dict.set(k, existing); named.push([k, existing]); continue; }
                 const m = { cls: cls, dict: new Map([["name", k], ["value", value]]) };
+                if (isIntMixin) m.pyval = asInt(value);
+                else if (isStrMixin) m.pyval = typeof value === "string" ? value : str(value);
+                else if (isFloatMixin) m.pyval = toFloat(value);
                 members.push(m); named.push([k, m]); cls.dict.set(k, m);
             }
             cls.members = members;
@@ -2967,6 +3141,9 @@
             const mixin = cls.mro.find((c) => c !== rt.ObjectType && rt.constructors.has(c));
             if (mixin !== undefined) {
                 const enumIndex = cls.mro.indexOf(Enum), mixinIndex = cls.mro.indexOf(mixin);
+                if (!cls.mro.slice(0, mixinIndex).some((c) => c.dict.has("__new__"))) {
+                    cls.dict.set("__new__", Enum.dict.get("__new__"));
+                }
                 for (const name of ["__str__", "__repr__", "__format__"]) {
                     const owner = cls.mro.find((c) => c.dict.has(name));
                     if (owner !== undefined && cls.mro.indexOf(owner) === mixinIndex && mixinIndex < enumIndex) {
@@ -2975,7 +3152,9 @@
                     }
                 }
                 if (!cls.mro.slice(0, mixinIndex).some((c) => c.dict.has("__eq__"))) {
-                    cls.dict.set("__eq__", builtin("__eq__", 2, (a) => a[0] === a[1] || (isInstance(a[1], mixin) && !(a[1] !== null && typeof a[1] === "object" && a[1].dict !== undefined && a[1].dict.has("value") && isInstance(a[1], Enum)) && eq(a[0].dict.get("value"), a[1]))));
+                    if (mixin !== T.int && mixin !== T.str && mixin !== T.float) {
+                        cls.dict.set("__eq__", builtin("__eq__", 2, (a) => a[0] === a[1] || (isInstance(a[1], mixin) && eq(a[0].dict.get("value"), a[1]))));
+                    }
                     cls.dict.set("__hash__", builtin("__hash__", 1, (a) => rt.hashInt(a[0].dict.get("value"))));
                 }
             }
@@ -3029,16 +3208,22 @@
         Enum.dict.set("__len__", { cls: T.classmethod, func: builtin("__len__", 1, (a) => BigInt((a[0].members || []).length)) });
         Enum.dict.set("__getitem__", { cls: T.classmethod, func: builtin("__getitem__", 2, (a) => { const ms = a[0].dict.get("__members__"); const m = ms === undefined || typeof a[1] !== "string" ? undefined : dictGet(ms, a[1]); if (m !== undefined) return m; throw rt.makeExc(E.KeyError, [a[1]]); }) });
         g.set("Enum", Enum);
-        const IntEnum = rt.newType("IntEnum", [Enum], new Map(), "enum");
+        const IntEnum = rt.newType("IntEnum", [T.int, Enum], new Map(), "enum");
+        IntEnum.dict.set("__new__", Enum.dict.get("__new__"));
         IntEnum.dict.set("__int__", builtin("__int__", 1, (a) => asInt(a[0].dict.get("value"))));
         IntEnum.dict.set("__str__", builtin("__str__", 1, (a) => str(a[0].dict.get("value"))));
+        IntEnum.dict.set("__repr__", builtin("__repr__", 1, (a) => { const n = a[0].dict.get("name"); return "<" + typeOf(a[0]).name + (n === null ? "" : "." + n) + ": " + repr(a[0].dict.get("value")) + ">"; }));
         IntEnum.dict.set("__format__", builtin("__format__", 2, (a) => rt.formatValue(a[0].dict.get("value"), a[1])));
         IntEnum.dict.set("__index__", builtin("__index__", 1, (a) => asInt(a[0].dict.get("value"))));
-        IntEnum.dict.set("__eq__", builtin("__eq__", 2, (a) => isInt(a[1]) ? eq(a[0].dict.get("value"), a[1]) : a[0] === a[1]));
-        IntEnum.dict.set("__lt__", builtin("__lt__", 2, (a) => cmp("lt", a[0].dict.get("value"), isInt(a[1]) ? a[1] : a[1].dict.get("value"))));
         IntEnum.dict.set("__hash__", builtin("__hash__", 1, (a) => rt.hashInt(a[0].dict.get("value"))));
-        for (const [n, op] of [["__add__", "add"], ["__sub__", "sub"], ["__mul__", "mul"]]) IntEnum.dict.set(n, builtin(n, 2, (a) => R.binop(op, a[0].dict.get("value"), isInt(a[1]) ? a[1] : a[1].dict.get("value"))));
-        g.set("IntEnum", IntEnum); g.set("StrEnum", rt.newType("StrEnum", [Enum], new Map(), "enum"));
+        g.set("IntEnum", IntEnum);
+        const StrEnum = rt.newType("StrEnum", [T.str, Enum], new Map(), "enum");
+        StrEnum.dict.set("__new__", Enum.dict.get("__new__"));
+        StrEnum.dict.set("__str__", builtin("__str__", 1, (a) => a[0].dict.get("value")));
+        StrEnum.dict.set("__repr__", builtin("__repr__", 1, (a) => { const n = a[0].dict.get("name"); return "<" + typeOf(a[0]).name + (n === null ? "" : "." + n) + ": " + repr(a[0].dict.get("value")) + ">"; }));
+        StrEnum.dict.set("__format__", builtin("__format__", 2, (a) => rt.formatValue(a[0].dict.get("value"), a[1])));
+        StrEnum.dict.set("__hash__", builtin("__hash__", 1, (a) => rt.hashInt(a[0].dict.get("value"))));
+        g.set("StrEnum", StrEnum);
         // Flag members combine bitwise; a combination without its own member
         // is a pseudo-member named after the flags it contains.
         const Flag = rt.newType("Flag", [Enum], new Map(), "enum");
@@ -3053,6 +3238,7 @@
                 let covered = 0n; for (const x of named) covered |= x.dict.get("value");
                 if (parts.length && (v & ~covered) !== 0n) parts.push(String(v & ~covered));
                 m = { cls: cls, dict: new Map([["name", parts.length ? parts.join("|") : null], ["value", v]]) };
+                if (rt.isSubclass(cls, T.int)) m.pyval = v;
                 cls.composites.set(v, m);
             }
             return m;
@@ -3071,7 +3257,11 @@
         Flag.dict.set("__eq__", builtin("__eq__", 2, (a) => a[1] !== null && typeof a[1] === "object" && typeOf(a[1]) === typeOf(a[0]) && fv(a[0]) === fv(a[1])));
         g.set("Flag", Flag);
         const IntFlag = rt.newType("IntFlag", [Flag, IntEnum], new Map(), "enum");
-        IntFlag.dict.set("__eq__", builtin("__eq__", 2, (a) => isInt(a[1]) ? fv(a[0]) === asInt(a[1]) : (a[1] !== null && typeof a[1] === "object" && a[1].dict !== undefined && a[1].dict.has("value") && fv(a[0]) === fv(a[1]))));
+        IntFlag.dict.set("__eq__", builtin("__eq__", 2, (a) => {
+            if (isInt(a[1])) return fv(a[0]) === asInt(a[1]);
+            if (typeof a[1] === "number") return Number(fv(a[0])) === a[1];
+            return a[1] !== null && typeof a[1] === "object" && isInstance(a[1], T.int) && fv(a[0]) === asInt(a[1]);
+        }));
         IntFlag.dict.set("__str__", builtin("__str__", 1, (a) => str(fv(a[0]))));
         for (const n of ["__or__", "__and__", "__xor__", "__ror__", "__rand__", "__rxor__"]) IntFlag.dict.set(n, builtin(n, 2, (a) => { const other = a[1]; if (!isInt(other) && !(other !== null && typeof other === "object" && other.dict !== undefined && other.dict.has("value"))) return NOTIMPL; return call(Flag.dict.get(n), [a[0], other], null); }));
         g.set("IntFlag", IntFlag);
@@ -3083,5 +3273,369 @@
             return cls;
         });
     });
-    mod("fractions", (g) => { g.set("Fraction", null); });
+
+    // ---- types --------------------------------------------------------------------------------------
+    mod("types", (g) => {
+        const SimpleNamespace = rt.newType("SimpleNamespace", [rt.ObjectType], new Map(), "types");
+        SimpleNamespace.dict.set("__init__", (() => {
+            const f = builtin("__init__", -1, (a) => {
+                const kw = a[a.length - 1] instanceof Map ? a.pop() : null;
+                const self = a[0];
+                if (a.length > 2) fail(E.TypeError, "SimpleNamespace expected at most 1 arguments, got " + (a.length - 1));
+                if (a.length === 2) {
+                    const m = a[1];
+                    if (m !== null && typeof m === "object" && m.map !== undefined && isInstance(m, T.dict)) {
+                        for (const [k, v] of dictEntries(m)) self.dict.set(needStr(k, "keywords"), v);
+                    } else {
+                        for (const pair of drain(m)) {
+                            const p = drain(pair);
+                            if (p.length !== 2) fail(E.ValueError, "dictionary update sequence element has length " + p.length + "; 2 is required");
+                            self.dict.set(needStr(p[0], "keywords"), p[1]);
+                        }
+                    }
+                }
+                if (kw) for (const [k, v] of kw) self.dict.set(k, v);
+                return null;
+            });
+            f.kwnames = true;
+            return f;
+        })());
+        SimpleNamespace.dict.set("__repr__", builtin("__repr__", 1, (a) => {
+            const parts = [];
+            for (const [k, v] of a[0].dict) parts.push(k + "=" + repr(v));
+            const t = typeOf(a[0]);
+            return (t === SimpleNamespace ? "namespace" : t.name) + "(" + parts.join(", ") + ")";
+        }));
+        SimpleNamespace.dict.set("__eq__", builtin("__eq__", 2, (a) => {
+            if (!isInstance(a[1], SimpleNamespace)) return NOTIMPL;
+            const d1 = a[0].dict, d2 = a[1].dict;
+            if (d1.size !== d2.size) return false;
+            for (const [k, v] of d1) if (!d2.has(k) || !eq(v, d2.get(k))) return false;
+            return true;
+        }));
+        SimpleNamespace.dict.set("__replace__", (() => {
+            const f = builtin("__replace__", -1, (a) => {
+                const kw = a[a.length - 1] instanceof Map ? a.pop() : null;
+                const d = new Map(a[0].dict);
+                if (kw) for (const [k, v] of kw) d.set(k, v);
+                return { cls: typeOf(a[0]), dict: d };
+            });
+            f.kwnames = true;
+            return f;
+        })());
+        g.set("SimpleNamespace", SimpleNamespace);
+        const MappingProxyType = rt.newType("mappingproxy", [rt.ObjectType], new Map(), "types");
+        rt.constructors.set(MappingProxyType, (a) => {
+            if (a.length !== 1) fail(E.TypeError, "mappingproxy() takes exactly 1 argument");
+            const src = a[0];
+            if (src === null || typeof src !== "object" || (src.map === undefined && rt.lookupType(typeOf(src), "__getitem__") === undefined)) {
+                fail(E.TypeError, "mappingproxy() argument must be a mapping, not " + typeOf(src).name);
+            }
+            return { cls: MappingProxyType, dict: new Map(), _src: src };
+        });
+        MappingProxyType.dict.set("__getitem__", builtin("__getitem__", 2, (a) => getitem(a[0]._src, a[1])));
+        MappingProxyType.dict.set("__contains__", builtin("__contains__", 2, (a) => rt.contains(a[0]._src, a[1])));
+        MappingProxyType.dict.set("__len__", builtin("__len__", 1, (a) => rt.len(a[0]._src)));
+        MappingProxyType.dict.set("__iter__", builtin("__iter__", 1, (a) => iter(a[0]._src)));
+        MappingProxyType.dict.set("get", builtin("get", 3, (a) => call(rt.getattr(a[0]._src, "get"), a.length >= 3 ? [a[1], a[2]] : [a[1]], null), 2));
+        MappingProxyType.dict.set("keys", builtin("keys", 1, (a) => call(rt.getattr(a[0]._src, "keys"), [], null)));
+        MappingProxyType.dict.set("values", builtin("values", 1, (a) => call(rt.getattr(a[0]._src, "values"), [], null)));
+        MappingProxyType.dict.set("items", builtin("items", 1, (a) => call(rt.getattr(a[0]._src, "items"), [], null)));
+        MappingProxyType.dict.set("copy", builtin("copy", 1, (a) => call(rt.getattr(a[0]._src, "copy"), [], null)));
+        MappingProxyType.dict.set("__eq__", builtin("__eq__", 2, (a) => eq(a[0]._src, a[1] !== null && typeof a[1] === "object" && a[1].cls === MappingProxyType ? a[1]._src : a[1])));
+        MappingProxyType.dict.set("__repr__", builtin("__repr__", 1, (a) => "mappingproxy(" + repr(a[0]._src) + ")"));
+        g.set("MappingProxyType", MappingProxyType);
+        g.set("FunctionType", T.function);
+        g.set("LambdaType", T.function);
+        g.set("MethodType", T.method);
+        g.set("ModuleType", T.module);
+        g.set("GeneratorType", T.generator);
+        g.set("CoroutineType", T.coroutine);
+        g.set("AsyncGeneratorType", T.async_generator);
+        g.set("BuiltinFunctionType", T.builtin_function_or_method);
+        g.set("BuiltinMethodType", T.builtin_function_or_method);
+        g.set("GenericAlias", rt.GenericAlias);
+        g.set("UnionType", rt.UnionType);
+        g.set("NoneType", T.NoneType);
+        g.set("EllipsisType", T.ellipsis);
+        g.set("NotImplementedType", T.NotImplementedType);
+        g.set("CellType", T.cell);
+        g.set("CodeType", T.code);
+        g.set("FrameType", T.frame);
+        g.set("TracebackType", T.traceback);
+        fnkw(g, "prepare_class", (a) => {
+            const name = needStr(a[0]);
+            const bases = a[1] === undefined ? [] : drain(a[1]);
+            const kwds = a[2] !== undefined && a[2] !== null ? rt.asDict(a[2]) : dict();
+            const kw = new Map();
+            let meta = rt.TypeType;
+            for (const [k, v] of dictEntries(kwds)) {
+                if (k === "metaclass") meta = v;
+                else kw.set(k, v);
+            }
+            for (const b of bases) {
+                const m = b.cls || rt.TypeType;
+                if (rt.isSubclass(m, meta)) meta = m;
+            }
+            const prep = rt.lookupType(meta, "__prepare__");
+            const ns = prep !== undefined ? call(descrGet(prep, null, meta), [name, tuple(bases)], kw) : dict();
+            return tuple([meta, ns, rt.dictFromMap(kw)]);
+        });
+        fnkw(g, "new_class", (a) => {
+            const name = needStr(a[0]);
+            const bases = a[1] === undefined ? [] : drain(a[1]);
+            const kwds = a[2] !== undefined && a[2] !== null ? rt.asDict(a[2]) : null;
+            const execBody = a[3] === undefined ? null : a[3];
+            const res = call(g.get("prepare_class"), [name, tuple(bases), kwds], null).items;
+            const meta = res[0], ns = res[1], kw = rt.mapFromDict(res[2]);
+            if (execBody !== null) call(execBody, [ns], null);
+            return call(meta, [name, tuple(bases), ns], kw);
+        });
+    });
+
+    // ---- weakref ------------------------------------------------------------------------------------
+    mod("weakref", (g) => {
+        const hasWR = typeof WeakRef === "function";
+        const mkWR = (obj) => hasWR ? new WeakRef(obj) : { deref: () => obj };
+        const canWeakref = (obj) => {
+            if (obj === null || typeof obj !== "object") return false;
+            const c = obj.cls;
+            if (c === T.list || c === T.tuple || c === T.dict || c === T.bytes || c === T.bytearray || c === T.range || c === T.slice || c === T.complex) return false;
+            return true;
+        };
+        const refMap = typeof WeakMap === "function" ? new WeakMap() : null;
+        const trackRef = (obj, r) => {
+            if (refMap === null) return;
+            let arr = refMap.get(obj);
+            if (arr === undefined) { arr = []; refMap.set(obj, arr); }
+            arr.push(mkWR(r));
+        };
+        const liveRefs = (obj) => {
+            if (refMap === null || obj === null || typeof obj !== "object") return [];
+            const arr = refMap.get(obj);
+            if (arr === undefined) return [];
+            const out = [];
+            for (let i = 0; i < arr.length; i++) {
+                const r = arr[i].deref();
+                if (r !== undefined && r._wr.deref() === obj) out.push(r);
+            }
+            return out;
+        };
+        const defaultRefMap = typeof WeakMap === "function" ? new WeakMap() : null;
+        const RefType = rt.newType("ReferenceType", [rt.ObjectType], new Map(), "weakref");
+        rt.constructors.set(RefType, (a, _kw, cls) => {
+            if (a.length < 1 || a.length > 2) fail(E.TypeError, "ref expected at most 2 arguments, got " + a.length);
+            const obj = a[0], cb = a[1] === undefined ? null : a[1];
+            if (!canWeakref(obj)) fail(E.TypeError, "cannot create weak reference to '" + typeOf(obj).name + "' object");
+            const targetCls = cls || RefType;
+            if (cb === null && targetCls === RefType && defaultRefMap !== null) {
+                const cached = defaultRefMap.get(obj);
+                if (cached !== undefined) {
+                    const live = cached.deref();
+                    if (live !== undefined && live._wr.deref() === obj) return live;
+                }
+            }
+            const r = { cls: targetCls, dict: new Map(), _wr: mkWR(obj), _cb: cb, _hash: undefined };
+            if (cb === null && targetCls === RefType && defaultRefMap !== null) defaultRefMap.set(obj, mkWR(r));
+            trackRef(obj, r);
+            return r;
+        });
+        RefType.dict.set("__call__", builtin("__call__", 1, (a) => { const v = a[0]._wr.deref(); return v === undefined ? null : v; }));
+        RefType.dict.set("__callback__", { cls: T.property, fget: builtin("__callback__", 1, (a) => a[0]._cb), fset: null, fdel: null, doc: null });
+        RefType.dict.set("__eq__", builtin("__eq__", 2, (a) => {
+            if (!isInstance(a[1], RefType)) return NOTIMPL;
+            const x = a[0]._wr.deref(), y = a[1]._wr.deref();
+            if (x === undefined || y === undefined) return a[0] === a[1];
+            return eq(x, y);
+        }));
+        RefType.dict.set("__hash__", builtin("__hash__", 1, (a) => {
+            if (a[0]._hash !== undefined) return a[0]._hash;
+            const v = a[0]._wr.deref();
+            if (v === undefined) fail(E.TypeError, "weak object has gone away");
+            a[0]._hash = rt.hashInt(v);
+            return a[0]._hash;
+        }));
+        RefType.dict.set("__repr__", builtin("__repr__", 1, (a) => {
+            const v = a[0]._wr.deref();
+            const id = rt.ident(a[0]).toString(16).padStart(8, "0");
+            if (v === undefined) return "<weakref at 0x" + id + "; dead>";
+            const t = typeOf(v);
+            const name = typeof v.name === "string" ? " '" + v.name + "'" : "";
+            return "<weakref at 0x" + id + "; to '" + t.name + "'" + name + " at 0x" + rt.ident(v).toString(16).padStart(8, "0") + ">";
+        }));
+        g.set("ref", RefType);
+        g.set("ReferenceType", RefType);
+
+        const derefProxy = (p) => {
+            const v = p._wr.deref();
+            if (v === undefined) fail(E.ReferenceError, "weakly-referenced object no longer exists");
+            return v;
+        };
+        const ProxyType = rt.newType("ProxyType", [rt.ObjectType], new Map(), "weakref");
+        const CallableProxyType = rt.newType("CallableProxyType", [ProxyType], new Map(), "weakref");
+        ProxyType.dict.set("__getattribute__", builtin("__getattribute__", 2, (a) => rt.getattr(derefProxy(a[0]), a[1])));
+        ProxyType.dict.set("__setattr__", builtin("__setattr__", 3, (a) => rt.setattr(derefProxy(a[0]), a[1], a[2])));
+        ProxyType.dict.set("__delattr__", builtin("__delattr__", 2, (a) => R.delattr(derefProxy(a[0]), a[1])));
+        ProxyType.dict.set("__repr__", builtin("__repr__", 1, (a) => repr(derefProxy(a[0]))));
+        ProxyType.dict.set("__str__", builtin("__str__", 1, (a) => str(derefProxy(a[0]))));
+        ProxyType.dict.set("__eq__", builtin("__eq__", 2, (a) => eq(derefProxy(a[0]), a[1])));
+        ProxyType.dict.set("__bool__", builtin("__bool__", 1, (a) => truth(derefProxy(a[0]))));
+        ProxyType.dict.set("__len__", builtin("__len__", 1, (a) => rt.len(derefProxy(a[0]))));
+        ProxyType.dict.set("__iter__", builtin("__iter__", 1, (a) => iter(derefProxy(a[0]))));
+        ProxyType.dict.set("__getitem__", builtin("__getitem__", 2, (a) => getitem(derefProxy(a[0]), a[1])));
+        ProxyType.dict.set("__setitem__", builtin("__setitem__", 3, (a) => { R.setitem(derefProxy(a[0]), a[1], a[2]); return null; }));
+        ProxyType.dict.set("__delitem__", builtin("__delitem__", 2, (a) => { R.delitem(derefProxy(a[0]), a[1]); return null; }));
+        ProxyType.dict.set("__contains__", builtin("__contains__", 2, (a) => rt.contains(derefProxy(a[0]), a[1])));
+        CallableProxyType.dict.set("__call__", (() => {
+            const f = builtin("__call__", -1, (a) => {
+                const kw = a[a.length - 1] instanceof Map ? a.pop() : null;
+                return call(derefProxy(a[0]), a.slice(1), kw);
+            });
+            f.kwnames = true;
+            return f;
+        })());
+        g.set("ProxyType", ProxyType);
+        g.set("CallableProxyType", CallableProxyType);
+        g.set("ProxyTypes", tuple([ProxyType, CallableProxyType]));
+        fn(g, "proxy", 2, (a) => {
+            const obj = a[0], cb = a[1] === undefined ? null : a[1];
+            if (!canWeakref(obj)) fail(E.TypeError, "cannot create weak reference to '" + typeOf(obj).name + "' object");
+            const cls = rt.isCallable(obj) ? CallableProxyType : ProxyType;
+            const p = { cls: cls, dict: new Map(), _wr: mkWR(obj), _cb: cb };
+            trackRef(obj, p);
+            return p;
+        }, 1);
+        fn(g, "getweakrefcount", 1, (a) => BigInt(liveRefs(a[0]).length));
+        fn(g, "getweakrefs", 1, (a) => list(liveRefs(a[0])));
+
+        const WeakValueDictionary = pyClass("WeakValueDictionary", "weakref", {
+            __init__: (a) => {
+                const kw = a[a.length - 1] instanceof Map ? a.pop() : null;
+                a[0]._data = dict();
+                if (a[1] !== undefined) {
+                    const src = a[1];
+                    const pairs = src !== null && typeof src === "object" && src.map !== undefined && isInstance(src, T.dict) ? dictEntries(src) : drain(src).map((p) => drain(p));
+                    for (const [k, v] of pairs) dictSet(a[0]._data, k, call(RefType, [v], null));
+                }
+                if (kw) for (const [k, v] of kw) dictSet(a[0]._data, k, call(RefType, [v], null));
+                return null;
+            },
+            __getitem__: (a) => { const r = dictGet(a[0]._data, a[1]); const v = r === undefined ? undefined : r._wr.deref(); if (v === undefined) throw rt.makeExc(E.KeyError, [a[1]]); return v; },
+            __setitem__: (a) => { dictSet(a[0]._data, a[1], call(RefType, [a[2]], null)); return null; },
+            __delitem__: (a) => { if (!rt.dictDel(a[0]._data, a[1])) throw rt.makeExc(E.KeyError, [a[1]]); return null; },
+            __contains__: (a) => { const r = dictGet(a[0]._data, a[1]); return r !== undefined && r._wr.deref() !== undefined; },
+            __len__: (a) => { let n = 0n; for (const [, r] of dictEntries(a[0]._data)) if (r._wr.deref() !== undefined) n++; return n; },
+            __iter__: (a) => { const ks = []; for (const [k, r] of dictEntries(a[0]._data)) if (r._wr.deref() !== undefined) ks.push(k); return iter(list(ks)); },
+            get: (a) => { const r = dictGet(a[0]._data, a[1]); const v = r === undefined ? undefined : r._wr.deref(); return v === undefined ? (a[2] === undefined ? null : a[2]) : v; },
+            keys: (a) => { const ks = []; for (const [k, r] of dictEntries(a[0]._data)) if (r._wr.deref() !== undefined) ks.push(k); return list(ks); },
+            values: (a) => { const vs = []; for (const [, r] of dictEntries(a[0]._data)) { const v = r._wr.deref(); if (v !== undefined) vs.push(v); } return list(vs); },
+            items: (a) => { const ps = []; for (const [k, r] of dictEntries(a[0]._data)) { const v = r._wr.deref(); if (v !== undefined) ps.push(tuple([k, v])); } return list(ps); },
+            pop: (a) => { const r = dictGet(a[0]._data, a[1]); const v = r === undefined ? undefined : r._wr.deref(); if (v !== undefined) { rt.dictDel(a[0]._data, a[1]); return v; } if (a.length >= 3) return a[2]; throw rt.makeExc(E.KeyError, [a[1]]); },
+            clear: (a) => { rt.dictClear(a[0]._data); return null; },
+        });
+        WeakValueDictionary.dict.get("__init__").kwnames = true;
+        g.set("WeakValueDictionary", WeakValueDictionary);
+
+        const WeakKeyDictionary = pyClass("WeakKeyDictionary", "weakref", {
+            __init__: (a) => {
+                a[0]._entries = [];
+                if (a[1] !== undefined) {
+                    const src = a[1];
+                    const pairs = src !== null && typeof src === "object" && src.map !== undefined && isInstance(src, T.dict) ? dictEntries(src) : drain(src).map((p) => drain(p));
+                    for (const [k, v] of pairs) a[0]._entries.push([call(RefType, [k], null), v]);
+                }
+                return null;
+            },
+            __getitem__: (a) => { for (const [r, v] of a[0]._entries) { const k = r._wr.deref(); if (k !== undefined && eq(k, a[1])) return v; } throw rt.makeExc(E.KeyError, [a[1]]); },
+            __setitem__: (a) => {
+                const ref = call(RefType, [a[1]], null);
+                for (let i = 0; i < a[0]._entries.length; i++) {
+                    const k = a[0]._entries[i][0]._wr.deref();
+                    if (k !== undefined && eq(k, a[1])) { a[0]._entries[i][1] = a[2]; return null; }
+                }
+                a[0]._entries.push([ref, a[2]]);
+                return null;
+            },
+            __delitem__: (a) => {
+                for (let i = 0; i < a[0]._entries.length; i++) {
+                    const k = a[0]._entries[i][0]._wr.deref();
+                    if (k !== undefined && eq(k, a[1])) { a[0]._entries.splice(i, 1); return null; }
+                }
+                throw rt.makeExc(E.KeyError, [a[1]]);
+            },
+            __contains__: (a) => { for (const [r] of a[0]._entries) { const k = r._wr.deref(); if (k !== undefined && eq(k, a[1])) return true; } return false; },
+            __len__: (a) => { let n = 0n; for (const [r] of a[0]._entries) if (r._wr.deref() !== undefined) n++; return n; },
+            __iter__: (a) => { const ks = []; for (const [r] of a[0]._entries) { const k = r._wr.deref(); if (k !== undefined) ks.push(k); } return iter(list(ks)); },
+            get: (a) => { for (const [r, v] of a[0]._entries) { const k = r._wr.deref(); if (k !== undefined && eq(k, a[1])) return v; } return a[2] === undefined ? null : a[2]; },
+            clear: (a) => { a[0]._entries.length = 0; return null; },
+        });
+        g.set("WeakKeyDictionary", WeakKeyDictionary);
+
+        const WeakSet = pyClass("WeakSet", "weakref", {
+            __init__: (a) => {
+                a[0]._refs = [];
+                if (a[1] !== undefined) for (const x of drain(a[1])) a[0]._refs.push(call(RefType, [x], null));
+                return null;
+            },
+            add: (a) => {
+                const ref = call(RefType, [a[1]], null);
+                for (const r of a[0]._refs) { const v = r._wr.deref(); if (v !== undefined && eq(v, a[1])) return null; }
+                a[0]._refs.push(ref);
+                return null;
+            },
+            discard: (a) => {
+                for (let i = 0; i < a[0]._refs.length; i++) {
+                    const v = a[0]._refs[i]._wr.deref();
+                    if (v !== undefined && eq(v, a[1])) { a[0]._refs.splice(i, 1); return null; }
+                }
+                return null;
+            },
+            remove: (a) => {
+                for (let i = 0; i < a[0]._refs.length; i++) {
+                    const v = a[0]._refs[i]._wr.deref();
+                    if (v !== undefined && eq(v, a[1])) { a[0]._refs.splice(i, 1); return null; }
+                }
+                throw rt.makeExc(E.KeyError, [a[1]]);
+            },
+            __contains__: (a) => { for (const r of a[0]._refs) { const v = r._wr.deref(); if (v !== undefined && eq(v, a[1])) return true; } return false; },
+            __len__: (a) => { let n = 0n; for (const r of a[0]._refs) if (r._wr.deref() !== undefined) n++; return n; },
+            __iter__: (a) => { const vs = []; for (const r of a[0]._refs) { const v = r._wr.deref(); if (v !== undefined) vs.push(v); } return iter(list(vs)); },
+            clear: (a) => { a[0]._refs.length = 0; return null; },
+        });
+        g.set("WeakSet", WeakSet);
+
+        const Finalize = pyClass("finalize", "weakref", {
+            __init__: (a) => {
+                const kw = a[a.length - 1] instanceof Map ? a.pop() : null;
+                if (a.length < 3) fail(E.TypeError, "finalize() requires at least 2 arguments");
+                a[0]._ref = call(RefType, [a[1]], null);
+                a[0]._func = a[2];
+                a[0]._args = a.slice(3);
+                a[0]._kw = kw;
+                a[0]._alive = true;
+                return null;
+            },
+            __call__: (a) => {
+                if (!a[0]._alive) return null;
+                a[0]._alive = false;
+                return call(a[0]._func, a[0]._args, a[0]._kw);
+            },
+            detach: (a) => {
+                if (!a[0]._alive) return null;
+                a[0]._alive = false;
+                const obj = a[0]._ref._wr.deref();
+                if (obj === undefined) return null;
+                return tuple([obj, a[0]._func, tuple(a[0]._args), a[0]._kw ? rt.dictFromMap(a[0]._kw) : dict()]);
+            },
+            peek: (a) => {
+                if (!a[0]._alive) return null;
+                const obj = a[0]._ref._wr.deref();
+                if (obj === undefined) return null;
+                return tuple([obj, a[0]._func, tuple(a[0]._args), a[0]._kw ? rt.dictFromMap(a[0]._kw) : dict()]);
+            },
+        });
+        Finalize.dict.get("__init__").kwnames = true;
+        Finalize.dict.set("alive", { cls: T.property, fget: builtin("alive", 1, (a) => a[0]._alive && a[0]._ref._wr.deref() !== undefined), fset: null, fdel: null, doc: null });
+        g.set("finalize", Finalize);
+    });
 })(__zipp_py);

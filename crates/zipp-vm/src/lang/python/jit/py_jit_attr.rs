@@ -2,7 +2,7 @@
 //! sites of a Python body about to compile read or write layout-mode
 //! instance storage, from the interpreter's per-site caches (`vm::py_attr`).
 use super::*;
-use crate::codegen::PyAttrInline;
+use crate::codegen::{PyAttrInline, PyCompilePlan, PyRegionExtras, PySqrtInline};
 
 impl<'p> Vm<'p> {
     /// The out-of-line step of an inline attribute site
@@ -49,8 +49,16 @@ impl<'p> Vm<'p> {
     /// Settle the hot mirror of the record `o`'s class (see
     /// `jit_py_attr_miss`), when it is a record whose map is settled.
     pub(crate) fn py_settle_class_of(&mut self, o: Value) {
-        let Some((cls, _)) = self.py_inst_parts(o) else {
-            return;
+        let cls = if o.is_heap() && self.heap.is_str_like(o.heap_index()) {
+            match self.py_rt.as_deref() {
+                Some(p) => p.t_str,
+                None => return,
+            }
+        } else {
+            match self.py_inst_parts(o) {
+                Some((cls, _)) => cls,
+                None => return,
+            }
         };
         if !cls.is_heap() || !self.ic_obj_ok(cls.heap_index()) {
             return;
@@ -63,8 +71,9 @@ impl<'p> Vm<'p> {
     /// Plan the attribute sites of `func_id` (every site of the body: an
     /// extended region reaches its out-of-line code too) and hand the plan
     /// to the JIT for the compile that follows. A site is planned only while
-    /// its cache holds a layout-mode entry whose class still has the entry's
-    /// stamp; every planned fact is re-checked by the emitted guards.
+    /// its cache holds a layout-mode entry (or a simple `@property` getter/
+    /// setter backed by one) whose class still has the entry's stamp; every
+    /// planned fact is re-checked by the emitted guards.
     pub(crate) fn py_attr_inline_plan(&self, func_id: u32) {
         let Some(rt) = self.py_rt.as_deref() else {
             return;
@@ -81,10 +90,43 @@ impl<'p> Vm<'p> {
         let proto = self.func(func_id as usize);
         let store_lane = self.heap.inline_store_lane_ok();
         let mut plan = rustc_hash::FxHashMap::default();
+        let mut extras = PyRegionExtras {
+            seq_shape: rt.seq_shape,
+            t_list_bits: rt.t_list.bits(),
+            t_tuple_bits: rt.t_tuple.bits(),
+            store_lane,
+            sqrt_sites: rustc_hash::FxHashMap::default(),
+        };
         for (ip, instr) in proto.code.iter().enumerate() {
             let set = match instr {
                 Instr::PyGetAttr { .. } => false,
                 Instr::PySetAttr { .. } => true,
+                Instr::PyCall { argc: 1, .. } if !super::prof_py::on() => {
+                    let e = self.py_ic(func_id, ip);
+                    let f = Value::from_bits(e.a);
+                    if let Some((strop_slot, 11)) = self.py_strm_hit(&e, f) {
+                        if let HeapObj::Object(m) = self.heap.get(f.heap_index()) {
+                            let f_shape = m.shape();
+                            let pos = e.pos as usize;
+                            if f_shape != crate::shape::DICT && pos < m.slot_len() {
+                                if let (Ok(ip_u32), Ok(strop_u32)) = (u32::try_from(ip), u32::try_from(strop_slot)) {
+                                    extras.sqrt_sites.insert(
+                                        ip_u32,
+                                        PySqrtInline {
+                                            f_bits: e.a,
+                                            f_shape,
+                                            hver: e.hver,
+                                            entry_slot: e.pos,
+                                            entry_bits: m.val_at(pos).bits(),
+                                            strop_slot: strop_u32,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
                 Instr::PyMethod { .. } if crate::codegen::py_method_inline_enabled() => {
                     // A method found in the receiver's class's tables
                     // (`Vm::py_method_plan`), answered inline while the
@@ -122,9 +164,20 @@ impl<'p> Vm<'p> {
             };
             let e = self.py_ic(func_id, ip);
             let want = if set { super::py_rt::ic::ATTR_SET_L } else { super::py_rt::ic::ATTR_GET_L };
-            if e.kind != want {
+            let (layout, slot) = if e.kind == want {
+                (e.d, e.pos)
+            } else if e.kind == super::py_rt::ic::ATTR_PROP {
+                let cls = Value::from_bits(e.a);
+                if !cls.is_heap() || !self.py_cls_stamp_ok(cls, e.hver, e.c) {
+                    continue;
+                }
+                let Some(ls) = self.py_prop_inline_plan(cls, set, &e) else {
+                    continue;
+                };
+                ls
+            } else {
                 continue;
-            }
+            };
             let cls = Value::from_bits(e.a);
             if !cls.is_heap() || !self.py_cls_stamp_ok(cls, e.hver, e.c) {
                 continue;
@@ -146,8 +199,8 @@ impl<'p> Vm<'p> {
                     ver_slot,
                     ver_bits: e.c,
                     hver: e.hver,
-                    layout: e.d,
-                    slot: e.pos,
+                    layout,
+                    slot,
                     store_lane,
                     method: 0,
                 },
@@ -156,6 +209,10 @@ impl<'p> Vm<'p> {
         if !plan.is_empty() && crate::jitlog_enabled() {
             eprintln!("[jit] PY attr plan fn{func_id}: {} inline site(s)", plan.len());
         }
-        crate::codegen::set_py_attr_plan(&self.jit as *const crate::codegen::Jit as usize, func_id, plan);
+        crate::codegen::set_py_attr_plan(
+            &self.jit as *const crate::codegen::Jit as usize,
+            func_id,
+            PyCompilePlan { attrs: plan, extras },
+        );
     }
 }

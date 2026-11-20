@@ -11,6 +11,12 @@ env_off_switch! {
     fn instanceof_memo_enabled() = "ZIPP_NO_INSTANCEOF_MEMO"
 }
 
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+pub(crate) fn instanceof_memo_on() -> bool {
+    instanceof_memo_enabled()
+}
+
 /// Whether a function's own-property side table holds `@@hasInstance`, and
 /// whether it holds `prototype`: the two keys `instanceof` asks of a plain
 /// function. Side tables have no shape for the (shape, key) memo, so each
@@ -214,11 +220,188 @@ impl<'p> Vm<'p> {
     /// `None`, with nothing observable done, sends the caller to the full
     /// operator. The general path paid a property lookup of `@@hasInstance` up
     /// the class's statics and %Function.prototype% for every test.
+    /// Extract the immediate prototype/class key of heap value `v` for
+    /// `instanceof_pair_memo`: `FID_MIRROR_CLASS | class` for a non-overridden
+    /// class instance, or the immediate prototype heap index (`< FID_MIRROR_CLASS`)
+    /// for a plain object or dense array. Returns `0` for non-objects, proxies,
+    /// `null`-prototype objects, or anything needing the full walk.
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    #[inline(always)]
+    fn instanceof_v_key(&self, v: Value) -> u32 {
+        // Sentinel key for all non-object values (primitives, strings, symbols,
+        // BigInts): strictly below `FID_MIRROR_CLASS` and never a valid heap
+        // prototype index.
+        const VKEY_NON_OBJ: u32 = crate::heap::FID_MIRROR_STR;
+        if !v.is_heap() {
+            return VKEY_NON_OBJ;
+        }
+        let vi = v.heap_index();
+        let mir = self.heap.hot_mirror_of(vi);
+        if mir.fid == crate::heap::FID_MIRROR_STR {
+            return VKEY_NON_OBJ;
+        }
+        if mir.fid >= crate::heap::FID_MIRROR_CLASS && mir.fid != crate::heap::FID_MIRROR_NONE {
+            return if !self.proto_of.has(vi) {
+                mir.fid
+            } else {
+                match self.proto_of.get_copied(vi) {
+                    Some(p) if p.is_heap() => p.heap_index(),
+                    _ => 0,
+                }
+            };
+        }
+        #[cfg(target_arch = "x86_64")]
+        if mir.shape != crate::shape::DICT && mir.fid == crate::heap::FID_MIRROR_NONE {
+            return match self.proto_of.get_copied(vi) {
+                Some(p) if p.is_heap() => p.heap_index(),
+                Some(_) => 0,
+                None => self.obj_proto,
+            };
+        }
+        #[cfg(target_arch = "x86_64")]
+        if self.heap.arr_mirror_live(vi) {
+            return match self.proto_of.get_copied(vi) {
+                Some(p) if p.is_heap() => p.heap_index(),
+                Some(_) => 0,
+                None => self.arr_proto,
+            };
+        }
+        match self.heap.get(vi) {
+            HeapObj::Object(m) => {
+                if let Some(c) = m.class {
+                    if !m.is_ctor && !m.class_proto && !self.proto_of.has(vi) {
+                        let k = crate::heap::class_mirror_fid(c);
+                        if k != crate::heap::FID_MIRROR_NONE {
+                            return k;
+                        }
+                    }
+                }
+                return match self.proto_of.get_copied(vi) {
+                    Some(p) if p.is_heap() => p.heap_index(),
+                    Some(_) => 0,
+                    None => if m.is_ctor { self.fn_proto } else { self.obj_proto },
+                };
+            }
+            HeapObj::Array(_) => {
+                return match self.proto_of.get_copied(vi) {
+                    Some(p) if p.is_heap() => p.heap_index(),
+                    Some(_) => 0,
+                    None => self.arr_proto,
+                };
+            }
+            HeapObj::Date(_) => {
+                return match self.proto_of.get_copied(vi) {
+                    Some(p) if p.is_heap() => p.heap_index(),
+                    Some(_) => 0,
+                    None => self.date_proto,
+                };
+            }
+            HeapObj::RegExp(_) => {
+                return match self.proto_of.get_copied(vi) {
+                    Some(p) if p.is_heap() => p.heap_index(),
+                    Some(_) => 0,
+                    None => self.regexp_proto,
+                };
+            }
+            HeapObj::Map { .. } => {
+                return match self.proto_of.get_copied(vi) {
+                    Some(p) if p.is_heap() => p.heap_index(),
+                    Some(_) => 0,
+                    None => self.map_proto,
+                };
+            }
+            HeapObj::Set(_) => {
+                return match self.proto_of.get_copied(vi) {
+                    Some(p) if p.is_heap() => p.heap_index(),
+                    Some(_) => 0,
+                    None => self.set_proto,
+                };
+            }
+            HeapObj::TypedArray { kind, .. } => {
+                return match self.proto_of.get_copied(vi) {
+                    Some(p) if p.is_heap() => p.heap_index(),
+                    Some(_) => 0,
+                    None => self.ta_protos.get(*kind as usize).copied().unwrap_or(0),
+                };
+            }
+            HeapObj::Func(fid) | HeapObj::Closure { func: fid, .. } => {
+                let f = self.func(*fid as usize);
+                if f.is_generator || f.is_async {
+                    return 0;
+                }
+                return match self.proto_of.get_copied(vi) {
+                    Some(p) if p.is_heap() => p.heap_index(),
+                    Some(_) => 0,
+                    None => self.fn_proto,
+                };
+            }
+            HeapObj::Native(_) | HeapObj::Bound { .. } => {
+                return match self.proto_of.get_copied(vi) {
+                    Some(p) if p.is_heap() => p.heap_index(),
+                    Some(_) => 0,
+                    None => self.fn_proto,
+                };
+            }
+            HeapObj::Promise { .. } => {
+                return match self.proto_of.get_copied(vi) {
+                    Some(p) if p.is_heap() => p.heap_index(),
+                    Some(_) => 0,
+                    None => self.promise_proto,
+                };
+            }
+            HeapObj::ArrayBuffer { .. } => {
+                return match self.proto_of.get_copied(vi) {
+                    Some(p) if p.is_heap() => p.heap_index(),
+                    Some(_) => 0,
+                    None => self.arraybuffer_proto,
+                };
+            }
+            HeapObj::DataView { .. } => {
+                return match self.proto_of.get_copied(vi) {
+                    Some(p) if p.is_heap() => p.heap_index(),
+                    Some(_) => 0,
+                    None => self.dataview_proto,
+                };
+            }
+            _ => {}
+        }
+        if !self.is_object_value(v) {
+            return VKEY_NON_OBJ;
+        }
+        0
+    }
+
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    #[inline(always)]
+    fn instanceof_pair_slot(v_key: u32, ci: u32) -> usize {
+        ((v_key.wrapping_mul(0x9E37_79B1) ^ ci.wrapping_mul(0x85EB_CA77)).wrapping_mul(0x27D4_EB2F)
+            >> 20) as usize
+            & (crate::vm::INSTANCEOF_PAIR_SLOTS - 1)
+    }
+
     pub(crate) fn instanceof_fast(&mut self, c: Value, v: Value) -> Option<bool> {
         if !c.is_heap() {
             return None;
         }
         let ci = c.heap_index();
+        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+        let v_key = if instanceof_memo_enabled() {
+            let vk = self.instanceof_v_key(v);
+            if vk != 0 {
+                let e = self.instanceof_pair_memo[Self::instanceof_pair_slot(vk, ci)];
+                if e.v_key == vk
+                    && e.ci == ci
+                    && e.chain_epoch == self.heap.chain_epoch
+                    && e.fn_props_gen == self.fn_props_gen
+                    && e.class_proto_epoch == self.class_proto_epoch
+                {
+                    return Some(e.result);
+                }
+            }
+            vk
+        } else {
+            0
+        };
         // An ordinary function whose checks below passed since its version
         // and `fn_props` last changed (`instanceof_memo`): its prototype.
         let memo = self.instanceof_memo[ci as usize & (crate::vm::INSTANCEOF_MEMO_SLOTS - 1)];
@@ -232,13 +415,54 @@ impl<'p> Vm<'p> {
         } else {
             match self.instanceof_rhs_checked(c, v)? {
                 Ok(p) => p,
-                Err(answer) => return Some(answer),
+                Err(answer) => {
+                    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+                    if v_key != 0 {
+                        // Guard `ci` (+ its parent classes) and `v`'s class chain
+                        // so any structural/prototype change bumps `chain_epoch`.
+                        self.guard_instanceof_class_chain(ci);
+                        if v_key >= crate::heap::FID_MIRROR_CLASS && v_key != crate::heap::FID_MIRROR_NONE {
+                            self.guard_instanceof_class_chain(v_key & !crate::heap::FID_MIRROR_CLASS);
+                        }
+                        self.instanceof_pair_memo[Self::instanceof_pair_slot(v_key, ci)] =
+                            crate::vm::InstanceofPairMemo {
+                                v_key,
+                                ci,
+                                chain_epoch: self.heap.chain_epoch,
+                                fn_props_gen: self.fn_props_gen,
+                                class_proto_epoch: self.class_proto_epoch,
+                                result: answer,
+                                _pad: [0; 11],
+                            };
+                    }
+                    return Some(answer);
+                }
             }
         };
         if !self.is_object_value(v) {
+            #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+            if v_key != 0 {
+                self.guard_instanceof_class_chain(ci);
+                self.instanceof_pair_memo[Self::instanceof_pair_slot(v_key, ci)] =
+                    crate::vm::InstanceofPairMemo {
+                        v_key,
+                        ci,
+                        chain_epoch: self.heap.chain_epoch,
+                        fn_props_gen: self.fn_props_gen,
+                        class_proto_epoch: self.class_proto_epoch,
+                        result: false,
+                        _pad: [0; 11],
+                    };
+            }
             return Some(false);
         }
         let mut cur = v;
+        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+        let mut hops_buf = [0u32; 16];
+        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+        let mut nhops = 0usize;
+        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+        let mut cacheable = v_key != 0;
         for _ in 0..10_000 {
             cur = match self.instanceof_proto_step(cur) {
                 Some(next) => next,
@@ -246,17 +470,88 @@ impl<'p> Vm<'p> {
                     if self.proxy_parts(cur.heap_index()).is_some() {
                         return None;
                     }
+                    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+                    {
+                        cacheable = false;
+                    }
                     self.object_get_prototype_of(cur)
                 }
             };
             if !cur.is_heap() {
+                #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+                if cacheable {
+                    self.guard_instanceof_pair_and_store(v_key, ci, &hops_buf[..nhops], false);
+                }
                 return Some(false);
             }
+            #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+            if cacheable {
+                if nhops < hops_buf.len() {
+                    hops_buf[nhops] = cur.heap_index();
+                    nhops += 1;
+                } else {
+                    cacheable = false;
+                }
+            }
             if cur == p {
+                #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+                if cacheable {
+                    self.guard_instanceof_pair_and_store(v_key, ci, &hops_buf[..nhops], true);
+                }
                 return Some(true);
             }
         }
         None
+    }
+
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    fn guard_instanceof_class_chain(&self, start: u32) {
+        let mut cur = start;
+        for _ in 0..64 {
+            self.heap.guard_version(cur);
+            if let Some(p) = self.proto_of.get_copied(cur) {
+                if p.is_heap() {
+                    let next = p.heap_index();
+                    if next == self.fn_proto || next == cur {
+                        break;
+                    }
+                    cur = next;
+                    continue;
+                }
+                break;
+            }
+            match self.heap.get(cur) {
+                HeapObj::Class(cc) => match cc.parent {
+                    Some(p) => cur = p,
+                    None => break,
+                },
+                _ => break,
+            }
+        }
+        if self.fn_proto != 0 {
+            self.heap.guard_version(self.fn_proto);
+        }
+    }
+
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    fn guard_instanceof_pair_and_store(&mut self, v_key: u32, ci: u32, hops: &[u32], result: bool) {
+        self.guard_instanceof_class_chain(ci);
+        if v_key >= crate::heap::FID_MIRROR_CLASS && v_key != crate::heap::FID_MIRROR_NONE {
+            self.guard_instanceof_class_chain(v_key & !crate::heap::FID_MIRROR_CLASS);
+        }
+        for &h in hops {
+            self.heap.guard_version(h);
+        }
+        self.instanceof_pair_memo[Self::instanceof_pair_slot(v_key, ci)] =
+            crate::vm::InstanceofPairMemo {
+                v_key,
+                ci,
+                chain_epoch: self.heap.chain_epoch,
+                fn_props_gen: self.fn_props_gen,
+                class_proto_epoch: self.class_proto_epoch,
+                result,
+                _pad: [0; 11],
+            };
     }
 
     /// The right-hand side half of [`Self::instanceof_fast`]: `None` when
@@ -270,6 +565,8 @@ impl<'p> Vm<'p> {
         // Whether `c` itself, a function, has an own `prototype`, when the
         // walk below already looked at its side table.
         let mut ci_own_prototype = None;
+        // Builtin `is_ctor` object's immutable own `prototype` value.
+        let mut ctor_proto_val: Option<Value> = None;
         for _ in 0..64 {
             match self.heap.get(cur) {
                 HeapObj::Func(_) | HeapObj::Closure { .. } => {
@@ -277,14 +574,31 @@ impl<'p> Vm<'p> {
                         Some(m) => own_has_instance_and_prototype(m),
                         None => (false, false),
                     };
-                    if has_instance || self.proto_of.has(cur) {
+                    if has_instance {
                         return None;
                     }
                     if cur == ci {
                         ci_own_prototype = Some(prototype);
                     }
-                    chain_ok = true;
-                    break;
+                    match self.proto_of.get_copied(cur) {
+                        None => {
+                            chain_ok = true;
+                            break;
+                        }
+                        Some(p) if !p.is_heap() => {
+                            chain_ok = true;
+                            break;
+                        }
+                        Some(p) if p.heap_index() == self.fn_proto => {
+                            chain_ok = true;
+                            break;
+                        }
+                        Some(p) => {
+                            // Follow ES5 transpiled subclass chains
+                            // (`_inherits(Sub, Super)` -> `Sub.__proto__ = Super`).
+                            cur = p.heap_index();
+                        }
+                    }
                 }
                 HeapObj::Class(cc) => {
                     if !class_lacks_has_instance(cc) || self.proto_of.has(cur) {
@@ -300,35 +614,88 @@ impl<'p> Vm<'p> {
                         Some(p) => cur = p,
                     }
                 }
+                HeapObj::Object(m) if m.is_ctor && m.class.is_none() && self.ic_obj_ok(cur) => {
+                    if crate::vm::ic::own_pos_in(&self.own_slot_cache, m, "@@hasInstance").is_some()
+                    {
+                        return None;
+                    }
+                    if cur == ci {
+                        let pi = crate::vm::ic::own_pos_in(&self.own_slot_cache, m, "prototype")?;
+                        let a = m.attr_at(pi);
+                        if a.accessor || a.writable || a.configurable {
+                            return None;
+                        }
+                        let pv = m.val_at(pi);
+                        if !self.is_object_value(pv) {
+                            return None;
+                        }
+                        ctor_proto_val = Some(pv);
+                    }
+                    match self.proto_of.get_copied(cur) {
+                        None => {
+                            chain_ok = true;
+                            break;
+                        }
+                        Some(p) if !p.is_heap() => {
+                            chain_ok = true;
+                            break;
+                        }
+                        Some(p) if p.heap_index() == self.fn_proto => {
+                            chain_ok = true;
+                            break;
+                        }
+                        Some(p) => {
+                            // E.g. `Float32Array -> %TypedArray%`, `TypeError -> Error`.
+                            cur = p.heap_index();
+                        }
+                    }
+                }
                 _ => return None,
             }
         }
         if !chain_ok {
             return None;
         }
+        if let Some(pv) = ctor_proto_val {
+            return Some(Ok(pv));
+        }
         // C.prototype: a function that has none of its own (an arrow, a
-        // method; the general path throws), a generator or async function
-        // (their own prototype objects), or an own `prototype` in the side
-        // table (an accessor, or a non-object reassignment) keeps the full
-        // path.
+        // method; the general path throws), or an own accessor / non-object
+        // `prototype` keeps the full path. An own DATA object `prototype` in
+        // `fn_props` (ES5 `Sub.prototype = Object.create(Base.prototype)`) is
+        // safe because every `fn_props` write bumps `fn_props_gen`.
+        let mut fn_own_proto_val: Option<Value> = None;
         if matches!(self.heap.get(ci), HeapObj::Func(_) | HeapObj::Closure { .. }) {
             let Some((fid, _)) = self.ic_plain_fn(c) else {
                 return None;
             };
             let f = self.func(fid as usize);
-            if f.non_constructable
-                || f.lexical_this
-                || ci_own_prototype.unwrap_or_else(|| {
-                    self.fn_props.get(&ci).is_some_and(|m| m.pos("prototype").is_some())
-                })
-            {
+            if f.non_constructable || f.lexical_this {
                 return None;
+            }
+            let has_own_proto = ci_own_prototype.unwrap_or_else(|| {
+                self.fn_props.get(&ci).is_some_and(|m| m.pos("prototype").is_some())
+            });
+            if has_own_proto {
+                let m = self.fn_props.get(&ci)?;
+                let i = m.pos("prototype")?;
+                if m.attr_at(i).accessor {
+                    return None;
+                }
+                let pv = m.val_at(i);
+                if !self.is_object_value(pv) {
+                    return None;
+                }
+                fn_own_proto_val = Some(pv);
             }
         }
         if let Some(b) = self.instanceof_class_walk(ci, v) {
             return Some(Err(b));
         }
-        let p = self.prototype_of(c)?;
+        let p = match fn_own_proto_val {
+            Some(pv) => pv,
+            None => self.prototype_of(c)?,
+        };
         if !self.is_object_value(p) {
             return None;
         }
@@ -392,20 +759,57 @@ impl<'p> Vm<'p> {
     #[inline]
     fn instanceof_proto_step(&mut self, cur: Value) -> Option<Value> {
         let idx = cur.heap_index();
-        let class = match self.heap.get(idx) {
-            HeapObj::Object(m) if !m.is_ctor => m.class,
-            _ => return None,
-        };
         if let Some(p) = self.proto_of.get_copied(idx) {
-            return Some(p);
+            return if matches!(self.heap.get(idx), HeapObj::Proxy { .. }) {
+                None
+            } else {
+                Some(p)
+            };
         }
         if idx == self.obj_proto {
             return Some(Value::NULL);
         }
-        match class {
-            Some(cidx) => self.prototype_of(Value::heap(cidx)),
-            None if self.obj_proto != 0 => Some(Value::heap(self.obj_proto)),
-            None => None,
+        match self.heap.get(idx) {
+            HeapObj::Object(m) if !m.is_ctor => match m.class {
+                Some(cidx) => self.prototype_of(Value::heap(cidx)),
+                None if self.obj_proto != 0 => Some(Value::heap(self.obj_proto)),
+                None => None,
+            },
+            HeapObj::Object(m) if m.is_ctor && self.fn_proto != 0 => {
+                Some(Value::heap(self.fn_proto))
+            }
+            HeapObj::Array(_) if self.arr_proto != 0 => Some(Value::heap(self.arr_proto)),
+            HeapObj::Date(_) if self.date_proto != 0 => Some(Value::heap(self.date_proto)),
+            HeapObj::RegExp(_) if self.regexp_proto != 0 => Some(Value::heap(self.regexp_proto)),
+            HeapObj::Map { .. } if self.map_proto != 0 => Some(Value::heap(self.map_proto)),
+            HeapObj::Set(_) if self.set_proto != 0 => Some(Value::heap(self.set_proto)),
+            HeapObj::TypedArray { kind, .. } => self
+                .ta_protos
+                .get(*kind as usize)
+                .copied()
+                .filter(|&p| p != 0)
+                .map(Value::heap),
+            HeapObj::Promise { .. } if self.promise_proto != 0 => {
+                Some(Value::heap(self.promise_proto))
+            }
+            HeapObj::ArrayBuffer { .. } if self.arraybuffer_proto != 0 => {
+                Some(Value::heap(self.arraybuffer_proto))
+            }
+            HeapObj::DataView { .. } if self.dataview_proto != 0 => {
+                Some(Value::heap(self.dataview_proto))
+            }
+            HeapObj::Func(fid) | HeapObj::Closure { func: fid, .. } => {
+                let f = self.func(*fid as usize);
+                if !f.is_generator && !f.is_async && self.fn_proto != 0 {
+                    Some(Value::heap(self.fn_proto))
+                } else {
+                    None
+                }
+            }
+            HeapObj::Native(_) | HeapObj::Bound { .. } if self.fn_proto != 0 => {
+                Some(Value::heap(self.fn_proto))
+            }
+            _ => None,
         }
     }
 

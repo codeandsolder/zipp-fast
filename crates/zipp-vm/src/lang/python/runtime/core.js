@@ -152,7 +152,8 @@ var __zipp_py = (function () {
     rt.T = T;
     for (const name of ["NoneType", "bool", "int", "float", "complex", "str", "list", "tuple", "dict", "set",
         "frozenset", "range", "function", "builtin_function_or_method", "method", "module",
-        "generator", "NotImplementedType", "ellipsis", "slice", "property", "staticmethod",
+        "generator", "coroutine", "coroutine_wrapper", "async_generator", "async_generator_asend",
+        "NotImplementedType", "ellipsis", "slice", "property", "staticmethod",
         "classmethod", "super", "cell", "bytes", "list_iterator", "dict_keys", "dict_values",
         "dict_items", "enumerate", "zip", "map", "filter", "reversed", "iterator", "code", "traceback", "frame"]) {
         T[name] = newType(name, [], new Map());
@@ -587,9 +588,12 @@ var __zipp_py = (function () {
     R.popexc = function () { excStack.pop(); return null; };
     rt.currentExc = function () { return excStack.length ? excStack[excStack.length - 1] : null; };
     R.excmatch = function (e, spec) {
-        if (isType(spec)) return isInstance(e, spec);
+        if (isType(spec)) {
+            if (!isSubclass(spec, E.BaseException)) fail(TypeError, "catching classes that do not inherit from BaseException is not allowed");
+            return isInstance(e, spec);
+        }
         if (spec !== null && typeof spec === "object" && spec.cls === T.tuple) {
-            for (const t of spec.items) if (isType(t) && isInstance(e, t)) return true;
+            for (const t of spec.items) if (R.excmatch(e, t)) return true;
             return false;
         }
         fail(TypeError, "catching classes that do not inherit from BaseException is not allowed");
@@ -653,6 +657,9 @@ var __zipp_py = (function () {
     // plain `obj.dict.set` is exactly what `setattr` ends up doing for this
     // class (no `__setattr__` override, an instance dict), false otherwise.
     const SET_PLAN = { setPlan: true };
+    // The `lcache` key of the instance-attribute get plan: true when `t` uses
+    // object's own `__getattribute__` (no custom override).
+    const GET_PLAN = { getPlan: true };
     // Inline-cache tables the emitter's fast paths read with plain property
     // loads (`obj.cls.ga.x`), set by the slow helpers once they know a name's
     // answer for a class and cleared wherever `lcache` entries are:
@@ -699,7 +706,7 @@ var __zipp_py = (function () {
     function forgetName(t, name) {
         t.ver++;
         if (t.flagged === true) {
-            if (name === "__setattr__") clearFlags(t);
+            if (name === "__setattr__" || name === "__getattribute__") clearFlags(t);
             else {
                 t.ga[name] = undefined; t.sa[name] = undefined; t.gm[name] = undefined; t.gb = Object.create(null);
                 t.gp[name] = undefined; t.sp[name] = undefined; t.gx[name] = undefined; t.gs[name] = undefined; t.gv[name] = undefined;
@@ -712,6 +719,7 @@ var __zipp_py = (function () {
         cache.delete(name);
         if (name === "__init__" || name === "__new__") cache.delete(CTOR_PLAN);
         else if (name === "__setattr__") cache.delete(SET_PLAN);
+        else if (name === "__getattribute__") cache.delete(GET_PLAN);
     }
     function typeChanged(t, name) {
         // A builtin type changed (the runtime's own types are never changed
@@ -759,6 +767,18 @@ var __zipp_py = (function () {
         }
         return plain;
     }
+    function getPlan(t) {
+        let cache = t.lcache;
+        if (cache === undefined || t.lepoch !== typeEpoch) { cache = t.lcache = new Map(); t.lepoch = typeEpoch; }
+        let plain = cache.get(GET_PLAN);
+        if (plain === undefined) {
+            const ga = lookupType(t, "__getattribute__");
+            plain = ga === undefined || ga === ObjectType.dict.get("__getattribute__");
+            cache.set(GET_PLAN, plain);
+        }
+        return plain;
+    }
+    rt.getPlan = getPlan;
     function isFunction(v) { return v !== null && typeof v === "object" && (v.cls === T.function || v.cls === T.builtin_function_or_method); }
     rt.isFunction = isFunction;
     function bound(func, self) { return { cls: T.method, func: func, self: self }; }
@@ -811,6 +831,7 @@ var __zipp_py = (function () {
         if (name === "__bases__") return tuple(t.bases.slice());
         if (name === "__dict__") return rt.mappingProxy(t.dict);
         if (name === "__class__") return t.cls;
+        if (name === "__type_params__") { const tp = t.dict.get("__type_params__"); return tp === undefined ? tuple([]) : tp; }
         if (name === "__doc__") { const d = t.dict.get("__doc__"); return d === undefined ? null : d; }
         const attr = lookupType(t, name);
         if (attr !== undefined) return descrGet(attr, null, t);
@@ -819,11 +840,10 @@ var __zipp_py = (function () {
         if (missing !== undefined) return missing;
         attrError("type object '" + t.name + "' has no attribute '" + name + "'", t, name);
     }
-    // `missing` (hasattr, getattr with a default, imports): returned instead
-    // of raising when the lookup itself finds nothing, so a miss allocates no
-    // exception. An AttributeError raised by a descriptor or __getattr__
-    // still propagates.
-    function getattr(obj, name, missing) {
+    // `object.__getattribute__(obj, name)` without custom `__getattribute__`
+    // dispatch or `__getattr__` fallback (so overriding `__getattribute__` can
+    // call `super().__getattribute__(name)` or `object.__getattribute__(self, name)`).
+    function objectGetattr(obj, name, missing) {
         let t, dict;
         if (obj !== null && typeof obj === "object") {
             if (obj.isType) return typeAttr(obj, name, missing);
@@ -834,6 +854,70 @@ var __zipp_py = (function () {
             dict = obj.dict;
         } else {
             t = typeOf(obj);
+        }
+        if (name === "__class__") return t;
+        let attr = cachedType(t, name);
+        if (attr === MISSING_ATTR) attr = lookupType(t, name);
+        if (attr !== undefined && attr !== null && typeof attr === "object") {
+            const ac = attr.cls;
+            if (ac === T.property || (ac !== undefined && ac !== T.function && lookupType(ac, "__set__") !== undefined)) {
+                return descrGet(attr, obj, t);
+            }
+        }
+        if (dict !== undefined) {
+            const v = dict.get(name);
+            if (v !== undefined) return v;
+            if (name === "__dict__" && t.noDict !== true) return rt.instanceDict(obj);
+        }
+        if (attr !== undefined) return descrGet(attr, obj, t);
+        const special = rt.specialAttr(obj, t, name);
+        if (special !== undefined) return special;
+        if (missing !== undefined) return missing;
+        attrError("'" + t.name + "' object has no attribute '" + name + "'", obj, name);
+    }
+    rt.objectGetattr = objectGetattr;
+    // `missing` (hasattr, getattr with a default, imports): returned instead
+    // of raising when the lookup itself finds nothing, so a miss allocates no
+    // exception. An AttributeError raised by a descriptor or __getattr__
+    // still propagates.
+    function getattr(obj, name, missing) {
+        let t, dict;
+        if (obj !== null && typeof obj === "object") {
+            if (obj.isType) {
+                const mc = obj.cls;
+                if (mc !== undefined && mc !== TypeType && !getPlan(mc)) {
+                    const mga = lookupType(mc, "__getattribute__");
+                    try { return rt.call(mga, [obj, name], null); }
+                    catch (e) {
+                        if (e !== null && typeof e === "object" && isInstance(e, E.AttributeError)) {
+                            const mfb = lookupType(mc, "__getattr__");
+                            if (mfb !== undefined) return rt.call(mfb, [obj, name], null);
+                            if (missing !== undefined) return missing;
+                        }
+                        throw e;
+                    }
+                }
+                return typeAttr(obj, name, missing);
+            }
+            t = obj.cls || ObjectType;
+            if (t === T.module) return rt.moduleAttr(obj, name, missing);
+            if (t === T.super) return rt.superAttr(obj, name);
+            if (t === TypeType) return typeAttr(obj, name, missing);
+            dict = obj.dict;
+        } else {
+            t = typeOf(obj);
+        }
+        if (!getPlan(t)) {
+            const gaFn = lookupType(t, "__getattribute__");
+            try { return rt.call(gaFn, [obj, name], null); }
+            catch (e) {
+                if (e !== null && typeof e === "object" && isInstance(e, E.AttributeError)) {
+                    const fb = lookupType(t, "__getattr__");
+                    if (fb !== undefined) return rt.call(fb, [obj, name], null);
+                    if (missing !== undefined) return missing;
+                }
+                throw e;
+            }
         }
         if (name === "__class__") return t;
         if (dict !== undefined && t.gx[name] === true) {
@@ -1016,35 +1100,38 @@ var __zipp_py = (function () {
     // to its GenStart, binding the parameters, now) from `this.real`, the
     // generator code object, forwarding the bound values as they came.
     const GEN_ENTRY = [
-        function () { return rt.makeGenerator(this.real(), this); },
-        function (a) { return rt.makeGenerator(this.real(a), this); },
-        function (a, b) { return rt.makeGenerator(this.real(a, b), this); },
-        function (a, b, c) { return rt.makeGenerator(this.real(a, b, c), this); },
-        function (a, b, c, d) { return rt.makeGenerator(this.real(a, b, c, d), this); },
-        function (a, b, c, d, e) { return rt.makeGenerator(this.real(a, b, c, d, e), this); },
-        function (a, b, c, d, e, g) { return rt.makeGenerator(this.real(a, b, c, d, e, g), this); },
-        function (a, b, c, d, e, g, h) { return rt.makeGenerator(this.real(a, b, c, d, e, g, h), this); },
-        function (a, b, c, d, e, g, h, i) { return rt.makeGenerator(this.real(a, b, c, d, e, g, h, i), this); },
-        function (a, b, c, d, e, g, h, i, j) { return rt.makeGenerator(this.real(a, b, c, d, e, g, h, i, j), this); },
-        function (a, b, c, d, e, g, h, i, j, k) { return rt.makeGenerator(this.real(a, b, c, d, e, g, h, i, j, k), this); },
-        function (a, b, c, d, e, g, h, i, j, k, l) { return rt.makeGenerator(this.real(a, b, c, d, e, g, h, i, j, k, l), this); },
-        function (a, b, c, d, e, g, h, i, j, k, l, m) { return rt.makeGenerator(this.real(a, b, c, d, e, g, h, i, j, k, l, m), this); },
+        function () { return this.wrap(this.real(), this); },
+        function (a) { return this.wrap(this.real(a), this); },
+        function (a, b) { return this.wrap(this.real(a, b), this); },
+        function (a, b, c) { return this.wrap(this.real(a, b, c), this); },
+        function (a, b, c, d) { return this.wrap(this.real(a, b, c, d), this); },
+        function (a, b, c, d, e) { return this.wrap(this.real(a, b, c, d, e), this); },
+        function (a, b, c, d, e, g) { return this.wrap(this.real(a, b, c, d, e, g), this); },
+        function (a, b, c, d, e, g, h) { return this.wrap(this.real(a, b, c, d, e, g, h), this); },
+        function (a, b, c, d, e, g, h, i) { return this.wrap(this.real(a, b, c, d, e, g, h, i), this); },
+        function (a, b, c, d, e, g, h, i, j) { return this.wrap(this.real(a, b, c, d, e, g, h, i, j), this); },
+        function (a, b, c, d, e, g, h, i, j, k) { return this.wrap(this.real(a, b, c, d, e, g, h, i, j, k), this); },
+        function (a, b, c, d, e, g, h, i, j, k, l) { return this.wrap(this.real(a, b, c, d, e, g, h, i, j, k, l), this); },
+        function (a, b, c, d, e, g, h, i, j, k, l, m) { return this.wrap(this.real(a, b, c, d, e, g, h, i, j, k, l, m), this); },
     ];
-    function genEntryArr(a) { return rt.makeGenerator(this.real(a), this); }
+    function genEntryArr(a) { return this.wrap(this.real(a), this); }
     // The positional-array entry every callable has (`f.fast(args)`).
     function funcFast(args) { return invoke(this, bindArgs(this, args, null)); }
     R.func = function (code, name, qualname, argnames, posonly, positional, varargs, varkw,
                        defaults, kwdefNames, kwdefValues, cells, globals, isgen, doc, module) {
+        const mode = isgen === true ? 1 : (isgen === false || isgen === 0 ? 0 : isgen);
         const f = { cls: T.function, code: code, name: name, qualname: qualname, argnames: argnames,
             posonly: posonly, positional: positional, varargs: varargs, varkw: varkw,
-            defaults: defaults, kwdefaults: null, cells: cells, globals: globals, isgen: isgen,
+            defaults: defaults, kwdefaults: null, cells: cells, globals: globals,
+            isgen: mode === 1, iscoro: mode === 2, isagen: mode === 3,
             doc: doc, module: module, dict: new Map(), simple: false, arr: false, fast: funcFast };
         if (kwdefNames.length) { f.kwdefaults = new Map(); for (let i = 0; i < kwdefNames.length; i++) f.kwdefaults.set(kwdefNames[i], kwdefValues[i]); }
         f.simple = !varargs && !varkw && argnames.length === positional && defaults.length === 0;
         const nbound = argnames.length + (varargs ? 1 : 0) + (varkw ? 1 : 0);
         f.arr = nbound > MAX_DIRECT;
-        if (isgen) {
+        if (mode !== 0) {
             f.real = code;
+            f.wrap = mode === 1 ? rt.makeGenerator : mode === 2 ? rt.makeCoroutine : rt.makeAsyncGenerator;
             f.code = f.arr ? genEntryArr : GEN_ENTRY[nbound];
         }
         if (!f.arr && !varargs && !varkw && argnames.length === positional) {
@@ -1655,7 +1742,29 @@ var __zipp_py = (function () {
                 else { if (kw === null) kw = new Map(); kw.set(k, v); }
             }
         }
-        for (const b of bases) if (!isType(b)) fail(TypeError, "bases must be types");
+        // PEP 560: resolve non-type bases via __mro_entries__ and record __orig_bases__.
+        let origBases = null;
+        const resolved = [];
+        const rawTuple = tuple(bases.slice());
+        for (let i = 0; i < bases.length; i++) {
+            const b = bases[i];
+            if (!isType(b)) {
+                const me = lookupType(typeOf(b), "__mro_entries__");
+                if (me !== undefined) {
+                    if (origBases === null) origBases = bases.slice();
+                    const entries = call(descrGet(me, b, typeOf(b)), [rawTuple], null);
+                    for (const e of rt.drain(entries)) {
+                        if (!isType(e)) fail(TypeError, "bases must be types");
+                        resolved.push(e);
+                    }
+                    continue;
+                }
+                fail(TypeError, "bases must be types");
+            }
+            resolved.push(b);
+        }
+        if (origBases !== null && !ns.has("__orig_bases__")) ns.set("__orig_bases__", tuple(origBases));
+        bases = resolved;
         // The metaclass: explicit, else the most derived metaclass of the bases.
         if (metaclass === null) {
             metaclass = TypeType;
@@ -2031,6 +2140,243 @@ var __zipp_py = (function () {
         return { cls: T.generator, js: jsgen, done: false, started: false, running: false, returned: null, excs: null,
             name: f.name, qualname: f.qualname, next: GEN_NEXT, send: genSend, throwIn: genThrow, close: genClose, grt: GEN_RT };
     };
+
+    // ---- coroutines & async generators (PEP 492 / 525) --------------------------------------
+    function coroEscape(c, e) {
+        c.running = false; c.done = true; c.returned = null;
+        if (!isExcOf(e, E.StopIteration)) return e;
+        const err = makeExc(E.RuntimeError, ["coroutine raised StopIteration"]);
+        err.cause = e; err.context = e; err.suppress = true;
+        return err;
+    }
+    function coroStep(c, throwing, v) {
+        const depth = excStack.length, saved = c.excs;
+        if (saved !== null) { c.excs = null; for (let i = 0; i < saved.length; i++) excStack.push(saved[i]); }
+        if (throwing && v !== null && typeof v === "object") { const cur = rt.currentExc(); if (cur !== null && cur !== v) v.context = cur; }
+        let r;
+        try { r = throwing ? c.js.throw(v) : c.js.next(v); }
+        catch (e) { excStack.length = depth; throw coroEscape(c, e); }
+        if (!r.done && excStack.length > depth) c.excs = excStack.splice(depth);
+        else excStack.length = depth;
+        return r;
+    }
+    function coroNext() {
+        const c = this;
+        if (c.running) fail(E.RuntimeError, "coroutine is being awaited already");
+        if (c.done) fail(E.RuntimeError, "cannot reuse already awaited coroutine");
+        c.running = true; c.started = true;
+        const r = coroStep(c, false, undefined);
+        if (r.done) { genFinish(c, r); return STOP; }
+        c.running = false;
+        return r.value;
+    }
+    function coroSend(v) {
+        const c = this;
+        if (c.running) fail(E.RuntimeError, "coroutine is being awaited already");
+        if (c.done) fail(E.RuntimeError, "cannot reuse already awaited coroutine");
+        if (!c.started && v !== null) fail(TypeError, "can't send non-None value to a just-started coroutine");
+        c.running = true; c.started = true;
+        const r = coroStep(c, false, v);
+        if (r.done) { genFinish(c, r); throw makeExc(E.StopIteration, c.returned === null ? [] : [c.returned]); }
+        c.running = false;
+        return r.value;
+    }
+    function coroThrow(exc) {
+        const c = this;
+        if (c.running) fail(E.RuntimeError, "coroutine is being awaited already");
+        if (c.done) fail(E.RuntimeError, "cannot reuse already awaited coroutine");
+        c.running = true; c.started = true;
+        const r = coroStep(c, true, exc);
+        if (r.done) { genFinish(c, r); throw makeExc(E.StopIteration, c.returned === null ? [] : [c.returned]); }
+        c.running = false;
+        return r.value;
+    }
+    function coroClose() {
+        const c = this;
+        if (c.done) return null;
+        if (c.running) fail(E.RuntimeError, "cannot close a running coroutine");
+        if (!c.started) { c.done = true; c.js.return(undefined); return null; }
+        c.running = true;
+        let r;
+        try { r = coroStep(c, true, makeExc(E.GeneratorExit, [])); }
+        catch (e) {
+            if (isExcOf(e, E.GeneratorExit)) return null;
+            throw e;
+        }
+        c.running = false;
+        if (!r.done) fail(E.RuntimeError, "coroutine ignored GeneratorExit");
+        c.done = true; c.returned = null;
+        return null;
+    }
+    rt.makeCoroutine = function (jsgen, f) {
+        return { cls: T.coroutine, js: jsgen, done: false, started: false, running: false, returned: null, excs: null,
+            name: f.name, qualname: f.qualname, next: coroNext, send: coroSend, throwIn: coroThrow, close: coroClose };
+    };
+    rt.makeCoroutineWrapper = function (c) {
+        return {
+            cls: T.coroutine_wrapper,
+            coro: c,
+            next: function () { const r = this.coro.next(); if (r === STOP) { this.returned = this.coro.returned; return STOP; } return r; },
+            send: function (v) { return this.coro.send(v); },
+            throwIn: function (e) { return this.coro.throwIn(e); },
+            close: function () { return this.coro.close(); },
+            returned: null,
+        };
+    };
+
+    const AYIELD_TAG = { ayield: true };
+    R.ayield = function (val) { return { tag: AYIELD_TAG, val: val }; };
+    function agenEscape(ag, e) {
+        ag.running = false; ag.done = true;
+        if (isExcOf(e, E.StopAsyncIteration)) {
+            const err = makeExc(E.RuntimeError, ["async generator raised StopAsyncIteration"]);
+            err.cause = e; err.context = e; err.suppress = true;
+            return err;
+        }
+        if (isExcOf(e, E.StopIteration)) {
+            const err = makeExc(E.RuntimeError, ["async generator raised StopIteration"]);
+            err.cause = e; err.context = e; err.suppress = true;
+            return err;
+        }
+        return e;
+    }
+    function makeAgStep(ag, mode, initVal) {
+        // mode: 0 = anext/asend, 1 = athrow, 2 = aclose
+        const step = {
+            cls: T.async_generator_asend,
+            ag: ag,
+            mode: mode,
+            initVal: initVal,
+            state: 0, // 0 = created, 1 = iterating (awaiting inside ag), 2 = finished
+            returned: null,
+            _drive: function (throwing, v) {
+                const s = this, g = s.ag;
+                if (s.state === 2) fail(E.RuntimeError, "cannot reuse already awaited " + (s.mode === 0 ? "asend" : s.mode === 1 ? "athrow" : "aclose"));
+                if (s.state === 0) {
+                    if (g.running) fail(E.RuntimeError, "asend(): asynchronous generator is already running");
+                    if (g.done) {
+                        s.state = 2;
+                        if (s.mode === 2) { s.returned = null; return STOP; }
+                        if (s.mode === 1) throw s.initVal;
+                        throw makeExc(E.StopAsyncIteration, []);
+                    }
+                    if (s.mode === 0 && !g.started && s.initVal !== null) {
+                        s.state = 2;
+                        fail(TypeError, "can't send non-None value to a just-started async generator");
+                    }
+                    if (s.mode === 2 && !g.started) {
+                        s.state = 2; g.done = true; g.js.return(undefined);
+                        s.returned = null; return STOP;
+                    }
+                    s.state = 1;
+                    g.running = true; g.started = true;
+                    throwing = s.mode !== 0;
+                    v = s.mode === 2 ? makeExc(E.GeneratorExit, []) : s.initVal;
+                }
+                const depth = excStack.length, saved = g.excs;
+                if (saved !== null) { g.excs = null; for (let i = 0; i < saved.length; i++) excStack.push(saved[i]); }
+                if (throwing && v !== null && typeof v === "object") { const cur = rt.currentExc(); if (cur !== null && cur !== v) v.context = cur; }
+                let r;
+                try { r = throwing ? g.js.throw(v) : g.js.next(v); }
+                catch (e) {
+                    excStack.length = depth;
+                    s.state = 2;
+                    if (s.mode === 2 && isExcOf(e, E.GeneratorExit)) {
+                        g.running = false; g.done = true; s.returned = null; return STOP;
+                    }
+                    throw agenEscape(g, e);
+                }
+                if (!r.done && excStack.length > depth) g.excs = excStack.splice(depth);
+                else excStack.length = depth;
+                if (r.done) {
+                    g.running = false; g.done = true; s.state = 2;
+                    if (s.mode === 2) { s.returned = null; return STOP; }
+                    throw makeExc(E.StopAsyncIteration, []);
+                }
+                const val = r.value;
+                if (val !== null && typeof val === "object" && val.tag === AYIELD_TAG) {
+                    g.running = false; s.state = 2;
+                    if (s.mode === 2) { g.done = true; fail(E.RuntimeError, "async generator ignored GeneratorExit"); }
+                    s.returned = val.val;
+                    return STOP;
+                }
+                return val;
+            },
+            next: function () { return this._drive(false, null); },
+            send: function (v) {
+                const r = this._drive(false, v);
+                if (r === STOP) throw makeExc(E.StopIteration, this.returned === null ? [] : [this.returned]);
+                return r;
+            },
+            throwIn: function (e) {
+                const r = this._drive(true, e);
+                if (r === STOP) throw makeExc(E.StopIteration, this.returned === null ? [] : [this.returned]);
+                return r;
+            },
+            close: function () {
+                if (this.state === 1) {
+                    this.state = 2;
+                    this.ag.running = false;
+                } else {
+                    this.state = 2;
+                }
+                return null;
+            },
+        };
+        return step;
+    }
+    rt.makeAgStep = makeAgStep;
+    rt.makeAsyncGenerator = function (jsgen, f) {
+        return { cls: T.async_generator, js: jsgen, done: false, started: false, running: false, excs: null,
+            name: f.name, qualname: f.qualname };
+    };
+
+    // Async protocol helpers for `await`, `async for`, `async with`.
+    R.awaititer = function (obj) {
+        if (obj !== null && typeof obj === "object") {
+            if (obj.cls === T.coroutine || obj.cls === T.async_generator_asend || obj.cls === T.coroutine_wrapper) return obj;
+            const m = typeMethod(obj, "__await__");
+            if (m !== undefined) {
+                const it = call(descrGet(m, obj, typeOf(obj)), [], null);
+                if (it === null || typeof it !== "object" || it.cls === T.coroutine || (it.next === undefined && typeMethod(it, "__next__") === undefined)) {
+                    fail(TypeError, "__await__() returned non-iterator of type '" + typeOf(it).name + "'");
+                }
+                if (it.next !== undefined) return it;
+                return { cls: T.iterator, next: () => callMethod(it, "__next__", []), wrapped: it };
+            }
+        }
+        fail(TypeError, "object " + typeOf(obj).name + " can't be used in 'await' expression");
+    };
+    R.aiter = function (obj) {
+        const m = typeMethod(obj, "__aiter__");
+        if (m === undefined) fail(TypeError, "'async for' requires an object with __aiter__ method, got " + typeOf(obj).name);
+        const ait = call(descrGet(m, obj, typeOf(obj)), [], null);
+        if (typeMethod(ait, "__anext__") === undefined) fail(TypeError, "'async for' received an object from __aiter__ that does not implement __anext__: " + typeOf(ait).name);
+        return ait;
+    };
+    R.anext_awaitable = function (ait) {
+        const m = typeMethod(ait, "__anext__");
+        if (m === undefined) fail(TypeError, "'" + typeOf(ait).name + "' object is not an async iterator");
+        return call(descrGet(m, ait, typeOf(ait)), [], null);
+    };
+    R.is_stop_async = function (e) { return isExcOf(normexc(e), E.StopAsyncIteration); };
+    R.awithenter = function (mgr) {
+        const t = typeOf(mgr);
+        const aenter = lookupType(t, "__aenter__"), aexit = lookupType(t, "__aexit__");
+        if (aenter === undefined) fail(TypeError, "'" + t.name + "' object does not support the asynchronous context manager protocol");
+        if (aexit === undefined) fail(TypeError, "'" + t.name + "' object does not support the asynchronous context manager protocol (missed __aexit__ method)");
+        return [descrGet(aexit, mgr, t), call(descrGet(aenter, mgr, t), [], null)];
+    };
+    R.awithexit_call = function (aexit, e, line) {
+        const exc = normexc(e);
+        if (exc.tbline === -1) exc.tbline = line;
+        return [exc, call(aexit, [typeOf(exc), exc, null], null)];
+    };
+    R.awithexit_check = function (res, e) {
+        if (!rt.truth(res)) throw e;
+        return null;
+    };
+    R.awithexit_normal = function (aexit) { return call(aexit, [null, null, null], null); };
 
     // ---- modules ----------------------------------------------------------------------------------------
     const inits = new Map(), modules = new Map(), builtinModules = new Map();

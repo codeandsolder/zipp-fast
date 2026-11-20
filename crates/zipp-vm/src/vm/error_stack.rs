@@ -258,7 +258,7 @@ impl<'p> Vm<'p> {
             }
         }
         match &self.script_name {
-            Some(name) if (func as usize) < self.main_func_count => name.to_string(),
+            Some(name) if self.is_main_func(func) => name.to_string(),
             _ => "<anonymous>".to_string(),
         }
     }

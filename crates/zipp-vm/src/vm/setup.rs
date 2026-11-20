@@ -165,6 +165,7 @@ impl<'p> Vm<'p> {
         }
         let p = self.setup_object(map);
         self.prototypes.insert(idx, p);
+        self.prototypes_fresh.push(p);
         if is_class {
             self.class_proto_owner.insert(p, idx);
         }
@@ -2833,6 +2834,10 @@ impl<'p> Vm<'p> {
         // global slots by name (see get_prop/set_prop/has_own_property).
         let global_this = self.setup_object(ObjMap::new());
         self.global_this = global_this;
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        {
+            self.global_this_bits = Value::heap(global_this).bits();
+        }
         self.heap.pin_mirror_dict(global_this);
         // The test262 `$262` host object: { global, detachArrayBuffer, gc }.
         let d262_detach = self.setup_native(DOLLAR262_DETACH);
@@ -2850,6 +2855,62 @@ impl<'p> Vm<'p> {
         } else {
             u32::MAX
         };
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        {
+            self.typeof_special_max = if self.htmldda_scalar_enabled && self.is_htmldda.len() <= 1 {
+                let mut m = self.fn_proto.max(self.symbol_ctor).max(self.bigint_ctor);
+                if self.htmldda_idx != u32::MAX {
+                    m = m.max(self.htmldda_idx);
+                }
+                m
+            } else {
+                u32::MAX
+            };
+            self.heap.refresh_mirror(self.fn_proto);
+            if let HeapObj::Object(m) = self.heap.get(self.fn_proto) {
+                let sh = m.shape();
+                if sh != crate::shape::DICT {
+                    if let Some(slot) = m.pos("call") {
+                        if !m.attr_at(slot).accessor {
+                            self.fn_proto_shape = sh;
+                            self.fn_proto_call_slot = slot as u32;
+                            self.fn_call_native_bits = m.val_at(slot).bits();
+                        }
+                    }
+                }
+            }
+            if self.array_ctor != 0 {
+                if let HeapObj::Object(m) = self.heap.get(self.array_ctor) {
+                    if let Some(v) = m.get("isArray") {
+                        self.array_ctor_bits = Value::heap(self.array_ctor).bits();
+                        self.array_is_array_bits = v.bits();
+                    }
+                }
+            }
+            if self.obj_proto != 0 {
+                self.obj_proto_setup_ver = self.heap.version_of(self.obj_proto);
+            }
+            if self.symbol_ctor != 0 {
+                if let HeapObj::Object(m) = self.heap.get(self.symbol_ctor) {
+                    if let Some(v) = m.get("iterator") {
+                        self.sym_iterator_bits = v.bits();
+                    }
+                }
+            }
+            if self.arr_proto != 0 && self.default_array_iter.is_heap() {
+                if let HeapObj::Object(m) = self.heap.get(self.arr_proto) {
+                    if let Some(slot) = m.pos("@@iterator") {
+                        if !m.attr_at(slot).accessor
+                            && m.val_at(slot).bits() == self.default_array_iter.bits()
+                        {
+                            self.arr_proto_iter_slot_ptr =
+                                m.vals_ptr_raw().wrapping_add(slot) as u64;
+                            self.arr_proto_iter_ver = self.heap.version_of(self.arr_proto);
+                        }
+                    }
+                }
+            }
+        }
         // `$262.agent`: the full multi-agent surface (vm/agents.rs). getReport
         // must exist (returning null on empty) even before any worker agent
         // starts — atomicsHelper.js binds it unconditionally at load. The
@@ -3039,6 +3100,58 @@ impl<'p> Vm<'p> {
                 self.bump_global_gen(slot as u32);
             }
         }
+        // The PHP runtime's private natives (`lang/php/vm/php_natives.rs`): bound
+        // by slot ONLY when `Program::php_natives == true`.
+        #[cfg(feature = "php")]
+        if self.program.php_natives {
+            for &(name, id) in &[
+                (native::PHP_OUTPUT_NAME, native::PHP_OUTPUT),
+                (native::PHP_INCLUDE_NAME, native::PHP_INCLUDE),
+                (native::PHP_FS_NAME, native::PHP_FS),
+                (native::PHP_CRYPTO_NAME, native::PHP_CRYPTO),
+                (native::PHP_ENV_NAME, native::PHP_ENV),
+                (native::PHP_SAPI_NAME, native::PHP_SAPI),
+                (native::PHP_MAP_KV_NAME, native::PHP_MAP_KV),
+                (native::PHP_SQL_NAME, native::PHP_SQL),
+            ] {
+                let slot = self
+                    .program
+                    .global_names
+                    .iter()
+                    .position(|n| n == name);
+                if let Some(slot) = slot.filter(|&slot| slot < self.globals.len()) {
+                    let h = self.heap.alloc(HeapObj::Native(id));
+                    self.globals[slot] = Value::heap(h);
+                    self.bump_global_gen(slot as u32);
+                }
+            }
+        }
+        // The Rust runtime's private natives (`lang/rust/vm/rust_natives.rs`): bound
+        // by slot ONLY when `Program::rust_natives == true`.
+        #[cfg(feature = "rust")]
+        if self.program.rust_natives {
+            for &(name, id) in &[
+                (native::RS_IO_NAME, native::RS_IO),
+                (native::RS_FS_NAME, native::RS_FS),
+                (native::RS_ENV_NAME, native::RS_ENV),
+                (native::RS_TIME_NAME, native::RS_TIME),
+                (native::RS_NET_NAME, native::RS_NET),
+                (native::RS_CRYPTO_NAME, native::RS_CRYPTO),
+                (native::RS_PROC_NAME, native::RS_PROC),
+                (native::RS_SQLITE_NAME, native::RS_SQLITE),
+            ] {
+                let slot = self
+                    .program
+                    .global_names
+                    .iter()
+                    .position(|n| n == name);
+                if let Some(slot) = slot.filter(|&slot| slot < self.globals.len()) {
+                    let h = self.heap.alloc(HeapObj::Native(id));
+                    self.globals[slot] = Value::heap(h);
+                    self.bump_global_gen(slot as u32);
+                }
+            }
+        }
         // The Python runtime's native tensor loops (`vm::py_tensor`): bound
         // by slot, only in the program the Python frontend built, and never
         // entered in `builtin_globals`, so no other program (nor an eval)
@@ -3073,6 +3186,16 @@ impl<'p> Vm<'p> {
             if let Some(slot) = slot.filter(|&slot| slot < self.globals.len()) {
                 let read = self.heap.alloc(HeapObj::Native(native::PY_VFS_READ));
                 self.globals[slot] = Value::heap(read);
+                self.bump_global_gen(slot as u32);
+            }
+            let slot = self
+                .program
+                .global_names
+                .iter()
+                .position(|name| name == native::PY_PKG_CALL_NAME);
+            if let Some(slot) = slot.filter(|&slot| slot < self.globals.len()) {
+                let call = self.heap.alloc(HeapObj::Native(native::PY_PKG_CALL));
+                self.globals[slot] = Value::heap(call);
                 self.bump_global_gen(slot as u32);
             }
             let slot = self

@@ -2963,7 +2963,10 @@ fn plan_region_cold_inner(
                     | Instr::ReturnUndefined
             )
         };
-        let grdbg = crate::env_var_os("ZIPP_GLOBRANGE_DEBUG").is_some();
+        let grdbg = {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| crate::env_var_os("ZIPP_GLOBRANGE_DEBUG").is_some())
+        };
         if !confined && grdbg {
             eprintln!("[globrange] [{s},{e}] outside-dead: NOT CONFINED");
         }
@@ -3926,7 +3929,10 @@ fn plan_region_cold_inner(
             values.push((vec![iv], NumVal::Glob(gi)));
         }
         values.sort_by_key(|v| v.0[0].0);
-        if crate::env_var_os("ZIPP_GLOBRANGE_DEBUG").is_some() {
+        if {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| crate::env_var_os("ZIPP_GLOBRANGE_DEBUG").is_some())
+        } {
             for (segs, v) in &values {
                 let name = match *v {
                     NumVal::Reg(r) => format!("r{r}"),
@@ -4014,7 +4020,10 @@ fn plan_region_cold_inner(
                         .count();
                     eprintln!("[pool] region [{s},{e}] numeric regs={nregs} globals={} | PERMANENT={perm} (read_outside={ro} live_in={li} hoisted={ho}) shareable={}",
                         glob_order.len(), nregs - perm);
-                    if crate::env_var_os("ZIPP_GLOBRANGE_DEBUG").is_some() {
+                    if {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| crate::env_var_os("ZIPP_GLOBRANGE_DEBUG").is_some())
+        } {
                         // Which numeric registers hold a permanent home, and
                         // why: `o` = read outside the region, `i` = live-in,
                         // `h` = hoisted.
@@ -4092,7 +4101,10 @@ fn plan_region_cold_inner(
                             .count();
                         eprintln!("[pool] region [{s},{e}] numeric regs={nregs} globals={} | PERMANENT={perm} (read_outside={ro} live_in={li} hoisted={ho}) shareable={}",
                             glob_order.len(), nregs - perm);
-                        if crate::env_var_os("ZIPP_GLOBRANGE_DEBUG").is_some() {
+                        if {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| crate::env_var_os("ZIPP_GLOBRANGE_DEBUG").is_some())
+        } {
                             let list: Vec<String> = reg_order
                                 .iter()
                                 .filter(|r| ty[r] == VTy::Num && !shareable(**r))
@@ -5271,30 +5283,39 @@ pub(crate) fn numeric_operand_uses(i: &Instr) -> Vec<u16> {
 /// (`region_can_compile` rejects them all), so attributing the capture read to
 /// the cell op rather than the closure op cannot mis-order in-region liveness.
 pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
+    let mut out = Vec::new();
+    instr_uses_into(i, &mut out);
+    out
+}
+
+/// Append every register read by `i` into `out` without per-instruction heap
+/// allocations when `out` is reused across a flat table build.
+pub(crate) fn instr_uses_into(i: &Instr, out: &mut Vec<u16>) {
     /// A contiguous argument window `[base, base + n)`, preceded by any
     /// explicitly named operands (a callee, a receiver, a key).
-    fn win(head: &[u16], base: u16, n: u16) -> Vec<u16> {
-        let mut v = Vec::with_capacity(head.len() + n as usize);
-        v.extend_from_slice(head);
-        v.extend((0..n).map(|k| base + k));
-        v
+    #[inline]
+    fn win(out: &mut Vec<u16>, head: &[u16], base: u16, n: u16) {
+        out.extend_from_slice(head);
+        out.extend((0..n).map(|k| base + k));
     }
     /// The activation's `this`.
     const THIS: u16 = 0;
     match *i {
         // ── interpreter superinstructions ── never in the code the JIT
         // reads (`FusedCode`); both halves' reads, conservatively.
-        Instr::FuseAddIntMove { a, msrc, .. } => vec![a, msrc],
-        Instr::FuseUpvalGetMove { msrc, .. } => vec![msrc],
-        Instr::FuseMove2 { src, src2, .. } => vec![src, src2],
+        Instr::FuseAddIntMove { a, msrc, .. } => out.extend_from_slice(&[a, msrc]),
+        Instr::FuseUpvalGetMove { msrc, .. } => out.push(msrc),
+        Instr::FuseMove2 { src, src2, .. } => out.extend_from_slice(&[src, src2]),
         Instr::FuseLoadGlobal2 { .. }
         | Instr::FusePopHandlerJump { .. }
         | Instr::FuseGlobalIntCmpJump { .. }
         | Instr::FuseGlobalIncJump { .. }
         | Instr::FuseGlobalInc { .. }
-        | Instr::FuseGlobalIntBitwise { .. } => vec![],
-        Instr::FuseIntBitwiseStoreGlobal { a, .. } => vec![a],
-        Instr::FuseLoadIntBitwise { a, b, .. } | Instr::FuseEqJump { a, b, .. } => vec![a, b],
+        | Instr::FuseGlobalIntBitwise { .. } => {}
+        Instr::FuseIntBitwiseStoreGlobal { a, .. } => out.push(a),
+        Instr::FuseLoadIntBitwise { a, b, .. } | Instr::FuseEqJump { a, b, .. } => {
+            out.extend_from_slice(&[a, b])
+        }
         Instr::FuseTypeOfJump { a, .. }
         | Instr::FuseNotJump { a, .. }
         | Instr::FuseIntEqJump { a, .. }
@@ -5307,10 +5328,10 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         | Instr::FuseGlobalCmpJump { a, .. }
         | Instr::FuseAddLoadInt { a, .. }
         | Instr::FuseAddIntJump { a, .. }
-        | Instr::FuseLoadGlobalAddInt { a, .. } => vec![a],
-        Instr::FuseAddReturn { a, b, src, .. } => vec![a, b, src],
+        | Instr::FuseLoadGlobalAddInt { a, .. } => out.push(a),
+        Instr::FuseAddReturn { a, b, src, .. } => out.extend_from_slice(&[a, b, src]),
         // ── pure transfers ──
-        Instr::Move { src, .. } => vec![src],
+        Instr::Move { src, .. } => out.push(src),
         Instr::StoreGlobal { src, .. }
         | Instr::StoreGlobalStrict { src, .. }
         | Instr::StoreGlobalResolved { src, .. }
@@ -5318,10 +5339,10 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         | Instr::EvalScopeSet { src, .. }
         | Instr::UpvalSet { src, .. }
         | Instr::StoreUpvalDyn { src, .. }
-        | Instr::TemplateSetCached { src, .. } => vec![src],
+        | Instr::TemplateSetCached { src, .. } => out.push(src),
 
         // ── arithmetic / logic ──
-        Instr::AddInt { a, .. } | Instr::Neg { a, .. } => vec![a],
+        Instr::AddInt { a, .. } | Instr::Neg { a, .. } => out.push(a),
         Instr::Add { a, b, .. }
         | Instr::Sub { a, b, .. }
         | Instr::Mul { a, b, .. }
@@ -5343,13 +5364,13 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         | Instr::LooseEq { a, b, .. }
         | Instr::LooseNe { a, b, .. }
         | Instr::JumpIfNotLt { a, b, .. }
-        | Instr::JumpIfNotLe { a, b, .. } => vec![a, b],
+        | Instr::JumpIfNotLe { a, b, .. } => out.extend_from_slice(&[a, b]),
         Instr::StrAppendIndex {
             a, obj, key, ..
-        } => vec![a, obj, key],
-        Instr::AddRightPair { a, b, c, .. } => vec![a, b, c],
-        Instr::Pad2Concat { src, .. } => vec![src],
-        Instr::Pad2Conditional { src, .. } => vec![src],
+        } => out.extend_from_slice(&[a, obj, key]),
+        Instr::AddRightPair { a, b, c, .. } => out.extend_from_slice(&[a, b, c]),
+        Instr::Pad2Concat { src, .. } => out.push(src),
+        Instr::Pad2Conditional { src, .. } => out.push(src),
         // Unary value ops. `TypeOf`/`TypeOfIs` are the pair this table was
         // missing; see the note above.
         Instr::ToNum { a, .. }
@@ -5357,29 +5378,29 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         | Instr::Not { a, .. }
         | Instr::ToStr { a, .. }
         | Instr::TypeOf { a, .. }
-        | Instr::TypeOfIs { a, .. } => vec![a],
-        Instr::TypeOfSame { a, b, .. } => vec![a, b],
+        | Instr::TypeOfIs { a, .. } => out.push(a),
+        Instr::TypeOfSame { a, b, .. } => out.extend_from_slice(&[a, b]),
         Instr::JsonParse {
             a, callee, this_v, ..
-        } => vec![a, callee, this_v],
+        } => out.extend_from_slice(&[a, callee, this_v]),
         Instr::IsArray {
             a, callee, this_v, ..
-        } => vec![a, callee, this_v],
+        } => out.extend_from_slice(&[a, callee, this_v]),
         Instr::JsonStringify {
             val,
             space,
             callee,
             this_v,
             ..
-        } => vec![val, space, callee, this_v],
+        } => out.extend_from_slice(&[val, space, callee, this_v]),
 
         // ── control flow ──
-        Instr::JumpIfFalse { cond, .. } | Instr::JumpIfTrue { cond, .. } => vec![cond],
-        Instr::Return { src } => vec![src],
-        Instr::Throw { src } => vec![src],
+        Instr::JumpIfFalse { cond, .. } | Instr::JumpIfTrue { cond, .. } => out.push(cond),
+        Instr::Return { src } => out.push(src),
+        Instr::Throw { src } => out.push(src),
         // The handler/finally BRACKET ops record their registers for the
         // unwinder, which WRITES them; `EndFinally` reads the completion back.
-        Instr::EndFinally { kind_reg, val_reg } => vec![kind_reg, val_reg],
+        Instr::EndFinally { kind_reg, val_reg } => out.extend_from_slice(&[kind_reg, val_reg]),
 
         // ── heap property / element ops ──
         Instr::GetProp { obj, .. }
@@ -5388,7 +5409,7 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         | Instr::WithHas { obj, .. }
         | Instr::WithGet { obj, .. }
         | Instr::ForInKeys { obj, .. }
-        | Instr::LenOf { obj, .. } => vec![obj],
+        | Instr::LenOf { obj, .. } => out.push(obj),
         Instr::ObjectKeys {
             obj, callee, this_v, ..
         }
@@ -5397,7 +5418,7 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         }
         | Instr::ObjectEntries {
             obj, callee, this_v, ..
-        } => vec![obj, callee, this_v],
+        } => out.extend_from_slice(&[obj, callee, this_v]),
         Instr::SetProp { obj, val, .. }
         | Instr::SetPrivate { obj, val, .. }
         | Instr::InitDataProp { obj, val, .. }
@@ -5405,28 +5426,28 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         | Instr::DefineField { obj, val, .. }
         | Instr::SetLiteralProto { obj, val }
         | Instr::ObjectSpread { target: obj, src: val }
-        | Instr::WithSet { obj, val, .. } => vec![obj, val],
+        | Instr::WithSet { obj, val, .. } => out.extend_from_slice(&[obj, val]),
         // The staged value block of a one-step literal — exactly `NewArray`'s
         // contiguous-window pattern, with the count carried in the instruction.
         Instr::FinalizeObject {
             val_base, count, ..
-        } => win(&[], val_base, count),
-        Instr::GetIndex { obj, key, .. } => vec![obj, key],
-        Instr::SetIndex { obj, key, val } => vec![obj, key, val],
-        Instr::GetIndexConcat { obj, key, .. } => vec![obj, key],
-        Instr::SetIndexConcat { obj, key, val, .. } => vec![obj, key, val],
-        Instr::InitDataPropDyn { obj, key, val } => vec![obj, key, val],
-        Instr::DeleteIndex { obj, key, .. } => vec![obj, key],
-        Instr::DeleteIndexConcat { obj, key, .. } => vec![obj, key],
-        Instr::ForInLive { obj, key, .. } => vec![obj, key],
-        Instr::HasProp { obj, key, .. } => vec![obj, key],
-        Instr::DefineAccessor { obj, key, func, .. } => vec![obj, key, func],
-        Instr::SetFnNameFromKey { func, key, .. } => vec![func, key],
+        } => win(out, &[], val_base, count),
+        Instr::GetIndex { obj, key, .. } => out.extend_from_slice(&[obj, key]),
+        Instr::SetIndex { obj, key, val } => out.extend_from_slice(&[obj, key, val]),
+        Instr::GetIndexConcat { obj, key, .. } => out.extend_from_slice(&[obj, key]),
+        Instr::SetIndexConcat { obj, key, val, .. } => out.extend_from_slice(&[obj, key, val]),
+        Instr::InitDataPropDyn { obj, key, val } => out.extend_from_slice(&[obj, key, val]),
+        Instr::DeleteIndex { obj, key, .. } => out.extend_from_slice(&[obj, key]),
+        Instr::DeleteIndexConcat { obj, key, .. } => out.extend_from_slice(&[obj, key]),
+        Instr::ForInLive { obj, key, .. } => out.extend_from_slice(&[obj, key]),
+        Instr::HasProp { obj, key, .. } => out.extend_from_slice(&[obj, key]),
+        Instr::DefineAccessor { obj, key, func, .. } => out.extend_from_slice(&[obj, key, func]),
+        Instr::SetFnNameFromKey { func, key, .. } => out.extend_from_slice(&[func, key]),
         // ToPropKey reads the receiver (nullish check) and the key. `src` MUST
         // be listed or the dead-code pass drops the load that feeds it; `obj`
         // follows the GetIndex/SetIndex pattern and is exempted at the pinned
         // receiver's use-site scan like theirs.
-        Instr::ToPropKey { obj, src, .. } => vec![obj, src],
+        Instr::ToPropKey { obj, src, .. } => out.extend_from_slice(&[obj, src]),
         Instr::ToConcatKey { src, .. }
         | Instr::ToObject { src, .. }
         | Instr::CheckCoercible { src }
@@ -5437,8 +5458,8 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         | Instr::GetIteratorObj { src, .. }
         | Instr::IterToArray { src, .. }
         | Instr::GetAsyncIterator { src, .. }
-        | Instr::DateParse { src, .. } => vec![src],
-        Instr::ObjectRestDyn { src, keys_base, n, .. } => win(&[src], keys_base, n),
+        | Instr::DateParse { src, .. } => out.push(src),
+        Instr::ObjectRestDyn { src, keys_base, n, .. } => win(out, &[src], keys_base, n),
 
         // ── calls ──
         // A call reads a CONTIGUOUS argument window starting at `arg_base`, plus
@@ -5451,7 +5472,7 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
             arg_base,
             argc,
             ..
-        } => win(&[callee, this_v], arg_base, argc),
+        } => win(out, &[callee, this_v], arg_base, argc),
         // A BARE MathOp (`callee == NO_REG`) reads only its argument window —
         // `this_v` is a global index there, not a register.
         Instr::MathOp {
@@ -5462,90 +5483,92 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
             ..
         } => {
             if callee == crate::bytecode::NO_REG {
-                win(&[], arg_base, argc)
+                win(out, &[], arg_base, argc)
             } else {
-                win(&[callee, this_v], arg_base, argc)
+                win(out, &[callee, this_v], arg_base, argc)
             }
         }
-        Instr::GlobalFn { callee, arg_base, argc, .. } => win(&[callee], arg_base, argc),
-        Instr::ArrayCtor { callee, arg_base, argc, .. } => {
-            match callee {
-                Some(callee) => win(&[callee], arg_base, argc),
-                None => win(&[], arg_base, argc),
-            }
-        }
+        Instr::GlobalFn { callee, arg_base, argc, .. } => win(out, &[callee], arg_base, argc),
+        Instr::ArrayCtor { callee, arg_base, argc, .. } => match callee {
+            Some(callee) => win(out, &[callee], arg_base, argc),
+            None => win(out, &[], arg_base, argc),
+        },
         Instr::NewArray { arg_base, argc, .. }
         | Instr::DateNew { arg_base, argc, .. }
-        | Instr::DateUTC { arg_base, argc, .. } => win(&[], arg_base, argc),
+        | Instr::DateUTC { arg_base, argc, .. } => win(out, &[], arg_base, argc),
         // Python-only fast paths; no JIT tier admits them.
-        Instr::PyArith { a, b, .. } | Instr::PyCompare { a, b, .. } | Instr::PyJumpCompare { a, b, .. } => vec![a, b],
-        Instr::PyAddImm { a, .. } => vec![a],
-        Instr::PyClassOf { obj, .. } | Instr::PyDictGet { obj, .. } => vec![obj],
-        Instr::PyDictSet { obj, val, .. } => vec![obj, val],
-        Instr::PyCallEntry { f, .. } => vec![f],
-        Instr::PyGetItem { o, k, seq, dict, .. } => vec![o, k, seq, dict],
-        Instr::PySetItem { o, k, v, seq, dict, .. } => vec![o, k, v, seq, dict],
-        Instr::PyGlobal { globals, rt, .. } => vec![globals, rt],
-        Instr::PyStrItem { s, k, .. } => vec![s, k],
-        Instr::PyStrLen { s, .. } => vec![s],
-        Instr::PyGetAttr { obj, .. } => vec![obj],
-        Instr::PySetAttr { obj, val, .. } => vec![obj, val],
-        Instr::PyIsInstance { v, t, rt, .. } => vec![v, t, rt],
-        Instr::PyGenNext { next, this, .. } => vec![next, this],
-        Instr::PyMethod { obj, rt, .. } => vec![obj, rt],
-        Instr::PyModGet { obj, rt, .. } => vec![obj, rt],
-        Instr::PyLen { v, rt, .. } => vec![v, rt],
-        Instr::PyAttrFn { obj, .. } => vec![obj],
-        Instr::PySeq { items, rt, .. } => vec![items, rt],
-        Instr::PyRaise { e, rt, .. } => vec![e, rt],
-        Instr::PyCaught { e, line, rt, .. } => vec![e, line, rt],
-        Instr::PyClassAttr { obj, .. } => vec![obj],
-        Instr::PyDictLookup { d, k, rt, .. } => vec![d, k, rt],
-        Instr::PyUnpack { v, rt, .. } => vec![v, rt],
-        Instr::PyMakeExc { cls, args, rt, .. } => vec![cls, args, rt],
-        Instr::PyExcPop { rt, .. } => vec![rt],
-        Instr::PyNew { cls, rt, .. } => vec![cls, rt],
-        Instr::PyCall { f, arg_base, argc, .. } => win(&[f], arg_base, argc),
+        Instr::PyArith { a, b, .. } | Instr::PyCompare { a, b, .. } | Instr::PyJumpCompare { a, b, .. } => {
+            out.extend_from_slice(&[a, b])
+        }
+        Instr::PyAddImm { a, .. } => out.push(a),
+        Instr::PyClassOf { obj, .. } | Instr::PyDictGet { obj, .. } => out.push(obj),
+        Instr::PyDictSet { obj, val, .. } => out.extend_from_slice(&[obj, val]),
+        Instr::PyCallEntry { f, .. } => out.push(f),
+        Instr::PyGetItem { o, k, seq, dict, .. } => out.extend_from_slice(&[o, k, seq, dict]),
+        Instr::PySetItem { o, k, v, seq, dict, .. } => out.extend_from_slice(&[o, k, v, seq, dict]),
+        Instr::PyGlobal { globals, rt, .. } => out.extend_from_slice(&[globals, rt]),
+        Instr::PyStrItem { s, k, .. } => out.extend_from_slice(&[s, k]),
+        Instr::PyStrLen { s, .. } => out.push(s),
+        Instr::PyGetAttr { obj, .. } => out.push(obj),
+        Instr::PySetAttr { obj, val, .. } => out.extend_from_slice(&[obj, val]),
+        Instr::PyIsInstance { v, t, rt, .. } => out.extend_from_slice(&[v, t, rt]),
+        Instr::PyGenNext { next, this, .. } => out.extend_from_slice(&[next, this]),
+        Instr::PyMethod { obj, rt, .. } => out.extend_from_slice(&[obj, rt]),
+        Instr::PyModGet { obj, rt, .. } => out.extend_from_slice(&[obj, rt]),
+        Instr::PyLen { v, rt, .. } => out.extend_from_slice(&[v, rt]),
+        Instr::PyAttrFn { obj, .. } => out.push(obj),
+        Instr::PySeq { items, rt, .. } => out.extend_from_slice(&[items, rt]),
+        Instr::PyRaise { e, rt, .. } => out.extend_from_slice(&[e, rt]),
+        Instr::PyCaught { e, line, rt, .. } => out.extend_from_slice(&[e, line, rt]),
+        Instr::PyClassAttr { obj, .. } => out.push(obj),
+        Instr::PyDictLookup { d, k, rt, .. } => out.extend_from_slice(&[d, k, rt]),
+        Instr::PyUnpack { v, rt, .. } => out.extend_from_slice(&[v, rt]),
+        Instr::PyMakeExc { cls, args, rt, .. } => out.extend_from_slice(&[cls, args, rt]),
+        Instr::PyExcPop { rt, .. } => out.push(rt),
+        Instr::PyNew { cls, rt, .. } => out.extend_from_slice(&[cls, rt]),
+        Instr::PyCall { f, arg_base, argc, .. } => win(out, &[f], arg_base, argc),
         Instr::Call { callee, arg_base, argc, .. }
         | Instr::TailCall { callee, arg_base, argc }
-        | Instr::New { callee, arg_base, argc, .. } => win(&[callee], arg_base, argc),
+        | Instr::New { callee, arg_base, argc, .. } => win(out, &[callee], arg_base, argc),
         Instr::CallWithThis { callee, this_v, arg_base, argc, .. }
         | Instr::CallWithThisDv { callee, this_v, arg_base, argc, .. }
         | Instr::RegExpMethod { callee, this_v, arg_base, argc, .. }
         | Instr::TailCallWithThis { callee, this_v, arg_base, argc } => {
-            win(&[callee, this_v], arg_base, argc)
+            win(out, &[callee, this_v], arg_base, argc)
         }
         Instr::CallMethod { obj, arg_base, argc, .. } | Instr::CallMethodDv { obj, arg_base, argc, .. } => {
-            win(&[obj], arg_base, argc)
+            win(out, &[obj], arg_base, argc)
         }
         Instr::CallMethodComputed { obj, key, arg_base, argc, .. } => {
-            win(&[obj, key], arg_base, argc)
+            win(out, &[obj, key], arg_base, argc)
         }
         Instr::CallSpread { callee, args, .. } | Instr::NewSpread { callee, args, .. } => {
-            vec![callee, args]
+            out.extend_from_slice(&[callee, args])
         }
         Instr::CallWithThisSpread {
             callee,
             this_v,
             args,
             ..
-        } => vec![callee, this_v, args],
-        Instr::CallMethodSpread { obj, args, .. } => vec![obj, args],
-        Instr::CallMethodComputedSpread { obj, key, args, .. } => vec![obj, key, args],
+        } => out.extend_from_slice(&[callee, this_v, args]),
+        Instr::CallMethodSpread { obj, args, .. } => out.extend_from_slice(&[obj, args]),
+        Instr::CallMethodComputedSpread { obj, key, args, .. } => {
+            out.extend_from_slice(&[obj, key, args])
+        }
         Instr::MathSpread {
             callee,
             this_v,
             args,
             ..
-        } => vec![callee, this_v, args],
+        } => out.extend_from_slice(&[callee, this_v, args]),
         Instr::ArrayFrom {
             src,
             mapfn,
             callee,
             this_v,
             ..
-        } => vec![src, mapfn, callee, this_v],
-        Instr::InstanceOfDyn { val, ctor, .. } => vec![val, ctor],
+        } => out.extend_from_slice(&[src, mapfn, callee, this_v]),
+        Instr::InstanceOfDyn { val, ctor, .. } => out.extend_from_slice(&[val, ctor]),
         // The syntactic `eval` reference (callee + WithBaseObject), caller
         // lexical `this`, and its COMPLETE argument source. A spread site uses
         // one materialized Array register; an ordinary site uses a contiguous
@@ -5562,93 +5585,105 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
             ..
         } => {
             if argc == 0 {
-                vec![callee, this_v, arg_base, this_reg]
+                out.extend_from_slice(&[callee, this_v, arg_base, this_reg])
             } else {
-                win(&[callee, this_v, this_reg], arg_base, argc)
+                win(out, &[callee, this_v, this_reg], arg_base, argc)
             }
         }
 
         // ── `super` ── every form also consumes the activation's `this`
         // (register 0), which no operand field names.
-        Instr::SuperCtor { ctor, arg_base, argc, .. } => win(&[ctor, THIS], arg_base, argc),
-        Instr::SuperCtorSpread { ctor, args, .. } => vec![ctor, THIS, args],
-        Instr::SuperMethod { base, arg_base, argc, .. } => win(&[base, THIS], arg_base, argc),
+        Instr::SuperCtor { ctor, arg_base, argc, .. } => win(out, &[ctor, THIS], arg_base, argc),
+        Instr::SuperCtorSpread { ctor, args, .. } => out.extend_from_slice(&[ctor, THIS, args]),
+        Instr::SuperMethod { base, arg_base, argc, .. } => win(out, &[base, THIS], arg_base, argc),
         Instr::SuperMethodComputed { base, key, arg_base, argc, .. } => {
-            win(&[base, key, THIS], arg_base, argc)
+            win(out, &[base, key, THIS], arg_base, argc)
         }
-        Instr::SuperGet { .. } | Instr::SuperGetObj { .. } => vec![THIS],
+        Instr::SuperGet { .. } | Instr::SuperGetObj { .. } => out.push(THIS),
         Instr::SuperGetComputed { key, .. } | Instr::SuperGetObjComputed { key, .. } => {
-            vec![key, THIS]
+            out.extend_from_slice(&[key, THIS])
         }
-        Instr::SuperGetRef { receiver, .. } => vec![receiver],
-        Instr::SuperGetRefComputed { key, receiver, .. } => vec![key, receiver],
-        Instr::SuperSet { base, val, .. } => vec![base, val, THIS],
-        Instr::SuperSetComputed { base, key, val, .. } => vec![base, key, val, THIS],
-        Instr::SuperSetObj { val, .. } => vec![val, THIS],
-        Instr::SuperSetObjComputed { key, val } => vec![key, val, THIS],
-        Instr::SuperMethodObj { arg_base, argc, .. } => win(&[THIS], arg_base, argc),
+        Instr::SuperGetRef { receiver, .. } => out.push(receiver),
+        Instr::SuperGetRefComputed { key, receiver, .. } => out.extend_from_slice(&[key, receiver]),
+        Instr::SuperSet { base, val, .. } => out.extend_from_slice(&[base, val, THIS]),
+        Instr::SuperSetComputed { base, key, val, .. } => {
+            out.extend_from_slice(&[base, key, val, THIS])
+        }
+        Instr::SuperSetObj { val, .. } => out.extend_from_slice(&[val, THIS]),
+        Instr::SuperSetObjComputed { key, val } => out.extend_from_slice(&[key, val, THIS]),
+        Instr::SuperMethodObj { arg_base, argc, .. } => win(out, &[THIS], arg_base, argc),
         Instr::SuperMethodObjComputed { key, arg_base, argc, .. } => {
-            win(&[key, THIS], arg_base, argc)
+            win(out, &[key, THIS], arg_base, argc)
         }
-        Instr::SuperMethodSpread { args, .. } => vec![args, THIS],
-        Instr::SuperMethodComputedSpread { key, args, .. } => vec![key, args, THIS],
-        Instr::SetHomeObject { method, home } => vec![method, home],
+        Instr::SuperMethodSpread { args, .. } => out.extend_from_slice(&[args, THIS]),
+        Instr::SuperMethodComputedSpread { key, args, .. } => {
+            out.extend_from_slice(&[key, args, THIS])
+        }
+        Instr::SetHomeObject { method, home } => out.extend_from_slice(&[method, home]),
 
         // ── classes / decorators ──
         // `DecElem`/`DecClass` read `argc` (decorator, receiver) PAIRS — the
         // window is 2 * argc wide, not argc.
         Instr::DecElem { class, arg_base, argc, .. } => {
-            win(&[class], arg_base, argc.saturating_mul(2))
+            win(out, &[class], arg_base, argc.saturating_mul(2))
         }
         Instr::DecClass { class, arg_base, argc } => {
-            win(&[class], arg_base, argc.saturating_mul(2))
+            win(out, &[class], arg_base, argc.saturating_mul(2))
         }
         // DecKey / PushFieldKey / ClassAddMember ToPropertyKey the key IN PLACE:
         // read-modify-write, so `key` is a use as well as a def.
         Instr::DecKey { class, key, .. }
         | Instr::PushFieldKey { class, key }
-        | Instr::ClassAddMember { class, key, .. } => vec![class, key],
-        Instr::ClassStaticField { class, key, val } => vec![class, key, val],
-        Instr::DecInits { recv, .. } => vec![recv],
-        Instr::DecField { val, recv, .. } => vec![val, recv],
+        | Instr::ClassAddMember { class, key, .. } => out.extend_from_slice(&[class, key]),
+        Instr::ClassStaticField { class, key, val } => out.extend_from_slice(&[class, key, val]),
+        Instr::DecInits { recv, .. } => out.push(recv),
+        Instr::DecField { val, recv, .. } => out.extend_from_slice(&[val, recv]),
         // The field's value plus the activation's `this` (the instance).
-        Instr::FieldInit { val, .. } => vec![val, THIS],
-        Instr::MakeClass { parent, .. } => parent.into_iter().collect(),
+        Instr::FieldInit { val, .. } => out.extend_from_slice(&[val, THIS]),
+        Instr::MakeClass { parent, .. } => {
+            if let Some(p) = parent {
+                out.push(p);
+            }
+        }
 
         // ── generators / async / iteration ──
         Instr::Yield { val, .. }
         | Instr::Await { val, .. }
         | Instr::YieldDelegate { val, .. }
         | Instr::AsyncYieldDelegate { val, .. }
-        | Instr::RequireObject { val } => vec![val],
-        Instr::AsyncIterThrowStep { iter, exc, .. } => vec![iter, exc],
+        | Instr::RequireObject { val } => out.push(val),
+        Instr::AsyncIterThrowStep { iter, exc, .. } => out.extend_from_slice(&[iter, exc]),
         Instr::AsyncIterNextStep { iter, idx, sent, next_fn, .. } => {
-            vec![iter, idx, sent, next_fn]
+            out.extend_from_slice(&[iter, idx, sent, next_fn])
         }
-        Instr::AsyncIterReturnStep { iter, ret, .. } => vec![iter, ret],
-        Instr::AsyncFromSyncStep { step, iter, .. } => vec![step, iter],
-        Instr::IterDelegate { iter, mode, sent, .. } => vec![iter, mode, sent],
+        Instr::AsyncIterReturnStep { iter, ret, .. } => out.extend_from_slice(&[iter, ret]),
+        Instr::AsyncFromSyncStep { step, iter, .. } => out.extend_from_slice(&[step, iter]),
+        Instr::IterDelegate { iter, mode, sent, .. } => out.extend_from_slice(&[iter, mode, sent]),
         // The cursor `idx` is read-modify-write. `next` is the PRIMED next
         // method, or the `u16::MAX` absent sentinel at a destructuring site.
         Instr::IterNext { iter, idx, next, .. } => {
-            let mut v = vec![iter, idx];
+            out.push(iter);
+            out.push(idx);
             if next != u16::MAX {
-                v.push(next);
+                out.push(next);
             }
-            v
         }
-        Instr::ForAwaitNext { iter, idx, .. } => vec![iter, idx],
+        Instr::ForAwaitNext { iter, idx, .. } => out.extend_from_slice(&[iter, idx]),
         Instr::IterPrime { iter, .. }
         | Instr::IterClose { iter }
-        | Instr::IterCloseQuiet { iter } => vec![iter],
-        Instr::IterCloseFinally { iter, kind_reg } => vec![iter, kind_reg],
+        | Instr::IterCloseQuiet { iter } => out.push(iter),
+        Instr::IterCloseFinally { iter, kind_reg } => out.extend_from_slice(&[iter, kind_reg]),
 
         // ── `using` / disposal ──
         Instr::RegisterDisposable { scope, val }
-        | Instr::RegisterAsyncDisposable { scope, val } => vec![scope, val],
-        Instr::DisposeScope { scope, kind_reg, val_reg } => vec![scope, kind_reg, val_reg],
-        Instr::AsyncDisposeNext { scope, .. } => vec![scope],
-        Instr::MergeDispose { kind_reg, val_reg, err } => vec![kind_reg, val_reg, err],
+        | Instr::RegisterAsyncDisposable { scope, val } => out.extend_from_slice(&[scope, val]),
+        Instr::DisposeScope { scope, kind_reg, val_reg } => {
+            out.extend_from_slice(&[scope, kind_reg, val_reg])
+        }
+        Instr::AsyncDisposeNext { scope, .. } => out.push(scope),
+        Instr::MergeDispose { kind_reg, val_reg, err } => {
+            out.extend_from_slice(&[kind_reg, val_reg, err])
+        }
 
         // ── closure cells ──
         // `MakeCellTdz` only WRITES its reg; it is declared a use because it is
@@ -5657,36 +5692,57 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         Instr::MakeCell { reg }
         | Instr::MakeCellTdz { reg }
         | Instr::MakeCellFnName { reg }
-        | Instr::MarkCellConst { reg } => vec![reg],
-        Instr::CellGet { cell, .. } => vec![cell],
-        Instr::CellSet { cell, src } | Instr::CellSetChecked { cell, src } => vec![cell, src],
-        Instr::LoadSpill { vec, .. } => vec![vec],
-        Instr::StoreSpill { vec, src, .. } => vec![vec, src],
-        Instr::NewSpill { .. } => vec![],
-        Instr::MakeArrow { this_reg, .. } => vec![this_reg],
+        | Instr::MarkCellConst { reg } => out.push(reg),
+        Instr::CellGet { cell, .. } => out.push(cell),
+        Instr::CellSet { cell, src } | Instr::CellSetChecked { cell, src } => {
+            out.extend_from_slice(&[cell, src])
+        }
+        Instr::LoadSpill { vec, .. } => out.push(vec),
+        Instr::StoreSpill { vec, src, .. } => out.extend_from_slice(&[vec, src]),
+        Instr::NewSpill { .. } => {}
+        Instr::MakeArrow { this_reg, .. } => out.push(this_reg),
 
         // ── constructors / literals with register operands ──
         Instr::NewMap { src, .. }
         | Instr::NewSet { src, .. }
         | Instr::NewWeakMap { src, .. }
-        | Instr::NewWeakSet { src, .. } => src.into_iter().collect(),
+        | Instr::NewWeakSet { src, .. } => {
+            if let Some(s) = src {
+                out.push(s);
+            }
+        }
         Instr::NewBox { arg, .. } | Instr::MakeSymbol { desc: arg, .. } => {
-            arg.into_iter().collect()
+            if let Some(a) = arg {
+                out.push(a);
+            }
         }
         Instr::NewError { arg, opts, errors, .. } => {
-            arg.get().into_iter().chain(opts.get()).chain(errors.get()).collect()
+            if let Some(a) = arg.get() {
+                out.push(a);
+            }
+            if let Some(o) = opts.get() {
+                out.push(o);
+            }
+            if let Some(e) = errors.get() {
+                out.push(e);
+            }
         }
-        Instr::NewWeakRef { target, .. } => vec![target],
-        Instr::NewFinalizationRegistry { cleanup, .. } => vec![cleanup],
-        Instr::NewPromise { executor, .. } => vec![executor],
-        Instr::NewRegExp { pattern, flags, .. } => vec![pattern, flags],
+        Instr::NewWeakRef { target, .. } => out.push(target),
+        Instr::NewFinalizationRegistry { cleanup, .. } => out.push(cleanup),
+        Instr::NewPromise { executor, .. } => out.push(executor),
+        Instr::NewRegExp { pattern, flags, .. } => out.extend_from_slice(&[pattern, flags]),
         // `pattern`/`flags` are constant indices, not registers.
-        Instr::RegExpLitProbe { .. } => vec![],
-        Instr::RegExpLitTest { arg, .. } => vec![arg],
-        Instr::BigIntFrom { arg, .. } => vec![arg],
-        Instr::ArrayAppend { arr, val, .. } => vec![arr, val],
-        Instr::SetRaw { arr, raw } => vec![arr, raw],
-        Instr::ImportCall { spec, opts, .. } => std::iter::once(spec).chain(opts).collect(),
+        Instr::RegExpLitProbe { .. } => {}
+        Instr::RegExpLitTest { arg, .. } => out.push(arg),
+        Instr::BigIntFrom { arg, .. } => out.push(arg),
+        Instr::ArrayAppend { arr, val, .. } => out.extend_from_slice(&[arr, val]),
+        Instr::SetRaw { arr, raw } => out.extend_from_slice(&[arr, raw]),
+        Instr::ImportCall { spec, opts, .. } => {
+            out.push(spec);
+            if let Some(o) = opts {
+                out.push(o);
+            }
+        }
 
         // ── reads NO register ──
         // Constants and materializations (their only register is `dst`); the
@@ -5732,7 +5788,7 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         | Instr::PopFinally
         | Instr::GenStart
         | Instr::LazyCompile
-        | Instr::ReturnUndefined => vec![],
+        | Instr::ReturnUndefined => {}
     }
 }
 

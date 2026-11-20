@@ -104,46 +104,91 @@ impl<'a> FnCompiler<'a> {
         if let Some(n) = &name {
             strict_name_err(self.cx.in_strict || has_use_strict(fn_directives(f)), n)?;
         }
-        let (params, rest, body) = function_parts(f)?;
-        let mut names = with_rest(&params, &rest);
-        names.extend(param_pattern_leaves(&f.params));
-        names.extend(hoisted_var_names(body)); // function-scoped `var`s (capture)
-        let captured = capture::captured_locals(&names, Some(&f.params), body);
-        self.stash_child_with_shadows(&names, body);
         let enclosing = self.child_enclosing();
         let stub = if self.cx.lazy_mode == lazy::LazyMode::Off {
             None
         } else {
             let nested = self.cx.lazy_scan_fn(f);
+            let free = if enclosing.is_empty() {
+                Vec::new()
+            } else {
+                capture::function_free_matching(f, |n| enclosing_can_capture(&enclosing, n))
+            };
             self.lazy_prepare(
                 lazy::LazyKind::FuncDecl { name: name.clone() },
-                capture::function_free_names(f),
+                free,
                 nested,
                 (f.span.start, f.span.end),
+                f.body.lazy_span(),
                 name.as_deref().unwrap_or("<script>"),
                 false,
                 &f.params,
                 has_use_strict(fn_directives(f)),
-                &captured,
                 &enclosing,
             )
         };
         let mut proto = match stub {
             Some(stub) => stub,
-            None => self.cx.compile_function_body(
-                name.as_deref(),
-                None, // a declaration's name lives in the enclosing scope, not self-bound
-                &params,
-                rest.as_deref(),
-                Some(&f.params),
-                body,
-                fn_directives(f), // body prologue: drives `"use strict"` strictness
-                false,
-                f.is_generator,
-                f.is_async,
-                captured,
-                enclosing,
-            )?,
+            None => {
+                #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                let parsed_lazy = match f.body.lazy_span() {
+                    Some(span) => Some(
+                        crate::parse::stmt::parse_lazy_fn_body(
+                            &self.cx.source,
+                            span,
+                            &f.params,
+                            self.cx.in_strict,
+                            self.cx.lazy_mode == lazy::LazyMode::Run,
+                        )
+                        .map_err(|e| crate::front::failure(e).message)?,
+                    ),
+                    None => None,
+                };
+                #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                let _lazy_memo = parsed_lazy
+                    .as_ref()
+                    .map(|_| crate::capture::Session::new_with_source(self.cx.source.clone()));
+                #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                let saved_only = if parsed_lazy.is_some() {
+                    let s = self.cx.lazy_only_skipped;
+                    self.cx.lazy_only_skipped = true;
+                    Some(s)
+                } else {
+                    None
+                };
+                let (params, rest, orig_body) = function_parts(f)?;
+                #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                let (body, dirs): (&[ast::Stmt], &[ast::Directive]) = match &parsed_lazy {
+                    Some(b) => (&b.stmts, &b.directives),
+                    None => (orig_body, fn_directives(f)),
+                };
+                #[cfg(any(feature = "meter-only", feature = "safe-sandbox"))]
+                let (body, dirs): (&[ast::Stmt], &[ast::Directive]) = (orig_body, fn_directives(f));
+                let mut names = with_rest(&params, &rest);
+                names.extend(param_pattern_leaves(&f.params));
+                names.extend(hoisted_var_names(body)); // function-scoped `var`s (capture)
+                let captured = capture::captured_locals(&names, Some(&f.params), body);
+                self.stash_child_with_shadows(&names, body);
+                let res = self.cx.compile_function_body(
+                    name.as_deref(),
+                    None, // a declaration's name lives in the enclosing scope, not self-bound
+                    &params,
+                    rest.as_deref(),
+                    Some(&f.params),
+                    body,
+                    dirs, // body prologue: drives `"use strict"` strictness
+                    false,
+                    f.is_generator,
+                    f.is_async,
+                    captured,
+                    enclosing,
+                );
+                #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                if let Some(s) = saved_only {
+                    self.cx.lazy_only_skipped = s;
+                }
+                res?
+            }
         };
         proto.source = self.cx.src_slice(f.span.start, f.span.end);
         self.cx.mark_preamble_fn(&mut proto, f.span.start);
@@ -2086,56 +2131,100 @@ impl<'a> FnCompiler<'a> {
         // to the capture-analysis name set. Use the SYNTACTIC name (`f.name`), not the
         // inferred NamedEvaluation name (an anonymous expr has no self-binding).
         let self_name = f.name.as_ref().map(|n| n.to_string());
-        let (params, rest, body) = function_parts(f)?;
-        let mut names = with_rest(&params, &rest);
-        names.extend(param_pattern_leaves(&f.params));
-        if let Some(sn) = &self_name {
-            names.push(sn.clone());
-        }
-        names.extend(hoisted_var_names(body)); // function-scoped `var`s (capture)
-        let captured = capture::captured_locals(&names, Some(&f.params), body);
-        self.stash_child_with_shadows(&names, body);
-        // Its free names, when a deferral or a copied parameter asks for them.
-        let free = if self.cx.lazy_mode != lazy::LazyMode::Off || !self.copy_boxed.is_empty() {
-            capture::function_free_names(f)
+        let copies = if self.copy_boxed.is_empty() {
+            None
         } else {
-            Vec::new()
+            let copy_free = capture::function_free_matching(f, |n| self.copy_boxed.contains(n));
+            self.copy_box_for_child(&copy_free)
         };
-        let copies = self.copy_box_for_child(&free);
         let enclosing = self.child_enclosing();
         let stub = if self.cx.lazy_mode == lazy::LazyMode::Off {
             None
         } else {
             let nested = if lazy_ok { self.cx.lazy_scan_fn(f) } else { None };
+            let free = if enclosing.is_empty() {
+                Vec::new()
+            } else {
+                capture::function_free_matching(f, |n| enclosing_can_capture(&enclosing, n))
+            };
             self.lazy_prepare(
                 lazy::LazyKind::FuncExpr { name: name.clone(), self_name: self_name.clone() },
                 free,
                 nested,
                 (f.span.start, f.span.end),
+                f.body.lazy_span(),
                 name.as_deref().unwrap_or("<script>"),
                 false,
                 &f.params,
                 has_use_strict(fn_directives(f)),
-                &captured,
                 &enclosing,
             )
         };
         let mut proto = match stub {
             Some(stub) => stub,
-            None => self.cx.compile_function_body(
-                name.as_deref(),
-                self_name.as_deref(),
-                &params,
-                rest.as_deref(),
-                Some(&f.params),
-                body,
-                fn_directives(f), // body prologue: drives `"use strict"` strictness
-                false,
-                f.is_generator,
-                f.is_async,
-                captured,
-                enclosing,
-            )?,
+            None => {
+                #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                let parsed_lazy = match f.body.lazy_span() {
+                    Some(span) => Some(
+                        crate::parse::stmt::parse_lazy_fn_body(
+                            &self.cx.source,
+                            span,
+                            &f.params,
+                            self.cx.in_strict,
+                            self.cx.lazy_mode == lazy::LazyMode::Run,
+                        )
+                        .map_err(|e| crate::front::failure(e).message)?,
+                    ),
+                    None => None,
+                };
+                #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                let _lazy_memo = parsed_lazy
+                    .as_ref()
+                    .map(|_| crate::capture::Session::new_with_source(self.cx.source.clone()));
+                #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                let saved_only = if parsed_lazy.is_some() {
+                    let s = self.cx.lazy_only_skipped;
+                    self.cx.lazy_only_skipped = true;
+                    Some(s)
+                } else {
+                    None
+                };
+                let (params, rest, orig_body) = function_parts(f)?;
+                #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                let (body, dirs): (&[ast::Stmt], &[ast::Directive]) = match &parsed_lazy {
+                    Some(b) => (&b.stmts, &b.directives),
+                    None => (orig_body, fn_directives(f)),
+                };
+                #[cfg(any(feature = "meter-only", feature = "safe-sandbox"))]
+                let (body, dirs): (&[ast::Stmt], &[ast::Directive]) = (orig_body, fn_directives(f));
+                let mut names = with_rest(&params, &rest);
+                names.extend(param_pattern_leaves(&f.params));
+                if let Some(sn) = &self_name {
+                    names.push(sn.clone());
+                }
+                names.extend(hoisted_var_names(body)); // function-scoped `var`s (capture)
+                let captured = capture::captured_locals(&names, Some(&f.params), body);
+                self.stash_child_with_shadows(&names, body);
+                let res = self.cx.compile_function_body(
+                    name.as_deref(),
+                    self_name.as_deref(),
+                    &params,
+                    rest.as_deref(),
+                    Some(&f.params),
+                    body,
+                    dirs, // body prologue: drives `"use strict"` strictness
+                    false,
+                    f.is_generator,
+                    f.is_async,
+                    captured,
+                    enclosing,
+                );
+                #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                if let Some(s) = saved_only {
+                    self.cx.lazy_only_skipped = s;
+                }
+                res?
+            }
         };
         self.copy_box_done(copies);
         proto.source = self.cx.src_slice(f.span.start, f.span.end);
@@ -2150,56 +2239,111 @@ impl<'a> FnCompiler<'a> {
     /// expression-bodied arrow (`x => x + 1`) is a function whose single
     /// statement returns the expression.
     pub(crate) fn compile_arrow(&mut self, a: &ast::Arrow, name: &str) -> R<(u32, bool)> {
-        let params = param_slot_names(&a.params)?;
-        let rest = rest_name(&a.params)?;
-        let mut names = with_rest(&params, &rest);
-        names.extend(param_pattern_leaves(&a.params));
-        // A bare expression cannot contain this arrow's own `var` declaration;
-        // block bodies retain the ordinary hoisting analysis.
-        if let ast::ArrowBody::Block(b) = &a.body {
-            names.extend(hoisted_var_names(&b.stmts));
-        }
-        let captured = capture::captured_locals_arrow(&names, &a.params, &a.body);
-        self.stash_arrow_child_with_shadows(&names, &a.body);
-        let free = if self.cx.lazy_mode != lazy::LazyMode::Off || !self.copy_boxed.is_empty() {
-            capture::arrow_free_names(a)
+        let copies = if self.copy_boxed.is_empty() {
+            None
         } else {
-            Vec::new()
+            let copy_free = capture::arrow_free_matching(a, |n| self.copy_boxed.contains(n));
+            self.copy_box_for_child(&copy_free)
         };
-        let copies = self.copy_box_for_child(&free);
         let enclosing = self.child_enclosing();
         let stub = if self.cx.lazy_mode == lazy::LazyMode::Off {
             None
         } else {
             let nested = self.cx.lazy_scan_arrow(a);
+            let free = if enclosing.is_empty() {
+                Vec::new()
+            } else {
+                capture::arrow_free_matching(a, |n| enclosing_can_capture(&enclosing, n))
+            };
             let own_strict = matches!(&a.body, ast::ArrowBody::Block(b) if has_use_strict(&b.directives));
+            let skipped_body = match &a.body {
+                ast::ArrowBody::Block(b) => b.lazy_span(),
+                ast::ArrowBody::Expr(_) => None,
+            };
             self.lazy_prepare(
                 lazy::LazyKind::Arrow,
                 free,
                 nested,
                 (a.span.start, a.span.end),
+                skipped_body,
                 name,
                 true,
                 &a.params,
                 own_strict,
-                &captured,
                 &enclosing,
             )
         };
         let mut proto = match stub {
             Some(stub) => stub,
-            None => self.cx.compile_arrow_body(
-                &params,
-                rest.as_deref(),
-                a,
-                captured,
-                enclosing,
-                self.super_class,
-                self.super_static,
-                self.super_home_obj,
-                self.derived_class,
-                self.in_derived_ctor,
-            )?,
+            None => {
+                #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                let parsed_arrow = match &a.body {
+                    ast::ArrowBody::Block(b) => match b.lazy_span() {
+                        Some(span) => {
+                            let parsed_body = crate::parse::stmt::parse_lazy_fn_body(
+                                &self.cx.source,
+                                span,
+                                &a.params,
+                                self.cx.in_strict,
+                                self.cx.lazy_mode == lazy::LazyMode::Run,
+                            )
+                            .map_err(|e| crate::front::failure(e).message)?;
+                            Some(ast::Arrow {
+                                params: a.params.clone(),
+                                body: ast::ArrowBody::Block(parsed_body),
+                                is_async: a.is_async,
+                                span: a.span,
+                            })
+                        }
+                        None => None,
+                    },
+                    ast::ArrowBody::Expr(_) => None,
+                };
+                #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                let _lazy_memo = parsed_arrow
+                    .as_ref()
+                    .map(|_| crate::capture::Session::new_with_source(self.cx.source.clone()));
+                #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                let saved_only = if parsed_arrow.is_some() {
+                    let s = self.cx.lazy_only_skipped;
+                    self.cx.lazy_only_skipped = true;
+                    Some(s)
+                } else {
+                    None
+                };
+                #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                let a_ref = parsed_arrow.as_ref().unwrap_or(a);
+                #[cfg(any(feature = "meter-only", feature = "safe-sandbox"))]
+                let a_ref = a;
+                let params = param_slot_names(&a_ref.params)?;
+                let rest = rest_name(&a_ref.params)?;
+                let mut names = with_rest(&params, &rest);
+                names.extend(param_pattern_leaves(&a_ref.params));
+                // A bare expression cannot contain this arrow's own `var` declaration;
+                // block bodies retain the ordinary hoisting analysis.
+                if let ast::ArrowBody::Block(b) = &a_ref.body {
+                    names.extend(hoisted_var_names(&b.stmts));
+                }
+                let captured = capture::captured_locals_arrow(&names, &a_ref.params, &a_ref.body);
+                self.stash_arrow_child_with_shadows(&names, &a_ref.body);
+                let res = self.cx.compile_arrow_body(
+                    &params,
+                    rest.as_deref(),
+                    a_ref,
+                    captured,
+                    enclosing,
+                    self.super_class,
+                    self.super_static,
+                    self.super_home_obj,
+                    self.derived_class,
+                    self.in_derived_ctor,
+                );
+                #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                if let Some(s) = saved_only {
+                    self.cx.lazy_only_skipped = s;
+                }
+                res?
+            }
         };
         self.copy_box_done(copies);
         proto.name = name.to_string();

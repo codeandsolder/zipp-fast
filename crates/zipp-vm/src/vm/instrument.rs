@@ -2035,6 +2035,68 @@ impl super::Vm<'_> {
         self.instr_rec.as_ref()?.terminal_message()
     }
 
+    /// The meter's terminal message, if any resource ceiling has tripped.
+    pub(crate) fn host_terminal_error(&self) -> Option<&'static str> {
+        self.instr_rec.as_ref()?.terminal_message()
+    }
+
+    /// Steps still available under the running VM's step budget (`u64::MAX`
+    /// when unmetered; `0` once exhausted or aborted).
+    pub(crate) fn host_steps_remaining(&self) -> u64 {
+        let Some(rec) = self.instr_rec.as_ref() else {
+            return u64::MAX;
+        };
+        if rec.terminal_message().is_some() {
+            return 0;
+        }
+        #[cfg(not(feature = "meter-only"))]
+        if rec
+            .abort
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return 0;
+        }
+        let loan = self.jit_steps.max(0) as u64;
+        match rec.finite_remaining(self.meter_hot()) {
+            Some(left) => left.saturating_add(loan),
+            None => u64::MAX,
+        }
+    }
+
+    /// Deduct `n` steps of external host / plugin work from the VM's unified
+    /// instruction budget. Marks the budget exhausted and returns `Err` when
+    /// `n` crosses a finite ceiling or the VM was already stopped.
+    pub(crate) fn host_charge_steps(&mut self, n: u64) -> Result<(), String> {
+        if self.instr_rec.is_none() {
+            return Ok(());
+        }
+        if let Some(msg) = self.instr_rec.as_ref().and_then(|r| r.terminal_message()) {
+            return Err(msg.to_owned());
+        }
+        #[cfg(not(feature = "meter-only"))]
+        if let Some(rec) = rec_mut!(self) {
+            if rec
+                .abort
+                .as_ref()
+                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+            {
+                rec.exhaust(ResourceExhaustion::Abort);
+                return Err(ABORT_MSG.to_owned());
+            }
+        }
+        let mut left = n;
+        while left > 0 {
+            let chunk = left.min(i64::MAX as u64);
+            self.charge_steps(chunk as i64);
+            left -= chunk;
+            if let Some(msg) = self.instr_rec.as_ref().and_then(|r| r.terminal_message()) {
+                return Err(msg.to_owned());
+            }
+        }
+        Ok(())
+    }
+
     /// Whether the VM has a meter, which a WebAssembly store must then
     /// charge: its runtime is made metered (`webassembly::WasmRuntime`).
     #[cfg(feature = "webassembly")]

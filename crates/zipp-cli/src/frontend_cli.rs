@@ -7,25 +7,42 @@ use std::sync::{Arc, Mutex};
 use zipp_vm::embed::{ConsoleStream, ScriptGoal, ScriptState};
 use zipp_vm::frontend::{
     compile_python_script_files, compile_source, detect_language, Frontend, LanguageId,
-    PythonFile, PythonMode,
+    PhpMode, PythonFile, PythonMode, RustMode,
 };
 
 pub(super) fn try_run(args: &[String]) -> Option<Result<(), String>> {
     let first = args.first()?.as_str();
     if first != "py"
+        && first != "php"
+        && first != "rs"
+        && first != "rust"
         && first != "ts"
         && first != "run"
         && first != "--lang"
         && !first.starts_with("--lang=")
         && !is_typescript_file(first)
         && !is_javascript_file(first)
+        && !is_php_file(first)
+        && !is_rust_file(first)
     {
         return None;
+    }
+    if first == "php" && args.iter().any(|a| a == "-S" || a == "--worker") {
+        zipp_vm::frontend::set_php_runtime_cache(code_cache_dir());
+        return Some(run_php_server_cmd(&args[1..]));
+    }
+    if (first == "rs" || first == "rust") && args.iter().any(|a| a == "--serve" || a == "-S") {
+        zipp_vm::frontend::set_rust_runtime_cache(code_cache_dir());
+        return Some(run_rust_server_cmd(&args[1..]));
     }
     // One program per process: its compiled runtime is never reused in the
     // process, but compiled code is kept on disk for the next one.
     zipp_vm::frontend::set_python_runtime_memo(false);
     zipp_vm::frontend::set_python_runtime_cache(code_cache_dir());
+    zipp_vm::frontend::set_php_runtime_memo(false);
+    zipp_vm::frontend::set_php_runtime_cache(code_cache_dir());
+    zipp_vm::frontend::set_rust_runtime_memo(false);
+    zipp_vm::frontend::set_rust_runtime_cache(code_cache_dir());
     Some(run(args))
 }
 
@@ -67,24 +84,345 @@ fn is_typescript_file(arg: &str) -> bool {
     }) && path.is_file()
 }
 
+fn is_php_file(arg: &str) -> bool {
+    let path = Path::new(arg);
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "php" | "phtml"))
+        && path.is_file()
+}
+
+fn is_rust_file(arg: &str) -> bool {
+    let path = Path::new(arg);
+    if path.is_dir() && (path.join("Cargo.toml").is_file() || path.join("src/main.rs").is_file()) {
+        return true;
+    }
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("rs"))
+        && path.is_file()
+}
+
+pub(crate) fn resolve_rust_entry(path: &Path, test_mode: bool) -> Result<PathBuf, String> {
+    if !path.is_dir() {
+        return Ok(path.to_path_buf());
+    }
+    let candidates: &[&str] = if test_mode {
+        &["src/main.rs", "src/lib.rs", "main.rs", "lib.rs"]
+    } else {
+        &["src/main.rs", "main.rs", "src/lib.rs"]
+    };
+    for rel in candidates {
+        let p = path.join(rel);
+        if p.is_file() {
+            return Ok(p);
+        }
+    }
+    Err(format!(
+        "Rust project directory `{}` has no `src/main.rs` or `main.rs`",
+        path.display()
+    ))
+}
+
+#[cfg(feature = "rust")]
+pub(crate) fn rust_watch_root(entry: &Path) -> PathBuf {
+    let canon = std::fs::canonicalize(entry).unwrap_or_else(|_| entry.to_path_buf());
+    if canon.is_dir() {
+        return canon;
+    }
+    let parent = canon.parent().unwrap_or_else(|| Path::new("."));
+    if parent.file_name().and_then(|n| n.to_str()) == Some("src") {
+        if let Some(proj) = parent.parent() {
+            if proj.join("Cargo.toml").is_file() {
+                return proj.to_path_buf();
+            }
+        }
+    }
+    parent.to_path_buf()
+}
+
+#[cfg(feature = "rust")]
+pub(crate) fn snapshot_rust_sources(root: &Path) -> Vec<(PathBuf, u128, u64)> {
+    fn walk(dir: &Path, out: &mut Vec<(PathBuf, u128, u64)>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if ft.is_dir() {
+                let name = entry.file_name();
+                if matches!(
+                    name.to_str(),
+                    Some("target" | ".git" | "node_modules" | ".idea" | ".vscode")
+                ) {
+                    continue;
+                }
+                walk(&path, out);
+            } else if ft.is_file() {
+                let is_rs = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("rs"));
+                let is_manifest = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n == "Cargo.toml");
+                if is_rs || is_manifest {
+                    if let Ok(meta) = entry.metadata() {
+                        let mtime = meta
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_nanos())
+                            .unwrap_or(0);
+                        out.push((path, mtime, meta.len()));
+                    }
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    if root.is_file() {
+        if let Ok(meta) = std::fs::metadata(root) {
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            out.push((root.to_path_buf(), mtime, meta.len()));
+        }
+    } else {
+        walk(root, &mut out);
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+#[cfg(feature = "rust")]
+pub(crate) fn diff_rust_snapshot(
+    old: &[(PathBuf, u128, u64)],
+    new: &[(PathBuf, u128, u64)],
+) -> Option<PathBuf> {
+    if old == new {
+        return None;
+    }
+    let old_map: std::collections::HashMap<&Path, (u128, u64)> =
+        old.iter().map(|(p, m, l)| (p.as_path(), (*m, *l))).collect();
+    for (p, m, l) in new {
+        if old_map.get(p.as_path()) != Some(&(*m, *l)) {
+            return Some(p.clone());
+        }
+    }
+    let new_set: HashSet<&Path> = new.iter().map(|(p, _, _)| p.as_path()).collect();
+    for (p, _, _) in old {
+        if !new_set.contains(p.as_path()) {
+            return Some(p.clone());
+        }
+    }
+    None
+}
+
+#[cfg(feature = "rust")]
+fn run_rust_watch(entry: &Path, args: &[String], test_mode: bool) -> Result<(), String> {
+    let watch_root = rust_watch_root(entry);
+    let exe = std::env::current_exe().map_err(|e| format!("failed to locate zipp exe: {e}"))?;
+    let mut snap = snapshot_rust_sources(&watch_root);
+    eprintln!(
+        "[zipp rs --watch] watching {} ({} files) — edit any .rs file to reload",
+        watch_root.display(),
+        snap.len()
+    );
+
+    let spawn_child = |exe: &Path, entry: &Path, args: &[String], test_mode: bool| {
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("rs");
+        if test_mode {
+            cmd.arg("--test");
+        }
+        cmd.arg(entry);
+        cmd.args(args);
+        cmd.spawn()
+            .map_err(|e| format!("zipp rs --watch failed to spawn child: {e}"))
+    };
+
+    let mut child: Option<std::process::Child> = Some(spawn_child(&exe, entry, args, test_mode)?);
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        if let Some(ch) = child.as_mut() {
+            if let Ok(Some(status)) = ch.try_wait() {
+                eprintln!(
+                    "[zipp rs --watch] process exited ({status}); waiting for .rs file changes..."
+                );
+                child = None;
+            }
+        }
+        let next = snapshot_rust_sources(&watch_root);
+        if let Some(changed) = diff_rust_snapshot(&snap, &next) {
+            snap = next;
+            let label = changed
+                .strip_prefix(&watch_root)
+                .unwrap_or(&changed)
+                .display();
+            eprintln!("[zipp rs --watch] change detected ({label}) — reloading...");
+            if let Some(mut ch) = child.take() {
+                let _ = ch.kill();
+                let _ = ch.wait();
+                // Allow the OS a moment to release bound TCP ports before respawning.
+                std::thread::sleep(std::time::Duration::from_millis(60));
+            }
+            child = Some(spawn_child(&exe, entry, args, test_mode)?);
+        }
+    }
+}
+
+#[cfg(not(feature = "rust"))]
+fn run_rust_watch(_entry: &Path, _args: &[String], _test_mode: bool) -> Result<(), String> {
+    Err("Rust support is not built; enable the `rust` Cargo feature".into())
+}
+
+fn run_rust_server_cmd(args: &[String]) -> Result<(), String> {
+    #[cfg(not(feature = "rust"))]
+    {
+        let _ = args;
+        return Err("Rust support is not built; enable the `rust` Cargo feature".into());
+    }
+    #[cfg(feature = "rust")]
+    {
+        let mut addr: Option<String> = None;
+        let mut entry: Option<PathBuf> = None;
+        let mut workers: Option<usize> = None;
+        let mut watch = false;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--serve" | "-S" => {
+                    i += 1;
+                    addr = Some(
+                        args.get(i)
+                            .ok_or("zipp rs --serve requires HOST:PORT")?
+                            .clone(),
+                    );
+                }
+                "--workers" | "-w" => {
+                    i += 1;
+                    let n = args
+                        .get(i)
+                        .ok_or("--workers requires a number")?
+                        .parse::<usize>()
+                        .map_err(|_| "--workers must be a positive integer")?;
+                    workers = Some(n.max(1));
+                }
+                "--watch" | "-W" => {
+                    watch = true;
+                }
+                other if !other.starts_with('-') && entry.is_none() => {
+                    entry = Some(PathBuf::from(other));
+                }
+                other => {
+                    return Err(format!("unknown zipp rs server option {other:?}"));
+                }
+            }
+            i += 1;
+        }
+        let addr = addr.ok_or("usage: zipp rs --serve HOST:PORT [--watch] [--workers N] APP.rs")?;
+        let entry = entry.ok_or("usage: zipp rs --serve HOST:PORT [--watch] [--workers N] APP.rs")?;
+        super::rust_server::serve(super::rust_server::ServerConfig {
+            addr,
+            entry,
+            workers,
+            watch,
+        })
+    }
+}
+
+fn run_php_server_cmd(args: &[String]) -> Result<(), String> {
+    #[cfg(not(feature = "php"))]
+    {
+        let _ = args;
+        return Err("PHP support is not built; enable the `php` Cargo feature".into());
+    }
+    #[cfg(feature = "php")]
+    {
+        let mut addr: Option<String> = None;
+        let mut docroot: Option<PathBuf> = None;
+        let mut router: Option<PathBuf> = None;
+        let mut worker_mode = false;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "-S" => {
+                    i += 1;
+                    addr = Some(
+                        args.get(i)
+                            .ok_or("zipp php -S requires HOST:PORT")?
+                            .clone(),
+                    );
+                }
+                "-t" => {
+                    i += 1;
+                    docroot = Some(PathBuf::from(
+                        args.get(i).ok_or("zipp php -t requires DOCROOT")?,
+                    ));
+                }
+                "--worker" => {
+                    worker_mode = true;
+                }
+                other if !other.starts_with('-') && router.is_none() => {
+                    router = Some(PathBuf::from(other));
+                }
+                other => {
+                    return Err(format!("unknown zipp php server option {other:?}"));
+                }
+            }
+            i += 1;
+        }
+        let addr = addr.ok_or("usage: zipp php [--worker] -S HOST:PORT [-t DOCROOT] [ROUTER.php]")?;
+        let docroot = docroot.unwrap_or_else(|| {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        });
+        super::php_server::serve(super::php_server::ServerConfig {
+            addr,
+            docroot,
+            router,
+            worker_mode,
+        })
+    }
+}
+
 fn run(args: &[String]) -> Result<(), String> {
     let first = args[0].as_str();
     let python_command = first == "py";
     let mut explicit = if python_command {
         Some(LanguageId::Python)
+    } else if first == "php" {
+        Some(LanguageId::Php)
+    } else if first == "rs" || first == "rust" {
+        Some(LanguageId::Rust)
     } else if first == "ts" {
         Some(LanguageId::TypeScript)
     } else {
         None
     };
     let mut filename: Option<String> = None;
-    let mut index = if first == "py" || first == "ts" || first == "run" {
+    let mut index = if first == "py"
+        || first == "php"
+        || first == "rs"
+        || first == "rust"
+        || first == "ts"
+        || first == "run"
+    {
         1
     } else {
         0
     };
     let mut options = true;
     let mut bytecode = false;
+    let mut rust_test = false;
+    let mut rust_watch = false;
     // `--no-gpu`: keep a torch/zipp_gpu program on the CPU graph evaluator
     // even when a GPU adapter is available (as `ZIPP_GPU=0` does).
     let mut gpu = true;
@@ -98,6 +436,16 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         if options && arg == "--bc" {
             bytecode = true;
+            index += 1;
+            continue;
+        }
+        if options && arg == "--test" {
+            rust_test = true;
+            index += 1;
+            continue;
+        }
+        if options && (arg == "--watch" || arg == "-W") {
+            rust_watch = true;
             index += 1;
             continue;
         }
@@ -135,21 +483,35 @@ fn run(args: &[String]) -> Result<(), String> {
         index += 1;
     }
     let filename = filename.ok_or(
-        "usage: zipp py [--bc] [--no-gpu] FILE|DIR [ARGS...] | zipp ts [--bc] FILE | zipp run [--lang=python|javascript|typescript] [--no-gpu] FILE [ARGS...] | zipp --lang=python -",
+        "usage: zipp py [--bc] [--no-gpu] FILE|DIR [ARGS...] | zipp ts [--bc] FILE | zipp php [-S HOST:PORT] FILE | zipp rs [--bc] [--test] [--watch] [--serve HOST:PORT] FILE|DIR [ARGS...] | zipp run [--lang=python|javascript|typescript|php|rust] FILE [ARGS...]",
     )?;
     let stdin = filename == "-";
-    // A directory is a Python project rooted there with `main.py` as the
-    // entry; a `.py` file runs as the entry of the project rooted at its
-    // folder (so it can import its neighbours and read the files next to
-    // it), unless bytecode inspection was asked for.
+    // A directory can be either a Rust Cargo project (`Cargo.toml` / `src/main.rs`
+    // or explicit `zipp rs DIR`) or a Python project (`main.py`).
     if !stdin && Path::new(&filename).is_dir() {
+        let dir = Path::new(&filename);
+        let is_rust_dir = explicit == Some(LanguageId::Rust)
+            || (explicit.is_none()
+                && (dir.join("Cargo.toml").is_file() || dir.join("src/main.rs").is_file()));
+        if is_rust_dir {
+            if bytecode {
+                return Err("--bc takes a file, not a directory".into());
+            }
+            if rust_watch {
+                return run_rust_watch(dir, &program_args, rust_test);
+            }
+            let entry = resolve_rust_entry(dir, rust_test)?;
+            let src = std::fs::read_to_string(&entry)
+                .map_err(|e| format!("{}: {e}", entry.display()))?;
+            return run_rust_file(&entry, &src, &program_args, rust_test);
+        }
         if explicit.is_some_and(|language| language != LanguageId::Python) {
-            return Err("only Python projects can be run from a directory".into());
+            return Err("only Python or Rust projects can be run from a directory".into());
         }
         if bytecode {
             return Err("--bc takes a file, not a directory".into());
         }
-        return run_project(Path::new(&filename), None, &program_args, gpu);
+        return run_project(dir, None, &program_args, gpu);
     }
     if !stdin
         && !bytecode
@@ -218,6 +580,19 @@ fn run(args: &[String]) -> Result<(), String> {
         let path = Path::new(&filename);
         return run_project(&project_root_of(path), Some(path), &program_args, gpu);
     }
+    // PHP script run from a file gets real filesystem access, `__FILE__`/`__DIR__`,
+    // `argv`, and streaming raw stdout.
+    if detected.language == LanguageId::Php && !stdin && !bytecode {
+        return run_php_file(Path::new(&filename), &source, &program_args);
+    }
+    // Rust script run from a file gets real filesystem, env, TCP/HTTP networking,
+    // external `mod foo;` loading, `argv`, `--test` mode, and streaming stdout/stderr.
+    if detected.language == LanguageId::Rust && !stdin && !bytecode {
+        if rust_watch {
+            return run_rust_watch(Path::new(&filename), &program_args, rust_test);
+        }
+        return run_rust_file(Path::new(&filename), &source, &program_args, rust_test);
+    }
     let frontend = match detected.language {
         LanguageId::JavaScript => Frontend::JavaScript {
             goal: ScriptGoal::Compat,
@@ -226,6 +601,12 @@ fn run(args: &[String]) -> Result<(), String> {
             mode: PythonMode::Module,
         },
         LanguageId::TypeScript => Frontend::TypeScript,
+        LanguageId::Php => Frontend::Php {
+            mode: PhpMode::Script,
+        },
+        LanguageId::Rust => Frontend::Rust {
+            mode: RustMode::Script,
+        },
     };
     if bytecode {
         // Developer inspection: the compiled program, no execution.
@@ -260,6 +641,10 @@ fn enable_python_jit(state: &mut ScriptState) {
 
 fn execute(mut compiled: zipp_vm::frontend::CompiledSource, gpu: bool) -> Result<(), String> {
     let python = compiled.language() == LanguageId::Python;
+    #[cfg(feature = "php")]
+    let php = compiled.language() == LanguageId::Php;
+    #[cfg(feature = "rust")]
+    let rust = compiled.language() == LanguageId::Rust;
     let state = compiled.state_mut();
     stream_console(state);
     if python {
@@ -297,7 +682,159 @@ fn execute(mut compiled: zipp_vm::frontend::CompiledSource, gpu: bool) -> Result
     if python {
         return python_exit(state, outcome.map(|_| ()));
     }
+    #[cfg(feature = "php")]
+    if php {
+        let raw = state.take_php_output();
+        if !raw.is_empty() {
+            let _ = io::stdout().lock().write_all(&raw);
+        }
+        return php_exit(state, outcome.map(|_| ()));
+    }
+    #[cfg(feature = "rust")]
+    if rust {
+        let out = state.take_rust_output();
+        if !out.is_empty() {
+            let _ = io::stdout().lock().write_all(&out);
+        }
+        let err = state.take_rust_stderr();
+        if !err.is_empty() {
+            let _ = io::stderr().lock().write_all(&err);
+        }
+        return rust_exit(state, outcome.map(|_| ()));
+    }
     outcome.map(|_| ())
+}
+
+#[cfg(feature = "rust")]
+fn run_rust_file(
+    path: &Path,
+    source: &str,
+    program_args: &[String],
+    test_mode: bool,
+) -> Result<(), String> {
+    let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let file_str = canon.to_string_lossy().replace('\\', "/");
+    let file_str = file_str.strip_prefix("//?/").unwrap_or(&file_str).to_owned();
+    let base_dir = canon
+        .parent()
+        .map(|p| {
+            let s = p.to_string_lossy().replace('\\', "/");
+            s.strip_prefix("//?/").unwrap_or(&s).to_owned()
+        })
+        .unwrap_or_else(|| ".".to_owned());
+    let mut argv = Vec::with_capacity(1 + program_args.len());
+    argv.push(path.to_string_lossy().into_owned());
+    argv.extend(program_args.iter().cloned());
+
+    let mut compiled = zipp_vm::frontend::compile_rust_program(
+        source,
+        zipp_vm::frontend::RustProgramConfig {
+            file: file_str,
+            base_dir,
+            argv,
+            allow_native_fs: true,
+            allow_net: true,
+            stream_stdout: true,
+            mode: if test_mode { "test" } else { "run" }.to_owned(),
+            ..Default::default()
+        },
+    )?;
+    let state = compiled.state_mut();
+    let outcome = state.run_init();
+    let leftover = state.take_rust_output();
+    if !leftover.is_empty() {
+        let _ = io::stdout().lock().write_all(&leftover);
+    }
+    let leftover_err = state.take_rust_stderr();
+    if !leftover_err.is_empty() {
+        let _ = io::stderr().lock().write_all(&leftover_err);
+    }
+    let _ = io::stdout().flush();
+    let _ = io::stderr().flush();
+    rust_exit(state, outcome.map(|_| ()))
+}
+
+#[cfg(not(feature = "rust"))]
+fn run_rust_file(
+    _path: &Path,
+    _source: &str,
+    _program_args: &[String],
+    _test_mode: bool,
+) -> Result<(), String> {
+    Err("Rust support is not built; enable the `rust` Cargo feature".into())
+}
+
+#[cfg(feature = "rust")]
+fn rust_exit(
+    state: &mut zipp_vm::embed::ScriptState,
+    outcome: Result<(), String>,
+) -> Result<(), String> {
+    let status = match state.call_global("__zipp_rs_exit_status", &[]) {
+        Ok(zipp_vm::embed::JsValue::Number(code)) => (code as i64 & 0xff) as u8,
+        _ => return outcome,
+    };
+    super::request_exit(status);
+    Ok(())
+}
+
+#[cfg(feature = "php")]
+fn run_php_file(path: &Path, source: &str, program_args: &[String]) -> Result<(), String> {
+    let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let file_str = canon.to_string_lossy().replace('\\', "/");
+    let file_str = file_str.strip_prefix("//?/").unwrap_or(&file_str).to_owned();
+    let base_dir = canon
+        .parent()
+        .map(|p| {
+            let s = p.to_string_lossy().replace('\\', "/");
+            s.strip_prefix("//?/").unwrap_or(&s).to_owned()
+        })
+        .unwrap_or_else(|| ".".to_owned());
+    let mut argv = Vec::with_capacity(1 + program_args.len());
+    argv.push(path.to_string_lossy().into_owned());
+    argv.extend(program_args.iter().cloned());
+
+    let mut compiled = zipp_vm::frontend::compile_php_program(
+        source,
+        zipp_vm::frontend::PhpProgramConfig {
+            file: file_str,
+            base_dir,
+            argv,
+            allow_native_fs: true,
+            stream_stdout: true,
+            ..Default::default()
+        },
+    )?;
+    let state = compiled.state_mut();
+    let outcome = state.run_init();
+    let leftover = state.take_php_output();
+    if !leftover.is_empty() {
+        let _ = io::stdout().lock().write_all(&leftover);
+    }
+    let _ = io::stdout().flush();
+    zipp_vm::frontend::flush_php_opcache();
+    php_exit(state, outcome.map(|_| ()))
+}
+
+#[cfg(not(feature = "php"))]
+fn run_php_file(_path: &Path, _source: &str, _program_args: &[String]) -> Result<(), String> {
+    Err("PHP support is not built; enable the `php` Cargo feature".into())
+}
+
+#[cfg(feature = "php")]
+fn php_exit(
+    state: &mut zipp_vm::embed::ScriptState,
+    outcome: Result<(), String>,
+) -> Result<(), String> {
+    let status = match state.call_global("__zipp_php_exit_status", &[]) {
+        Ok(zipp_vm::embed::JsValue::Number(code)) => (code as i64 & 0xff) as u8,
+        Ok(zipp_vm::embed::JsValue::String(text)) => {
+            eprintln!("{text}");
+            1
+        }
+        _ => return outcome,
+    };
+    super::request_exit(status);
+    Ok(())
 }
 
 /// A Python program that ended by `SystemExit` sets the process status the way

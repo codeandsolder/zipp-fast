@@ -146,6 +146,14 @@ pub(super) mod ic {
     pub const NEW_NO: u8 = 20;
     /// `PyModGet`: as [`GLOBAL`], over the module's globals Map.
     pub const MOD_GET: u8 = 21;
+    /// `PyCall` plain Python callee classified once at IC fill time so hot
+    /// call sites skip irrelevant fast-path probes in one byte match:
+    /// `CALL_PLAIN` (regular frame push), `CALL_STORE` (`py_store_call`),
+    /// `CALL_LEAF` (`py_leaf_exec`), `CALL_REC` (`py_rec_exec`).
+    pub const CALL_PLAIN: u8 = 22;
+    pub const CALL_STORE: u8 = 23;
+    pub const CALL_LEAF: u8 = 24;
+    pub const CALL_REC: u8 = 25;
 }
 
 /// Alternate entries a site keeps (see `Vm::py_ic_class`).
@@ -218,6 +226,64 @@ pub(super) struct TySlots {
     pub ver: usize,
 }
 
+/// Direct-mapped string hash cache size (power of two).
+pub(crate) const STR_HASH_CACHE_LEN: usize = 512;
+
+/// Direct-mapped `super().method()` (`py_smfind`) cache size (power of two).
+pub(crate) const SMFIND_CACHE_LEN: usize = 64;
+
+/// Direct-mapped `isinstance` / `issubclass` MRO cache size (power of two).
+pub(crate) const ISINST_CACHE_LEN: usize = 64;
+
+/// Cached Python `hash(s)` for a flat string `(heap_idx, heap_version)`.
+#[derive(Clone, Copy)]
+pub(crate) struct StrHashEntry {
+    pub idx: u32,
+    pub ver: u32,
+    pub hash: i64,
+}
+
+impl Default for StrHashEntry {
+    fn default() -> Self {
+        Self { idx: u32::MAX, ver: 0, hash: 0 }
+    }
+}
+
+/// Cached `py_smfind(cls, self, name)` entry keyed by `(cls, cls_hver, t, t_hver, t_ver, name, name_ver)`.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SmfindEntry {
+    pub cls: u64,
+    pub cls_hver: u32,
+    pub t: u64,
+    pub t_hver: u32,
+    pub t_ver: u64,
+    pub name: u64,
+    pub name_ver: u32,
+    pub f: u64,
+}
+
+/// Cached MRO membership check `(c, t) -> result` (1 = false, 2 = true, 0 = empty).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct IsInstEntry {
+    pub c: u64,
+    pub c_hver: u32,
+    pub c_ver: u64,
+    pub t: u64,
+    pub t_hver: u32,
+    pub result: u8,
+}
+
+/// Cached validated store-body plan for fresh layout-0 instances (`Vm::py_store_call`).
+#[derive(Clone, Copy)]
+pub(crate) struct StorePlan {
+    pub cls_bits: u64,
+    pub cls_hver: u32,
+    pub cls_ver: u64,
+    pub final_layout: u32,
+    pub count: u8,
+    pub arg_idx: [u8; 8],
+}
+
 /// The registry.
 pub(crate) struct PyRt {
     /// The runtime's helper object `R`.
@@ -284,12 +350,26 @@ pub(crate) struct PyRt {
     /// Per code object: 0 not looked at yet, 1 not a store body, `k + 1` a
     /// store body of `k` stores (`Vm::py_store_call`).
     pub(super) store_bodies: Vec<u8>,
+    /// Cached validated store-body plans per code object (`Vm::py_store_call`).
+    pub(super) store_plans: Vec<Option<StorePlan>>,
+    /// Cached acyclic leaf-body scans per code object (`vm::py_leaf`).
+    pub(super) leaf_bodies: Vec<super::py_attr::py_leaf::LeafSlot>,
+    /// Compiled native x86-64 micro-JIT bodies for pure-int self-recursive
+    /// Python functions (`jit::py_rec`).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(super) rec_jits: Vec<crate::codegen::PyRecSlot>,
     /// The static key plans of the templates `Vm::py_alloc_like` has
     /// copied (a few), matched to a template's own plan by pointer: a
     /// record is then allocated from this reference, where a clone of the
     /// template's `Arc` changed its count twice per record.
     #[cfg(not(feature = "safe-sandbox"))]
     pub(super) plans: Vec<crate::bytecode::StaticKeyPlan>,
+    /// Direct-mapped cache of Python `hash(s)` keyed by `(heap_idx, version)`.
+    pub(crate) str_hashes: Box<[Cell<StrHashEntry>]>,
+    /// Direct-mapped cache of `super().method()` lookups (`Vm::py_smfind`).
+    pub(super) smfind_cache: Box<[Cell<SmfindEntry>]>,
+    /// Direct-mapped cache of MRO membership checks (`py_isinstance`, `py_exc_record`).
+    pub(super) isinstance_cache: Box<[Cell<IsInstEntry>]>,
 }
 
 /// The first bytes of the string constant a Python code object's frame
@@ -410,8 +490,15 @@ impl PyRt {
             pins: Value::UNDEFINED,
             layouts: Default::default(),
             store_bodies: Vec::new(),
+            store_plans: Vec::new(),
+            leaf_bodies: Vec::new(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            rec_jits: Vec::new(),
             #[cfg(not(feature = "safe-sandbox"))]
             plans: Vec::new(),
+            str_hashes: (0..STR_HASH_CACHE_LEN).map(|_| Cell::new(StrHashEntry::default())).collect(),
+            smfind_cache: (0..SMFIND_CACHE_LEN).map(|_| Cell::new(SmfindEntry::default())).collect(),
+            isinstance_cache: (0..ISINST_CACHE_LEN).map(|_| Cell::new(IsInstEntry::default())).collect(),
         }
     }
 }

@@ -1972,6 +1972,30 @@ impl<'p> Vm<'p> {
         let result = if index == usize::MAX {
             (Value::UNDEFINED, true)
         } else {
+            // Fast dense-Array value iteration (99%+ of JS `for-of` loops):
+            // reads `items[index]` directly without `js_array_len` or `get_index`.
+            if kind == 1
+                && (self.array_js_len.is_empty() || !self.array_js_len.has(coll))
+                && (self.arr_props.is_empty() || !self.arr_props.has(coll))
+                && (self.arguments_objs.is_empty() || !self.arguments_objs.has(coll))
+            {
+                if let HeapObj::Array(items) = self.heap.get(coll) {
+                    if index >= items.len() {
+                        if let HeapObj::Iterator { index: i, .. } = self.heap.get_mut(it_idx) {
+                            *i = usize::MAX;
+                        }
+                        return Ok((Value::UNDEFINED, true));
+                    }
+                    let v = items[index];
+                    if !v.is_hole() {
+                        let next_i = index + 1;
+                        if let HeapObj::Iterator { index: i, .. } = self.heap.get_mut(it_idx) {
+                            *i = next_i;
+                        }
+                        return Ok((v, false));
+                    }
+                }
+            }
             let n = match self.heap.get(coll) {
                 // Sparse/very large Arrays keep their live JS length outside
                 // the dense prefix. Re-read that authoritative length every
@@ -4952,6 +4976,10 @@ impl<'p> Vm<'p> {
             | TD_FATAL_GET | TD_IGNORE_BOM_GET => self.text_codec_native(id, this, args)?,
             #[cfg(feature = "node")]
             NODE_HOST_WRITE..=NODE_HOST_TIMER => self.node_host_native(id, args)?,
+            #[cfg(feature = "php")]
+            PHP_OUTPUT..=PHP_SQL => self.php_native_call(id, args)?,
+            #[cfg(feature = "rust")]
+            RS_IO..=RS_SQLITE => self.rust_native_call(id, args)?,
             #[cfg(feature = "webassembly")]
             WASM_HOST_OP => self.wasm_host_op(args)?,
             WR_DEREF => {
@@ -5471,6 +5499,57 @@ impl<'p> Vm<'p> {
             #[cfg(feature = "python")]
             PY_VFS_READ => self.py_vfs_read(a0)?,
             #[cfg(feature = "python")]
+            PY_PKG_CALL => {
+                let pkg = self.to_js_string(a0)?;
+                let op = self.to_js_string(a1)?;
+                let rest_len = args.len().saturating_sub(2);
+                self.preflight_native_iteration_work(rest_len as u64)?;
+                let mut aggregate = checked_native_output_add(pkg.len(), op.len())?;
+                self.preflight_guest_string_size(aggregate)?;
+                let mut rest: Vec<String> = Vec::new();
+                rest.try_reserve_exact(rest_len).map_err(|_| {
+                    Thrown::from_static("RangeError: package call argument allocation failed")
+                })?;
+                for &a in args.iter().skip(2) {
+                    let value = self.to_js_string(a)?;
+                    aggregate = checked_native_output_add(aggregate, value.len())?;
+                    self.preflight_guest_string_size(aggregate)?;
+                    rest.push(value);
+                }
+                let reply = if let Some(bridge) = crate::python_packages::package_bridge(&pkg) {
+                    bridge(self, &op, &rest)
+                } else {
+                    let kind = format!("app.{pkg}.{op}");
+                    if let Some(mut host) = self.host_ctx.take() {
+                        let r = host(self, &kind, &rest);
+                        self.host_ctx = Some(host);
+                        r
+                    } else if let Some(mut host) = self.host.take() {
+                        let r = host(&kind, &rest);
+                        self.host = Some(host);
+                        r
+                    } else {
+                        return Err(Thrown(format!(
+                            "RuntimeError: native bridge for Python package '{pkg}' is not installed"
+                        )));
+                    }
+                };
+                #[cfg(feature = "instrument")]
+                if let Some(msg) = self.host_terminal_error() {
+                    return Err(Thrown(msg.to_owned()));
+                }
+                match reply {
+                    Ok(s) => {
+                        self.preflight_guest_string_size(s.len())?;
+                        self.alloc_str(s)
+                    }
+                    Err(e) => {
+                        self.preflight_guest_string_size(e.len())?;
+                        return Err(Thrown(e));
+                    }
+                }
+            }
+            #[cfg(feature = "python")]
             PY_BIND => self.py_bind(args),
             #[cfg(feature = "python")]
             PY_STR => self.py_str_has_surrogate(a0),
@@ -5550,6 +5629,10 @@ impl<'p> Vm<'p> {
                     self.host = Some(host);
                     reply
                 };
+                #[cfg(feature = "instrument")]
+                if let Some(msg) = self.host_terminal_error() {
+                    return Err(Thrown(msg.to_owned()));
+                }
                 match reply {
                     Ok(s) => {
                         self.preflight_guest_string_size(s.len())?;

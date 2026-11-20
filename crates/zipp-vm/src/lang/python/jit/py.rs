@@ -48,6 +48,10 @@ use super::*;
 mod attr_inline;
 pub(crate) use attr_inline::*;
 
+#[path = "py_rec.rs"]
+mod py_rec;
+pub(crate) use py_rec::*;
+
 /// `Vm::jit_py_op` outcomes.
 pub(crate) const PY_NEXT: u64 = 0;
 /// A `PyJumpCompare` took its branch.
@@ -232,11 +236,11 @@ pub(crate) struct PyLabels {
 /// refresh (plain loads, or 1-argument helpers) and the typed-array pin
 /// refresh (4-argument helpers; empty in a Python loop anyway).
 pub(crate) fn emit_py_step(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     func_id: u32,
     ip: usize,
     labels: &PyLabels,
-    refetch: &mut dyn FnMut(&mut dynasmrt::x64::Assembler),
+    refetch: &mut dyn FnMut(&mut crate::codegen::X64Asm),
 ) {
     emit_py_step_with(ops, crate::vm::Vm::jit_py_op as *const () as usize, func_id, ip, None, labels, refetch);
 }
@@ -244,13 +248,13 @@ pub(crate) fn emit_py_step(
 /// [`emit_py_step`] through `helper`, which answers as `Vm::jit_py_op`
 /// does; `arg4`, when given, is its fourth argument (in `r9`).
 fn emit_py_step_with(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     helper: usize,
     func_id: u32,
     ip: usize,
     arg4: Option<u64>,
     labels: &PyLabels,
-    refetch: &mut dyn FnMut(&mut dynasmrt::x64::Assembler),
+    refetch: &mut dyn FnMut(&mut crate::codegen::X64Asm),
 ) {
     let packed = ((func_id as u64) << 32) | ip as u64;
     let cont = ops.new_dynamic_label();
@@ -289,12 +293,12 @@ fn emit_py_step_with(
 /// `Vm::jit_py_load_bigint` (an allocation, so `refetch` follows). `bail`
 /// resumes the interpreter at the instruction.
 pub(crate) fn emit_py_load_bigint(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     func_id: u32,
     ip: usize,
     dst: u16,
     bail: dynasmrt::DynamicLabel,
-    refetch: &mut dyn FnMut(&mut dynasmrt::x64::Assembler),
+    refetch: &mut dyn FnMut(&mut crate::codegen::X64Asm),
 ) {
     let packed = ((func_id as u64) << 32) | ip as u64;
     let helper = crate::vm::Vm::jit_py_load_bigint as *const () as usize;
@@ -324,7 +328,7 @@ const SMALL_BIGINT_BIAS: u64 = 1 << 46;
 
 /// Load `regs[reg]` into `dst` as the value of a small BigInt (sign-extended
 /// to 64 bits), or jump to `no` for anything else. Clobbers r10.
-fn py_load_small(ops: &mut dynasmrt::x64::Assembler, reg: u16, dst: u8, no: dynasmrt::DynamicLabel) {
+fn py_load_small(ops: &mut crate::codegen::X64Asm, reg: u16, dst: u8, no: dynasmrt::DynamicLabel) {
     dynasm!(ops
         ; mov Rq(dst), [rbx + dreg(reg)]
         ; mov r10, Rq(dst)
@@ -339,7 +343,7 @@ fn py_load_small(ops: &mut dynasmrt::x64::Assembler, reg: u16, dst: u8, no: dyna
 /// Store the i64 in r8 into `regs[dst]` as a small BigInt when it is in the
 /// immediate range, else jump to `no` (the helper the caller jumps to
 /// recomputes from the operands). Clobbers r10, r11.
-fn py_store_small(ops: &mut dynasmrt::x64::Assembler, dst: u16, no: dynasmrt::DynamicLabel) {
+fn py_store_small(ops: &mut crate::codegen::X64Asm, dst: u16, no: dynasmrt::DynamicLabel) {
     dynasm!(ops
         ; mov r10, QWORD SMALL_BIGINT_BIAS as i64
         ; add r10, r8
@@ -359,7 +363,7 @@ fn py_store_small(ops: &mut dynasmrt::x64::Assembler, dst: u16, no: dynasmrt::Dy
 /// `Vm::jit_py_rel` (a Number or BigInt pair; any other operand resumes the
 /// interpreter at `bail`, which performs the coercing comparison).
 pub(crate) fn emit_py_jump_if_not(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     a: u16,
     b: u16,
     le: bool,
@@ -425,13 +429,13 @@ pub(crate) fn emit_py_jump_if_not(
 /// anything else asks `Vm::jit_py_add_int` (which allocates, so `refetch`
 /// follows it; a decline resumes the interpreter at `bail`).
 pub(crate) fn emit_py_add_int(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     dst: u16,
     a: u16,
     imm: i32,
     upd: bool,
     bail: dynasmrt::DynamicLabel,
-    refetch: &mut dyn FnMut(&mut dynasmrt::x64::Assembler),
+    refetch: &mut dyn FnMut(&mut crate::codegen::X64Asm),
 ) {
     let not_int = ops.new_dynamic_label();
     let helper = ops.new_dynamic_label();
@@ -518,7 +522,7 @@ const QNAN_BITS: u64 = 0x7FF8_0000_0000_0000;
 
 /// Load `regs[reg]` as a Number into `xmm{which}` (an Int converts
 /// exactly), or jump to `not_num` for any other value. Clobbers rax, r10.
-fn py_load_num(ops: &mut dynasmrt::x64::Assembler, reg: u16, which: u8, not_num: dynasmrt::DynamicLabel) {
+fn py_load_num(ops: &mut crate::codegen::X64Asm, reg: u16, which: u8, not_num: dynasmrt::DynamicLabel) {
     let int_path = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
     dynasm!(ops
@@ -543,7 +547,7 @@ fn py_load_num(ops: &mut dynasmrt::x64::Assembler, reg: u16, which: u8, not_num:
 /// integral value in i32 range other than -0 as an Int, NaN as the
 /// canonical NaN, anything else as its double bits. So a compiled result is
 /// bit-identical to the interpreter's. Clobbers rax, r8, xmm1.
-fn py_store_num(ops: &mut dynasmrt::x64::Assembler, dst: u16) {
+fn py_store_num(ops: &mut crate::codegen::X64Asm, dst: u16) {
     let nan = ops.new_dynamic_label();
     let dbl = ops.new_dynamic_label();
     let int = ops.new_dynamic_label();
@@ -579,7 +583,7 @@ fn py_store_num(ops: &mut dynasmrt::x64::Assembler, dst: u16) {
 
 
 /// After `cmp a, b` (signed): branch to `to` when `a <op> b` is `holds`.
-fn int_cond_jump(ops: &mut dynasmrt::x64::Assembler, op: crate::bytecode::PyCmpOp, holds: bool, to: dynasmrt::DynamicLabel) {
+fn int_cond_jump(ops: &mut crate::codegen::X64Asm, op: crate::bytecode::PyCmpOp, holds: bool, to: dynasmrt::DynamicLabel) {
     use crate::bytecode::PyCmpOp as C;
     match (op, holds) {
         (C::Lt, true) | (C::Ge, false) => dynasm!(ops ; jl => to),
@@ -594,7 +598,7 @@ fn int_cond_jump(ops: &mut dynasmrt::x64::Assembler, op: crate::bytecode::PyCmpO
 /// Branch to `to` when the IEEE comparison `xmm0 <op> xmm1` has the truth
 /// value `holds` (a NaN makes every ordering and `==` false, `!=` true);
 /// fall through otherwise.
-fn float_cond_jump(ops: &mut dynasmrt::x64::Assembler, op: crate::bytecode::PyCmpOp, holds: bool, to: dynasmrt::DynamicLabel) {
+fn float_cond_jump(ops: &mut crate::codegen::X64Asm, op: crate::bytecode::PyCmpOp, holds: bool, to: dynasmrt::DynamicLabel) {
     use crate::bytecode::PyCmpOp as C;
     let skip = ops.new_dynamic_label();
     match op {
@@ -618,12 +622,12 @@ fn float_cond_jump(ops: &mut dynasmrt::x64::Assembler, op: crate::bytecode::PyCm
 /// comparisons, `Vm::jit_py_op` for the rest). `refetch` follows every helper
 /// that can allocate.
 pub(crate) fn emit_py_op(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     func_id: u32,
     ip: usize,
     instr: &Instr,
     labels: &PyLabels,
-    refetch: &mut dyn FnMut(&mut dynasmrt::x64::Assembler),
+    refetch: &mut dyn FnMut(&mut crate::codegen::X64Asm),
 ) {
     use crate::bytecode::PyArithOp as A;
     let done = ops.new_dynamic_label();
@@ -841,14 +845,16 @@ pub(crate) fn emit_py_op(
                 }
             }
         }
-        // A subscript: the step's own answer through `Vm::jit_py_get_item`
-        // over the operands (the instruction not looked up again), its fifth
-        // argument in the 5th-argument slot. (A `ZIPP_PY_PROF` run takes the
-        // ordinary step, which counts.)
+        // A subscript: inline fast path for exact `list`/`tuple` + small int,
+        // else `Vm::jit_py_get_item` (never allocates, so no `refetch`).
         Instr::PyGetItem { dst, o, k, seq, dict, .. } if labels.target.is_some() && !crate::vm::prof_py::on() => {
             let Some(absent) = labels.target else {
                 unreachable!("PyGetItem carries an absent label");
             };
+            let miss = ops.new_dynamic_label();
+            if emit_py_get_item_inline(ops, dst, o, k, seq, miss, done) {
+                dynasm!(ops ; => miss);
+            }
             dynasm!(ops
                 ; mov rcx, rdi
                 ; mov rdx, [rbx + dreg(o)]
@@ -858,11 +864,6 @@ pub(crate) fn emit_py_op(
                 ; mov [rsp + 32], rax
                 ; mov rax, QWORD crate::vm::Vm::jit_py_get_item as *const () as usize as i64
                 ; call rax
-                ; mov [rsp + 32], rax
-            );
-            refetch(ops);
-            dynasm!(ops
-                ; mov rax, [rsp + 32]
                 ; mov r10, QWORD PY_SLOW_BITS as i64
                 ; cmp rax, r10
                 ; je => labels.slow
@@ -875,11 +876,13 @@ pub(crate) fn emit_py_op(
                 ; mov [rbx + dreg(dst)], rax
             );
         }
-        // A subscript store: likewise through `Vm::jit_py_set_item`, which
-        // reads the operands from the window (`rbx`) by the registers packed
-        // here; 0 is done, anything but the slow edge's answer bails (a throw
-        // pending, or nothing done).
+        // A subscript store: inline fast path for exact `list` overwrite,
+        // else `Vm::jit_py_set_item`.
         Instr::PySetItem { o, k, v, seq, dict, .. } if !crate::vm::prof_py::on() => {
+            let miss = ops.new_dynamic_label();
+            if emit_py_set_item_inline(ops, o, k, v, seq, miss, done) {
+                dynasm!(ops ; => miss);
+            }
             let packed = o as u64 | (k as u64) << 16 | (v as u64) << 32 | (seq as u64) << 48;
             dynasm!(ops
                 ; mov rcx, rdi
@@ -936,6 +939,10 @@ pub(crate) fn emit_py_op(
         // instead of through `Vm::jit_py_op`, which finds and decodes the
         // instruction again first. (A `ZIPP_PY_PROF` run takes the ordinary
         // step, which counts.)
+        Instr::PyCallEntry { dst, f, name, .. } if !crate::vm::prof_py::on() => {
+            let h = crate::vm::Vm::jit_py_call_entry as *const () as usize;
+            emit_py_value_call_noalloc(ops, h, [V::Reg(f), V::Imm(site(func_id, ip)), V::Imm(name as u64), V::None], dst, labels);
+        }
         Instr::PyGlobal { dst, globals, rt, key, .. } if !crate::vm::prof_py::on() => {
             let h = crate::vm::Vm::jit_py_global as *const () as usize;
             emit_py_value_call(ops, h, [V::Reg(globals), V::Reg(rt), V::Imm(site(func_id, ip)), V::Imm(key as u64)], dst, labels, refetch);
@@ -962,11 +969,11 @@ pub(crate) fn emit_py_op(
         }
         Instr::PyClassOf { dst, obj, .. } if !crate::vm::prof_py::on() => {
             let h = crate::vm::Vm::jit_py_class_of as *const () as usize;
-            emit_py_value_call(ops, h, [V::Reg(obj), V::None, V::None, V::None], dst, labels, refetch);
+            emit_py_value_call_noalloc(ops, h, [V::Reg(obj), V::None, V::None, V::None], dst, labels);
         }
         Instr::PyCaught { dst, e, line, rt, .. } if !crate::vm::prof_py::on() => {
             let h = crate::vm::Vm::jit_py_caught as *const () as usize;
-            emit_py_value_call(ops, h, [V::Reg(e), V::Reg(line), V::Reg(rt), V::None], dst, labels, refetch);
+            emit_py_value_call_noalloc(ops, h, [V::Reg(e), V::Reg(line), V::Reg(rt), V::None], dst, labels);
         }
         // An instance dict's entry (`PyDictGet`): as a value helper, with
         // `PY_ABSENT_BITS` the fall-through that leaves `dst` untouched.
@@ -996,8 +1003,7 @@ pub(crate) fn emit_py_op(
                 ; mov [rbx + dreg(dst)], rax
             );
         }
-        // A dict's `.get` (`PyDictLookup`): as `PyGetItem`'s helper, its
-        // `absent` edge the second.
+        // A dict's `.get` (`PyDictLookup`): never allocates.
         Instr::PyDictLookup { dst, d, k, rt, .. } if labels.target.is_some() && !crate::vm::prof_py::on() => {
             let Some(absent) = labels.target else {
                 unreachable!("PyDictLookup carries an absent label");
@@ -1009,11 +1015,6 @@ pub(crate) fn emit_py_op(
                 ; mov r9, [rbx + dreg(rt)]
                 ; mov rax, QWORD crate::vm::Vm::jit_py_dict_lookup as *const () as usize as i64
                 ; call rax
-                ; mov [rsp + 32], rax
-            );
-            refetch(ops);
-            dynasm!(ops
-                ; mov rax, [rsp + 32]
                 ; mov r10, QWORD PY_SLOW_BITS as i64
                 ; cmp rax, r10
                 ; je => labels.slow
@@ -1023,18 +1024,13 @@ pub(crate) fn emit_py_op(
                 ; mov [rbx + dreg(dst)], rax
             );
         }
-        // An exception stack's pop (`PyExcPop`): 0 is done.
+        // An exception stack's pop (`PyExcPop`): never allocates.
         Instr::PyExcPop { rt, .. } if !crate::vm::prof_py::on() => {
             dynasm!(ops
                 ; mov rcx, rdi
                 ; mov rdx, [rbx + dreg(rt)]
                 ; mov rax, QWORD crate::vm::Vm::jit_py_exc_pop as *const () as usize as i64
                 ; call rax
-                ; mov [rsp + 32], rax
-            );
-            refetch(ops);
-            dynasm!(ops
-                ; mov rax, [rsp + 32]
                 ; test rax, rax
                 ; jz => done
                 ; mov r10, QWORD PY_SLOW_BITS as i64
@@ -1045,19 +1041,27 @@ pub(crate) fn emit_py_op(
         }
         Instr::PyIsInstance { dst, v, t, rt, .. } if !crate::vm::prof_py::on() => {
             let h = crate::vm::Vm::jit_py_isinstance as *const () as usize;
-            emit_py_value_call(ops, h, [V::Reg(v), V::Reg(t), V::Reg(rt), V::Imm(site(func_id, ip))], dst, labels, refetch);
+            emit_py_value_call_noalloc(ops, h, [V::Reg(v), V::Reg(t), V::Reg(rt), V::Imm(site(func_id, ip))], dst, labels);
         }
         Instr::PyLen { dst, v, rt, .. } if !crate::vm::prof_py::on() => {
+            let miss = ops.new_dynamic_label();
+            if emit_py_len_inline(ops, dst, v, miss, done) {
+                dynasm!(ops ; => miss);
+            }
             let h = crate::vm::Vm::jit_py_len as *const () as usize;
-            emit_py_value_call(ops, h, [V::Reg(v), V::Reg(rt), V::None, V::None], dst, labels, refetch);
+            emit_py_value_call_noalloc(ops, h, [V::Reg(v), V::Reg(rt), V::None, V::None], dst, labels);
         }
         Instr::PySeq { dst, items, rt, tuple, .. } if !crate::vm::prof_py::on() => {
             let h = crate::vm::Vm::jit_py_seq as *const () as usize;
             emit_py_value_call(ops, h, [V::Reg(items), V::Reg(rt), V::Imm(tuple as u64), V::None], dst, labels, refetch);
         }
         Instr::PyUnpack { dst, v, rt, n, .. } if !crate::vm::prof_py::on() => {
+            let miss = ops.new_dynamic_label();
+            if emit_py_unpack_inline(ops, dst, v, n, miss, done) {
+                dynasm!(ops ; => miss);
+            }
             let h = crate::vm::Vm::jit_py_unpack as *const () as usize;
-            emit_py_value_call(ops, h, [V::Reg(v), V::Reg(rt), V::Imm(n as u64), V::None], dst, labels, refetch);
+            emit_py_value_call_noalloc(ops, h, [V::Reg(v), V::Reg(rt), V::Imm(n as u64), V::None], dst, labels);
         }
         Instr::PyMakeExc { dst, cls, args, rt, .. } if !crate::vm::prof_py::on() => {
             let h = crate::vm::Vm::jit_py_make_exc as *const () as usize;
@@ -1070,10 +1074,14 @@ pub(crate) fn emit_py_op(
             let h = crate::vm::Vm::jit_py_gen_next as *const () as usize;
             emit_py_value_call(ops, h, [V::Reg(next), V::Reg(this), V::Imm(ip as u64), V::None], dst, labels, refetch);
         }
-        // A call: through `Vm::jit_py_call` with the operands packed, which
-        // calls a str method's native where it is and hands any other
-        // callee to `Vm::jit_py_op`; the same outcomes as the step's.
+        // A call: inline `math.sqrt` when planned, else `Vm::jit_py_call`.
         Instr::PyCall { dst, f, arg_base, argc, .. } if !crate::vm::prof_py::on() => {
+            if argc == 1 {
+                let miss = ops.new_dynamic_label();
+                if emit_py_sqrt_inline(ops, ip, dst, f, arg_base, miss, done) {
+                    dynasm!(ops ; => miss);
+                }
+            }
             let regs = f as u64 | (arg_base as u64) << 16 | (argc as u64) << 32 | (dst as u64) << 48;
             emit_py_step_with(ops, crate::vm::Vm::jit_py_call as *const () as usize, func_id, ip, Some(regs), labels, refetch);
         }
@@ -1118,12 +1126,12 @@ fn site(func_id: u32, ip: usize) -> u64 {
 /// arguments go in `rdx`, `r8` and `r9`, a fourth in the 5th-argument slot
 /// (`[rsp + 32]`, as `PyGetItem`'s is).
 fn emit_py_value_call(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     helper: usize,
     args: [V; 4],
     dst: u16,
     labels: &PyLabels,
-    refetch: &mut dyn FnMut(&mut dynasmrt::x64::Assembler),
+    refetch: &mut dyn FnMut(&mut crate::codegen::X64Asm),
 ) {
     match args[3] {
         V::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)] ; mov [rsp + 32], rax),
@@ -1153,15 +1161,58 @@ fn emit_py_value_call(
     emit_value_outcome(ops, dst, labels, refetch);
 }
 
+/// [`emit_py_value_call`] for a helper guaranteed never to allocate on the VM
+/// heap (no `[rsp + 32]` spill and no `refetch`).
+fn emit_py_value_call_noalloc(
+    ops: &mut crate::codegen::X64Asm,
+    helper: usize,
+    args: [V; 4],
+    dst: u16,
+    labels: &PyLabels,
+) {
+    match args[3] {
+        V::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)] ; mov [rsp + 32], rax),
+        V::Imm(v) => dynasm!(ops ; mov rax, QWORD v as i64 ; mov [rsp + 32], rax),
+        V::None => {}
+    }
+    match args[0] {
+        V::Reg(r) => dynasm!(ops ; mov rdx, [rbx + dreg(r)]),
+        V::Imm(v) => dynasm!(ops ; mov rdx, QWORD v as i64),
+        V::None => {}
+    }
+    match args[1] {
+        V::Reg(r) => dynasm!(ops ; mov r8, [rbx + dreg(r)]),
+        V::Imm(v) => dynasm!(ops ; mov r8, QWORD v as i64),
+        V::None => {}
+    }
+    match args[2] {
+        V::Reg(r) => dynasm!(ops ; mov r9, [rbx + dreg(r)]),
+        V::Imm(v) => dynasm!(ops ; mov r9, QWORD v as i64),
+        V::None => {}
+    }
+    dynasm!(ops
+        ; mov rcx, rdi
+        ; mov rax, QWORD helper as i64
+        ; call rax
+        ; mov r10, QWORD PY_SLOW_BITS as i64
+        ; cmp rax, r10
+        ; je => labels.slow
+        ; mov r10, QWORD CALL_THREW as i64
+        ; cmp rax, r10
+        ; je => labels.bail
+        ; mov [rbx + dreg(dst)], rax
+    );
+}
+
 /// After a `jit_py_arith`/`jit_py_add_imm` call: `PY_SLOW_BITS` takes the
 /// slow edge, `CALL_THREW` the bail (unwind), anything else is the result.
 /// The pinned pointers are re-derived first (the result is parked in the
 /// 5th-argument slot around `refetch`).
 fn emit_value_outcome(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     dst: u16,
     labels: &PyLabels,
-    refetch: &mut dyn FnMut(&mut dynasmrt::x64::Assembler),
+    refetch: &mut dyn FnMut(&mut crate::codegen::X64Asm),
 ) {
     dynasm!(ops ; mov [rsp + 32], rax);
     refetch(ops);
@@ -1343,6 +1394,7 @@ impl Jit {
                     },
                 );
                 self.note_reg_region_installed(func_id, true);
+                self.mark_has_region(func_id);
             }
             None => {
                 if log {
@@ -1359,7 +1411,7 @@ impl Jit {
 /// `Vm::jit_py_array_append`, the interpreter arm for an Array (anything
 /// else resumes the interpreter at `bail`, nothing done).
 pub(crate) fn emit_py_array_append(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     arr: u16,
     val: u16,
     bail: dynasmrt::DynamicLabel,
@@ -1379,13 +1431,13 @@ pub(crate) fn emit_py_array_append(
 /// `NewArray` in a Python loop: the whole-function tier's `jit_new_array`
 /// (an allocation; `refetch` follows).
 pub(crate) fn emit_py_new_array(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     reg_count: u16,
     dst: u16,
     arg_base: u16,
     argc: u16,
     bail: dynasmrt::DynamicLabel,
-    refetch: &mut dyn FnMut(&mut dynasmrt::x64::Assembler),
+    refetch: &mut dyn FnMut(&mut crate::codegen::X64Asm),
 ) {
     let packed = ((reg_count as u64) << 32) | ((arg_base as u64) << 16) | argc as u64;
     dynasm!(ops
@@ -1704,11 +1756,11 @@ pub(crate) fn py_region_plan(proto: &FuncProto, start: u32, end: u32, native: &[
 /// interpreter's own memoized `resolve_const_slot` (an allocation the first
 /// time, so `refetch` follows).
 pub(crate) fn emit_py_load_const(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     func_id: u32,
     dst: u16,
     idx: u32,
-    refetch: &mut dyn FnMut(&mut dynasmrt::x64::Assembler),
+    refetch: &mut dyn FnMut(&mut crate::codegen::X64Asm),
 ) {
     let packed = ((func_id as u64) << 32) | idx as u64;
     dynasm!(ops
@@ -1724,7 +1776,7 @@ pub(crate) fn emit_py_load_const(
 /// A Python body's `PushHandler` (a `try` statement's; a call pushes none,
 /// see `vm::py_rt`'s frame guard): `Vm::jit_py_push_handler`, the
 /// interpreter's arm verbatim on the body's own frame.
-pub(crate) fn emit_py_push_handler(ops: &mut dynasmrt::x64::Assembler, catch_target: u32, catch_reg: u16) {
+pub(crate) fn emit_py_push_handler(ops: &mut crate::codegen::X64Asm, catch_target: u32, catch_reg: u16) {
     let packed = ((catch_target as u64) << 16) | catch_reg as u64;
     dynasm!(ops
         ; mov rcx, rdi

@@ -169,7 +169,7 @@ pub(crate) fn compile_main_program_lazy<'a>(
 ) -> R<(Program, Option<super::lazy::LazySession<'a>>)> {
     let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Compile);
     let index = super::lazy::ProgramIndex::of(prog);
-    if index.functions() < min_functions {
+    if index.functions() < min_functions && !index.has_skipped_bodies() {
         return compile_main_program(prog, source).map(|p| (p, None));
     }
     // A regular expression literal's early error is the program's however
@@ -220,6 +220,10 @@ fn finish_program(c: &mut Compiler) -> Program {
         module_decl_globals,
         python_natives: false,
         python_lazy: None,
+        php_natives: false,
+        php_ctx: None,
+        rust_natives: false,
+        rust_ctx: None,
     }
 }
 
@@ -535,6 +539,10 @@ pub fn compile_eval(
         module_decl_globals,
         python_natives: false,
         python_lazy: None,
+        php_natives: false,
+        php_ctx: None,
+        rust_natives: false,
+        rust_ctx: None,
     })
 }
 

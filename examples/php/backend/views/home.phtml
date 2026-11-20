@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title><?= htmlspecialchars($title) ?></title>
+</head>
+<body>
+  <h1><?= htmlspecialchars($title) ?></h1>
+  <p>Powered by <?= htmlspecialchars(PHP_VERSION) ?> on ZIPP (SAPI: <?= htmlspecialchars(php_sapi_name()) ?>)</p>
+  <ul>
+  <?php foreach ($items as $item): ?>
+    <li>#<?= $item['id'] ?> — <?= htmlspecialchars($item['name']) ?></li>
+  <?php endforeach; ?>
+  </ul>
+</body>
+</html>

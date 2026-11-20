@@ -19,22 +19,50 @@ pub(crate) enum ConcatSetFast {
     Slow,
 }
 
-/// `Vm::keyed_slot_memo`'s size, a power of two.
-pub(crate) const KEYED_SLOT_MEMO_SLOTS: usize = 1024;
+/// `Vm::keyed_slot_memo`'s size, a power of two (allocated lazily on first put).
+pub(crate) const KEYED_SLOT_MEMO_SLOTS: usize = 16384;
+
+/// `KeyedSlotMemo::flags` bits.
+pub(crate) const KSM_IMMUTABLE_KEY: u8 = 1;
+const KSM_WRITABLE_DATA: u8 = 2;
+pub(crate) const KSM_PURE_SHAPE: u8 = 4;
+/// Proved-absent string key on a plain object with default `%Object.prototype%`
+/// (`slot` stores `heap.version_of(obj_proto)` at put time).
+pub(crate) const KSM_ABSENT_DEFAULT_PROTO: u8 = 8;
+/// Proved-absent string key on a plain object with explicit `null` prototype.
+pub(crate) const KSM_ABSENT_NULL_PROTO: u8 = 16;
+pub(crate) const KSM_ABSENT_MASK: u8 = KSM_ABSENT_DEFAULT_PROTO | KSM_ABSENT_NULL_PROTO;
 
 /// One prediction of `Vm::keyed_slot_memo`: an object of shape `owner`
 /// (or, with `by_object`, the dictionary-mode object `owner`) had the flat
-/// string key `key` at `slot`.
+/// string key `key` at `slot`. When `KSM_IMMUTABLE_KEY` is set, `key` was an
+/// immutable non-`"@@"` string (atom or frozen) at `kver`, and `over` is the
+/// object's version at put time so matching versions skip key byte comparison.
+/// `#[repr(C)]`, 32 bytes (power of two) for direct x86-64 JIT probing.
+#[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct KeyedSlotMemo {
-    owner: u32,
-    key: u32,
-    slot: u32,
-    by_object: bool,
+    pub(crate) owner: u32,
+    pub(crate) key: u32,
+    pub(crate) slot: u32,
+    pub(crate) kver: u32,
+    pub(crate) over: u32,
+    pub(crate) by_object: bool,
+    pub(crate) flags: u8,
+    pub(crate) _pad: [u8; 10],
 }
 
 impl KeyedSlotMemo {
-    pub(crate) const EMPTY: KeyedSlotMemo = KeyedSlotMemo { owner: u32::MAX, key: u32::MAX, slot: 0, by_object: true };
+    pub(crate) const EMPTY: KeyedSlotMemo = KeyedSlotMemo {
+        owner: u32::MAX,
+        key: u32::MAX,
+        slot: 0,
+        kver: 0,
+        over: 0,
+        by_object: true,
+        flags: 0,
+        _pad: [0; 10],
+    };
 }
 
 /// What a prediction is filed under: the receiver's shape when it has one
@@ -51,7 +79,8 @@ fn keyed_memo_owner(oidx: u32, map: &ObjMap) -> (u32, bool) {
 
 #[inline(always)]
 fn keyed_memo_index(owner: u32, kidx: u32) -> usize {
-    ((owner.wrapping_mul(0x9E37_79B1) ^ kidx.wrapping_mul(0x85EB_CA77)).wrapping_mul(0x27D4_EB2F) >> 22) as usize
+    ((owner.wrapping_mul(0x9E37_79B1) ^ kidx.wrapping_mul(0x85EB_CA77)).wrapping_mul(0x27D4_EB2F)
+        >> 18) as usize
         & (KEYED_SLOT_MEMO_SLOTS - 1)
 }
 
@@ -103,6 +132,10 @@ impl<'p> Vm<'p> {
             return None;
         }
         let idx = obj.heap_index();
+        #[cfg(all(feature = "jit", target_arch = "x86_64", not(feature = "safe-sandbox")))]
+        if let Some(v) = self.heap.arr_mirror_get_fast(idx, i as usize) {
+            return Some(v);
+        }
         let HeapObj::Array(items) = self.heap.get(idx) else {
             return None;
         };
@@ -110,11 +143,12 @@ impl<'p> Vm<'p> {
         // and used to decline every read; only an ELEMENT key there — a
         // defineProperty'd index or a sparse element — can override a present
         // dense slot. Integrity flags govern writes, not reads.
-        if self
-            .arr_props
-            .get(&idx)
-            .is_some_and(|m| m.has_element_key())
-            || self.arguments_objs.contains_key(&idx)
+        if (!self.arr_props.is_empty()
+            && self
+                .arr_props
+                .get(&idx)
+                .is_some_and(|m| m.has_element_key()))
+            || (!self.arguments_objs.is_empty() && self.arguments_objs.contains_key(&idx))
         {
             return None;
         }
@@ -134,20 +168,54 @@ impl<'p> Vm<'p> {
     /// UTF-8, hashed them and probed the receiver's index on every access:
     /// three quarters of a loop of keyed reads. A word count reads and writes
     /// the same keys of the same object over and over; a prediction checked
-    /// by one key compare answers it. A heap slot reused by another object or
-    /// string, or a string appended to in place, fails the compare and is
-    /// looked up again; nothing here is trusted.
+    /// by one key compare answers it. For immutable (atom or frozen) keys,
+    /// matching slot versions skip both the key fetch and byte compare.
     #[inline]
     pub(crate) fn keyed_memo_slot(&self, oidx: u32, kidx: u32, for_write: bool) -> Option<usize> {
+        if self.keyed_slot_memo.is_empty() {
+            return None;
+        }
         let HeapObj::Object(m) = self.heap.get(oidx) else {
             return None;
         };
         let (owner, by_object) = keyed_memo_owner(oidx, m);
         let e = self.keyed_slot_memo[keyed_memo_index(owner, kidx)];
-        if e.owner != owner || e.key != kidx || e.by_object != by_object {
+        if e.owner != owner || e.key != kidx || e.by_object != by_object || e.flags & KSM_ABSENT_MASK != 0 {
             return None;
         }
         let s = e.slot as usize;
+        // Fast version-guarded path: when the key was an immutable (atom or
+        // frozen) non-"@@" string at put time and its version is unchanged,
+        // and either the dict object's version is unchanged or the shape is
+        // guardable (immutable key layout), the key bytes are guaranteed equal.
+        if e.flags & KSM_IMMUTABLE_KEY != 0 && self.heap.version_of(kidx) == e.kver {
+            if by_object {
+                if self.heap.version_of(oidx) == e.over {
+                    if for_write && e.flags & KSM_WRITABLE_DATA == 0 {
+                        return None;
+                    }
+                    if m.val_at(s).is_uninitialized() {
+                        return None;
+                    }
+                    return Some(s);
+                }
+            } else {
+                // `owner == m.shape()` with `shape_guardable()` proves slot `s`
+                // has the exact same key name. Only attribute deviations need
+                // checking when `may_deviate_attrs()` is set or `class_proto`.
+                if !m.may_deviate_attrs() && !(for_write && m.class_proto) {
+                    if m.val_at(s).is_uninitialized() {
+                        return None;
+                    }
+                    return Some(s);
+                }
+                let a = m.attr_at(s);
+                if a.accessor || (for_write && (!a.writable || m.class_proto)) || m.val_at(s).is_uninitialized() {
+                    return None;
+                }
+                return Some(s);
+            }
+        }
         let HeapObj::Str(js) = self.heap.get(kidx) else {
             return None;
         };
@@ -166,6 +234,119 @@ impl<'p> Vm<'p> {
         Some(s)
     }
 
+    /// Fast own-data keyed read using `Vm::keyed_slot_memo`: checks the
+    /// receiver's settled hot mirror first (avoiding `Heap::objs[oidx]` and
+    /// the boxed `ObjMap` dereference completely for shaped receivers), and
+    /// serves dictionary-mode receivers with a single `Heap::objs[oidx]` load.
+    #[inline]
+    pub(crate) fn keyed_memo_get(&self, oidx: u32, kidx: u32) -> Option<Value> {
+        if self.keyed_slot_memo.is_empty() {
+            return None;
+        }
+        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+        {
+            let mir = self.heap.hot_mirror_of(oidx);
+            if mir.shape != crate::shape::DICT && crate::heap::fid_mirror_plain(mir.fid) {
+                let e = self.keyed_slot_memo[keyed_memo_index(mir.shape, kidx)];
+                if e.owner != mir.shape || e.key != kidx || e.by_object {
+                    // Settled mirror shape matches `keyed_memo_owner(oidx, m)`
+                    // exactly, so `keyed_memo_slot` would probe the same slot
+                    // and miss too.
+                    return None;
+                }
+                if (e.flags & KSM_PURE_SHAPE != 0) && self.heap.version_of(kidx) == e.kver {
+                    if e.flags & KSM_ABSENT_MASK != 0 {
+                        if mir.fid == crate::heap::FID_MIRROR_NONE
+                            && mir.shape != crate::shape::EMPTY
+                            && self.deferred_ns_state.is_empty()
+                            && self.realm_global_objs.is_empty()
+                        {
+                            if e.flags & KSM_ABSENT_NULL_PROTO != 0 {
+                                if self.proto_of.get_copied(oidx).is_some_and(|p| !p.is_heap()) {
+                                    return Some(Value::UNDEFINED);
+                                }
+                            } else if !self.proto_of.has(oidx)
+                                && self.obj_proto != 0
+                                && !self.proto_of.has(self.obj_proto)
+                                && self.heap.version_of(self.obj_proto) == e.slot
+                            {
+                                return Some(Value::UNDEFINED);
+                            }
+                        }
+                        return None;
+                    }
+                    // SAFETY: settled mirror shape proves `vals` is live and
+                    // holds `e.slot`; `KSM_PURE_SHAPE` proves immutable key
+                    // and non-accessor data attribute for this guardable shape.
+                    let v = unsafe { *(mir.vals as *const Value).add(e.slot as usize) };
+                    if !v.is_uninitialized() {
+                        return Some(v);
+                    }
+                    return None;
+                }
+            } else if mir.shape == crate::shape::DICT {
+                if !crate::heap::fid_mirror_plain(mir.fid) {
+                    return None;
+                }
+                #[cfg(target_arch = "x86_64")]
+                if self.heap.arr_mirror_live(oidx) {
+                    return None;
+                }
+                let e = self.keyed_slot_memo[keyed_memo_index(oidx, kidx)];
+                if e.owner == oidx
+                    && e.key == kidx
+                    && e.by_object
+                    && (e.flags & KSM_IMMUTABLE_KEY != 0)
+                    && self.heap.version_of(kidx) == e.kver
+                    && self.heap.version_of(oidx) == e.over
+                {
+                    if e.flags & KSM_ABSENT_MASK != 0 {
+                        if self.deferred_ns_state.is_empty() && self.realm_global_objs.is_empty() {
+                            if e.flags & KSM_ABSENT_NULL_PROTO != 0 {
+                                if self.proto_of.get_copied(oidx).is_some_and(|p| !p.is_heap()) {
+                                    return Some(Value::UNDEFINED);
+                                }
+                            } else if !self.proto_of.has(oidx)
+                                && self.obj_proto != 0
+                                && !self.proto_of.has(self.obj_proto)
+                                && self.heap.version_of(self.obj_proto) == e.slot
+                            {
+                                return Some(Value::UNDEFINED);
+                            }
+                        }
+                        return None;
+                    } else if mir.vals != 0 {
+                        // SAFETY: settled DICT mirror `vals` is live and holds
+                        // `e.slot` while `version_of(oidx) == e.over`.
+                        let v = unsafe { *(mir.vals as *const Value).add(e.slot as usize) };
+                        if !v.is_uninitialized() {
+                            return Some(v);
+                        }
+                        return None;
+                    } else if let HeapObj::Object(m) = self.heap.get(oidx) {
+                        let v = m.val_at(e.slot as usize);
+                        if !v.is_uninitialized() {
+                            return Some(v);
+                        }
+                        return None;
+                    }
+                }
+                // Settled DICT HeapObj::Object (vals != 0) never has a
+                // guardable shape, so an owner/key mismatch cannot hit in
+                // `keyed_memo_slot` either.
+                if mir.vals != 0 && (e.owner != oidx || e.key != kidx || !e.by_object) {
+                    return None;
+                }
+            }
+        }
+        let i = self.keyed_memo_slot(oidx, kidx, false)?;
+        if let HeapObj::Object(m) = self.heap.get(oidx) {
+            Some(m.val_at(i))
+        } else {
+            None
+        }
+    }
+
     /// `arr[sym]` for the ordinary Array `oidx` and the Symbol `kidx`, when
     /// the array holds no own properties beyond its elements, its
     /// [[Prototype]] is this realm's %Array.prototype%, and that object has
@@ -173,7 +354,7 @@ impl<'p> Vm<'p> {
     /// path copied the symbol's key string (`key_of`) and walked the member
     /// lookup to reach the same slot. Anything else is `None`, and the
     /// general path answers.
-    fn array_symbol_proto_get(&self, oidx: u32, kidx: u32) -> Option<Value> {
+    pub(crate) fn array_symbol_proto_get(&self, oidx: u32, kidx: u32) -> Option<Value> {
         let HeapObj::Symbol { prop_key, .. } = self.heap.get(kidx) else {
             return None;
         };
@@ -199,12 +380,150 @@ impl<'p> Vm<'p> {
     /// Record that `oidx` has the key `kidx` at `slot` (see `keyed_memo_slot`).
     #[inline]
     pub(crate) fn keyed_memo_put(&mut self, oidx: u32, kidx: u32, slot: usize) {
-        let HeapObj::Object(m) = self.heap.get(oidx) else {
-            return;
+        let (owner, by_object, is_accessor, writable_non_proto, pure_shape) =
+            match self.heap.get(oidx) {
+                HeapObj::Object(m) => {
+                    let (owner, by_object) = keyed_memo_owner(oidx, m);
+                    let a = m.attr_at(slot);
+                    (
+                        owner,
+                        by_object,
+                        a.accessor,
+                        a.writable && !m.class_proto,
+                        !by_object && !m.may_deviate_attrs(),
+                    )
+                }
+                _ => return,
+            };
+        let (should_freeze, can_immutable) = match self.heap.get(kidx) {
+            HeapObj::Str(js) if !js.as_bytes().starts_with(b"@@") && !is_accessor => {
+                let already = self.heap.is_atom(kidx) || js.frozen();
+                (!already, true)
+            }
+            _ => (false, false),
         };
-        let (owner, by_object) = keyed_memo_owner(oidx, m);
-        self.keyed_slot_memo[keyed_memo_index(owner, kidx)] =
-            KeyedSlotMemo { owner, key: kidx, slot: slot as u32, by_object };
+        if should_freeze {
+            self.heap.freeze_shared_str(kidx);
+        }
+        #[cfg(feature = "jit")]
+        if self.heap.hot_mirror_of(oidx).vals == 0 {
+            self.heap.refresh_mirror(oidx);
+        }
+        let (kver, over, flags) = if can_immutable {
+            let f = KSM_IMMUTABLE_KEY
+                | if writable_non_proto {
+                    KSM_WRITABLE_DATA
+                } else {
+                    0
+                }
+                | if pure_shape { KSM_PURE_SHAPE } else { 0 };
+            (self.heap.version_of(kidx), self.heap.version_of(oidx), f)
+        } else {
+            (0, 0, 0)
+        };
+        if self.keyed_slot_memo.is_empty() {
+            self.keyed_slot_memo = vec![KeyedSlotMemo::EMPTY; KEYED_SLOT_MEMO_SLOTS];
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            {
+                self.keyed_slot_memo_raw = self.keyed_slot_memo.as_ptr() as u64;
+            }
+        }
+        self.keyed_slot_memo[keyed_memo_index(owner, kidx)] = KeyedSlotMemo {
+            owner,
+            key: kidx,
+            slot: slot as u32,
+            kver,
+            over,
+            by_object,
+            flags,
+            _pad: [0; 10],
+        };
+    }
+
+    /// Record that the flat string key `kidx` is provably absent on plain
+    /// object `oidx` (and on `%Object.prototype%` when using the default
+    /// prototype), so repeated missing lookups (e.g. `visitor[node.type]`)
+    /// resolve to `undefined` in O(1) via `keyed_memo_get`.
+    #[inline]
+    pub(crate) fn keyed_memo_put_absent(&mut self, oidx: u32, kidx: u32) {
+        if !self.deferred_ns_state.is_empty()
+            || !self.realm_global_objs.is_empty()
+            || !self.ic_obj_ok(oidx)
+        {
+            return;
+        }
+        let (owner, by_object) = match self.heap.get(oidx) {
+            HeapObj::Object(m) => {
+                if m.class.is_some() || m.is_ctor || m.shape() == crate::shape::EMPTY {
+                    return;
+                }
+                keyed_memo_owner(oidx, m)
+            }
+            _ => return,
+        };
+        let (need_freeze, absent_flag, guard_word) = {
+            let HeapObj::Str(js) = self.heap.get(kidx) else {
+                return;
+            };
+            let kb = js.as_bytes();
+            if kb.starts_with(b"@@")
+                || kb == b"__proto__"
+                || !kb
+                    .first()
+                    .is_some_and(|b| !(b.is_ascii_digit() || *b == b'-' || *b == b'#'))
+            {
+                return;
+            }
+            let Ok(key_str) = std::str::from_utf8(kb) else {
+                return;
+            };
+            let need_freeze = !(self.heap.is_atom(kidx) || js.frozen());
+            let (absent_flag, guard_word) = match self.proto_of.get_copied(oidx) {
+                Some(p) if !p.is_heap() => (KSM_ABSENT_NULL_PROTO, 0u32),
+                Some(_) => return,
+                None => {
+                    if self.obj_proto == 0 || self.proto_of.has(self.obj_proto) {
+                        return;
+                    }
+                    let absent_on_proto = match self.heap.get(self.obj_proto) {
+                        HeapObj::Object(pm) => self.own_pos(pm, key_str).is_none(),
+                        _ => false,
+                    };
+                    if !absent_on_proto {
+                        return;
+                    }
+                    (KSM_ABSENT_DEFAULT_PROTO, self.heap.version_of(self.obj_proto))
+                }
+            };
+            (need_freeze, absent_flag, guard_word)
+        };
+        if need_freeze {
+            self.heap.freeze_shared_str(kidx);
+        }
+        #[cfg(feature = "jit")]
+        if self.heap.hot_mirror_of(oidx).vals == 0 {
+            self.heap.refresh_mirror(oidx);
+        }
+        let flags = KSM_IMMUTABLE_KEY
+            | absent_flag
+            | if !by_object { KSM_PURE_SHAPE } else { 0 };
+        if self.keyed_slot_memo.is_empty() {
+            self.keyed_slot_memo = vec![KeyedSlotMemo::EMPTY; KEYED_SLOT_MEMO_SLOTS];
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            {
+                self.keyed_slot_memo_raw = self.keyed_slot_memo.as_ptr() as u64;
+            }
+        }
+        self.keyed_slot_memo[keyed_memo_index(owner, kidx)] = KeyedSlotMemo {
+            owner,
+            key: kidx,
+            slot: guard_word,
+            kver: self.heap.version_of(kidx),
+            over: self.heap.version_of(oidx),
+            by_object,
+            flags,
+            _pad: [0; 10],
+        };
     }
 
     /// `o[k]` where the flat string `key` is not among the plain object
@@ -227,9 +546,17 @@ impl<'p> Vm<'p> {
                 .is_some_and(|b| !(b.is_ascii_digit() || *b == b'-' || *b == b'#'))
             || !self.deferred_ns_state.is_empty()
             || !self.ic_obj_ok(idx)
-            || map.class.is_some()
             || map.is_ctor
         {
+            return None;
+        }
+        if let Some(cls) = map.class {
+            if self.realm_global_objs.is_empty() {
+                let mut hops = [(0u32, 0u32); 5];
+                if self.class_chain_proof(idx, cls, key, &mut hops, true).is_some() {
+                    return Some(Value::UNDEFINED);
+                }
+            }
             return None;
         }
         let mut cur = idx;
@@ -541,24 +868,24 @@ impl<'p> Vm<'p> {
                     return Ok(v);
                 }
             }
+            let kidx = key.heap_index();
+            let plain_receiver = !(oidx == self.global_this && self.global_this != 0)
+                && !(!self.module_namespaces.is_empty()
+                    && self.module_namespaces.contains_key(&oidx))
+                && !(!self.deferred_ns_state.is_empty()
+                    && self.deferred_ns_state.contains_key(&oidx));
+            if plain_receiver {
+                if let Some(v) = self.keyed_memo_get(oidx, kidx) {
+                    return Ok(v);
+                }
+            }
             // A key built by concatenation is a rope until read: flattened in
             // place, so the view below sees its bytes (it is read as a key
             // whatever path the read takes).
             if matches!(self.heap.get(oidx), HeapObj::Object(_)) {
-                self.heap.flatten(key.heap_index());
+                self.heap.flatten(kidx);
             }
-            if !(oidx == self.global_this && self.global_this != 0)
-                && !(!self.module_namespaces.is_empty()
-                    && self.module_namespaces.contains_key(&oidx))
-                && !(!self.deferred_ns_state.is_empty()
-                    && self.deferred_ns_state.contains_key(&oidx))
-            {
-                let kidx = key.heap_index();
-                if let Some(i) = self.keyed_memo_slot(oidx, kidx, false) {
-                    if let HeapObj::Object(m) = self.heap.get(oidx) {
-                        return Ok(m.val_at(i));
-                    }
-                }
+            if plain_receiver {
                 let mut own_hit = None;
                 // ("@@…" is escaped as a key — `key_of` — so it takes the slow path.)
                 if let Some(std::borrow::Cow::Borrowed(b)) = self
@@ -579,6 +906,9 @@ impl<'p> Vm<'p> {
                         } else if let Some(v) = self.plain_string_key_miss(oidx, m, k) {
                             // `counts[w] || 0` for a word not seen yet: the
                             // general path built `w` as a `String` first.
+                            if v.is_undefined() {
+                                self.keyed_memo_put_absent(oidx, kidx);
+                            }
                             return Ok(v);
                         }
                     }

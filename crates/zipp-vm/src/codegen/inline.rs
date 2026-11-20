@@ -83,7 +83,7 @@ extern "win64" fn note_inline_same_proto_guard_hit() {
 /// region has GetProp/SetProp sites — the only r13/r14 consumers).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_region_call_ic(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     ip: usize,
     bail: dynasmrt::DynamicLabel,
     epilogue: dynasmrt::DynamicLabel,
@@ -236,7 +236,7 @@ pub(crate) fn captured_builtin_lane(
 /// call below exactly as before.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_captured_method_lane(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     callee: u16,
     this_v: u16,
     arg_base: u16,
@@ -356,7 +356,7 @@ pub(crate) fn emit_captured_method_lane(
 /// label the caller must define after its generic path.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_captured_builtin_lane(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     callee: u16,
     this_v: u16,
     arg_base: u16,
@@ -424,7 +424,7 @@ pub(crate) fn emit_captured_builtin_lane(
 /// (copied above), globals, and its own freshly-computed regs).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_inline_leaf_call(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     call_ip: usize,
     epilogue: dynasmrt::DynamicLabel,
     leaf_flag_off: i32,
@@ -1536,7 +1536,7 @@ pub(crate) fn emit_inline_leaf_call(
 /// super-chain version-guard miss jumps to `fallback` (the per-call helper).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_mi_body(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     call_ip: usize,
     epilogue: dynasmrt::DynamicLabel,
     fallback: dynasmrt::DynamicLabel,
@@ -1998,7 +1998,7 @@ pub(crate) fn emit_mi_body(
 /// `super.m()` is inlined recursively (Stage 3). See `MethodInlinePlan`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_inline_method_call(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     call_ip: usize,
     epilogue: dynasmrt::DynamicLabel,
     method_flag_off: i32,
@@ -2236,7 +2236,7 @@ pub(crate) fn emit_inline_method_call(
 /// helper). reg 0 = receiver; for a setter reg 1 = the value. Body via emit_mi_body.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_inline_accessor(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     call_ip: usize,
     epilogue: dynasmrt::DynamicLabel,
     method_flag_off: i32,
@@ -4310,7 +4310,7 @@ fn build_lane_inner(
 /// unchanged per-call helper — a pure prefix; nothing is committed before the
 /// exit steps). `dst` is the caller's destination register.
 fn emit_typed_lane(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     lane: &TypedLanePlan,
     cell_get: usize,
     cell_set: usize,
@@ -4822,7 +4822,7 @@ fn emit_typed_lane(
 /// Box the exact i64 in home `s` into window register `dst` with `Value::num`
 /// shaping: in-i32 narrows to the Int tag (proven at plan time when
 /// `narrow`), a wider exact integer converts to its (exact, ≤ 2^53) double.
-fn emit_lane_box_int(ops: &mut dynasmrt::x64::Assembler, s: u8, narrow: bool, dst: u16) {
+fn emit_lane_box_int(ops: &mut crate::codegen::X64Asm, s: u8, narrow: bool, dst: u16) {
     if narrow {
         dynasm!(ops
             ; mov eax, Rd(s)

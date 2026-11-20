@@ -651,7 +651,7 @@ pub(crate) fn compile_proto(
     // for small inputs (`fib`: `n<2 ? n`), inline that base case at each call
     // site so leaf invocations skip the call + prologue/epilogue entirely.
     let base_case = base_case_returns_arg(proto);
-    let mut ops = dynasmrt::x64::Assembler::new().ok()?;
+    let mut ops = crate::codegen::new_x64_asm();
 
     // A label per bytecode index so jumps resolve to the right native offset.
     // `labels[n]` is the fall-off-the-end label (treated as ReturnUndefined).
@@ -911,7 +911,7 @@ pub(crate) fn compile_proto(
         ; ret
     );
 
-    let buf = ops.finalize().ok()?;
+    let buf = crate::codegen::finalize_code(ops)?;
     let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
     // Record the self-binding this body assumed, for `try_run_jit` to re-check at
     // every entry. Only when a self-call was actually emitted — a Tier A body with
@@ -959,7 +959,7 @@ pub(crate) fn dreg(r: u16) -> i32 {
 /// (restore stack + callee-saved regs) and returns — a bare `ret` would leave
 /// the prologue's pushes/`sub rsp` on the stack and corrupt the caller.
 pub(crate) fn emit_bail(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     ip: usize,
     bail: dynasmrt::DynamicLabel,
 ) {
@@ -980,7 +980,7 @@ pub(crate) fn emit_bail(
 
 /// Guard that `regs[r]` is tagged `Int`; on mismatch jump to `bail`. Reads the
 /// high 16 bits and compares to `INT_TAG_HI`.
-pub(crate) fn guard_int(ops: &mut dynasmrt::x64::Assembler, r: u16, bail: dynasmrt::DynamicLabel) {
+pub(crate) fn guard_int(ops: &mut crate::codegen::X64Asm, r: u16, bail: dynasmrt::DynamicLabel) {
     dynasm!(ops
         ; mov rax, [rbx + dreg(r)]
         ; shr rax, 48
@@ -992,7 +992,7 @@ pub(crate) fn guard_int(ops: &mut dynasmrt::x64::Assembler, r: u16, bail: dynasm
 /// Guard that `regs[r]` is Int OR Bool (both used as conditions). Int hi =
 /// 0x7FF9, Bool hi = 0x7FFA. Accept either; else jump to `bail`.
 pub(crate) fn guard_int_or_bool(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     r: u16,
     bail: dynasmrt::DynamicLabel,
 ) {
@@ -1009,7 +1009,7 @@ pub(crate) fn guard_int_or_bool(
 }
 
 /// Box the i32 in `eax` into `regs[dst]` as an Int Value.
-pub(crate) fn box_eax(ops: &mut dynasmrt::x64::Assembler, dst: u16) {
+pub(crate) fn box_eax(ops: &mut crate::codegen::X64Asm, dst: u16) {
     dynasm!(ops
         ; mov r8, QWORD INT_TAG as i64
         ; mov eax, eax            // zero-extend i32 payload into rax
@@ -1019,7 +1019,7 @@ pub(crate) fn box_eax(ops: &mut dynasmrt::x64::Assembler, dst: u16) {
 }
 
 pub(crate) fn int_binop(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     ip: usize,
     bail: dynasmrt::DynamicLabel,
     dst: u16,
@@ -1080,7 +1080,7 @@ pub(crate) fn int_binop(
 
 /// `regs[dst] = (regs[a] <cmp> regs[b]) as Bool`. Guards both Int; bails else.
 pub(crate) fn int_cmp(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     ip: usize,
     bail: dynasmrt::DynamicLabel,
     dst: u16,
@@ -1115,7 +1115,7 @@ pub(crate) fn int_cmp(
 
 /// Fused `if !(regs[a] <cmp> regs[b]) goto target`. Guards both Int; bails else.
 pub(crate) fn jump_if_not_cmp(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     ip: usize,
     bail: dynasmrt::DynamicLabel,
     a: u16,

@@ -49,6 +49,41 @@ pub fn parse_exact(src: &str, exact: Option<&[u8]>, opts: ParseOptions) -> PResu
     Ok(program)
 }
 
+/// Parse a previously skipped function body (`FnBody::lazy_span`) in place
+/// inside `source`, preserving exact file-relative byte offsets.
+#[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+pub fn parse_lazy_fn_body(
+    source: &str,
+    span: (u32, u32),
+    params: &Params,
+    strict: bool,
+    skip_nested: bool,
+) -> PResult<FnBody> {
+    let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Parse);
+    let end = span.1 as usize;
+    let sub = source
+        .get(..end)
+        .ok_or_else(|| SyntaxError::new("internal: lazy body span out of bounds", span.0))?;
+    let opts = ParseOptions {
+        goal: Goal::Script,
+        force_strict: strict,
+        allow_return: true,
+        allow_new_target: true,
+        skip_fn_bodies: skip_nested,
+        ..ParseOptions::default()
+    };
+    let mut p = Parser::new_at(sub, span.0, opts)?;
+    p.fn_depth = 1;
+    let body = p.parse_fn_body_with_params_opt(Some(params), false)?;
+    if p.prev_end() != span.1 {
+        return Err(SyntaxError::new(
+            "SyntaxError: unexpected token in function body",
+            p.cur().span.start,
+        ));
+    }
+    Ok(body)
+}
+
 /// Parse `src` as a STANDALONE FormalParameters list, requiring the whole
 /// string to be consumed. CreateDynamicFunction (`new Function` & kin) parses
 /// the parameter STRING on its own before the assembled source
@@ -994,7 +1029,7 @@ impl<'s> Parser<'s> {
                     let is_break = kw == Keyword::Break;
                     self.bump_before_operand()?;
                     let label = if self.is_binding_ident() && !self.cur().newline_before {
-                        let (n, pos) = self.binding_ident()?;
+                        let (n, pos) = self.label_ident()?;
                         if !self.labels.iter().any(|l| **l == *n) {
                             return Err(SyntaxError::new(
                                 format!("SyntaxError: undefined label '{n}'"),

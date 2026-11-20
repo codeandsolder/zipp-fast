@@ -18,6 +18,8 @@ members = [
     "crates/regress-fork", # our fork of regress 0.11.1 — the regex engine (see its FORK.md)
     "crates/zipp-gpu",     # native GPU host for `zipp py`: gpu-lab's runtime over wgpu (CLI feature `gpu`)
     "crates/zipp-vm/src/lang/python/parser", # ZIPP's Python front end: lexer, arena AST, parser (see its README)
+    "crates/zipp-vm/src/lang/php/parser",    # ZIPP's PHP 8.x front end: dual-mode HTML/PHP lexer, AST, parser
+    "crates/zipp-vm/src/lang/rust/parser",   # ZIPP's Rust front end: pure-Rust lexer, AST, parser
     "crates/zipp-numparse", # decimal text to f64 without core's table, for zipp-vm and zipp-pyparse
 ]
 # The hardened native runner and WebAssembly embedding intentionally live in
@@ -28,7 +30,7 @@ members = [
 exclude = ["crates/zipp-sandbox", "crates/zipp-wasm"]
 
 [workspace.package]
-version = "0.0.36"
+version = "0.0.37"
 edition = "2021"
 license = "Apache-2.0"
 

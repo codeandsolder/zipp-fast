@@ -3890,6 +3890,8 @@ impl<'p> Vm<'p> {
                 Value::heap(gidx)
             };
             let indices_arr = self.alloc_array_current_realm(idx_elems).heap_index();
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            self.heap.clear_arr_mirror(indices_arr);
             self.arr_props
                 .entry(indices_arr)
                 .or_insert_with(ObjMap::new_side_table)

@@ -106,11 +106,11 @@ fn classes_exceptions_and_generators() {
 #[test]
 fn unsupported_syntax_is_a_compile_error() {
     for source in [
-        "async def f():\n    pass\n",
-        "type Point = tuple[int, int]\n",
-        "try:\n    pass\nexcept* ValueError:\n    pass\n",
         "def f(:\n",
         "x = = 1\n",
+        "return 1\n",
+        "await 1\n",
+        "try:\n    pass\nexcept* ValueError:\n    return 1\n",
     ] {
         assert!(
             compile_source(
@@ -123,6 +123,28 @@ fn unsupported_syntax_is_a_compile_error() {
             "{source}"
         );
     }
+}
+
+#[test]
+fn python_313_syntax_compiles_and_runs() {
+    let s = r#"
+import asyncio
+
+type Pair[T = int] = tuple[T, T]
+
+async def run_all[T](x: T) -> list[T]:
+    out = []
+    try:
+        raise ExceptionGroup("eg", [ValueError(x)])
+    except* ValueError as g:
+        out.append(g.exceptions[0].args[0])
+    await asyncio.sleep(0)
+    return out
+
+print(Pair.__name__, Pair.__type_params__[0].__default__.__name__)
+print(asyncio.run(run_all(42)))
+"#;
+    assert_eq!(execute(s).unwrap(), vec!["Pair int", "[42]"]);
 }
 
 #[test]

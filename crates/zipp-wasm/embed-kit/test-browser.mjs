@@ -94,7 +94,7 @@ async function inPage(page, version) {
     const { createZippHost } = await import("/host-sdk/zipp-host.mjs");
     const results = [];
     // Isolated sandboxes (their own Workers) for each engine.
-    for (const variant of ["javascript", "javascript-lite", "javascript-typescript", "javascript-python"]) {
+    for (const variant of ["javascript", "javascript-lite", "javascript-typescript", "javascript-python", "javascript-php", "javascript-rust"]) {
       const zipp = await loadZipp(`/zipp-${version}-${variant}.wasm`);
       const sandbox = await zipp.createSandbox({ permissions: { storage: true } });
       const out = (await sandbox.run("localStorage.setItem('k', 'v'); console.log(localStorage.getItem('k'), typeof fetch)")).output.join("|");
@@ -122,7 +122,7 @@ async function inPage(page, version) {
     try { await host.call("spin", [], { deadlineMs: 300 }); } catch (e) { spun = `${e.category} ${e.terminal} ${host.dead}`; }
     results.push({ type: "host-sdk", variant: "javascript", version, js: `${JSON.stringify(rendered)} ${spun}`, py: null });
     for (const type of ["wasm", "octet"]) {
-      for (const variant of ["javascript", "javascript-lite", "javascript-typescript", "javascript-python", "javascript-python-base"]) {
+      for (const variant of ["javascript", "javascript-lite", "javascript-typescript", "javascript-python", "javascript-python-base", "javascript-php", "javascript-rust"]) {
         const zipp = await loadZipp(`/zipp-${version}-${variant}.wasm?type=${type}`);
         const js = zipp.run("console.log([1, 2, 3].map(n => n * n).join(' '), typeof Intl)").output.join("|");
         const ts = zipp.languages.includes("typescript")

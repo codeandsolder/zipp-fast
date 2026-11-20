@@ -85,7 +85,7 @@ the step budget bounds it.
 ## Conformance and language coverage
 
 The core Test262 corpus is pinned to
-`0b4e0812022b18236b5276d2804948fdd9f71603`, including staging and excluding the
+`2e58f87d8350ad51224617a041c6e041d52f8444`, including staging and excluding the
 separate `intl402` suite. See the README for measured counts and build identity.
 CI runs the unmodified corpus once against the
 [expected-failure manifest](../tools/test262-expected-failures.txt), whose single
@@ -95,7 +95,7 @@ failure, an entry that passes, or a skip fails the gate. No test is patched.
 The German `String/internalUsage.js` modes now pass without test changes.
 DateTimeFormat uses generated CLDR 48 data for `en`/`en-US`, `de`/`de-DE`,
 `ja`/`ja-JP`, `zh`/`zh-CN` and `ar-EG`. Its original pinned ECMA-402 shard passes
-490/490 executions without skips. Other Intl services currently ship English
+492/492 executions without skips. Other Intl services currently ship English
 locale data only; this is not a claim of complete ECMA-402 conformance.
 
 One limitation there is about missing Unicode data rather than missing locales,

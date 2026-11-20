@@ -1,7 +1,7 @@
 //! Statement lowering for the Python emitter.
 use super::emitter::{Emitter, LoopCtx, R};
 use super::exprs::{known, small_int_literal, Known};
-use super::symtable::{ScopeKind, SymKind};
+use super::symtable::{ScopeKey, ScopeKind, SymKind};
 use crate::bytecode::{Instr, Reg};
 use ast::Ranged;
 use zipp_pyparse::tree as ast;
@@ -128,6 +128,12 @@ impl<'a> Emitter<'a> {
                 if !self.in_function() {
                     return Err(self.error(stmt, "'return' outside function"));
                 }
+                if self.except_star_depth > 0 {
+                    return Err(self.error(stmt, "'return' cannot appear in except* block"));
+                }
+                if self.scope().is_async && self.scope().is_generator && s.value.is_some() {
+                    return Err(self.error(stmt, "'return' with value in async generator"));
+                }
                 let value = match s.value.as_ref() {
                     Some(expr) => self.expr(expr, depth + 1)?,
                     None => self.none()?,
@@ -145,16 +151,21 @@ impl<'a> Emitter<'a> {
                     breaks: Vec::new(),
                     continues: Vec::new(),
                     handler_depth: self.handler_depth,
+                    except_star_depth: self.except_star_depth,
                 });
                 self.block_suite(&s.body, depth + 1)?;
                 self.emit(Instr::Jump { target: head })?;
                 self.finish_loop(exhausted, &s.orelse, depth + 1)?;
             }
             ast::Stmt::For(s) => self.for_stmt(s, depth)?,
+            ast::Stmt::AsyncFor(s) => self.async_for_stmt(stmt, s, depth)?,
             ast::Stmt::Break(_) => {
                 let Some(ctx) = self.loops.last() else {
                     return Err(self.error(stmt, "'break' outside loop"));
                 };
+                if ctx.except_star_depth < self.except_star_depth {
+                    return Err(self.error(stmt, "'break' cannot appear in except* block"));
+                }
                 let floor = ctx.handler_depth;
                 let jump = self.loop_jump(floor)?;
                 self.loops.last_mut().unwrap().breaks.push(jump);
@@ -163,6 +174,9 @@ impl<'a> Emitter<'a> {
                 let Some(ctx) = self.loops.last() else {
                     return Err(self.error(stmt, "'continue' outside loop"));
                 };
+                if ctx.except_star_depth < self.except_star_depth {
+                    return Err(self.error(stmt, "'continue' cannot appear in except* block"));
+                }
                 let floor = ctx.handler_depth;
                 let jump = self.loop_jump(floor)?;
                 self.loops.last_mut().unwrap().continues.push(jump);
@@ -204,7 +218,9 @@ impl<'a> Emitter<'a> {
                 self.helper("raise", &[exc, cause])?;
             }
             ast::Stmt::Try(s) => self.try_stmt(s, depth + 1)?,
+            ast::Stmt::TryStar(s) => self.try_star_stmt(s, depth + 1)?,
             ast::Stmt::With(s) => self.with_stmt(&s.items, &s.body, depth + 1)?,
+            ast::Stmt::AsyncWith(s) => self.async_with_stmt(stmt, &s.items, &s.body, depth + 1)?,
             ast::Stmt::FunctionDef(s) => {
                 let value = self.function_def(
                     stmt,
@@ -213,6 +229,20 @@ impl<'a> Emitter<'a> {
                     &s.body,
                     &s.decorator_list,
                     s.returns.as_deref(),
+                    &s.type_params,
+                    depth + 1,
+                )?;
+                self.store_name(s.name.as_str(), value)?;
+            }
+            ast::Stmt::AsyncFunctionDef(s) => {
+                let value = self.function_def(
+                    stmt,
+                    s.name.as_str(),
+                    &s.args,
+                    &s.body,
+                    &s.decorator_list,
+                    s.returns.as_deref(),
+                    &s.type_params,
                     depth + 1,
                 )?;
                 self.store_name(s.name.as_str(), value)?;
@@ -221,6 +251,7 @@ impl<'a> Emitter<'a> {
                 let value = self.class_def(stmt, s, depth + 1)?;
                 self.store_name(s.name.as_str(), value)?;
             }
+            ast::Stmt::TypeAlias(s) => self.type_alias_stmt(stmt, s, depth + 1)?,
             ast::Stmt::Import(s) => {
                 for alias in &s.names {
                     let module = self.import_module(stmt, alias.name.as_str())?;
@@ -316,7 +347,6 @@ impl<'a> Emitter<'a> {
                     self.store_name(bound.as_str(), value)?;
                 }
             }
-            _ => return Err(self.error(stmt, "statement is not supported yet")),
         }
         Ok(())
     }
@@ -659,6 +689,7 @@ impl<'a> Emitter<'a> {
             breaks: Vec::new(),
             continues: Vec::new(),
             handler_depth: self.handler_depth,
+            except_star_depth: self.except_star_depth,
         });
         self.block_suite(&s.body, depth + 1)?;
         self.emit(Instr::Jump { target: head })?;
@@ -1278,10 +1309,147 @@ impl<'a> Emitter<'a> {
                 self.store_name(name.as_str(), exc)?;
                 self.control_depth -= 1;
             }
-            self.push_exc(exc)?;
-            // The handler body runs under its own finally so the current-exception
-            // stack is popped (and the `as` name unbound) on EVERY exit: normal
-            // completion, `return`, `break`/`continue`, or a raise.
+            if self.fast && h.name.is_none() && self.is_trivial_except_body(&h.body) {
+                // Trivial non-raising, non-observing handler body (no `as`,
+                // no calls/raises/yields, only pure local ops): pushing/popping
+                // `EXCSTACK` and installing an inner `PushFinally` cannot be
+                // observed.
+                self.block_suite(&h.body, depth)?;
+            } else {
+                self.push_exc(exc)?;
+                // The handler body runs under its own finally so the current-exception
+                // stack is popped (and the `as` name unbound) on EVERY exit: normal
+                // completion, `return`, `break`/`continue`, or a raise.
+                let (k2, v2) = (self.alloc()?, self.alloc()?);
+                let body_fin = self.emit(Instr::PushFinally {
+                    target: 0,
+                    kind_reg: k2,
+                    val_reg: v2,
+                })?;
+                self.enter_handler(None);
+                self.block_suite(&h.body, depth)?;
+                self.emit(Instr::LoadInt { dst: k2, val: 0 })?;
+                self.emit(Instr::PopFinally)?;
+                self.leave_handler();
+                let fin2 = self.here();
+                self.patch(body_fin, fin2)?;
+                self.forget_line();
+                self.pop_exc()?;
+                if let Some(name) = &h.name {
+                    self.delete_name(name.as_str())?;
+                }
+                self.emit(Instr::EndFinally {
+                    kind_reg: k2,
+                    val_reg: v2,
+                })?;
+            }
+            to_finally.push(self.leave_normally(has_finally, kind_reg)?);
+            if let Some(next) = next {
+                let here = self.here();
+                self.patch(next, here)?;
+            }
+        }
+        // No handler matched: re-raise (through the finally, if any).
+        self.emit(Instr::Throw { src: ereg })?;
+        if let Some(fin_push) = fin_push {
+            self.leave_handler();
+            let fin = self.here();
+            self.patch(fin_push, fin)?;
+            for j in &to_finally {
+                self.patch(*j, fin)?;
+            }
+            self.forget_line();
+            self.finally_body(&s.finalbody, kind_reg, val_reg, depth)?;
+            self.emit(Instr::EndFinally { kind_reg, val_reg })?;
+        } else {
+            let end = self.here();
+            for j in &to_finally {
+                self.patch(*j, end)?;
+            }
+        }
+        self.forget_line();
+        Ok(())
+    }
+
+    /// `try ... except* ...` (PEP 654): splits the caught exception (or
+    /// `ExceptionGroup`) against each `except*` clause in order, runs every
+    /// matching clause, collects re-raised and newly raised exceptions, and
+    /// re-raises any unhandled remainder combined with handler raises.
+    fn try_star_stmt(&mut self, s: &ast::StmtTryStar, depth: usize) -> R<()> {
+        let has_finally = !s.finalbody.is_empty();
+        let (kind_reg, val_reg) = (self.alloc()?, self.alloc()?);
+        let fin_push = if has_finally {
+            let at = self.emit(Instr::PushFinally {
+                target: 0,
+                kind_reg,
+                val_reg,
+            })?;
+            self.enter_handler(None);
+            Some(at)
+        } else {
+            None
+        };
+        let mut to_finally: Vec<usize> = Vec::new();
+        let ereg = self.alloc()?;
+        let push = self.emit(Instr::PushHandler {
+            catch_target: 0,
+            catch_reg: ereg,
+        })?;
+        self.enter_handler(Some(push));
+        self.block_suite(&s.body, depth)?;
+        self.emit(Instr::PopHandler)?;
+        self.leave_handler();
+        self.block_suite(&s.orelse, depth)?;
+        to_finally.push(self.leave_normally(has_finally, kind_reg)?);
+
+        // Caught exception: dispatch across all `except*` clauses in order.
+        let catch_start = self.here();
+        self.patch(push, catch_start)?;
+        self.forget_line();
+        let orig = self.caught(ereg)?;
+        let unmatched = self.alloc()?;
+        self.emit(Instr::Move { dst: unmatched, src: orig })?;
+        let reraised = self.array(&[])?;
+        let raised = self.array(&[])?;
+        let zero = self.small_int(0)?;
+        let one = self.small_int(1)?;
+        let none = self.none()?;
+
+        // Keep `orig` on EXCSTACK while evaluating clause specs so errors
+        // raised during `except* <spec>` evaluation chain `__context__ = orig`.
+        self.push_exc(orig)?;
+        let (ok2, ov2) = (self.alloc()?, self.alloc()?);
+        let orig_fin = self.emit(Instr::PushFinally {
+            target: 0,
+            kind_reg: ok2,
+            val_reg: ov2,
+        })?;
+        self.enter_handler(None);
+
+        for handler in &s.handlers {
+            let ast::ExceptHandler::ExceptHandler(h) = handler;
+            self.stamp_line(handler)?;
+            let Some(ty) = &h.type_ else {
+                return Err(self.error(handler, "except* clause requires an exception type"));
+            };
+            let spec = self.expr(ty, depth)?;
+            let pair = self.helper("eg_split", &[unmatched, spec])?;
+            let matched = self.alloc()?;
+            self.emit(Instr::GetIndex { dst: matched, obj: pair, key: zero })?;
+            let rest = self.alloc()?;
+            self.emit(Instr::GetIndex { dst: rest, obj: pair, key: one })?;
+            self.emit(Instr::Move { dst: unmatched, src: rest })?;
+
+            let is_none = self.alloc()?;
+            self.emit(Instr::Eq { dst: is_none, a: matched, b: none })?;
+            let skip = self.jump_if_true(is_none)?;
+
+            if let Some(name) = &h.name {
+                self.control_depth += 1;
+                self.store_name(name.as_str(), matched)?;
+                self.control_depth -= 1;
+            }
+            self.push_exc(matched)?;
             let (k2, v2) = (self.alloc()?, self.alloc()?);
             let body_fin = self.emit(Instr::PushFinally {
                 target: 0,
@@ -1289,7 +1457,28 @@ impl<'a> Emitter<'a> {
                 val_reg: v2,
             })?;
             self.enter_handler(None);
-            self.block_suite(&h.body, depth)?;
+            let h_ereg = self.alloc()?;
+            let h_push = self.emit(Instr::PushHandler {
+                catch_target: 0,
+                catch_reg: h_ereg,
+            })?;
+            self.enter_handler(Some(h_push));
+            self.except_star_depth += 1;
+            let body_res = self.block_suite(&h.body, depth);
+            self.except_star_depth -= 1;
+            body_res?;
+            self.emit(Instr::PopHandler)?;
+            self.leave_handler();
+            let h_done = self.jump()?;
+
+            let h_catch = self.here();
+            self.patch(h_push, h_catch)?;
+            self.forget_line();
+            let thrown = self.caught(h_ereg)?;
+            self.helper("eg_record", &[reraised, raised, matched, thrown])?;
+
+            let h_after = self.here();
+            self.patch(h_done, h_after)?;
             self.emit(Instr::LoadInt { dst: k2, val: 0 })?;
             self.emit(Instr::PopFinally)?;
             self.leave_handler();
@@ -1300,18 +1489,25 @@ impl<'a> Emitter<'a> {
             if let Some(name) = &h.name {
                 self.delete_name(name.as_str())?;
             }
-            self.emit(Instr::EndFinally {
-                kind_reg: k2,
-                val_reg: v2,
-            })?;
-            to_finally.push(self.leave_normally(has_finally, kind_reg)?);
-            if let Some(next) = next {
-                let here = self.here();
-                self.patch(next, here)?;
-            }
+            self.emit(Instr::EndFinally { kind_reg: k2, val_reg: v2 })?;
+
+            let next = self.here();
+            self.patch(skip, next)?;
         }
-        // No handler matched: re-raise (through the finally, if any).
-        self.emit(Instr::Throw { src: ereg })?;
+
+        self.emit(Instr::LoadInt { dst: ok2, val: 0 })?;
+        self.emit(Instr::PopFinally)?;
+        self.leave_handler();
+        let orig_fin_at = self.here();
+        self.patch(orig_fin, orig_fin_at)?;
+        self.forget_line();
+        self.pop_exc()?;
+        self.emit(Instr::EndFinally { kind_reg: ok2, val_reg: ov2 })?;
+
+        // Re-raise any unhandled remainder and/or handler-raised exceptions.
+        self.helper("eg_finish", &[orig, unmatched, reraised, raised])?;
+        to_finally.push(self.leave_normally(has_finally, kind_reg)?);
+
         if let Some(fin_push) = fin_push {
             self.leave_handler();
             let fin = self.here();
@@ -1464,31 +1660,295 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
-    // ---- def / class / import ------------------------------------------------------------
+    fn async_for_stmt(&mut self, stmt: &ast::Stmt, s: &ast::StmtAsyncFor, depth: usize) -> R<()> {
+        let iterable = self.expr(&s.iter, depth + 1)?;
+        let ait = self.helper("aiter", &[iterable])?;
+        let head = self.here();
+        self.forget_line();
+        let ereg = self.alloc()?;
+        let push = self.emit(Instr::PushHandler {
+            catch_target: 0,
+            catch_reg: ereg,
+        })?;
+        self.enter_handler(Some(push));
+        let aw = self.helper("anext_awaitable", &[ait])?;
+        let item = self.await_value(stmt, aw)?;
+        self.emit(Instr::PopHandler)?;
+        self.leave_handler();
+        let got = self.jump()?;
+        let catch = self.here();
+        self.patch(push, catch)?;
+        self.forget_line();
+        let is_stop = self.helper("is_stop_async", &[ereg])?;
+        let exhausted = self.jump_if_true(is_stop)?;
+        self.emit(Instr::Throw { src: ereg })?;
+        let body_start = self.here();
+        self.patch(got, body_start)?;
+        self.loops.push(LoopCtx {
+            head,
+            breaks: Vec::new(),
+            continues: Vec::new(),
+            handler_depth: self.handler_depth,
+            except_star_depth: self.except_star_depth,
+        });
+        let saved = self.definite.clone();
+        self.control_depth += 1;
+        self.assign(&s.target, item, depth + 1)?;
+        self.suite(&s.body, depth + 1)?;
+        self.control_depth -= 1;
+        self.definite = saved;
+        self.forget_line();
+        self.emit(Instr::Jump { target: head })?;
+        self.finish_loop(vec![exhausted], &s.orelse, depth + 1)
+    }
+
+    fn async_with_stmt(&mut self, stmt: &ast::Stmt, items: &[ast::WithItem], body: &[ast::Stmt], depth: usize) -> R<()> {
+        let Some((first, rest)) = items.split_first() else {
+            return self.block_suite(body, depth);
+        };
+        let mgr = self.expr(&first.context_expr, depth)?;
+        let pair = self.helper("awithenter", &[mgr])?;
+        let zero = self.small_int(0)?;
+        let one = self.small_int(1)?;
+        let aexit = self.alloc()?;
+        self.emit(Instr::GetIndex {
+            dst: aexit,
+            obj: pair,
+            key: zero,
+        })?;
+        let entered_aw = self.alloc()?;
+        self.emit(Instr::GetIndex {
+            dst: entered_aw,
+            obj: pair,
+            key: one,
+        })?;
+        let entered = self.await_value(stmt, entered_aw)?;
+        let done = self.boolean(false)?;
+        let (kind_reg, val_reg) = (self.alloc()?, self.alloc()?);
+        let fin_push = self.emit(Instr::PushFinally {
+            target: 0,
+            kind_reg,
+            val_reg,
+        })?;
+        self.enter_handler(None);
+        let ereg = self.alloc()?;
+        let push = self.emit(Instr::PushHandler {
+            catch_target: 0,
+            catch_reg: ereg,
+        })?;
+        self.enter_handler(Some(push));
+        let saved = self.definite.clone();
+        if let Some(target) = &first.optional_vars {
+            self.assign(target, entered, depth)?;
+        }
+        if rest.is_empty() {
+            self.block_suite(body, depth)?;
+        } else {
+            self.async_with_stmt(stmt, rest, body, depth)?;
+        }
+        self.definite = saved;
+        self.emit(Instr::PopHandler)?;
+        self.leave_handler();
+        let j1 = self.leave_normally(true, kind_reg)?;
+        let catch = self.here();
+        self.patch(push, catch)?;
+        self.emit(Instr::LoadBool {
+            dst: done,
+            val: true,
+        })?;
+        let ex_pair = self.helper("awithexit_call", &[aexit, ereg, self.r_line])?;
+        let exc = self.alloc()?;
+        self.emit(Instr::GetIndex { dst: exc, obj: ex_pair, key: zero })?;
+        let exit_aw = self.alloc()?;
+        self.emit(Instr::GetIndex { dst: exit_aw, obj: ex_pair, key: one })?;
+        self.push_exc(exc)?;
+        let (k2, v2) = (self.alloc()?, self.alloc()?);
+        let ex_fin = self.emit(Instr::PushFinally {
+            target: 0,
+            kind_reg: k2,
+            val_reg: v2,
+        })?;
+        self.enter_handler(None);
+        let res = self.await_value(stmt, exit_aw)?;
+        self.emit(Instr::LoadInt { dst: k2, val: 0 })?;
+        self.emit(Instr::PopFinally)?;
+        self.leave_handler();
+        let ex_fin_at = self.here();
+        self.patch(ex_fin, ex_fin_at)?;
+        self.pop_exc()?;
+        self.emit(Instr::EndFinally { kind_reg: k2, val_reg: v2 })?;
+        self.helper("awithexit_check", &[res, ereg])?;
+        let j2 = self.leave_normally(true, kind_reg)?;
+        self.leave_handler();
+        let fin = self.here();
+        self.patch(fin_push, fin)?;
+        self.patch(j1, fin)?;
+        self.patch(j2, fin)?;
+        let skip = self.jump_if_true(done)?;
+        let norm_aw = self.helper("awithexit_normal", &[aexit])?;
+        self.await_value(stmt, norm_aw)?;
+        let here = self.here();
+        self.patch(skip, here)?;
+        self.emit(Instr::EndFinally { kind_reg, val_reg })?;
+        self.forget_line();
+        Ok(())
+    }
+
+    // ---- def / class / type alias / import ----------------------------------------------
+    /// Compile a zero-argument lazy thunk (for PEP 695/696 bounds, defaults,
+    /// and `type` alias values) into a Python function object.
+    fn make_lazy_thunk(
+        &mut self,
+        key: ScopeKey,
+        node: &impl Ranged,
+        name: &str,
+        expr: &ast::Expr,
+        depth: usize,
+    ) -> R<Reg> {
+        let qualname = format!("{}.{name}", self.qualname);
+        let (fid, child) = self.compile_child_key(key, node, name, qualname.clone(), None, |e| {
+            let v = e.expr(expr, depth)?;
+            e.emit(Instr::Return { src: v })?;
+            Ok(())
+        })?;
+        let empty = self.array(&[])?;
+        let none = self.none()?;
+        self.make_function(fid, child, name, &qualname, None, empty, empty, empty, none)
+    }
+
+    /// Create and bind PEP 695/696 type parameters inside a `TypeParams` scope;
+    /// returns the Python `tuple` of created type parameter objects.
+    fn emit_type_params(&mut self, tps: &[ast::TypeParam], depth: usize) -> R<Reg> {
+        let mut regs = Vec::with_capacity(tps.len());
+        for tp in tps {
+            let (name, obj) = match tp {
+                ast::TypeParam::TypeVar(tv) => {
+                    let name = tv.name.as_str();
+                    let name_r = self.string(name)?;
+                    let (bound_fn, is_constraints) = match &tv.bound {
+                        Some(b) => {
+                            let r = b.range();
+                            let k = ScopeKey::TypeBound(u32::from(r.start()), u32::from(r.end()));
+                            let thunk = self.make_lazy_thunk(k, b.as_ref(), "<type-bound>", b, depth)?;
+                            let is_c = matches!(b.as_ref(), ast::Expr::Tuple(_));
+                            (thunk, is_c)
+                        }
+                        None => (self.none()?, false),
+                    };
+                    let is_c_r = self.boolean(is_constraints)?;
+                    let default_fn = match &tv.default {
+                        Some(d) => {
+                            let r = d.range();
+                            let k = ScopeKey::TypeDefault(u32::from(r.start()), u32::from(r.end()));
+                            self.make_lazy_thunk(k, d.as_ref(), "<type-default>", d, depth)?
+                        }
+                        None => self.none()?,
+                    };
+                    let obj = self.helper("typevar", &[name_r, bound_fn, is_c_r, default_fn])?;
+                    (name, obj)
+                }
+                ast::TypeParam::ParamSpec(ps) => {
+                    let name = ps.name.as_str();
+                    let name_r = self.string(name)?;
+                    let default_fn = match &ps.default {
+                        Some(d) => {
+                            let r = d.range();
+                            let k = ScopeKey::TypeDefault(u32::from(r.start()), u32::from(r.end()));
+                            self.make_lazy_thunk(k, d.as_ref(), "<type-default>", d, depth)?
+                        }
+                        None => self.none()?,
+                    };
+                    let obj = self.helper("paramspec", &[name_r, default_fn])?;
+                    (name, obj)
+                }
+                ast::TypeParam::TypeVarTuple(tvt) => {
+                    let name = tvt.name.as_str();
+                    let name_r = self.string(name)?;
+                    let default_fn = match &tvt.default {
+                        Some(d) => {
+                            let r = d.range();
+                            let k = ScopeKey::TypeDefault(u32::from(r.start()), u32::from(r.end()));
+                            self.make_lazy_thunk(k, d.as_ref(), "<type-default>", d, depth)?
+                        }
+                        None => self.none()?,
+                    };
+                    let obj = self.helper("typevartuple", &[name_r, default_fn])?;
+                    (name, obj)
+                }
+            };
+            self.store_name(name, obj)?;
+            regs.push(obj);
+        }
+        let arr = self.array(&regs)?;
+        self.helper("tuple", &[arr])
+    }
+
+    fn type_alias_stmt(&mut self, stmt: &ast::Stmt, s: &ast::StmtTypeAlias, depth: usize) -> R<()> {
+        let alias_name = match s.name.as_ref() {
+            ast::Expr::Name(n) => n.id.as_str(),
+            other => return Err(self.error(other, "invalid type alias target")),
+        };
+        let range = stmt.range();
+        let (start, end) = (u32::from(range.start()), u32::from(range.end()));
+        let alias = if s.type_params.is_empty() {
+            let val_fn = self.make_lazy_thunk(
+                ScopeKey::TypeAliasValue(start, end),
+                stmt,
+                alias_name,
+                &s.value,
+                depth,
+            )?;
+            let name_r = self.string(alias_name)?;
+            let empty_arr = self.array(&[])?;
+            let empty_tup = self.helper("tuple", &[empty_arr])?;
+            let mod_r = self.string(self.module_name())?;
+            self.helper("typealias", &[name_r, val_fn, empty_tup, mod_r])?
+        } else {
+            let qualname = self.qualname.clone();
+            let (wfid, wchild) = self.compile_child_key(
+                ScopeKey::TypeParams(start, end),
+                stmt,
+                alias_name,
+                qualname.clone(),
+                None,
+                |e| {
+                    let tps = e.emit_type_params(&s.type_params, depth)?;
+                    let val_fn = e.make_lazy_thunk(
+                        ScopeKey::TypeAliasValue(start, end),
+                        stmt,
+                        alias_name,
+                        &s.value,
+                        depth,
+                    )?;
+                    let name_r = e.string(alias_name)?;
+                    let mod_r = e.string(e.module_name())?;
+                    let res = e.helper("typealias", &[name_r, val_fn, tps, mod_r])?;
+                    e.emit(Instr::Return { src: res })?;
+                    Ok(())
+                },
+            )?;
+            let empty = self.array(&[])?;
+            let none = self.none()?;
+            let wrapper = self.make_function(wfid, wchild, alias_name, &qualname, None, empty, empty, empty, none)?;
+            self.call_value(wrapper, empty, none)?
+        };
+        self.store_name(alias_name, alias)
+    }
+
     #[allow(clippy::too_many_arguments)]
-    pub fn function_def(
+    fn build_function_body(
         &mut self,
         node: &impl Ranged,
         name: &str,
+        qualname: &str,
         args: &ast::Arguments,
         body: &[ast::Stmt],
-        decorators: &[ast::Expr],
         returns: Option<&ast::Expr>,
+        defaults: Reg,
+        kw_names: Reg,
+        kw_values: Reg,
         depth: usize,
     ) -> R<Reg> {
-        self.validate_args(node, args)?;
-        let mut decorator_regs = Vec::new();
-        for d in decorators {
-            decorator_regs.push(self.expr(d, depth)?);
-        }
-        let (defaults, kw_names, kw_values) = self.defaults_of(args)?;
-        let qualname = if self.kind() == ScopeKind::Module {
-            name.to_owned()
-        } else if self.kind() == ScopeKind::Class {
-            format!("{}.{}", self.qualname, name)
-        } else {
-            format!("{}.<locals>.{}", self.qualname, name)
-        };
         let doc = match body.first() {
             Some(ast::Stmt::Expr(e)) => match e.value.as_ref() {
                 ast::Expr::Constant(c) => match &c.value {
@@ -1500,8 +1960,9 @@ impl<'a> Emitter<'a> {
             _ => self.none()?,
         };
         let line = self.line_of(node);
-        let (func_id, child) = self.compile_child(node, name, qualname.clone(), Some(args), |e| {
+        let (func_id, child) = self.compile_child(node, name, qualname.to_owned(), Some(args), |e| {
             e.hoist_ints(body)?;
+            e.scan_int_locals(body);
             e.frame_guard(line, |e| {
                 e.suite(body, depth)?;
                 let none = e.none()?;
@@ -1509,18 +1970,18 @@ impl<'a> Emitter<'a> {
                 Ok(())
             })
         })?;
-        let mut value = self.make_function(
+        let value = self.make_function(
             func_id,
             child,
             name,
-            &qualname,
+            qualname,
             Some(args),
             defaults,
             kw_names,
             kw_values,
             doc,
         )?;
-        // Annotations evaluate in the defining scope, into `__annotations__`.
+        // Annotations evaluate in the defining scope (or TypeParams scope), into `__annotations__`.
         let mut ann_names = Vec::new();
         let mut ann_values = Vec::new();
         for a in args
@@ -1549,6 +2010,56 @@ impl<'a> Emitter<'a> {
             let values = self.array(&ann_values)?;
             self.helper("fannotate", &[value, names, values])?;
         }
+        Ok(value)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn function_def(
+        &mut self,
+        node: &impl Ranged,
+        name: &str,
+        args: &ast::Arguments,
+        body: &[ast::Stmt],
+        decorators: &[ast::Expr],
+        returns: Option<&ast::Expr>,
+        type_params: &[ast::TypeParam],
+        depth: usize,
+    ) -> R<Reg> {
+        self.validate_args(node, args)?;
+        let mut decorator_regs = Vec::new();
+        for d in decorators {
+            decorator_regs.push(self.expr(d, depth)?);
+        }
+        let (defaults, kw_names, kw_values) = self.defaults_of(args)?;
+        let qualname = if self.kind() == ScopeKind::Module {
+            name.to_owned()
+        } else if self.kind() == ScopeKind::Class {
+            format!("{}.{}", self.qualname, name)
+        } else {
+            format!("{}.<locals>.{}", self.qualname, name)
+        };
+        let mut value = if type_params.is_empty() {
+            self.build_function_body(node, name, &qualname, args, body, returns, defaults, kw_names, kw_values, depth)?
+        } else {
+            let range = node.range();
+            let key = ScopeKey::TypeParams(u32::from(range.start()), u32::from(range.end()));
+            let qn = qualname.clone();
+            let (wfid, wchild) = self.compile_child_key(key, node, name, qn.clone(), None, |e| {
+                let tps = e.emit_type_params(type_params, depth)?;
+                let d_r = e.load_name(".d")?;
+                let kn_r = e.load_name(".kn")?;
+                let kv_r = e.load_name(".kv")?;
+                let fn_obj = e.build_function_body(node, name, &qn, args, body, returns, d_r, kn_r, kv_r, depth)?;
+                e.helper("set_type_params", &[fn_obj, tps])?;
+                e.emit(Instr::Return { src: fn_obj })?;
+                Ok(())
+            })?;
+            let empty = self.array(&[])?;
+            let none = self.none()?;
+            let wrapper = self.make_function(wfid, wchild, name, &qualname, None, empty, empty, empty, none)?;
+            let call_args = self.array(&[defaults, kw_names, kw_values])?;
+            self.call_value(wrapper, call_args, none)?
+        };
         for d in decorator_regs.into_iter().rev() {
             let args = self.array(&[value])?;
             let null = self.none()?;
@@ -1557,34 +2068,30 @@ impl<'a> Emitter<'a> {
         Ok(value)
     }
 
-    fn class_def(&mut self, node: &ast::Stmt, s: &ast::StmtClassDef, depth: usize) -> R<Reg> {
-        if !s.type_params.is_empty() {
-            return Err(self.error(node, "class type parameters are not supported"));
-        }
-        let mut decorator_regs = Vec::new();
-        for d in &s.decorator_list {
-            decorator_regs.push(self.expr(d, depth)?);
-        }
-        let mut bases = Vec::new();
+    fn build_class_body(
+        &mut self,
+        node: &ast::Stmt,
+        s: &ast::StmtClassDef,
+        qualname: &str,
+        tps: Option<Reg>,
+        depth: usize,
+    ) -> R<Reg> {
+        let mut bases_regs = Vec::new();
         for b in &s.bases {
-            bases.push(self.expr(b, depth)?);
+            bases_regs.push(self.expr(b, depth)?);
         }
-        let bases = self.array(&bases)?;
+        let mut bases = self.array(&bases_regs)?;
+        if let Some(tp_reg) = tps {
+            bases = self.helper("generic_base", &[bases, tp_reg])?;
+        }
         let kwargs = self.keywords(&s.keywords, depth)?;
-        let qualname = if self.kind() == ScopeKind::Module {
-            s.name.to_string()
-        } else if self.kind() == ScopeKind::Class {
-            format!("{}.{}", self.qualname, s.name)
-        } else {
-            format!("{}.<locals>.{}", self.qualname, s.name)
-        };
         let ns = self.helper("newns", &[])?;
         let name_r = self.string(s.name.as_str())?;
-        let qual_r = self.string(&qualname)?;
+        let qual_r = self.string(qualname)?;
         let module_r = self.string(self.module_name())?;
         self.helper("nsinit", &[ns, name_r, qual_r, module_r])?;
         let (func_id, child) =
-            self.compile_child(node, s.name.as_str(), qualname.clone(), None, |e| {
+            self.compile_child(node, s.name.as_str(), qualname.to_owned(), None, |e| {
                 if let Some(ast::Stmt::Expr(first)) = s.body.first() {
                     if let ast::Expr::Constant(c) = first.value.as_ref() {
                         if let ast::Constant::Str(doc) = &c.value {
@@ -1609,7 +2116,7 @@ impl<'a> Emitter<'a> {
             func_id,
             child,
             s.name.as_str(),
-            &qualname,
+            qualname,
             None,
             empty,
             empty,
@@ -1617,7 +2124,41 @@ impl<'a> Emitter<'a> {
             none,
         )?;
         let cls = self.helper("buildclass", &[body_fn, ns, name_r, bases, kwargs])?;
-        let mut value = cls;
+        if let Some(tp_reg) = tps {
+            self.helper("set_type_params", &[cls, tp_reg])?;
+        }
+        Ok(cls)
+    }
+
+    fn class_def(&mut self, node: &ast::Stmt, s: &ast::StmtClassDef, depth: usize) -> R<Reg> {
+        let mut decorator_regs = Vec::new();
+        for d in &s.decorator_list {
+            decorator_regs.push(self.expr(d, depth)?);
+        }
+        let qualname = if self.kind() == ScopeKind::Module {
+            s.name.to_string()
+        } else if self.kind() == ScopeKind::Class {
+            format!("{}.{}", self.qualname, s.name)
+        } else {
+            format!("{}.<locals>.{}", self.qualname, s.name)
+        };
+        let mut value = if s.type_params.is_empty() {
+            self.build_class_body(node, s, &qualname, None, depth)?
+        } else {
+            let range = node.range();
+            let key = ScopeKey::TypeParams(u32::from(range.start()), u32::from(range.end()));
+            let qn = qualname.clone();
+            let (wfid, wchild) = self.compile_child_key(key, node, s.name.as_str(), qn.clone(), None, |e| {
+                let tps = e.emit_type_params(&s.type_params, depth)?;
+                let cls = e.build_class_body(node, s, &qn, Some(tps), depth)?;
+                e.emit(Instr::Return { src: cls })?;
+                Ok(())
+            })?;
+            let empty = self.array(&[])?;
+            let none = self.none()?;
+            let wrapper = self.make_function(wfid, wchild, s.name.as_str(), &qualname, None, empty, empty, empty, none)?;
+            self.call_value(wrapper, empty, none)?
+        };
         for d in decorator_regs.into_iter().rev() {
             let args = self.array(&[value])?;
             let null = self.none()?;
@@ -1695,6 +2236,477 @@ impl<'a> Emitter<'a> {
             return Ok(None);
         };
         self.cell_get(cell).map(Some)
+    }
+
+    /// Identify function-local variables (not parameters, cells, or deleted)
+    /// whose every assignment in `body` is an `int` literal or safe int-only
+    /// augmented assignment (`+=`/`-=`/`*=`/`&=`/`|=`/`^=`).
+    pub fn scan_int_locals(&mut self, body: &[ast::Stmt]) {
+        if !self.in_function() {
+            return;
+        }
+        let scope = self.scope();
+        let mut candidates: BTreeSet<String> = scope
+            .symbols
+            .iter()
+            .filter(|(name, kind)| {
+                **kind == SymKind::Local
+                    && !name.starts_with('\u{0}')
+                    && !scope.params.contains(*name)
+                    && !scope.deleted.contains(*name)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        if candidates.is_empty() {
+            return;
+        }
+        let mut seen_int = BTreeSet::<String>::new();
+        fn kill_target(e: &ast::Expr, cands: &mut BTreeSet<String>) {
+            match e {
+                ast::Expr::Name(n) => {
+                    cands.remove(n.id.as_str());
+                }
+                ast::Expr::Tuple(t) => {
+                    for x in &t.elts {
+                        kill_target(x, cands);
+                    }
+                }
+                ast::Expr::List(l) => {
+                    for x in &l.elts {
+                        kill_target(x, cands);
+                    }
+                }
+                ast::Expr::Starred(s) => kill_target(&s.value, cands),
+                _ => {}
+            }
+        }
+        fn kill_pat(p: &ast::Pattern, cands: &mut BTreeSet<String>) {
+            match p {
+                ast::Pattern::MatchAs(m) => {
+                    if let Some(n) = &m.name {
+                        cands.remove(n.as_str());
+                    }
+                    if let Some(sub) = &m.pattern {
+                        kill_pat(sub, cands);
+                    }
+                }
+                ast::Pattern::MatchOr(m) => {
+                    for sub in &m.patterns {
+                        kill_pat(sub, cands);
+                    }
+                }
+                ast::Pattern::MatchSequence(m) => {
+                    for sub in &m.patterns {
+                        kill_pat(sub, cands);
+                    }
+                }
+                ast::Pattern::MatchMapping(m) => {
+                    for sub in &m.patterns {
+                        kill_pat(sub, cands);
+                    }
+                    if let Some(r) = &m.rest {
+                        cands.remove(r.as_str());
+                    }
+                }
+                ast::Pattern::MatchClass(m) => {
+                    for sub in &m.patterns {
+                        kill_pat(sub, cands);
+                    }
+                    for sub in &m.kwd_patterns {
+                        kill_pat(sub, cands);
+                    }
+                }
+                ast::Pattern::MatchStar(m) => {
+                    if let Some(n) = &m.name {
+                        cands.remove(n.as_str());
+                    }
+                }
+                _ => {}
+            }
+        }
+        fn scan_expr(e: &ast::Expr, cands: &mut BTreeSet<String>) {
+            match e {
+                ast::Expr::NamedExpr(n) => {
+                    kill_target(&n.target, cands);
+                    scan_expr(&n.value, cands);
+                }
+                ast::Expr::Lambda(_) => {}
+                ast::Expr::BoolOp(b) => {
+                    for v in &b.values {
+                        scan_expr(v, cands);
+                    }
+                }
+                ast::Expr::BinOp(b) => {
+                    scan_expr(&b.left, cands);
+                    scan_expr(&b.right, cands);
+                }
+                ast::Expr::UnaryOp(u) => scan_expr(&u.operand, cands),
+                ast::Expr::IfExp(i) => {
+                    scan_expr(&i.test, cands);
+                    scan_expr(&i.body, cands);
+                    scan_expr(&i.orelse, cands);
+                }
+                ast::Expr::Dict(d) => {
+                    for k in d.keys.iter().flatten() {
+                        scan_expr(k, cands);
+                    }
+                    for v in &d.values {
+                        scan_expr(v, cands);
+                    }
+                }
+                ast::Expr::Set(s) => {
+                    for v in &s.elts {
+                        scan_expr(v, cands);
+                    }
+                }
+                ast::Expr::ListComp(c) => {
+                    scan_expr(&c.elt, cands);
+                    for g in &c.generators {
+                        scan_expr(&g.iter, cands);
+                        for f in &g.ifs {
+                            scan_expr(f, cands);
+                        }
+                    }
+                }
+                ast::Expr::SetComp(c) => {
+                    scan_expr(&c.elt, cands);
+                    for g in &c.generators {
+                        scan_expr(&g.iter, cands);
+                        for f in &g.ifs {
+                            scan_expr(f, cands);
+                        }
+                    }
+                }
+                ast::Expr::GeneratorExp(c) => {
+                    scan_expr(&c.elt, cands);
+                    for g in &c.generators {
+                        scan_expr(&g.iter, cands);
+                        for f in &g.ifs {
+                            scan_expr(f, cands);
+                        }
+                    }
+                }
+                ast::Expr::DictComp(c) => {
+                    scan_expr(&c.key, cands);
+                    scan_expr(&c.value, cands);
+                    for g in &c.generators {
+                        scan_expr(&g.iter, cands);
+                        for f in &g.ifs {
+                            scan_expr(f, cands);
+                        }
+                    }
+                }
+                ast::Expr::Await(a) => scan_expr(&a.value, cands),
+                ast::Expr::Yield(y) => {
+                    if let Some(v) = &y.value {
+                        scan_expr(v, cands);
+                    }
+                }
+                ast::Expr::YieldFrom(y) => scan_expr(&y.value, cands),
+                ast::Expr::Compare(c) => {
+                    scan_expr(&c.left, cands);
+                    for v in &c.comparators {
+                        scan_expr(v, cands);
+                    }
+                }
+                ast::Expr::Call(c) => {
+                    scan_expr(&c.func, cands);
+                    for a in &c.args {
+                        scan_expr(a, cands);
+                    }
+                    for k in &c.keywords {
+                        scan_expr(&k.value, cands);
+                    }
+                }
+                ast::Expr::FormattedValue(f) => {
+                    scan_expr(&f.value, cands);
+                    if let Some(s) = &f.format_spec {
+                        scan_expr(s, cands);
+                    }
+                }
+                ast::Expr::JoinedStr(j) => {
+                    for v in &j.values {
+                        scan_expr(v, cands);
+                    }
+                }
+                ast::Expr::Attribute(a) => scan_expr(&a.value, cands),
+                ast::Expr::Subscript(s) => {
+                    scan_expr(&s.value, cands);
+                    scan_expr(&s.slice, cands);
+                }
+                ast::Expr::Starred(s) => scan_expr(&s.value, cands),
+                ast::Expr::List(l) => {
+                    for v in &l.elts {
+                        scan_expr(v, cands);
+                    }
+                }
+                ast::Expr::Tuple(t) => {
+                    for v in &t.elts {
+                        scan_expr(v, cands);
+                    }
+                }
+                ast::Expr::Slice(s) => {
+                    if let Some(v) = &s.lower {
+                        scan_expr(v, cands);
+                    }
+                    if let Some(v) = &s.upper {
+                        scan_expr(v, cands);
+                    }
+                    if let Some(v) = &s.step {
+                        scan_expr(v, cands);
+                    }
+                }
+                _ => {}
+            }
+        }
+        fn scan_stmts(stmts: &[ast::Stmt], cands: &mut BTreeSet<String>, seen_int: &mut BTreeSet<String>) {
+            for s in stmts {
+                match s {
+                    ast::Stmt::FunctionDef(f) => {
+                        cands.remove(f.name.as_str());
+                        for d in &f.decorator_list {
+                            scan_expr(d, cands);
+                        }
+                    }
+                    ast::Stmt::AsyncFunctionDef(f) => {
+                        cands.remove(f.name.as_str());
+                        for d in &f.decorator_list {
+                            scan_expr(d, cands);
+                        }
+                    }
+                    ast::Stmt::ClassDef(c) => {
+                        cands.remove(c.name.as_str());
+                        for d in &c.decorator_list {
+                            scan_expr(d, cands);
+                        }
+                        for b in &c.bases {
+                            scan_expr(b, cands);
+                        }
+                        for k in &c.keywords {
+                            scan_expr(&k.value, cands);
+                        }
+                    }
+                    ast::Stmt::Assign(a) => {
+                        scan_expr(&a.value, cands);
+                        if a.targets.len() == 1 && known(&a.value) == Known::Int {
+                            if let ast::Expr::Name(n) = &a.targets[0] {
+                                seen_int.insert(n.id.to_string());
+                                continue;
+                            }
+                        }
+                        for t in &a.targets {
+                            kill_target(t, cands);
+                        }
+                    }
+                    ast::Stmt::AugAssign(a) => {
+                        scan_expr(&a.value, cands);
+                        let safe_op = matches!(
+                            a.op,
+                            ast::Operator::Add
+                                | ast::Operator::Sub
+                                | ast::Operator::Mult
+                                | ast::Operator::BitAnd
+                                | ast::Operator::BitOr
+                                | ast::Operator::BitXor
+                        );
+                        if safe_op && known(&a.value) == Known::Int {
+                            if let ast::Expr::Name(_) = a.target.as_ref() {
+                                continue;
+                            }
+                        }
+                        kill_target(&a.target, cands);
+                    }
+                    ast::Stmt::AnnAssign(a) => {
+                        if let Some(v) = &a.value {
+                            scan_expr(v, cands);
+                            if known(v) == Known::Int {
+                                if let ast::Expr::Name(n) = a.target.as_ref() {
+                                    seen_int.insert(n.id.to_string());
+                                    continue;
+                                }
+                            }
+                        }
+                        kill_target(&a.target, cands);
+                    }
+                    ast::Stmt::For(f) => {
+                        scan_expr(&f.iter, cands);
+                        kill_target(&f.target, cands);
+                        scan_stmts(&f.body, cands, seen_int);
+                        scan_stmts(&f.orelse, cands, seen_int);
+                    }
+                    ast::Stmt::AsyncFor(f) => {
+                        scan_expr(&f.iter, cands);
+                        kill_target(&f.target, cands);
+                        scan_stmts(&f.body, cands, seen_int);
+                        scan_stmts(&f.orelse, cands, seen_int);
+                    }
+                    ast::Stmt::While(w) => {
+                        scan_expr(&w.test, cands);
+                        scan_stmts(&w.body, cands, seen_int);
+                        scan_stmts(&w.orelse, cands, seen_int);
+                    }
+                    ast::Stmt::If(i) => {
+                        scan_expr(&i.test, cands);
+                        scan_stmts(&i.body, cands, seen_int);
+                        scan_stmts(&i.orelse, cands, seen_int);
+                    }
+                    ast::Stmt::With(w) => {
+                        for item in &w.items {
+                            scan_expr(&item.context_expr, cands);
+                            if let Some(t) = &item.optional_vars {
+                                kill_target(t, cands);
+                            }
+                        }
+                        scan_stmts(&w.body, cands, seen_int);
+                    }
+                    ast::Stmt::AsyncWith(w) => {
+                        for item in &w.items {
+                            scan_expr(&item.context_expr, cands);
+                            if let Some(t) = &item.optional_vars {
+                                kill_target(t, cands);
+                            }
+                        }
+                        scan_stmts(&w.body, cands, seen_int);
+                    }
+                    ast::Stmt::Try(t) => {
+                        scan_stmts(&t.body, cands, seen_int);
+                        for h in &t.handlers {
+                            let ast::ExceptHandler::ExceptHandler(h) = h;
+                            if let Some(ty) = &h.type_ {
+                                scan_expr(ty, cands);
+                            }
+                            if let Some(n) = &h.name {
+                                cands.remove(n.as_str());
+                            }
+                            scan_stmts(&h.body, cands, seen_int);
+                        }
+                        scan_stmts(&t.orelse, cands, seen_int);
+                        scan_stmts(&t.finalbody, cands, seen_int);
+                    }
+                    ast::Stmt::TryStar(t) => {
+                        scan_stmts(&t.body, cands, seen_int);
+                        for h in &t.handlers {
+                            let ast::ExceptHandler::ExceptHandler(h) = h;
+                            if let Some(ty) = &h.type_ {
+                                scan_expr(ty, cands);
+                            }
+                            if let Some(n) = &h.name {
+                                cands.remove(n.as_str());
+                            }
+                            scan_stmts(&h.body, cands, seen_int);
+                        }
+                        scan_stmts(&t.orelse, cands, seen_int);
+                        scan_stmts(&t.finalbody, cands, seen_int);
+                    }
+                    ast::Stmt::Match(m) => {
+                        scan_expr(&m.subject, cands);
+                        for c in &m.cases {
+                            kill_pat(&c.pattern, cands);
+                            if let Some(g) = &c.guard {
+                                scan_expr(g, cands);
+                            }
+                            scan_stmts(&c.body, cands, seen_int);
+                        }
+                    }
+                    ast::Stmt::Import(i) => {
+                        for a in &i.names {
+                            let b = a.asname.as_ref().map(|n| n.as_str()).unwrap_or_else(|| a.name.split('.').next().unwrap_or(""));
+                            cands.remove(b);
+                        }
+                    }
+                    ast::Stmt::ImportFrom(i) => {
+                        for a in &i.names {
+                            let b = a.asname.as_ref().map(|n| n.as_str()).unwrap_or(a.name.as_str());
+                            cands.remove(b);
+                        }
+                    }
+                    ast::Stmt::Delete(d) => {
+                        for t in &d.targets {
+                            kill_target(t, cands);
+                        }
+                    }
+                    ast::Stmt::Return(r) => {
+                        if let Some(v) = &r.value {
+                            scan_expr(v, cands);
+                        }
+                    }
+                    ast::Stmt::Raise(r) => {
+                        if let Some(v) = &r.exc {
+                            scan_expr(v, cands);
+                        }
+                        if let Some(v) = &r.cause {
+                            scan_expr(v, cands);
+                        }
+                    }
+                    ast::Stmt::Assert(a) => {
+                        scan_expr(&a.test, cands);
+                        if let Some(m) = &a.msg {
+                            scan_expr(m, cands);
+                        }
+                    }
+                    ast::Stmt::Expr(e) => scan_expr(&e.value, cands),
+                    ast::Stmt::TypeAlias(t) => {
+                        if let ast::Expr::Name(n) = t.name.as_ref() {
+                            cands.remove(n.id.as_str());
+                        }
+                    }
+                    ast::Stmt::Pass(_) | ast::Stmt::Break(_) | ast::Stmt::Continue(_) | ast::Stmt::Global(_) | ast::Stmt::Nonlocal(_) => {}
+                }
+            }
+        }
+        scan_stmts(body, &mut candidates, &mut seen_int);
+        self.int_locals = candidates.intersection(&seen_int).cloned().collect();
+    }
+
+    /// True if every statement in `body` is provably non-raising and cannot
+    /// observe `sys.exc_info()` / `EXCSTACK` (no calls, raises, yields, awaits,
+    /// attribute/subscript ops, or global lookups).
+    fn is_trivial_except_body(&self, body: &[ast::Stmt]) -> bool {
+        let pure_expr = |e: &ast::Expr| -> bool {
+            match e {
+                ast::Expr::Constant(c) => matches!(
+                    c.value,
+                    ast::Constant::None
+                        | ast::Constant::Bool(_)
+                        | ast::Constant::Int(_)
+                        | ast::Constant::Float(_)
+                        | ast::Constant::Str(_)
+                ),
+                ast::Expr::Name(n) => {
+                    let id = n.id.as_str();
+                    self.sym_kind(id) == SymKind::Local && self.is_definite(id)
+                }
+                _ => false,
+            }
+        };
+        body.iter().all(|s| match s {
+            ast::Stmt::Pass(_) | ast::Stmt::Break(_) | ast::Stmt::Continue(_) => true,
+            ast::Stmt::Return(r) => r.value.as_deref().is_none_or(&pure_expr),
+            ast::Stmt::Assign(a) => {
+                pure_expr(&a.value)
+                    && a.targets.iter().all(|t| matches!(t, ast::Expr::Name(n) if self.sym_kind(n.id.as_str()) == SymKind::Local))
+            }
+            ast::Stmt::AugAssign(a) => {
+                let safe_op = matches!(
+                    a.op,
+                    ast::Operator::Add
+                        | ast::Operator::Sub
+                        | ast::Operator::Mult
+                        | ast::Operator::BitAnd
+                        | ast::Operator::BitOr
+                        | ast::Operator::BitXor
+                );
+                safe_op
+                    && known(&a.value) == Known::Int
+                    && matches!(a.target.as_ref(), ast::Expr::Name(n) if {
+                        let id = n.id.as_str();
+                        self.sym_kind(id) == SymKind::Local
+                            && self.is_definite(id)
+                            && self.int_locals.contains(id)
+                    })
+            }
+            _ => false,
+        })
     }
 }
 

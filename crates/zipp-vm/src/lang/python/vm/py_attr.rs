@@ -17,6 +17,9 @@ use super::*;
 use crate::heap::HeapObj;
 use crate::value::Value;
 
+#[path = "py_leaf.rs"]
+pub(super) mod py_leaf;
+
 
 /// A `PyIc` key stamp (`d` of an `ATTR_GET` / `ATTR_SET` / `GLOBAL` /
 /// `BUILTIN` entry): the key is the site's cached constant, never freed.
@@ -281,6 +284,45 @@ impl<'p> Vm<'p> {
         (!p.is_generator && !p.is_async && p.rest_reg.is_none() && p.param_count as usize >= argc).then_some(PyAccessor { fid, closure, f, entry })
     }
 
+    /// For the JIT's inline `PyGetAttr` / `PySetAttr` (`py_jit_attr`): when an
+    /// `ATTR_PROP` site's accessor is a trivial `return self.<attr>` getter or
+    /// `self.<attr> = val` setter whose own inner attribute site at ip 1 holds
+    /// a layout-mode entry (`ATTR_GET_L` / `ATTR_SET_L`) for the same class
+    /// and stamp, return `(layout, slot)` so the JIT can inline it directly.
+    #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
+    pub(super) fn py_prop_inline_plan(&self, cls: Value, set: bool, e: &PyIc) -> Option<(u32, u32)> {
+        use crate::bytecode::Instr;
+        if super::prof_py::on() {
+            return None;
+        }
+        let ty = self.py_rt.as_deref()?.ty?;
+        let (table, entry_key, argc, want) = if set {
+            (ty.sp, "c2", 2usize, ic::ATTR_SET_L)
+        } else {
+            (ty.gp, "c1", 1usize, ic::ATTR_GET_L)
+        };
+        let a = self.py_accessor(cls, table, e, entry_key, argc)?;
+        let p = self.func(a.fid as usize);
+        let simple = if set {
+            p.param_count == 2
+                && matches!(*p.code.as_slice(),
+                    [Instr::LoadGlobal { .. }, Instr::PySetAttr { obj: 1, val: 2, .. }, Instr::LoadNull { dst }, Instr::Return { src }, ..] if src == dst)
+        } else {
+            p.param_count == 1
+                && matches!(*p.code.as_slice(),
+                    [Instr::LoadGlobal { .. }, Instr::PyGetAttr { dst, obj: 1, .. }, Instr::Return { src }, ..] if src == dst && dst > 1)
+        };
+        if !simple {
+            return None;
+        }
+        let inner = self.py_ic(a.fid, 1);
+        if inner.kind == want && inner.a == e.a && inner.hver == e.hver && inner.c == e.c {
+            Some((inner.d, inner.pos))
+        } else {
+            None
+        }
+    }
+
     /// What the frame of the property accessor `a` would answer for the
     /// instance `o`, without the frame, when the accessor's code is only
     /// `return self.<name>` (a getter, `value` `None`) or `self.<name> =
@@ -304,19 +346,21 @@ impl<'p> Vm<'p> {
                 let simple = p.param_count == 1
                     && matches!(*p.code.as_slice(),
                         [Instr::LoadGlobal { .. }, Instr::PyGetAttr { dst, obj: 1, .. }, Instr::Return { src }, ..] if src == dst && dst > 1);
-                if !simple {
-                    return None;
+                if simple {
+                    if let Some(v) = self.py_attr_get_hit(a.fid, 1, o) {
+                        return Some(v);
+                    }
                 }
-                self.py_attr_get_hit(a.fid, 1, o)
+                self.py_leaf_exec(a.fid, a.f, &[o])
             }
             Some(v) => {
                 let simple = p.param_count == 2
                     && matches!(*p.code.as_slice(),
                         [Instr::LoadGlobal { .. }, Instr::PySetAttr { obj: 1, val: 2, .. }, Instr::LoadNull { dst }, Instr::Return { src }, ..] if src == dst);
-                if !simple {
-                    return None;
+                if simple && self.py_attr_set_hit(a.fid, 1, o, v) {
+                    return Some(Value::UNDEFINED);
                 }
-                self.py_attr_set_hit(a.fid, 1, o, v).then_some(Value::UNDEFINED)
+                self.py_leaf_exec(a.fid, a.f, &[o, v]).map(|_| Value::UNDEFINED)
             }
         }
     }
@@ -352,6 +396,37 @@ impl<'p> Vm<'p> {
         let Some((mut l, mut n)) = self.py_attrs_of(dict) else {
             return false;
         };
+        // Fast path: cached fresh-instance append plan (layout 0, len 0 -> final_layout).
+        if l == 0 && n == 0 {
+            if let Some(plan) = self
+                .py_rt
+                .as_deref()
+                .and_then(|p| p.store_plans.get(fid as usize).copied().flatten())
+            {
+                if plan.cls_bits == cls.bits()
+                    && (plan.count as usize) == stores
+                    && self.py_cls_stamp_ok(cls, plan.cls_hver, plan.cls_ver)
+                {
+                    let di = dict.heap_index();
+                    let mut vals = [Value::UNDEFINED; MAX];
+                    for i in 0..stores {
+                        let Some(&v) = args.get(plan.arg_idx[i] as usize) else {
+                            return false;
+                        };
+                        vals[i] = v;
+                        if v.is_heap() {
+                            self.heap.write_barrier_val(di, v);
+                        }
+                    }
+                    if let HeapObj::PyAttrs { layout, vals: dst } = self.heap.get_mut(di) {
+                        dst.extend_from_slice(&vals[..stores]);
+                        *layout = plan.final_layout;
+                    }
+                    self.heap.refresh_mirror(di);
+                    return true;
+                }
+            }
+        }
         let mut ents = [PyIc::default(); MAX];
         // The stores' entries, their sites' in a row (one look-up of the
         // code object's table).
@@ -359,12 +434,18 @@ impl<'p> Vm<'p> {
             return false;
         }
         let mut vals = [Value::UNDEFINED; MAX];
+        let mut arg_idx = [0u8; MAX];
         let mut stamp: Option<(u32, u64)> = None;
+        let mut all_fresh_append = l == 0 && n == 0;
+        let mut single_stamp = true;
         for i in 0..stores {
             let Some(&Instr::PySetAttr { val, .. }) = code.get(1 + i) else {
                 return false;
             };
-            let Some(&v) = (val as usize).checked_sub(1).and_then(|at| args.get(at)) else {
+            let Some(at) = (val as usize).checked_sub(1) else {
+                return false;
+            };
+            let Some(&v) = args.get(at) else {
                 return false;
             };
             let e = ents[i];
@@ -372,13 +453,18 @@ impl<'p> Vm<'p> {
                 return false;
             }
             if stamp != Some((e.hver, e.c)) {
+                if stamp.is_some() {
+                    single_stamp = false;
+                }
                 if !self.py_cls_stamp_ok(cls, e.hver, e.c) {
                     return false;
                 }
                 stamp = Some((e.hver, e.c));
             }
             match e.kind {
-                ic::ATTR_SET_L if l == e.d && (e.pos as usize) < n => {}
+                ic::ATTR_SET_L if l == e.d && (e.pos as usize) < n => {
+                    all_fresh_append = false;
+                }
                 ic::ATTR_APPEND_L if (l, n) == (e.d, e.pos as usize) => {
                     l = e.b as u32;
                     n += 1;
@@ -386,21 +472,42 @@ impl<'p> Vm<'p> {
                 _ => return false,
             }
             vals[i] = v;
+            arg_idx[i] = at as u8;
+        }
+        if all_fresh_append && single_stamp {
+            if let (Some((cls_hver, cls_ver)), Some(p)) = (stamp, self.py_rt.as_deref_mut()) {
+                let f = fid as usize;
+                if p.store_plans.len() <= f {
+                    p.store_plans.resize(f + 1, None);
+                }
+                p.store_plans[f] = Some(super::py_rt::StorePlan {
+                    cls_bits: cls.bits(),
+                    cls_hver,
+                    cls_ver,
+                    final_layout: l,
+                    count: stores as u8,
+                    arg_idx,
+                });
+            }
         }
         // The stores, as `py_attrs_put` / `py_attrs_push` make them, with
         // the storage's mirror republished once, after the last append (no
         // code runs between them).
         let di = dict.heap_index();
+        for &v in &vals[..stores] {
+            if v.is_heap() {
+                self.heap.write_barrier_val(di, v);
+            }
+        }
         let mut appended = false;
-        for (e, &v) in ents[..stores].iter().zip(&vals[..stores]) {
-            self.heap.write_barrier_val(di, v);
-            if let HeapObj::PyAttrs { layout, vals } = self.heap.get_mut(di) {
+        if let HeapObj::PyAttrs { layout, vals: dst } = self.heap.get_mut(di) {
+            for (e, &v) in ents[..stores].iter().zip(&vals[..stores]) {
                 if e.kind == ic::ATTR_SET_L {
-                    if let Some(x) = vals.get_mut(e.pos as usize) {
+                    if let Some(x) = dst.get_mut(e.pos as usize) {
                         *x = v;
                     }
                 } else {
-                    vals.push(v);
+                    dst.push(v);
                     *layout = e.b as u32;
                     appended = true;
                 }
@@ -421,7 +528,7 @@ impl<'p> Vm<'p> {
     #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
     #[inline(never)]
     pub(super) fn py_store_call_site(&mut self, e: &PyIc, f: Value, base: usize, arg_base: u16, argc: u16) -> bool {
-        if e.kind != ic::CALL_ENTRY || e.c == 0 || e.a != f.bits() || !f.is_heap() {
+        if e.kind != ic::CALL_STORE || e.c == 0 || e.a != f.bits() || !f.is_heap() {
             return false;
         }
         // The entry's `c`: the code object's id, register count and
@@ -451,7 +558,7 @@ impl<'p> Vm<'p> {
     /// ([`py_store_body_scan`]), found once per code object.
     #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
     #[inline]
-    fn py_store_body(&mut self, fid: u32) -> Option<usize> {
+    pub(super) fn py_store_body(&mut self, fid: u32) -> Option<usize> {
         let f = fid as usize;
         let known = self.py_rt.as_deref()?.store_bodies.get(f).copied().unwrap_or(0);
         let s = if known != 0 {
@@ -1138,6 +1245,11 @@ impl<'p> Vm<'p> {
         match e.kind {
             ic::METHOD if e.d != 0 && p.inst_shape != crate::shape::DICT => Some((p.inst_shape, Value::from_bits(e.b), e.d)),
             ic::BUILTIN_METHOD => {
+                if cls.bits() == p.t_str.bits() {
+                    // Sentinel `shape::DICT` marks a primitive `str` receiver
+                    // (`FID_MIRROR_STR` in `emit_py_method_inline`).
+                    return Some((crate::shape::DICT, Value::from_bits(e.b), 0));
+                }
                 let shape = if cls.bits() == p.t_list.bits() || cls.bits() == p.t_tuple.bits() {
                     p.seq_shape
                 } else if cls.bits() == p.t_dict.bits() {
@@ -1441,32 +1553,73 @@ impl<'p> Vm<'p> {
     }
 
     fn py_smfind_hit(&mut self, cls: Value, this_self: Value, name: Value, rt: Value) -> Option<(Value, usize)> {
-        if !this_self.is_heap() || !name.is_heap() {
+        if !this_self.is_heap() || !name.is_heap() || !cls.is_heap() {
             return None;
         }
-        let slot = self.py_rt_for(rt)?.mself_slot?;
+        let (slot, inst_shape, ver_slot) = {
+            let p = self.py_rt_for(rt)?;
+            (p.mself_slot?, p.inst_shape, p.ty.map(|ty| ty.ver))
+        };
         let si = this_self.heap_index();
-        // `self.isType !== true`: a record without an own `isType` of true
-        // (a type's is its own data property).
-        match self.heap.get(si) {
+        // Fast path: plain instance record of `inst_shape` cannot have `isType`,
+        // and its `cls` is at slot 0.
+        let t = match self.heap.get(si) {
+            HeapObj::Object(m) if !m.is_ctor && inst_shape != crate::shape::DICT && m.shape() == inst_shape => m.val_at(0),
             HeapObj::Object(m) if !m.is_ctor => {
                 if m.pos("isType").is_some_and(|s| m.is_accessor_at(s) || m.val_at(s) == Value::TRUE) {
                     return None;
                 }
+                self.py_cls_of(this_self)?
             }
             _ => return None,
-        }
-        let t = self.py_cls_of(this_self)?;
+        };
         if !t.is_heap() {
             return None;
         }
-        let gs = self.py_hint_field(hint::GS, t.heap_index(), "gs")?;
-        if !gs.is_heap() || !self.heap.is_str_like(name.heap_index()) {
+        let ci = cls.heap_index();
+        let ti = t.heap_index();
+        let ni = name.heap_index();
+        let (cls_hver, t_hver, name_ver) = (
+            self.heap.version_of(ci),
+            self.heap.version_of(ti),
+            self.heap.version_of(ni),
+        );
+        let t_ver = ver_slot.and_then(|vs| match self.heap.get(ti) {
+            HeapObj::Object(m) if !m.is_ctor && vs < m.slot_len() => Some(m.val_at(vs).bits()),
+            _ => None,
+        });
+        // Check direct-mapped `smfind_cache` keyed by `(cls, t, name)` stamps.
+        let cache_idx = ((ci.wrapping_mul(31) ^ ti.wrapping_mul(17) ^ ni) as usize)
+            & (super::py_rt::SMFIND_CACHE_LEN - 1);
+        if let (Some(tv), Some(p)) = (t_ver, self.py_rt.as_deref()) {
+            let ce = p.smfind_cache[cache_idx].get();
+            if ce.f != 0
+                && ce.cls == cls.bits()
+                && ce.cls_hver == cls_hver
+                && ce.t == t.bits()
+                && ce.t_hver == t_hver
+                && ce.t_ver == tv
+                && ce.name == name.bits()
+                && ce.name_ver == name_ver
+            {
+                if let HeapObj::Object(r) = self.heap.get(rt.heap_index()) {
+                    if slot < r.slot_len() && super::py_rt::key_eq(r.key_at(slot), "mself") {
+                        let a = r.attr_at(slot);
+                        if !a.accessor && a.writable {
+                            return Some((Value::from_bits(ce.f), slot));
+                        }
+                    }
+                }
+                return None;
+            }
+        }
+        let gs = self.py_hint_field(hint::GS, ti, "gs")?;
+        if !gs.is_heap() || !self.heap.is_str_like(ni) {
             return None;
         }
-        self.heap.flatten(name.heap_index());
+        self.heap.flatten(ni);
         let hit = {
-            let HeapObj::Str(s) = self.heap.get(name.heap_index()) else {
+            let HeapObj::Str(s) = self.heap.get(ni) else {
                 return None;
             };
             let key = std::str::from_utf8(s.as_bytes()).ok()?;
@@ -1485,12 +1638,25 @@ impl<'p> Vm<'p> {
         let HeapObj::Object(r) = self.heap.get(rt.heap_index()) else {
             return None;
         };
-        if slot >= r.slot_len() || r.key_at(slot) != "mself" {
+        if slot >= r.slot_len() || !super::py_rt::key_eq(r.key_at(slot), "mself") {
             return None;
         }
         let a = r.attr_at(slot);
         if a.accessor || !a.writable {
             return None;
+        }
+        if let (Some(tv), Some(p)) = (t_ver, self.py_rt.as_deref()) {
+            let name_ver_now = self.heap.version_of(ni);
+            p.smfind_cache[cache_idx].set(super::py_rt::SmfindEntry {
+                cls: cls.bits(),
+                cls_hver,
+                t: t.bits(),
+                t_hver,
+                t_ver: tv,
+                name: name.bits(),
+                name_ver: name_ver_now,
+                f: f.bits(),
+            });
         }
         Some((f, slot))
     }

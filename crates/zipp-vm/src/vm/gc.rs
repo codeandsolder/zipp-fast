@@ -407,6 +407,18 @@ impl Vm<'_> {
     #[inline]
     pub(crate) fn register_weak_container(&mut self, idx: u32) {
         self.weak_containers.insert(idx);
+        match self.heap.get(idx) {
+            HeapObj::WeakMap { keys, .. } if !keys.is_empty() => {
+                self.weak_young_entries.push((idx, usize::MAX));
+            }
+            HeapObj::WeakSet(items) if !items.is_empty() => {
+                self.weak_young_entries.push((idx, usize::MAX));
+            }
+            HeapObj::WeakRef(_) | HeapObj::FinalizationRegistry(_) => {
+                self.weak_nonmap_containers.push(idx);
+            }
+            _ => {}
+        }
     }
 
     /// End an ECMAScript job, release its kept weak targets, and expose the
@@ -580,14 +592,31 @@ impl Vm<'_> {
         }
         self.const_string_fresh.clear();
         // Enumeration's key strings: one per distinct key text, bounded.
-        for &v in self.key_str_cache.values() {
-            root_val!(v);
+        // A minor roots only entries added since the last collection.
+        if minor {
+            for &i in &self.key_str_fresh {
+                root_idx!(i);
+            }
+        } else {
+            for &v in self.key_str_cache.values() {
+                root_val!(v);
+            }
         }
+        self.key_str_fresh.clear();
         // Strings interned at region-compile time whose bits are embedded in
         // native code (LoadConst immediates) — see `jit_const_strings`.
+        // Append-only, so a minor roots only the newly appended suffix.
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-        for &v in &self.jit_const_strings {
-            root_val!(v);
+        {
+            let start = if minor {
+                self.jit_const_strings_old.min(self.jit_const_strings.len())
+            } else {
+                0
+            };
+            for &v in &self.jit_const_strings[start..] {
+                root_val!(v);
+            }
+            self.jit_const_strings_old = self.jit_const_strings.len();
         }
         // Frame-free Tier-C activations have no `Frame` entry. Trace exact
         // closure/callee identities for the current activation AND every
@@ -870,9 +899,16 @@ impl Vm<'_> {
                 }
             }
         }
-        for &p in self.prototypes.values() {
-            root_idx!(p);
+        if minor {
+            for &p in &self.prototypes_fresh {
+                root_idx!(p);
+            }
+        } else {
+            for &p in self.prototypes.values() {
+                root_idx!(p);
+            }
         }
+        self.prototypes_fresh.clear();
         for (disposers, _) in self.dispose_stacks.values() {
             for &v in disposers {
                 root_val!(v);
@@ -1175,7 +1211,7 @@ impl Vm<'_> {
         self.regexp_exact_source.retain_marked(&marks);
         // Collection hash index (u32 hash tags -> u32 slots, no Values): drop
         // a dead Map/Set's index so a recycled slot can't inherit a stale one.
-        self.collection_index.retain_marked(&marks);
+        self.collection_index.retain(|&k, _| marks[k as usize]);
         self.async_stacks.retain_marked(&marks);
         self.shadow_realms.retain_marked(&marks);
         self.realm_globals.retain_marked(&marks);
@@ -1279,13 +1315,13 @@ impl Vm<'_> {
             }
         }
         self.drain_mark_stack(&mut marks, &mut stack, n);
-        self.trace_ephemeron_fixpoint(&mut marks, &mut stack, n);
+        self.trace_ephemeron_fixpoint_minor(&mut marks, &mut stack, n);
         let t_trace = gcstats::now(stats);
         if nursery_verify::enabled() {
             // Before the sweep, while the young log is intact.
             self.verify_minor_marks(&marks, n);
         }
-        self.process_weak_references(&marks, n);
+        self.process_weak_references_minor(&marks, n);
         let log_len = self.heap.young_log().len();
         let allocated = self.heap.young_allocated();
         // `free_slot` appends every reclaimed young slot to `Heap::free`.
@@ -1306,12 +1342,14 @@ impl Vm<'_> {
             self.heap.adapt_young_budget(log_len - swept, allocated);
         }
         // A minor prunes only what it FREED (see `prune_freed`); the
-        // whole-table retains are the major's.
+        // whole-table retains are the major's. Recycled `ready` slots are
+        // plain shaped `HeapObj::Object`s (`ready_reset` verified), so they
+        // only need the plain-object side-table subset.
         let freed = self.heap.take_free();
         self.prune_freed(&freed[free_before..], &marks);
         self.heap.restore_free(freed);
         let ready = self.heap.take_young();
-        self.prune_freed(&ready, &marks);
+        self.prune_freed_ready(&ready, &marks);
         self.heap.restore_young(ready);
         // W10: restore the freed slots to TRUE (their tombstones are OLD) —
         // survivors were already set true by the trace — and the vector is
@@ -1552,10 +1590,44 @@ impl Vm<'_> {
         prune_map!(self.closure_new_target);
         prune_map!(self.dispose_stacks);
         prune_map!(self.regexp_exact_source);
-        prune_map!(self.collection_index);
+        self.collection_index.prune_freed(freed, live_bits);
         prune_set!(self.async_stacks);
         prune_set!(self.shadow_realms);
         prune_map!(self.realm_globals);
+        prune_set!(self.weak_containers);
+    }
+
+    /// Subset of [`Self::prune_freed`] for slots recycled in-place by
+    /// `Heap::ready_recycle`: every occupant was a plain shaped
+    /// `HeapObj::Object` (`ready_reset` verified), so it can never appear in
+    /// function/array/regexp/collection/buffer/error/closure/module side tables.
+    fn prune_freed_ready(&mut self, freed: &[u32], live_bits: &[bool]) {
+        if freed.is_empty() {
+            return;
+        }
+        debug_assert!(freed.iter().all(|&i| !live_bits[i as usize]));
+        self.proto_of.prune_freed(freed, live_bits);
+        self.this_tdz.prune_freed(freed, live_bits);
+        self.super_called.prune_freed(freed, live_bits);
+        self.super_this.prune_freed(freed, live_bits);
+        self.pending_ctor_proto.prune_freed(freed, live_bits);
+        self.class_proto_owner.prune_freed(freed, live_bits);
+        self.zdt_tz.prune_freed(freed, live_bits);
+        self.temporal_cal.prune_freed(freed, live_bits);
+        if !self.deleted_callable_intrinsics.is_empty() {
+            self.deleted_callable_intrinsics
+                .retain(|&(k, _)| live_bits[k as usize]);
+        }
+        if !self.brand_owner.is_empty() {
+            let owners = self.brand_owner.len();
+            self.brand_owner.retain(|_, &mut c| live_bits[c as usize]);
+            if self.brand_owner.len() != owners {
+                self.private_memo.fill(super::values::PrivateMemo::EMPTY);
+                self.private_epoch = self.private_epoch.wrapping_add(1);
+            }
+        }
+        self.private_fields.prune_freed(freed, live_bits);
+        self.dispose_stacks.prune_freed(freed, live_bits);
     }
 
     /// Check every live object's shape against its actual layout, panicking on
@@ -1808,6 +1880,259 @@ impl Vm<'_> {
                 .push_back(Microtask::FinalizationCleanup { registry });
         }
         self.weak_containers = weak_containers;
+        self.weak_young_entries.clear();
+        if !self.weak_nonmap_containers.is_empty() {
+            self.weak_nonmap_containers
+                .retain(|&raw_idx| (raw_idx as usize) < n && marks[raw_idx as usize]);
+        }
+    }
+
+    /// Minor-GC ephemeron fixpoint: entries present before this epoch in OLD
+    /// `WeakMap`s already have OLD keys and OLD values (pre-marked in `marks`),
+    /// so a minor only inspects entries recorded in `weak_young_entries` (plus
+    /// any newly-marked young `WeakMap` popped during the fixpoint loop).
+    fn trace_ephemeron_fixpoint_minor(
+        &self,
+        marks: &mut [bool],
+        stack: &mut Vec<u32>,
+        n: usize,
+    ) {
+        if self.weak_young_entries.is_empty() {
+            return;
+        }
+        let mut pending: rustc_hash::FxHashMap<u32, Vec<Value>> =
+            rustc_hash::FxHashMap::default();
+        let mut scanned_maps: rustc_hash::FxHashSet<u32> = rustc_hash::FxHashSet::default();
+
+        for &(map, pos) in &self.weak_young_entries {
+            let idx = map as usize;
+            if idx >= n || !marks[idx] {
+                continue;
+            }
+            if pos == usize::MAX {
+                if scanned_maps.insert(map) {
+                    self.queue_weak_map_edges_fx(map, marks, stack, n, &mut pending);
+                }
+            } else if !scanned_maps.contains(&map) {
+                if let HeapObj::WeakMap { keys, vals } = self.heap.get(map) {
+                    if pos < keys.len() {
+                        let key = keys[pos];
+                        let value = vals[pos];
+                        if key.is_heap() {
+                            let key_idx = key.heap_index() as usize;
+                            if key_idx < n {
+                                if marks[key_idx] {
+                                    Self::mark_weak_value(value, marks, stack, n);
+                                } else {
+                                    pending.entry(key.heap_index()).or_default().push(value);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        while let Some(idx) = stack.pop() {
+            if let Some(values) = pending.remove(&idx) {
+                for value in values {
+                    Self::mark_weak_value(value, marks, stack, n);
+                }
+            }
+            self.trace_edges(idx, marks, stack, n);
+            if self.weak_containers.contains(&idx)
+                && scanned_maps.insert(idx)
+                && matches!(self.heap.get(idx), HeapObj::WeakMap { .. })
+            {
+                self.queue_weak_map_edges_fx(idx, marks, stack, n, &mut pending);
+            }
+        }
+    }
+
+    fn queue_weak_map_edges_fx(
+        &self,
+        map: u32,
+        marks: &mut [bool],
+        stack: &mut Vec<u32>,
+        n: usize,
+        pending: &mut rustc_hash::FxHashMap<u32, Vec<Value>>,
+    ) {
+        let HeapObj::WeakMap { keys, vals } = self.heap.get(map) else {
+            return;
+        };
+        for (&key, &value) in keys.iter().zip(vals.iter()) {
+            if !key.is_heap() {
+                continue;
+            }
+            let key_idx = key.heap_index() as usize;
+            if key_idx >= n {
+                continue;
+            }
+            if marks[key_idx] {
+                Self::mark_weak_value(value, marks, stack, n);
+            } else {
+                pending.entry(key.heap_index()).or_default().push(value);
+            }
+        }
+    }
+
+    /// Minor-GC weak-reference sweep: old entries of `WeakMap`/`WeakSet` have
+    /// OLD keys (pre-marked in `marks`) and cannot die in a minor, so only
+    /// entries in `weak_young_entries` (plus `weak_nonmap_containers` for
+    /// `WeakRef` / `FinalizationRegistry`) are visited.
+    fn process_weak_references_minor(&mut self, marks: &[bool], n: usize) {
+        let young_entries = std::mem::take(&mut self.weak_young_entries);
+        let mut dead_indexed: Vec<(u32, Value, usize)> = Vec::new();
+        let mut full_scanned: rustc_hash::FxHashSet<u32> = rustc_hash::FxHashSet::default();
+        let dead = |v: Value| {
+            v.is_heap() && ((v.heap_index() as usize) >= n || !marks[v.heap_index() as usize])
+        };
+
+        for (raw_idx, pos) in young_entries {
+            let idx = raw_idx as usize;
+            if idx >= n || !marks[idx] || full_scanned.contains(&raw_idx) {
+                continue;
+            }
+            let indexed = self.collection_index.contains_key(&raw_idx);
+            if !indexed || pos == usize::MAX {
+                full_scanned.insert(raw_idx);
+                match self.heap.get_mut(raw_idx) {
+                    HeapObj::WeakMap { keys, vals } if indexed => {
+                        for p in 0..keys.len() {
+                            if dead(keys[p]) {
+                                dead_indexed.push((raw_idx, keys[p], p));
+                                keys[p] = Value::HOLE;
+                                vals[p] = Value::UNDEFINED;
+                            }
+                        }
+                    }
+                    HeapObj::WeakSet(items) if indexed => {
+                        for p in 0..items.len() {
+                            if dead(items[p]) {
+                                dead_indexed.push((raw_idx, items[p], p));
+                                items[p] = Value::HOLE;
+                            }
+                        }
+                    }
+                    HeapObj::WeakMap { keys, vals } => {
+                        let mut write = 0usize;
+                        for read in 0..keys.len() {
+                            let key = keys[read];
+                            if key.is_heap() && !dead(key) {
+                                if write != read {
+                                    keys[write] = key;
+                                    vals[write] = vals[read];
+                                }
+                                write += 1;
+                            }
+                        }
+                        keys.truncate(write);
+                        vals.truncate(write);
+                    }
+                    HeapObj::WeakSet(items) => {
+                        items.retain(|&value| value.is_heap() && !dead(value));
+                    }
+                    _ => {}
+                }
+            } else {
+                match self.heap.get_mut(raw_idx) {
+                    HeapObj::WeakMap { keys, vals } => {
+                        if pos < keys.len() && dead(keys[pos]) {
+                            dead_indexed.push((raw_idx, keys[pos], pos));
+                            keys[pos] = Value::HOLE;
+                            vals[pos] = Value::UNDEFINED;
+                        }
+                    }
+                    HeapObj::WeakSet(items) => {
+                        if pos < items.len() && dead(items[pos]) {
+                            dead_indexed.push((raw_idx, items[pos], pos));
+                            items[pos] = Value::HOLE;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let mut cleanup_jobs = Vec::new();
+        if !self.weak_nonmap_containers.is_empty() {
+            let mut nonmap = std::mem::take(&mut self.weak_nonmap_containers);
+            nonmap.retain(|&raw_idx| {
+                let idx = raw_idx as usize;
+                idx < n
+                    && marks[idx]
+                    && matches!(
+                        self.heap.get(raw_idx),
+                        HeapObj::WeakRef(_) | HeapObj::FinalizationRegistry(_)
+                    )
+            });
+            for &raw_idx in &nonmap {
+                match self.heap.get_mut(raw_idx) {
+                    HeapObj::WeakRef(target) => {
+                        if target.is_heap()
+                            && ((target.heap_index() as usize) >= n
+                                || !marks[target.heap_index() as usize])
+                        {
+                            *target = Value::UNDEFINED;
+                        }
+                    }
+                    HeapObj::FinalizationRegistry(fr) => {
+                        let crate::heap::FinRegData {
+                            cells,
+                            cleared,
+                            cleanup_queued,
+                            ..
+                        } = &mut **fr;
+                        let token_is_dead = |token: Value| {
+                            token.is_heap()
+                                && ((token.heap_index() as usize) >= n
+                                    || !marks[token.heap_index() as usize])
+                        };
+                        for cell in cleared.iter_mut() {
+                            if token_is_dead(cell.token) {
+                                cell.token = Value::UNDEFINED;
+                            }
+                        }
+                        let mut pos = cells.len();
+                        while pos != 0 {
+                            pos -= 1;
+                            let target_is_dead = cells[pos].target.is_heap()
+                                && ((cells[pos].target.heap_index() as usize) >= n
+                                    || !marks[cells[pos].target.heap_index() as usize]);
+                            if token_is_dead(cells[pos].token) {
+                                cells[pos].token = Value::UNDEFINED;
+                            }
+                            if target_is_dead {
+                                let mut cell = cells.swap_remove(pos);
+                                cell.target = Value::UNDEFINED;
+                                cleared.push(cell);
+                            }
+                        }
+                        if !cleared.is_empty() && !*cleanup_queued {
+                            *cleanup_queued = true;
+                            cleanup_jobs.push(raw_idx);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            self.weak_nonmap_containers = nonmap;
+        }
+
+        let mut touched: Vec<u32> = Vec::new();
+        for (idx, key, pos) in dead_indexed {
+            self.coll_index_remove(idx, key, pos);
+            if touched.last() != Some(&idx) {
+                touched.push(idx);
+            }
+        }
+        for idx in touched {
+            self.weak_coll_compact_if_sparse(idx);
+        }
+        for registry in cleanup_jobs {
+            self.microtasks
+                .push_back(Microtask::FinalizationCleanup { registry });
+        }
     }
 
     /// Push every heap reference held by object `idx` onto the mark stack.
@@ -1852,6 +2177,11 @@ impl Vm<'_> {
                     let i = v.heap_index() as usize;
                     if i < n && !marks[i] {
                         marks[i] = true;
+                        #[cfg(feature = "jit")]
+                        if !self.heap.is_flat_str_mirror(i) {
+                            stack.push(v.heap_index());
+                        }
+                        #[cfg(not(feature = "jit"))]
                         stack.push(v.heap_index());
                     }
                 }
@@ -2108,11 +2438,15 @@ impl Vm<'_> {
         // Trace them only when that function is itself reachable. Rooting every
         // value from `mark_roots` makes a dead object-literal method cycle
         // immortal: home -> method (own property), method -> home (this table).
-        if let Some(&home) = self.closure_home.get(&idx) {
-            m_val!(home);
+        if !self.closure_home.is_empty() {
+            if let Some(&home) = self.closure_home.get(&idx) {
+                m_val!(home);
+            }
         }
-        if let Some(&new_target) = self.closure_new_target.get(&idx) {
-            m_val!(new_target);
+        if !self.closure_new_target.is_empty() {
+            if let Some(&new_target) = self.closure_new_target.get(&idx) {
+                m_val!(new_target);
+            }
         }
     }
 }

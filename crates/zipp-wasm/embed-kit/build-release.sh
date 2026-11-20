@@ -23,12 +23,12 @@ export ZIPP_SOURCE_SHA="${ZIPP_SOURCE_SHA:-$(git rev-parse HEAD)}"
 version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' ../../Cargo.toml)"
 target=wasm32-unknown-unknown
 
-declare -A FEATURES=([javascript]="" [lite]="--features lite" [javascript-typescript]="--features typescript" [javascript-python]="--features python" [javascript-python-base]="--features python-base")
-declare -A PROFILE=([javascript]=release [lite]=lite [javascript-typescript]=release [javascript-python]=release [javascript-python-base]=release)
-declare -A STACK=([javascript]=1048576 [lite]=1048576 [javascript-typescript]=1048576 [javascript-python]=16777216 [javascript-python-base]=16777216)
-declare -A OPTIMIZE=([javascript]="" [lite]="--prefer-raw-size" [javascript-typescript]="" [javascript-python]="" [javascript-python-base]="")
+declare -A FEATURES=([javascript]="" [lite]="--features lite" [javascript-typescript]="--features typescript" [javascript-python]="--features python" [javascript-python-base]="--features python-base" [javascript-php]="--features php" [javascript-rust]="--features rust")
+declare -A PROFILE=([javascript]=release [lite]=lite [javascript-typescript]=release [javascript-python]=release [javascript-python-base]=release [javascript-php]=release [javascript-rust]=release)
+declare -A STACK=([javascript]=1048576 [lite]=1048576 [javascript-typescript]=1048576 [javascript-python]=16777216 [javascript-python-base]=16777216 [javascript-php]=16777216 [javascript-rust]=16777216)
+declare -A OPTIMIZE=([javascript]="" [lite]="--prefer-raw-size" [javascript-typescript]="" [javascript-python]="" [javascript-python-base]="" [javascript-php]="" [javascript-rust]="")
 
-for v in javascript lite javascript-typescript javascript-python javascript-python-base; do
+for v in javascript lite javascript-typescript javascript-python javascript-python-base javascript-php javascript-rust; do
   echo "=== $v"
   profile="${PROFILE[$v]}"
   dir="target/release-variants/$v"
@@ -58,6 +58,7 @@ for v in javascript lite javascript-typescript javascript-python javascript-pyth
       node tests/node/python-javascript.cjs
       ;;
     javascript-python-base) node tests/node/python-frontend.cjs && node tests/node/sort-semantics.cjs ;;
+    javascript-php|javascript-rust) node tests/node/run-boundary-suite.cjs ;;
   esac
   # shellcheck disable=SC2086
   bash "$here/package-variant.sh" "$v" "$built" "$pkg/zipp_wasm_bg.wasm" "$out" ${OPTIMIZE[$v]}

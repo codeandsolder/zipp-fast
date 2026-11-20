@@ -233,7 +233,14 @@ impl<'s> Parser<'s> {
             // `ConciseBody : { FunctionBody }` — a fresh statement region, so
             // `[In]` is on inside it however the arrow was reached.
             self.ctx.in_ = true;
-            ArrowBody::Block(self.parse_fn_body_with_params(Some(&params))?)
+            #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+            let allow_skip = !is_async
+                && !self.ctx.super_prop
+                && !self.ctx.super_call
+                && !self.ctx.in_field_init;
+            #[cfg(any(feature = "meter-only", feature = "safe-sandbox"))]
+            let allow_skip = false;
+            ArrowBody::Block(self.parse_fn_body_with_params_opt(Some(&params), allow_skip)?)
         } else if self.ts() {
             // TypeScript reads which names a reference reaches (import
             // elision), so the parameters are in scope here as in a block body.
@@ -253,7 +260,18 @@ impl<'s> Parser<'s> {
             // in a `for` head the `in` of `for (x => 0 in 1;;)` can belong
             // neither to the body nor to a relational expression headed by an
             // arrow — it is a SyntaxError, not an `in` test on a function.
-            ArrowBody::Expr(Box::new(self.parse_assign_full()?))
+            #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+            let saved_fn_depth = {
+                let d = self.fn_depth;
+                self.fn_depth = d.saturating_add(1);
+                d
+            };
+            let expr = self.parse_assign_full();
+            #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+            {
+                self.fn_depth = saved_fn_depth;
+            }
+            ArrowBody::Expr(Box::new(expr?))
         };
         self.leave_fn_code(fn_code);
         self.ctx = saved;

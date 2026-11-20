@@ -115,7 +115,7 @@ pub(crate) extern "win64" fn jit_new_object(vm: *mut core::ffi::c_void, hint: u3
     if vm.is_null() || hint > u16::MAX as u32 {
         return crate::codegen::SELF_CALL_DEOPT;
     }
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    crate::vm::helpers_misc::catch_effectful_jit_u64(|| {
         let vm = unsafe { &mut *(vm as *mut Vm) };
         vm.maybe_gc();
         let idx = vm
@@ -125,14 +125,7 @@ pub(crate) extern "win64" fn jit_new_object(vm: *mut core::ffi::c_void, hint: u3
             ))));
         vm.realm_born(idx, vm.obj_proto);
         Value::heap(idx).bits()
-    })) {
-        Ok(bits) => bits,
-        // A panic after Heap::alloc/realm_born may have committed VM-internal
-        // state.  Returning the replay sentinel would violate its pure-prefix
-        // contract, so this impossible/corruption edge is deliberately
-        // fail-stop instead of re-executing NewObject.
-        Err(_) => std::process::abort(),
-    }
+    })
 }
 
 /// Allocate the ordinary object described by one immutable compiler key plan.
@@ -146,7 +139,7 @@ pub(crate) extern "win64" fn jit_new_planned_object(
     if vm.is_null() {
         return crate::codegen::SELF_CALL_DEOPT;
     }
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    crate::vm::helpers_misc::catch_effectful_jit_u64(|| {
         let vm = unsafe { &mut *(vm as *mut Vm) };
         let func_id = (packed >> 32) as u32 as usize;
         let plan_id = packed as u32 as usize;
@@ -171,10 +164,7 @@ pub(crate) extern "win64" fn jit_new_planned_object(
         vm.realm_born(idx, vm.obj_proto);
         crate::heap::note_static_key_jit_object();
         Value::heap(idx).bits()
-    })) {
-        Ok(bits) => bits,
-        Err(_) => std::process::abort(),
-    }
+    })
 }
 
 /// Allocate AND fully populate one `FinalizeObject` literal from a validated
@@ -224,7 +214,7 @@ pub(crate) extern "win64" fn jit_finalize_object_baked(
     {
         return crate::codegen::SELF_CALL_DEOPT;
     }
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    crate::vm::helpers_misc::catch_effectful_jit_u64(|| {
         let vm = unsafe { &mut *(vm as *mut Vm) };
         vm.maybe_gc();
         if !regs_window_valid(vm, regs, reg_count as usize) {
@@ -247,12 +237,7 @@ pub(crate) extern "win64" fn jit_finalize_object_baked(
         vm.realm_born(idx, vm.obj_proto);
         crate::heap::note_static_key_jit_object();
         Value::heap(idx).bits()
-    })) {
-        Ok(bits) => bits,
-        // Allocation/realm bookkeeping may already be committed. Never replay
-        // after an unwind across this boundary.
-        Err(_) => std::process::abort(),
-    }
+    })
 }
 
 /// B257: the window slots a baked `FinalizeObject` READS — `regs[val_base ..
@@ -315,7 +300,7 @@ pub(crate) extern "win64" fn jit_finalize_object_thin(
     if count == 0 || count > FINALIZE_STAGE_SLOTS {
         return crate::codegen::SELF_CALL_DEOPT;
     }
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    crate::vm::helpers_misc::catch_effectful_jit_u64(|| {
         let vm = unsafe { &mut *(vm as *mut Vm) };
         vm.maybe_gc();
         let Some(src) = window_read_range(vm, regs, val_base, count) else {
@@ -338,12 +323,7 @@ pub(crate) extern "win64" fn jit_finalize_object_thin(
             crate::heap::note_static_key_jit_object();
         }
         Value::heap(idx).bits()
-    })) {
-        Ok(bits) => bits,
-        // Allocation/realm bookkeeping may already be committed. Never replay
-        // after an unwind across this boundary.
-        Err(_) => std::process::abort(),
-    }
+    })
 }
 
 pub(crate) extern "win64" fn jit_finalize_object(
@@ -366,7 +346,7 @@ pub(crate) extern "win64" fn jit_finalize_object(
     {
         return crate::codegen::SELF_CALL_DEOPT;
     }
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    crate::vm::helpers_misc::catch_effectful_jit_u64(|| {
         let vm = unsafe { &mut *(vm as *mut Vm) };
         let func_id = (packed_plan >> 32) as u32;
         let plan_idx = packed_plan as u32;
@@ -398,12 +378,7 @@ pub(crate) extern "win64" fn jit_finalize_object(
         vm.realm_born(idx, vm.obj_proto);
         crate::heap::note_static_key_jit_object();
         Value::heap(idx).bits()
-    })) {
-        Ok(bits) => bits,
-        // Allocation/realm bookkeeping may already be committed. Never replay
-        // after an unwind across this boundary.
-        Err(_) => std::process::abort(),
-    }
+    })
 }
 
 /// Allocate a fixed-block array literal from a validated native register
@@ -429,7 +404,7 @@ pub(crate) extern "win64" fn jit_new_array(
         return crate::codegen::SELF_CALL_DEOPT;
     }
 
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    crate::vm::helpers_misc::catch_effectful_jit_u64(|| {
         let vm = unsafe { &mut *(vm as *mut Vm) };
         vm.maybe_gc();
 
@@ -451,12 +426,7 @@ pub(crate) extern "win64" fn jit_new_array(
         let idx = vm.heap.alloc_array_settled(items);
         vm.realm_born(idx, vm.arr_proto);
         Value::heap(idx).bits()
-    })) {
-        Ok(bits) => bits,
-        // Allocation/realm bookkeeping may already be committed.  Never replay
-        // after an unwind across this boundary.
-        Err(_) => std::process::abort(),
-    }
+    })
 }
 
 /// Exact `String(value)` for a tagged Int.
@@ -492,16 +462,13 @@ pub(crate) extern "win64" fn jit_int_string(
     // and left the rest of the call to the interpreter.
     if value.is_double() {
         let n = value.as_f64();
-        return match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        return crate::vm::helpers_misc::catch_effectful_jit_u64(|| {
             // As below: the argument is immediate and every other live Value
             // is in the frame's window, so a collection here is safe.
             vm.maybe_gc();
             let text = crate::heap::JsStr::from_ascii(crate::vm::helpers_num2::fmt_f64(n).into_bytes());
             Value::heap(vm.heap.alloc_js(text)).bits()
-        })) {
-            Ok(bits) => bits,
-            Err(_) => std::process::abort(),
-        };
+        });
     }
     if !value.is_int() {
         return crate::codegen::SELF_CALL_DEOPT;
@@ -514,7 +481,7 @@ pub(crate) extern "win64" fn jit_int_string(
         return Value::heap(crate::heap::INTERN_PAD2_START + n as u32).bits();
     }
 
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    crate::vm::helpers_misc::catch_effectful_jit_u64(|| {
         // The argument is immediate and every other live Value remains in the
         // native frame's vm.regs window, so collection is safe before copying
         // the stack-local decimal bytes into the new heap string.
@@ -522,10 +489,7 @@ pub(crate) extern "win64" fn jit_int_string(
         let (digits, start) = super::coerce::fmt_i32_buf(n);
         let text = crate::heap::JsStr::from_ascii(digits[start..].to_vec());
         Value::heap(vm.heap.alloc_js(text)).bits()
-    })) {
-        Ok(bits) => bits,
-        Err(_) => std::process::abort(),
-    }
+    })
 }
 
 /// Exact read-only implementation of Abstract Equality when at least one live
@@ -533,6 +497,7 @@ pub(crate) extern "win64" fn jit_int_string(
 /// special case is the engine's rooted `[[IsHTMLDDA]]` exotic.  If neither
 /// operand is currently nullish, decline before effects.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) extern "win64" fn jit_loose_null_eq(
     vm: *mut core::ffi::c_void,
     a_bits: u64,
@@ -541,7 +506,7 @@ pub(crate) extern "win64" fn jit_loose_null_eq(
     if vm.is_null() {
         return crate::codegen::SELF_CALL_DEOPT;
     }
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    crate::vm::helpers_misc::catch_effectful_jit_u64(|| {
         let vm = unsafe { &*(vm as *const Vm) };
         let a = Value::from_bits(a_bits);
         let b = Value::from_bits(b_bits);
@@ -552,8 +517,135 @@ pub(crate) extern "win64" fn jit_loose_null_eq(
             || (a.is_heap() && b.is_nullish() && vm.is_htmldda_index(a.heap_index()))
             || (b.is_heap() && a.is_nullish() && vm.is_htmldda_index(b.heap_index()));
         Value::bool(equal).bits()
-    }))
-    .unwrap_or(crate::codegen::SELF_CALL_DEOPT)
+    })
+}
+
+/// Pure, side-effect-free Abstract Equality (`==` when `ne == 0`, `!=` when
+/// `ne != 0`) for Tier C: handles nullish, `[[IsHTMLDDA]]`, object-vs-object
+/// identity, and all primitive-vs-primitive comparisons (including strings,
+/// numbers, booleans, Symbols, and BigInts) without invoking JS user code.
+/// Declines ONLY object-vs-non-nullish-primitive (which may invoke observable
+/// `ToPrimitive` / `valueOf` / `toString`) before any effects.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_loose_eq(
+    vm: *mut core::ffi::c_void,
+    a_bits: u64,
+    b_bits: u64,
+    ne: u64,
+) -> u64 {
+    if vm.is_null() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let a = Value::from_bits(a_bits);
+    let b = Value::from_bits(b_bits);
+    let flip = ne != 0;
+    if let Some(eq) = vm.loose_eq_nullish(a, b) {
+        return Value::bool(eq ^ flip).bits();
+    }
+    let (a_obj, b_obj) = (vm.is_eq_object(a), vm.is_eq_object(b));
+    if a_obj != b_obj {
+        // Object vs non-nullish primitive: may invoke user ToPrimitive.
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    if a_obj {
+        // Object vs Object is pure reference equality.
+        return Value::bool((a_bits == b_bits) ^ flip).bits();
+    }
+    // Both operands are non-nullish primitives: `loose_eq` performs zero
+    // user-visible calls and never throws.
+    match vm.loose_eq(a, b) {
+        Ok(eq) => Value::bool(eq ^ flip).bits(),
+        Err(_) => crate::codegen::SELF_CALL_DEOPT,
+    }
+}
+
+/// Pure `~a` fallback for Tier C when `a` is off the inline `load_toint32`
+/// fast path: handles arbitrary doubles (NaN, ±Inf, outside i32), null,
+/// undefined, booleans, and string primitives without allocating or invoking
+/// user JS. Declines BigInt, Symbol, and objects to the interpreter.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_bit_not_slow(
+    vm: *mut core::ffi::c_void,
+    a_bits: u64,
+) -> u64 {
+    if vm.is_null() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let a = Value::from_bits(a_bits);
+    let n = if a.is_number() {
+        a.as_f64()
+    } else if a.is_nullish() {
+        0.0
+    } else if a.is_bool() {
+        if a.as_bool() { 1.0 } else { 0.0 }
+    } else if a.is_heap() && vm.heap.is_str_like(a.heap_index()) {
+        match vm.to_number(a) {
+            Ok(v) => v,
+            Err(_) => return crate::codegen::SELF_CALL_DEOPT,
+        }
+    } else {
+        return crate::codegen::SELF_CALL_DEOPT;
+    };
+    Value::int(!to_int32(n)).bits()
+}
+
+/// Pure unary `+a` fallback for Tier C when `a` is not already a Number:
+/// handles null, undefined, booleans, and string primitives without invoking
+/// user JS or throwing. Declines BigInt, Symbol, and objects to the interpreter.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_to_num_slow(
+    vm: *mut core::ffi::c_void,
+    a_bits: u64,
+) -> u64 {
+    if vm.is_null() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let a = Value::from_bits(a_bits);
+    if a.is_number() {
+        return a_bits;
+    }
+    if a.is_null() {
+        return Value::num(0.0).bits();
+    }
+    if a.is_undefined() {
+        return Value::num(f64::NAN).bits();
+    }
+    if a.is_bool() {
+        return Value::num(if a.as_bool() { 1.0 } else { 0.0 }).bits();
+    }
+    if a.is_heap() && vm.heap.is_str_like(a.heap_index()) {
+        return match vm.to_number_strict(a) {
+            Ok(v) => Value::num(v).bits(),
+            Err(_) => crate::codegen::SELF_CALL_DEOPT,
+        };
+    }
+    crate::codegen::SELF_CALL_DEOPT
+}
+
+/// Read the active callee for Tier-C `Instr::LoadCallee` from
+/// `Vm::jit_tierc_activation` (which is always installed because `LoadCallee`
+/// is excluded from `activation_free`). Declines cleanly if no callee/closure
+/// handle is recorded (so the interpreter synthesizes a fresh Func if needed).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_load_callee(vm: *mut core::ffi::c_void) -> u64 {
+    if vm.is_null() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let vm = unsafe { &*(vm as *const Vm) };
+    let act = vm.jit_tierc_activation;
+    if !act.active {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    if act.callee != NO_CLOSURE {
+        Value::heap(act.callee).bits()
+    } else if act.closure != NO_CLOSURE {
+        Value::heap(act.closure).bits()
+    } else {
+        crate::codegen::SELF_CALL_DEOPT
+    }
 }
 
 /// Append one compiler-proved-new static data property.
@@ -572,7 +664,7 @@ pub(crate) extern "win64" fn jit_append_data_prop(
     if vm.is_null() {
         return crate::codegen::SELF_CALL_DEOPT;
     }
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    crate::vm::helpers_misc::catch_effectful_jit_u64(|| {
         let vm = unsafe { &mut *(vm as *mut Vm) };
         let obj = Value::from_bits(obj_bits);
         if !obj.is_heap() {
@@ -629,14 +721,9 @@ pub(crate) extern "win64" fn jit_append_data_prop(
             return crate::codegen::SELF_CALL_DEOPT;
         };
         map.push_static_data(key, val);
+        vm.heap.bump_version(obj_idx);
         0
-    })) {
-        Ok(bits) => bits,
-        // `push_data` is the commit point.  Never translate a panic after it
-        // (or its write barrier) into SELF_CALL_DEOPT: interpreter replay could
-        // append the same property twice and corrupt insertion order/shapes.
-        Err(_) => std::process::abort(),
-    }
+    })
 }
 
 /// Tier C's `DefineField` — a class field defined on an instance being
@@ -661,7 +748,7 @@ pub(crate) extern "win64" fn jit_define_field(
     if vm.is_null() {
         return crate::codegen::SELF_CALL_DEOPT;
     }
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    crate::vm::helpers_misc::catch_effectful_jit_u64(|| {
         let vm = unsafe { &mut *(vm as *mut Vm) };
         let obj = Value::from_bits(obj_bits);
         if !obj.is_heap() || obj.heap_index() as usize >= vm.heap.len() {
@@ -689,11 +776,7 @@ pub(crate) extern "win64" fn jit_define_field(
         } else {
             crate::codegen::SELF_CALL_DEOPT
         }
-    })) {
-        Ok(bits) => bits,
-        // As `jit_append_data_prop`: never replay after the commit point.
-        Err(_) => std::process::abort(),
-    }
+    })
 }
 
 #[cfg(all(test, feature = "jit", target_arch = "x86_64"))]

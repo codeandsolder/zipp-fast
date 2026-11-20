@@ -88,16 +88,11 @@ pub(crate) extern "win64" fn jit_make_func(vm: *mut core::ffi::c_void, packed_fi
     if vm.is_null() {
         return crate::codegen::SELF_CALL_DEOPT;
     }
-    let plan = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let vm = unsafe { &*(vm as *const Vm) };
-        make_func_preflight(vm, packed_fip)
-    })) {
-        Ok(Some(plan)) => plan,
-        Ok(None) | Err(_) => return crate::codegen::SELF_CALL_DEOPT,
-    };
-
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    crate::vm::helpers_misc::catch_effectful_jit_u64(|| {
         let vm = unsafe { &mut *(vm as *mut Vm) };
+        let Some(plan) = make_func_preflight(vm, packed_fip) else {
+            return crate::codegen::SELF_CALL_DEOPT;
+        };
         // The active Tier-C callable, its EvalScope and all frame/register Values are
         // explicit roots. The collector is non-moving; the preflighted ids
         // remain valid after this safe point.
@@ -112,10 +107,7 @@ pub(crate) extern "win64" fn jit_make_func(vm: *mut core::ffi::c_void, packed_fi
             vm.obj_realm.insert(idx, plan.realm);
         }
         Value::heap(idx).bits()
-    })) {
-        Ok(bits) => bits,
-        Err(_) => std::process::abort(),
-    }
+    })
 }
 
 /// B257: the PLAIN `MakeFunc` lane. The emitted site reaches it only after
@@ -137,7 +129,7 @@ pub(crate) extern "win64" fn jit_make_func_plain(vm: *mut core::ffi::c_void, chi
     if vm.is_null() {
         return crate::codegen::SELF_CALL_DEOPT;
     }
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    crate::vm::helpers_misc::catch_effectful_jit_u64(|| {
         let vm = unsafe { &mut *(vm as *mut Vm) };
         let child = child as u32;
         if vm.obj_realm.nonempty_raw != 0
@@ -152,10 +144,7 @@ pub(crate) extern "win64" fn jit_make_func_plain(vm: *mut core::ffi::c_void, chi
         let idx = vm.heap.alloc_func_settled(child);
         vm.heap.note_makefunc_plain();
         Value::heap(idx).bits()
-    })) {
-        Ok(bits) => bits,
-        Err(_) => std::process::abort(),
-    }
+    })
 }
 
 /// Exact `SetHomeObject` side-table write.
@@ -172,38 +161,23 @@ pub(crate) extern "win64" fn jit_set_home_object(
     if vm.is_null() {
         return crate::codegen::SELF_CALL_DEOPT;
     }
-    let preflight = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let vm = unsafe { &*(vm as *const Vm) };
+    crate::vm::helpers_misc::catch_effectful_jit_u64(|| {
+        let vm = unsafe { &mut *(vm as *mut Vm) };
         let method = Value::from_bits(method_bits);
         let home = Value::from_bits(home_bits);
         if !method.is_heap() {
-            return Some(None);
+            return Value::UNDEFINED.bits();
         }
         if method.heap_index() as usize >= vm.heap.len()
             || (home.is_heap() && home.heap_index() as usize >= vm.heap.len())
         {
-            return None;
+            return crate::codegen::SELF_CALL_DEOPT;
         }
-        Some(Some((method.heap_index(), home)))
-    }));
-    let write = match preflight {
-        Ok(Some(write)) => write,
-        Ok(None) | Err(_) => return crate::codegen::SELF_CALL_DEOPT,
-    };
-    let Some((method, home)) = write else {
-        return Value::UNDEFINED.bits();
-    };
-
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let vm = unsafe { &mut *(vm as *mut Vm) };
         // Includes the old-method -> young-home generational barrier before
         // publishing the keyed strong edge.
-        vm.record_closure_home(method, home);
+        vm.record_closure_home(method.heap_index(), home);
         Value::UNDEFINED.bits()
-    })) {
-        Ok(bits) => bits,
-        Err(_) => std::process::abort(),
-    }
+    })
 }
 
 #[cfg(all(test, feature = "jit", target_arch = "x86_64"))]

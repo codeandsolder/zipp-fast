@@ -75,7 +75,7 @@ fn kernel_reads_this(instr: &Instr) -> bool {
 /// region's number load/store; a non-number operand jumps to `bail`. No
 /// overflow concept — JS numbers are f64, so this never wraps or deopts.
 pub(crate) fn kmap_dbinop(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     bail: dynasmrt::DynamicLabel,
     dst: u16,
     a: u16,
@@ -111,7 +111,7 @@ pub(crate) fn kmap_dbinop(
 /// would hand the whole rest of the array to the per-element tail at the first
 /// fractional element.
 pub(crate) fn kmap_dmod(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     bail: dynasmrt::DynamicLabel,
     dst: u16,
     a: u16,
@@ -207,7 +207,7 @@ pub(crate) fn kmap_dmod(
 /// f64 ordered comparison → Bool for a kernel body. Mirrors the region `dcmp`
 /// (NaN compares false for </<=/>/>=/==, true for !=). Non-number → `bail`.
 pub(crate) fn kmap_dcmp(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     bail: dynasmrt::DynamicLabel,
     dst: u16,
     a: u16,
@@ -239,7 +239,7 @@ pub(crate) fn kmap_dcmp(
 /// is an Int except a `>>>` above i32::MAX, an exact double. Clobbers
 /// rax/rcx/r8/r10 and xmm0/xmm1, as the arithmetic ops do.
 pub(crate) fn kmap_bitwise(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     bail: dynasmrt::DynamicLabel,
     dst: u16,
     a: u16,
@@ -302,7 +302,7 @@ pub(crate) enum KBody {
 /// region f64 helpers (handling int-tagged AND double), bailing to `bail` on a
 /// non-number. Returns `None` for an unsupported op (reject the kernel).
 pub(crate) fn emit_kernel_arith(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     instr: &Instr,
     bail: dynasmrt::DynamicLabel,
     upv_base: usize,
@@ -401,7 +401,7 @@ pub(crate) fn compile_map_kernel(proto: &FuncProto) -> Option<JitFn> {
     if proto.param_count == 0 || proto.param_count > 2 || !can_kernel_body(proto) {
         return None;
     }
-    let mut ops = dynasmrt::x64::Assembler::new().ok()?;
+    let mut ops = crate::codegen::new_x64_asm();
     let loop_top = ops.new_dynamic_label();
     let loop_continue = ops.new_dynamic_label();
     let loop_done = ops.new_dynamic_label();
@@ -493,7 +493,7 @@ pub(crate) fn compile_map_kernel(proto: &FuncProto) -> Option<JitFn> {
         ; ret
     );
 
-    let buf = ops.finalize().ok()?;
+    let buf = crate::codegen::finalize_code(ops)?;
     let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
     Some(JitFn {
         _buf: buf,
@@ -514,7 +514,7 @@ pub(crate) fn compile_reduce_kernel(proto: &FuncProto) -> Option<JitFn> {
     if proto.param_count != 2 || !can_kernel_body(proto) {
         return None;
     }
-    let mut ops = dynasmrt::x64::Assembler::new().ok()?;
+    let mut ops = crate::codegen::new_x64_asm();
     let loop_top = ops.new_dynamic_label();
     let loop_continue = ops.new_dynamic_label();
     let loop_done = ops.new_dynamic_label();
@@ -587,7 +587,7 @@ pub(crate) fn compile_reduce_kernel(proto: &FuncProto) -> Option<JitFn> {
         ; ret
     );
 
-    let buf = ops.finalize().ok()?;
+    let buf = crate::codegen::finalize_code(ops)?;
     let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
     Some(JitFn {
         _buf: buf,
@@ -611,7 +611,7 @@ pub(crate) fn compile_filter_kernel(proto: &FuncProto) -> Option<JitFn> {
     if proto.param_count == 0 || proto.param_count > 2 || !can_kernel_body(proto) {
         return None;
     }
-    let mut ops = dynasmrt::x64::Assembler::new().ok()?;
+    let mut ops = crate::codegen::new_x64_asm();
     let loop_top = ops.new_dynamic_label();
     let loop_continue = ops.new_dynamic_label();
     let loop_done = ops.new_dynamic_label();
@@ -712,7 +712,7 @@ pub(crate) fn compile_filter_kernel(proto: &FuncProto) -> Option<JitFn> {
         ; ret
     );
 
-    let buf = ops.finalize().ok()?;
+    let buf = crate::codegen::finalize_code(ops)?;
     let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
     Some(JitFn {
         _buf: buf,
@@ -737,7 +737,7 @@ pub(crate) fn compile_scan_kernel(proto: &FuncProto, stop_on: bool) -> Option<Ji
     if proto.param_count == 0 || proto.param_count > 2 || !can_kernel_body(proto) {
         return None;
     }
-    let mut ops = dynasmrt::x64::Assembler::new().ok()?;
+    let mut ops = crate::codegen::new_x64_asm();
     let loop_top = ops.new_dynamic_label();
     let loop_continue = ops.new_dynamic_label();
     let loop_done = ops.new_dynamic_label();
@@ -837,7 +837,7 @@ pub(crate) fn compile_scan_kernel(proto: &FuncProto, stop_on: bool) -> Option<Ji
         ; pop rbx
         ; ret
     );
-    let buf = ops.finalize().ok()?;
+    let buf = crate::codegen::finalize_code(ops)?;
     let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
     Some(JitFn {
         _buf: buf,

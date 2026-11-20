@@ -395,6 +395,12 @@ struct Compiler {
     /// The eligibility scan's findings by function node (`lazy::ScanFacts`),
     /// keyed by the node's address and kind in the tree this compiles.
     lazy_scan: rustc_hash::FxHashMap<(usize, u8), lazy::ScanFacts>,
+    /// True while compiling a lazily-parsed temporary `FnBody` whose AST will
+    /// be dropped when the compile finishes: only nested functions with their
+    /// own `lazy_span` (self-contained `SkippedJob`) may be deferred; all other
+    /// nested functions compile eagerly while the temporary AST is alive.
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    lazy_only_skipped: bool,
 }
 
 /// Resolve `name` to an `UpvalSource` for the INNERMOST function whose enclosing
@@ -405,6 +411,26 @@ struct Compiler {
 /// grandparent — and the source is `ParentUpval(parent's upvalue index)`. This
 /// is the standard Lua "find/create upvalue" walk, threading a capture through
 /// every intermediate level. `None` if no enclosing function binds `name`.
+/// Pure read-only check: whether `capture_source(chain, name)` would succeed,
+/// without mutating any ancestor's `upvalues`. Used to filter free names in
+/// place without allocating `String`s for globals.
+fn enclosing_can_capture(chain: &[EnclosingFn], name: &str) -> bool {
+    for parent in chain.iter().rev() {
+        if !parent.cell_locals.index.is_empty() && parent.cell_locals.get(name).is_some() {
+            return true;
+        }
+    }
+    // Every inner frame's upvalue originates from an ancestor's `cell_locals`
+    // or from the outermost frame's pre-seeded upvalues (direct eval caller scope).
+    if let Some(root) = chain.first() {
+        let up = root.upvalues.borrow();
+        if !up.is_empty() && up.iter().any(|(n, _)| n == name) {
+            return true;
+        }
+    }
+    false
+}
+
 fn capture_source(chain: &[EnclosingFn], name: &str) -> Option<UpvalSource> {
     let (parent, outer) = chain.split_last()?;
     // Direct parent holds the cell as a local. Scanned BACKWARDS: `cell_locals`

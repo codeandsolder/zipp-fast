@@ -617,10 +617,6 @@ impl<'p> Vm<'p> {
         arg_base: u16,
         argc: u16,
     ) -> Option<Value> {
-        #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
-        if self.jit_enabled {
-            return None;
-        }
         let op = super::helpers_misc::arr_mutate_op(key, argc);
         let memo = match op {
             Some(_) => 0,

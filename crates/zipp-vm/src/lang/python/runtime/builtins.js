@@ -52,7 +52,7 @@
     // A class (a metaclass's `super().__setattr__`) goes through setattr so
     // the lookup caches see the change.
     method(ObjectType, "__setattr__", 3, function (args) { const o = args[0]; if (o !== null && typeof o === "object" && o.isType === true) return rt.setattr(o, args[1], args[2]); if (o === null || typeof o !== "object" || o.dict === undefined) fail(E.AttributeError, "can't set attribute"); o.dict.set(args[1], args[2]); return null; });
-    method(ObjectType, "__getattribute__", 2, function (args) { return rt.getattr(args[0], args[1]); });
+    method(ObjectType, "__getattribute__", 2, function (args) { return rt.objectGetattr(args[0], args[1]); });
     method(ObjectType, "__delattr__", 2, function (args) { const o = args[0]; if (o !== null && typeof o === "object" && o.isType === true) return R.delattr(o, args[1]); if (o === null || typeof o !== "object" || o.dict === undefined || o.dict === null || !o.dict.delete(args[1])) fail(E.AttributeError, "'" + typeOf(o).name + "' object has no attribute '" + args[1] + "'"); return null; });
     method(ObjectType, "__format__", 2, function (args) { if (args[1] !== "") fail(E.TypeError, "unsupported format string passed to " + typeOf(args[0]).name + ".__format__"); return str(args[0]); });
     method(ObjectType, "__init_subclass__", -1, function () { return null; });
@@ -111,7 +111,18 @@
         const it = self.args.items; return it.length === 0 ? "" : it.length === 1 ? str(it[0]) : repr(self.args);
     });
     method(E.BaseException, "with_traceback", 2, function (args) { return args[0]; });
-    method(E.BaseException, "add_note", 2, function (args) { return null; });
+    method(E.BaseException, "add_note", 2, function (args) {
+        const self = args[0], note = args[1];
+        if (typeof note !== "string") fail(E.TypeError, "note must be a str, not '" + typeOf(note).name + "'");
+        let notes = self.dict.get("__notes__");
+        if (notes === undefined) { notes = list([]); self.dict.set("__notes__", notes); }
+        else if (notes === null || typeof notes !== "object" || notes.cls !== T.list) {
+            rt.call(rt.getattr(notes, "append"), [note], null);
+            return null;
+        }
+        notes.items.push(note);
+        return null;
+    });
     // A constructed exception has no context until it is raised. (One
     // allocator for all, so construction can recognize it: `excEntry`.)
     const excAlloc = (cls) => { const e = rt.makeExc(cls, []); e.context = null; return e; };
@@ -137,22 +148,357 @@
         return rt.makeClass(args[0], args[1], args[2], args[3], kw);
     });
     methodkw(TypeType, "__init__", function () { return null; });
-    // `int | None`: a union type (PEP 604) usable in isinstance().
+    // `int | None`: a union type (PEP 604) usable in isinstance(), plus
+    // types.GenericAlias and PEP 695/696 typing runtime types.
     const UnionType = rt.newType("UnionType", [ObjectType], new Map(), "types");
-    const unionArgs = (v) => v !== null && typeof v === "object" && v.cls === UnionType ? v.dict.get("__args__").items : [v];
-    const makeUnion = (a, b) => {
-        for (const x of [a, b]) if (!(x === null || isType(x) || (x !== null && typeof x === "object" && (x.cls === UnionType || x.cls !== undefined && rt.typeOf(x).name === "_Alias")))) return NOTIMPL;
-        const args = []; for (const x of unionArgs(a).concat(unionArgs(b))) if (!args.includes(x)) args.push(x);
-        return { cls: UnionType, dict: new Map([["__args__", tuple(args)]]) };
+    const GenericAlias = rt.newType("GenericAlias", [ObjectType], new Map(), "types");
+    const NoDefaultType = rt.newType("_NoDefaultType", [ObjectType], new Map(), "typing");
+    NoDefaultType.dict.set("__repr__", builtin("__repr__", 1, () => "typing.NoDefault"));
+    const NoDefault = { cls: NoDefaultType, dict: new Map() };
+    const TypeVar = rt.newType("TypeVar", [ObjectType], new Map(), "typing");
+    const ParamSpec = rt.newType("ParamSpec", [ObjectType], new Map(), "typing");
+    const ParamSpecArgs = rt.newType("ParamSpecArgs", [ObjectType], new Map(), "typing");
+    const ParamSpecKwargs = rt.newType("ParamSpecKwargs", [ObjectType], new Map(), "typing");
+    const TypeVarTuple = rt.newType("TypeVarTuple", [ObjectType], new Map(), "typing");
+    const TypeAliasType = rt.newType("TypeAliasType", [ObjectType], new Map(), "typing");
+    const Generic = rt.newType("Generic", [ObjectType], new Map(), "typing");
+    const UnpackType = rt.newType("_UnpackGenericAlias", [ObjectType], new Map(), "typing");
+    const UnpackSpecial = rt.newType("_UnpackForm", [ObjectType], new Map(), "typing");
+    const Unpack = { cls: UnpackSpecial, dict: new Map([["name", "Unpack"]]) };
+
+    const isTypeParam = (v) => v !== null && typeof v === "object" && (v.cls === TypeVar || v.cls === ParamSpec || v.cls === TypeVarTuple);
+    const isUnionOperand = (x) => {
+        if (x === null || isType(x)) return true;
+        if (x !== null && typeof x === "object") {
+            const c = x.cls;
+            if (c === UnionType || c === GenericAlias || c === TypeVar || c === ParamSpec || c === TypeAliasType) return true;
+            if (c !== undefined && rt.typeOf(x).name === "_Alias") return true;
+        }
+        return false;
     };
+    const unionArgs = (v) => v !== null && typeof v === "object" && v.cls === UnionType ? v.dict.get("__args__").items : [v];
+    const isTypingOnlyUnionArg = (x) => x !== null && typeof x === "object" && (x.cls === TypeVar || x.cls === ParamSpec || x.cls === TypeAliasType || (x.cls !== undefined && rt.typeOf(x).name === "_Alias"));
+    const makeUnion = (a, b) => {
+        if (!isUnionOperand(a) || !isUnionOperand(b)) return NOTIMPL;
+        const args = []; for (const x of unionArgs(a).concat(unionArgs(b))) if (!args.includes(x)) args.push(x);
+        const typingUnion = args.some(isTypingOnlyUnionArg);
+        return { cls: UnionType, dict: new Map([["__args__", tuple(args)]]), typingUnion: typingUnion };
+    };
+    const gaName = (x) => {
+        if (x === rt.ELLIPSIS) return "...";
+        if (x === null) return "None";
+        if (isType(x)) return x.module === "builtins" ? x.qualname : x.module + "." + x.qualname;
+        return repr(x);
+    };
+    const collectParams = (items, out) => {
+        for (let i = 0; i < items.length; i++) {
+            const x = items[i];
+            if (isTypeParam(x)) { if (!out.includes(x)) out.push(x); }
+            else if (x !== null && typeof x === "object" && x.dict !== undefined) {
+                const p = x.dict.get("__parameters__");
+                if (p !== undefined && p !== null && p.cls === T.tuple) {
+                    for (const t of p.items) if (!out.includes(t)) out.push(t);
+                }
+            }
+        }
+    };
+    const makeGenericAlias = (origin, rawArgs) => {
+        const items = rawArgs !== null && typeof rawArgs === "object" && rawArgs.cls === T.tuple ? rawArgs.items.slice() : [rawArgs];
+        const params = [];
+        collectParams(items, params);
+        return {
+            cls: GenericAlias,
+            dict: new Map([
+                ["__origin__", origin],
+                ["__args__", tuple(items)],
+                ["__parameters__", tuple(params)],
+            ]),
+        };
+    };
+    const makeUnpack = (target) => {
+        const params = [];
+        collectParams([target], params);
+        return {
+            cls: UnpackType,
+            dict: new Map([
+                ["__origin__", Unpack],
+                ["__args__", tuple([target])],
+                ["__parameters__", tuple(params)],
+            ]),
+        };
+    };
+    UnpackSpecial.dict.set("__getitem__", builtin("__getitem__", 2, (a) => makeUnpack(a[1])));
+    UnpackSpecial.dict.set("__repr__", builtin("__repr__", 1, () => "typing.Unpack"));
+    UnpackType.dict.set("__repr__", builtin("__repr__", 1, (a) => "typing.Unpack[" + gaName(a[0].dict.get("__args__").items[0]) + "]"));
+    UnpackType.dict.set("__eq__", builtin("__eq__", 2, (a) => a[1] !== null && typeof a[1] === "object" && a[1].cls === UnpackType && rt.eq(a[0].dict.get("__args__"), a[1].dict.get("__args__"))));
+    UnpackType.dict.set("__hash__", builtin("__hash__", 1, (a) => rt.hashInt(tuple([Unpack, a[0].dict.get("__args__")]))));
+
+    const substArg = (arg, map) => {
+        if (map.has(arg)) return map.get(arg);
+        if (arg !== null && typeof arg === "object" && arg.cls === GenericAlias) {
+            const sub = arg.dict.get("__args__").items.map((x) => substArg(x, map));
+            return makeGenericAlias(arg.dict.get("__origin__"), tuple(sub));
+        }
+        if (arg !== null && typeof arg === "object" && arg.cls === UnionType) {
+            const sub = arg.dict.get("__args__").items.map((x) => substArg(x, map));
+            let acc = sub[0];
+            for (let i = 1; i < sub.length; i++) acc = makeUnion(acc, sub[i]);
+            return acc;
+        }
+        return arg;
+    };
+    rt.constructors.set(GenericAlias, (args) => {
+        if (args.length !== 2) fail(E.TypeError, "GenericAlias expected 2 arguments, got " + args.length);
+        return makeGenericAlias(args[0], args[1]);
+    });
+    GenericAlias.dict.set("__repr__", builtin("__repr__", 1, (a) => {
+        const o = a[0].dict.get("__origin__"), xs = a[0].dict.get("__args__").items;
+        return gaName(o) + "[" + xs.map(gaName).join(", ") + "]";
+    }));
+    GenericAlias.dict.set("__eq__", builtin("__eq__", 2, (a) => {
+        const y = a[1];
+        if (y === null || typeof y !== "object" || y.cls !== GenericAlias) return NOTIMPL;
+        return rt.eq(a[0].dict.get("__origin__"), y.dict.get("__origin__")) && rt.eq(a[0].dict.get("__args__"), y.dict.get("__args__"));
+    }));
+    GenericAlias.dict.set("__hash__", builtin("__hash__", 1, (a) => rt.hashInt(tuple([a[0].dict.get("__origin__"), a[0].dict.get("__args__")]))));
+    GenericAlias.dict.set("__or__", builtin("__or__", 2, (a) => makeUnion(a[0], a[1])));
+    GenericAlias.dict.set("__ror__", builtin("__ror__", 2, (a) => makeUnion(a[1], a[0])));
+    GenericAlias.dict.set("__call__", (() => {
+        const f = builtin("__call__", -1, (a) => {
+            const kw = a[a.length - 1] instanceof Map ? a.pop() : null;
+            return rt.call(a[0].dict.get("__origin__"), a.slice(1), kw);
+        });
+        f.kwnames = true;
+        return f;
+    })());
+    GenericAlias.dict.set("__mro_entries__", builtin("__mro_entries__", 2, (a) => {
+        const self = a[0], origin = self.dict.get("__origin__"), bases = a[1];
+        if (origin === Generic) {
+            if (bases !== null && typeof bases === "object" && bases.cls === T.tuple) {
+                for (const b of bases.items) {
+                    if (b === self) continue;
+                    const t = isType(b) ? b : (b !== null && typeof b === "object" && b.cls === GenericAlias && isType(b.dict.get("__origin__")) ? b.dict.get("__origin__") : null);
+                    if (t !== null && isSubclass(t, Generic)) return tuple([]);
+                }
+            }
+            return tuple([Generic]);
+        }
+        return tuple([origin]);
+    }));
+    GenericAlias.dict.set("__getitem__", builtin("__getitem__", 2, (a) => {
+        const self = a[0], params = self.dict.get("__parameters__").items;
+        const vals = a[1] !== null && typeof a[1] === "object" && a[1].cls === T.tuple ? a[1].items : [a[1]];
+        if (!params.length) fail(E.TypeError, repr(self) + " is not a generic class");
+        if (vals.length !== params.length) fail(E.TypeError, "Too " + (vals.length < params.length ? "few" : "many") + " arguments for " + repr(self) + "; actual " + vals.length + ", expected " + params.length);
+        const map = new Map();
+        for (let i = 0; i < params.length; i++) map.set(params[i], vals[i]);
+        const nextArgs = self.dict.get("__args__").items.map((x) => substArg(x, map));
+        return makeGenericAlias(self.dict.get("__origin__"), tuple(nextArgs));
+    }));
+    GenericAlias.dict.set("__getattr__", builtin("__getattr__", 2, (a) => {
+        const name = a[1];
+        if (typeof name === "string" && (name === "__origin__" || name === "__args__" || name === "__parameters__")) fail(E.AttributeError, name);
+        return rt.getattr(a[0].dict.get("__origin__"), name);
+    }));
+    Generic.dict.set("__class_getitem__", { cls: T.classmethod, func: builtin("__class_getitem__", 2, (a) => makeGenericAlias(a[0], a[1])) });
+
+    // TypeVar / ParamSpec / TypeVarTuple / TypeAliasType (PEP 695 & 696).
+    const evalLazy = (obj, key, fnKey, fallback) => {
+        if (obj.dict.has(key)) return obj.dict.get(key);
+        const fn = obj[fnKey];
+        if (fn === null || fn === undefined) return fallback;
+        const v = rt.call(fn, [], null);
+        obj.dict.set(key, v);
+        return v;
+    };
+    const makeTypeVar = (name, boundFn, isConstraints, defaultFn, cov, contra, infer, eagerBound, eagerConstraints, eagerDefault, hasDefault) => {
+        const obj = {
+            cls: TypeVar,
+            dict: new Map([
+                ["__name__", name],
+                ["__covariant__", !!cov],
+                ["__contravariant__", !!contra],
+                ["__infer_variance__", !!infer],
+            ]),
+            _boundFn: !isConstraints ? boundFn : null,
+            _constraintsFn: isConstraints ? boundFn : null,
+            _defaultFn: defaultFn,
+            _hasDefault: !!hasDefault,
+        };
+        if (eagerBound !== undefined) obj.dict.set("_bound", eagerBound);
+        if (eagerConstraints !== undefined) obj.dict.set("_constraints", eagerConstraints);
+        if (eagerDefault !== undefined) obj.dict.set("_default", eagerDefault);
+        return obj;
+    };
+    rt.constructors.set(TypeVar, (args, kw) => {
+        if (args.length < 1) fail(E.TypeError, "TypeVar() missing 1 required positional argument: 'name'");
+        const name = needStr(args[0]);
+        const constraints = args.slice(1);
+        const bound = kw && kw.has("bound") ? kw.get("bound") : null;
+        const cov = kw && kw.has("covariant") ? truth(kw.get("covariant")) : false;
+        const contra = kw && kw.has("contravariant") ? truth(kw.get("contravariant")) : false;
+        const infer = kw && kw.has("infer_variance") ? truth(kw.get("infer_variance")) : false;
+        const hasDef = kw && kw.has("default") && kw.get("default") !== NoDefault;
+        const defVal = hasDef ? kw.get("default") : NoDefault;
+        return makeTypeVar(name, null, false, null, cov, contra, infer, bound, tuple(constraints), defVal, hasDef);
+    });
+    TypeVar.dict.set("__bound__", { cls: T.property, fget: builtin("__bound__", 1, (a) => evalLazy(a[0], "_bound", "_boundFn", null)), fset: null, fdel: null, doc: null });
+    TypeVar.dict.set("__constraints__", { cls: T.property, fget: builtin("__constraints__", 1, (a) => {
+        const v = evalLazy(a[0], "_constraints", "_constraintsFn", tuple([]));
+        return v !== null && typeof v === "object" && v.cls === T.tuple ? v : tuple([]);
+    }), fset: null, fdel: null, doc: null });
+    TypeVar.dict.set("__default__", { cls: T.property, fget: builtin("__default__", 1, (a) => evalLazy(a[0], "_default", "_defaultFn", NoDefault)), fset: null, fdel: null, doc: null });
+    TypeVar.dict.set("has_default", builtin("has_default", 1, (a) => a[0]._hasDefault === true));
+    TypeVar.dict.set("__repr__", builtin("__repr__", 1, (a) => {
+        const d = a[0].dict;
+        const p = d.get("__infer_variance__") ? "" : d.get("__covariant__") ? "+" : d.get("__contravariant__") ? "-" : "~";
+        return p + d.get("__name__");
+    }));
+    TypeVar.dict.set("__or__", builtin("__or__", 2, (a) => makeUnion(a[0], a[1])));
+    TypeVar.dict.set("__ror__", builtin("__ror__", 2, (a) => makeUnion(a[1], a[0])));
+
+    ParamSpecArgs.dict.set("__repr__", builtin("__repr__", 1, (a) => a[0].dict.get("__origin__").dict.get("__name__") + ".args"));
+    ParamSpecKwargs.dict.set("__repr__", builtin("__repr__", 1, (a) => a[0].dict.get("__origin__").dict.get("__name__") + ".kwargs"));
+    const makeParamSpec = (name, defaultFn, infer, eagerDefault, hasDefault) => {
+        const obj = {
+            cls: ParamSpec,
+            dict: new Map([
+                ["__name__", name],
+                ["__covariant__", false],
+                ["__contravariant__", false],
+                ["__infer_variance__", !!infer],
+            ]),
+            _defaultFn: defaultFn,
+            _hasDefault: !!hasDefault,
+        };
+        obj.dict.set("args", { cls: ParamSpecArgs, dict: new Map([["__origin__", obj]]) });
+        obj.dict.set("kwargs", { cls: ParamSpecKwargs, dict: new Map([["__origin__", obj]]) });
+        if (eagerDefault !== undefined) obj.dict.set("_default", eagerDefault);
+        return obj;
+    };
+    rt.constructors.set(ParamSpec, (args, kw) => {
+        if (args.length < 1) fail(E.TypeError, "ParamSpec() missing 1 required positional argument: 'name'");
+        const name = needStr(args[0]);
+        const hasDef = kw && kw.has("default") && kw.get("default") !== NoDefault;
+        const defVal = hasDef ? kw.get("default") : NoDefault;
+        return makeParamSpec(name, null, false, defVal, hasDef);
+    });
+    ParamSpec.dict.set("__default__", { cls: T.property, fget: builtin("__default__", 1, (a) => evalLazy(a[0], "_default", "_defaultFn", NoDefault)), fset: null, fdel: null, doc: null });
+    ParamSpec.dict.set("has_default", builtin("has_default", 1, (a) => a[0]._hasDefault === true));
+    ParamSpec.dict.set("__repr__", builtin("__repr__", 1, (a) => (a[0].dict.get("__infer_variance__") ? "" : "~") + a[0].dict.get("__name__")));
+    ParamSpec.dict.set("__or__", builtin("__or__", 2, (a) => makeUnion(a[0], a[1])));
+    ParamSpec.dict.set("__ror__", builtin("__ror__", 2, (a) => makeUnion(a[1], a[0])));
+
+    const makeTypeVarTuple = (name, defaultFn, eagerDefault, hasDefault) => {
+        const obj = {
+            cls: TypeVarTuple,
+            dict: new Map([["__name__", name]]),
+            _defaultFn: defaultFn,
+            _hasDefault: !!hasDefault,
+        };
+        if (eagerDefault !== undefined) obj.dict.set("_default", eagerDefault);
+        return obj;
+    };
+    rt.constructors.set(TypeVarTuple, (args, kw) => {
+        if (args.length < 1) fail(E.TypeError, "TypeVarTuple() missing 1 required positional argument: 'name'");
+        const name = needStr(args[0]);
+        const hasDef = kw && kw.has("default") && kw.get("default") !== NoDefault;
+        const defVal = hasDef ? kw.get("default") : NoDefault;
+        return makeTypeVarTuple(name, null, defVal, hasDef);
+    });
+    TypeVarTuple.dict.set("__default__", { cls: T.property, fget: builtin("__default__", 1, (a) => evalLazy(a[0], "_default", "_defaultFn", NoDefault)), fset: null, fdel: null, doc: null });
+    TypeVarTuple.dict.set("has_default", builtin("has_default", 1, (a) => a[0]._hasDefault === true));
+    TypeVarTuple.dict.set("__iter__", builtin("__iter__", 1, (a) => { let done = false; return { cls: T.iterator, next: () => { if (done) return STOP; done = true; return makeUnpack(a[0]); } }; }));
+    TypeVarTuple.dict.set("__repr__", builtin("__repr__", 1, (a) => a[0].dict.get("__name__")));
+
+    const makeTypeAlias = (name, valueFn, typeParams, modName, eagerValue) => {
+        const tp = typeParams !== null && typeParams !== undefined && typeParams.cls === T.tuple ? typeParams : tuple([]);
+        const obj = {
+            cls: TypeAliasType,
+            dict: new Map([
+                ["__name__", name],
+                ["__type_params__", tp],
+                ["__parameters__", tp],
+                ["__module__", modName || "__main__"],
+            ]),
+            _valueFn: valueFn,
+        };
+        if (eagerValue !== undefined) obj.dict.set("_value", eagerValue);
+        return obj;
+    };
+    rt.constructors.set(TypeAliasType, (args, kw) => {
+        if (args.length < 2) fail(E.TypeError, "TypeAliasType() takes at least 2 arguments");
+        const tp = kw && kw.has("type_params") ? tuple(drain(kw.get("type_params"))) : tuple([]);
+        return makeTypeAlias(needStr(args[0]), null, tp, "__main__", args[1]);
+    });
+    TypeAliasType.dict.set("__value__", { cls: T.property, fget: builtin("__value__", 1, (a) => evalLazy(a[0], "_value", "_valueFn", null)), fset: null, fdel: null, doc: null });
+    TypeAliasType.dict.set("__getitem__", builtin("__getitem__", 2, (a) => {
+        const tp = a[0].dict.get("__type_params__").items;
+        if (!tp.length) fail(E.TypeError, "Only generic type aliases are subscriptable");
+        return makeGenericAlias(a[0], a[1]);
+    }));
+    TypeAliasType.dict.set("__or__", builtin("__or__", 2, (a) => makeUnion(a[0], a[1])));
+    TypeAliasType.dict.set("__ror__", builtin("__ror__", 2, (a) => makeUnion(a[1], a[0])));
+    TypeAliasType.dict.set("__repr__", builtin("__repr__", 1, (a) => a[0].dict.get("__name__")));
+
+    // Builtin generic types support `list[int]`, `dict[str, int]`, etc.
+    const cgBuiltin = { cls: T.classmethod, func: builtin("__class_getitem__", 2, (a) => makeGenericAlias(a[0], a[1])) };
+    for (const gt of [T.list, T.tuple, T.dict, T.set, T.frozenset, TypeType, T.dict_keys, T.dict_values, T.dict_items]) {
+        gt.dict.set("__class_getitem__", cgBuiltin);
+    }
+
+    // PEP 695/696 emitter helpers (available without importing typing).
+    R.typevar = function (name, boundFn, isConstraints, defaultFn) {
+        return makeTypeVar(name, boundFn, isConstraints, defaultFn, false, false, true, undefined, undefined, undefined, defaultFn !== null);
+    };
+    R.paramspec = function (name, defaultFn) {
+        return makeParamSpec(name, defaultFn, true, undefined, defaultFn !== null);
+    };
+    R.typevartuple = function (name, defaultFn) {
+        return makeTypeVarTuple(name, defaultFn, undefined, defaultFn !== null);
+    };
+    R.typealias = function (name, valueFn, typeParams, modName) {
+        return makeTypeAlias(name, valueFn, typeParams, modName, undefined);
+    };
+    R.generic_base = function (bases, tps) {
+        for (let i = 0; i < bases.length; i++) {
+            const b = bases[i];
+            if (b === Generic) return bases;
+            if (b !== null && typeof b === "object" && b.cls === GenericAlias && b.dict.get("__origin__") === Generic) return bases;
+        }
+        bases.push(makeGenericAlias(Generic, tps));
+        return bases;
+    };
+    R.set_type_params = function (obj, tps) {
+        if (obj !== null && typeof obj === "object") {
+            if (obj.isType) obj.dict.set("__type_params__", tps);
+            else obj.type_params = tps;
+        }
+        return obj;
+    };
+    R.unpack_type = function (v) { return makeUnpack(v); };
+
     method(TypeType, "__or__", 2, (a) => makeUnion(a[0], a[1]));
     method(TypeType, "__ror__", 2, (a) => makeUnion(a[1], a[0]));
     UnionType.dict.set("__or__", builtin("__or__", 2, (a) => makeUnion(a[0], a[1])));
     UnionType.dict.set("__ror__", builtin("__ror__", 2, (a) => makeUnion(a[1], a[0])));
-    UnionType.dict.set("__repr__", builtin("__repr__", 1, (a) => a[0].dict.get("__args__").items.map((x) => x === null ? "None" : isType(x) ? x.name : repr(x)).join(" | ")));
+    UnionType.dict.set("__repr__", builtin("__repr__", 1, (a) => {
+        const items = a[0].dict.get("__args__").items;
+        if (a[0].typingUnion) return "typing.Union[" + items.map(gaName).join(", ") + "]";
+        return items.map((x) => x === null ? "None" : isType(x) ? x.name : repr(x)).join(" | ");
+    }));
     UnionType.dict.set("__eq__", builtin("__eq__", 2, (a) => a[1] !== null && typeof a[1] === "object" && a[1].cls === UnionType && rt.eq(a[0].dict.get("__args__"), a[1].dict.get("__args__"))));
     UnionType.dict.set("__hash__", builtin("__hash__", 1, (a) => rt.hashInt(a[0].dict.get("__args__"))));
     rt.UnionType = UnionType;
+    rt.GenericAlias = GenericAlias;
+    rt.makeGenericAlias = makeGenericAlias;
+    rt.NoDefault = NoDefault;
+    rt.TypeVar = TypeVar;
+    rt.ParamSpec = ParamSpec;
+    rt.TypeVarTuple = TypeVarTuple;
+    rt.TypeAliasType = TypeAliasType;
+    rt.Generic = Generic;
+    rt.Unpack = Unpack;
     method(TypeType, "__prepare__", -1, function () { return dict(); });
     method(TypeType, "__repr__", 1, function (args) { return repr(args[0]); });
     method(TypeType, "mro", 1, function (args) { return list(args[0].mro.slice()); });
@@ -620,14 +966,14 @@
             native("strip", 1, 1); native("lstrip", 1, 2); native("rstrip", 1, 3);
             native("split", 1, 4); native("split", 2, 4); native("replace", 3, 5); native("find", 2, 6);
             native("join", 2, 7); native("lower", 1, 8); native("upper", 1, 9);
-            native("startswith", 2, 18); native("endswith", 2, 19);
+            native("startswith", 2, 18); native("endswith", 2, 19); native("capitalize", 1, 21);
         }
         // An f-string's parts (strs, and ints left as ints: `"" + 5n` is
         // "5", as `str(5)`) are joined by `R.FJOIN.c<n>(...parts)`, a call
         // the emitter makes with the record as `this`; the native (op 20)
         // joins them in one allocation and calls `j<n>` for anything else.
         const FJ = { strop: 20, ltmpl: null, ttype: null };
-        const fjoin = function (...parts) { let out = ""; for (let i = 0; i < parts.length; i++) out += parts[i]; return rt.checkedText(out); };
+        const fjoin = function (...parts) { let out = ""; for (let i = 0; i < parts.length; i++) { const p = parts[i]; out += typeof p === "string" ? p : typeof p === "bigint" ? "" + p : R.fmt(p, "", 0); } return rt.checkedText(out); };
         for (let n = 1; n <= 12; n++) { FJ["j" + n] = fjoin; FJ["c" + n] = STRM !== null ? STRM : fjoin; }
         R.FJOIN = FJ;
     }
@@ -1206,6 +1552,23 @@
     method(T.generator, "send", 2, (a) => a[0].send(a[1]));
     method(T.generator, "close", 1, (a) => a[0].close());
     method(T.generator, "throw", -1, (a) => { let e = a[1]; if (isType(e)) e = rt.construct(e, a[2] === undefined ? [] : [a[2]], null); return a[0].throwIn(e); });
+    method(T.coroutine, "send", 2, (a) => a[0].send(a[1]));
+    method(T.coroutine, "close", 1, (a) => a[0].close());
+    method(T.coroutine, "throw", -1, (a) => { let e = a[1]; if (isType(e)) e = rt.construct(e, a[2] === undefined ? [] : [a[2]], null); return a[0].throwIn(e); });
+    method(T.coroutine, "__await__", 1, (a) => rt.makeCoroutineWrapper(a[0]));
+    for (const t of [T.coroutine_wrapper, T.async_generator_asend]) {
+        method(t, "__iter__", 1, (a) => a[0]);
+        method(t, "__next__", 1, (a) => { const v = a[0].next(); if (v === STOP) throw rt.makeExc(E.StopIteration, a[0].returned === null || a[0].returned === undefined ? [] : [a[0].returned]); return v; });
+        method(t, "send", 2, (a) => a[0].send(a[1]));
+        method(t, "close", 1, (a) => a[0].close());
+        method(t, "throw", -1, (a) => { let e = a[1]; if (isType(e)) e = rt.construct(e, a[2] === undefined ? [] : [a[2]], null); return a[0].throwIn(e); });
+    }
+    method(T.async_generator_asend, "__await__", 1, (a) => a[0]);
+    method(T.async_generator, "__aiter__", 1, (a) => a[0]);
+    method(T.async_generator, "__anext__", 1, (a) => rt.makeAgStep(a[0], 0, null));
+    method(T.async_generator, "asend", 2, (a) => rt.makeAgStep(a[0], 0, a[1]));
+    method(T.async_generator, "athrow", -1, (a) => { let e = a[1]; if (isType(e)) e = rt.construct(e, a[2] === undefined ? [] : [a[2]], null); return rt.makeAgStep(a[0], 1, e); });
+    method(T.async_generator, "aclose", 1, (a) => rt.makeAgStep(a[0], 2, null));
     // `enumerate` over an exact list or tuple keeps its state in its own
     // fields (`a` the sequence, `i` the position, `b` the count), as the
     // list iterator it would wrap reads the live items (see `view`).
@@ -1529,18 +1892,61 @@
     def("all", 1, (a) => { const it = iter(a[0]); for (;;) { const v = fornext(it); if (v === STOP) return true; if (!truth(v)) return false; } });
     def("iter", 2, (a) => { if (a.length === 2) { const f = a[0], sentinel = a[1]; return { cls: T.iterator, next: () => { const v = call(f, [], null); return eq(v, sentinel) ? STOP : v; } }; } return iter(a[0]); }, 1);
     def("next", 2, (a) => { const it = a[0]; if (it === null || typeof it !== "object" || (it.next === undefined && typeMethod(it, "__next__") === undefined)) fail(E.TypeError, "'" + typeOf(it).name + "' object is not an iterator"); const v = it.next !== undefined ? fornext(it) : (() => { try { return callMethod(it, "__next__", []); } catch (e) { if (e && e.cls === E.StopIteration) return STOP; throw e; } })(); if (v === STOP) { if (a.length === 2) return a[1]; throw rt.makeExc(E.StopIteration, it.cls === T.generator && it.returned !== null ? [it.returned] : []); } return v; }, 1);
+    def("aiter", 1, (a) => R.aiter(a[0]));
+    def("anext", 2, (a) => {
+        const aw = R.anext_awaitable(a[0]);
+        if (a.length === 1) return aw;
+        const dflt = a[1];
+        let sub = null, done = false;
+        const wrap = {
+            cls: T.async_generator_asend,
+            returned: null,
+            _step: function (mode, v) {
+                if (done) fail(E.RuntimeError, "cannot reuse already awaited anext");
+                if (sub === null) sub = R.awaititer(aw);
+                try {
+                    const r = R.yfstep(sub, mode, v);
+                    if (r === STOP) { done = true; this.returned = R.yfret; return STOP; }
+                    return r;
+                } catch (e) {
+                    if (R.is_stop_async(e)) { done = true; this.returned = dflt; return STOP; }
+                    done = true; throw e;
+                }
+            },
+            next: function () { return this._step(0, null); },
+            send: function (v) { const r = this._step(0, v); if (r === STOP) throw rt.makeExc(E.StopIteration, this.returned === null ? [] : [this.returned]); return r; },
+            throwIn: function (e) { const r = this._step(1, e); if (r === STOP) throw rt.makeExc(E.StopIteration, this.returned === null ? [] : [this.returned]); return r; },
+            close: function () { done = true; if (sub !== null) R.yfclose(sub); return null; },
+        };
+        return wrap;
+    }, 1);
     // A tuple of types may nest further tuples (and unions), as in CPython.
     const instanceOfAny = (v, t) => { if (t !== null && typeof t === "object" && t.cls === T.tuple) return t.items.some((x) => instanceOfAny(v, x)); if (t !== null && typeof t === "object" && t.cls === rt.UnionType) return t.dict.get("__args__").items.some((x) => x === null ? v === null : rt.isinstanceCheck(v, x)); return rt.isinstanceCheck(v, t); };
     def("isinstance", 2, (a) => instanceOfAny(a[0], a[1]));
     rt.isinstanceCheck = function (v, t) {
         if (!isType(t)) { const m = typeMethod(t, "__instancecheck__"); if (m !== undefined) return truth(call(descrGet(m, t, typeOf(t)), [v], null)); fail(E.TypeError, "isinstance() arg 2 must be a type, a tuple of types, or a union"); }
+        if (t.cls !== undefined && t.cls !== TypeType) {
+            const ic = rt.lookupType(t.cls, "__instancecheck__");
+            if (ic !== undefined && ic !== TypeType.dict.get("__instancecheck__")) return truth(call(descrGet(ic, t, t.cls), [v], null));
+        }
         if (t === T.int && typeof v === "boolean") return true;
         return isInstance(v, t) && (t !== T.bytes || !isInstance(v, T.bytearray));
     };
     // bytearray reuses bytes' storage and methods by subclassing it here;
     // Python-visible checks keep them unrelated, as in CPython.
-    const subclassCheck = (a, b) => isSubclass(a, b) && (b !== T.bytes || !isSubclass(a, T.bytearray));
-    const subclassOfAny = (c, t) => { if (t !== null && typeof t === "object" && t.cls === T.tuple) return t.items.some((x) => subclassOfAny(c, x)); if (!isType(t)) fail(E.TypeError, "issubclass() arg 2 must be a class, a tuple of classes, or a union"); return subclassCheck(c, t); };
+    const subclassCheck = (a, b) => {
+        if (b.cls !== undefined && b.cls !== TypeType) {
+            const sc = rt.lookupType(b.cls, "__subclasscheck__");
+            if (sc !== undefined && sc !== TypeType.dict.get("__subclasscheck__")) return truth(call(descrGet(sc, b, b.cls), [a], null));
+        }
+        return isSubclass(a, b) && (b !== T.bytes || !isSubclass(a, T.bytearray));
+    };
+    const subclassOfAny = (c, t) => {
+        if (t !== null && typeof t === "object" && t.cls === T.tuple) return t.items.some((x) => subclassOfAny(c, x));
+        if (t !== null && typeof t === "object" && t.cls === rt.UnionType) return t.dict.get("__args__").items.some((x) => x === null ? c === T.NoneType : subclassOfAny(c, x));
+        if (!isType(t)) fail(E.TypeError, "issubclass() arg 2 must be a class, a tuple of classes, or a union");
+        return subclassCheck(c, t);
+    };
     def("issubclass", 2, (a) => { if (!isType(a[0])) fail(E.TypeError, "issubclass() arg 1 must be a class"); return subclassOfAny(a[0], a[1]); });
     const attrName = (v) => { if (typeof v === "string") return v; fail(E.TypeError, "attribute name must be string, not '" + typeOf(v).name + "'"); };
     // A plain miss comes back as MISSING_ATTR (no exception is built); an
@@ -1559,7 +1965,9 @@
     def("hash", 1, (a) => rt.hashInt(a[0]));
     // A str's hash natively (`vm::py_str`, op 10).
     if (rt.nativeEntry !== null) rt.nativeEntry(B.get("hash"), 1, 10);
-    def("callable", 1, (a) => { const v = a[0]; return v !== null && typeof v === "object" && (v.cls === T.function || v.cls === T.builtin_function_or_method || v.cls === T.method || v.isType === true || typeMethod(v, "__call__") !== undefined); });
+    const isCallable = (v) => v !== null && typeof v === "object" && (v.cls === T.function || v.cls === T.builtin_function_or_method || v.cls === T.method || v.isType === true || typeMethod(v, "__call__") !== undefined);
+    rt.isCallable = isCallable;
+    def("callable", 1, (a) => isCallable(a[0]));
     def("chr", 1, (a) => { const n = Number(needInt(a[0])); if (n < 0 || n > 0x10FFFF) fail(E.ValueError, "chr() arg not in range(0x110000)"); return String.fromCodePoint(n); });
     def("ord", 1, (a) => { const s = needStr(a[0], "ord() expected string of length 1, but"); const cps = codepoints(s); if (cps.length !== 1) fail(E.TypeError, "ord() expected a character, but string of length " + cps.length + " found"); return BigInt(cps[0].codePointAt(0)); });
     def("round", 2, (a) => roundValue(a[0], a[1]), 1);
@@ -1771,7 +2179,6 @@
     def("__build_class__", -1, () => fail(E.RuntimeError, "__build_class__ is internal"));
     def("breakpoint", -1, () => null);
     def("help", -1, () => { rt.writeOut("help() is not available in this environment\n", null); return null; });
-    def("aiter", 1, () => fail(E.TypeError, "async iteration is not supported"));
     def("memoryview", 1, (a) => a[0]);
     // bytearray: a mutable bytes (a subtype here, so every bytes method and
     // structural operation applies; CPython keeps them distinct).
@@ -1813,18 +2220,176 @@
     }
     B.set("__name__", "builtins");
     B.set("__debug__", true);
-    // ExceptionGroup(message, exceptions): `.message`, `.exceptions`, and
-    // `.subgroup(type)`.
-    E.BaseExceptionGroup.dict.set("__init__", builtin("__init__", 3, (a) => {
-        const self = a[0]; const excs = drain(a[2]);
-        if (typeof a[1] !== "string") fail(E.TypeError, "argument 1 must be str, not " + typeOf(a[1]).name);
-        if (!excs.length) fail(E.ValueError, "second argument (exceptions) must be a non-empty sequence");
-        self.args = tuple([a[1], list(excs)]); self.dict.set("message", a[1]); self.dict.set("exceptions", tuple(excs)); return null;
-    }));
-    E.BaseExceptionGroup.dict.set("__str__", builtin("__str__", 1, (a) => { const n = a[0].dict.get("exceptions").items.length; return a[0].dict.get("message") + " (" + n + " sub-exception" + (n === 1 ? "" : "s") + ")"; }));
-    E.BaseExceptionGroup.dict.set("__repr__", builtin("__repr__", 1, (a) => typeOf(a[0]).name + "(" + repr(a[0].dict.get("message")) + ", " + repr(list(a[0].dict.get("exceptions").items.slice())) + ")"));
-    E.BaseExceptionGroup.dict.set("subgroup", builtin("subgroup", 2, (a) => { const keep = a[0].dict.get("exceptions").items.filter((e) => R.excmatch(e, a[1])); if (!keep.length) return null; return rt.construct(typeOf(a[0]), [a[0].dict.get("message"), list(keep)], null); }));
-    E.BaseExceptionGroup.dict.set("split", builtin("split", 2, (a) => { const items = a[0].dict.get("exceptions").items; const keep = items.filter((e) => R.excmatch(e, a[1])), rest = items.filter((e) => !R.excmatch(e, a[1])); const mk = (xs) => xs.length ? rt.construct(typeOf(a[0]), [a[0].dict.get("message"), list(xs)], null) : null; return tuple([mk(keep), mk(rest)]); }));
+    // BaseExceptionGroup / ExceptionGroup (PEP 654): auto-narrowing __new__,
+    // recursive .subgroup() / .split() / .derive(), and except* helpers.
+    {
+        const isSeqArg = (v) => {
+            if (v === null || typeof v !== "object") return false;
+            if (v.cls === T.list || v.cls === T.tuple) return true;
+            if (v.cls === T.dict || v.cls === T.set || v.cls === T.frozenset) return false;
+            return rt.lookupType(typeOf(v), "__getitem__") !== undefined && rt.lookupType(typeOf(v), "__len__") !== undefined;
+        };
+        const makeEg = (cls, msg, excsArg) => {
+            if (typeof msg !== "string") fail(E.TypeError, "argument 1 must be str, not " + typeOf(msg).name);
+            if (!isSeqArg(excsArg)) fail(E.TypeError, "second argument (exceptions) must be a sequence");
+            const excs = drain(excsArg);
+            if (!excs.length) fail(E.ValueError, "second argument (exceptions) must be a non-empty sequence");
+            let hasNonExc = false;
+            for (let i = 0; i < excs.length; i++) {
+                const x = excs[i];
+                if (!isInstance(x, E.BaseException)) fail(E.ValueError, "Item " + i + " of second argument (exceptions) is not an exception");
+                if (!isInstance(x, E.Exception)) hasNonExc = true;
+            }
+            let target = cls;
+            if (cls === E.BaseExceptionGroup) {
+                if (!hasNonExc) target = E.ExceptionGroup;
+            } else if (isSubclass(cls, E.Exception)) {
+                if (hasNonExc) fail(E.TypeError, "Cannot nest BaseExceptions in an ExceptionGroup");
+            }
+            const self = rt.makeExc(target, [msg, excsArg]);
+            self.context = null;
+            self.dict.set("message", msg);
+            self.dict.set("exceptions", tuple(excs));
+            return self;
+        };
+        const copyEgMeta = (src, dst) => {
+            if (dst === null || typeof dst !== "object") return dst;
+            dst.cause = src.cause;
+            dst.context = src.context;
+            dst.suppress = src.suppress;
+            if (src.frames !== undefined) dst.frames = src.frames.slice();
+            dst.tbline = src.tbline;
+            const notes = src.dict.get("__notes__");
+            if (notes !== undefined) {
+                dst.dict.set("__notes__", notes !== null && typeof notes === "object" && notes.cls === T.list ? list(notes.items.slice()) : notes);
+            }
+            return dst;
+        };
+        const egCondFn = (cond) => {
+            if (isType(cond)) {
+                if (!isSubclass(cond, E.BaseException)) fail(E.TypeError, "expected a function, exception type or tuple of exception types");
+                return (e) => isInstance(e, cond);
+            }
+            if (cond !== null && typeof cond === "object" && cond.cls === T.tuple) {
+                for (const item of cond.items) {
+                    if (!isType(item) || !isSubclass(item, E.BaseException)) fail(E.TypeError, "expected a function, exception type or tuple of exception types");
+                }
+                return (e) => {
+                    for (const item of cond.items) if (isInstance(e, item)) return true;
+                    return false;
+                };
+            }
+            if (rt.isCallable(cond)) return (e) => truth(rt.call(cond, [e], null));
+            fail(E.TypeError, "expected a function, exception type or tuple of exception types");
+        };
+        const egSplitRec = (eg, matchFn) => {
+            if (matchFn(eg)) return [eg, null];
+            const excs = eg.dict.get("exceptions").items;
+            const matched = [], unmatched = [];
+            for (let i = 0; i < excs.length; i++) {
+                const e = excs[i];
+                if (isInstance(e, E.BaseExceptionGroup)) {
+                    const pair = egSplitRec(e, matchFn);
+                    if (pair[0] !== null) matched.push(pair[0]);
+                    if (pair[1] !== null) unmatched.push(pair[1]);
+                } else if (matchFn(e)) {
+                    matched.push(e);
+                } else {
+                    unmatched.push(e);
+                }
+            }
+            const mk = (xs) => {
+                if (!xs.length) return null;
+                const d = rt.call(rt.getattr(eg, "derive"), [list(xs)], null);
+                if (!isInstance(d, E.BaseExceptionGroup)) fail(E.TypeError, "derive must return an instance of BaseExceptionGroup");
+                return copyEgMeta(eg, d);
+            };
+            return [mk(matched), mk(unmatched)];
+        };
+        E.BaseExceptionGroup.dict.set("__new__", { cls: T.staticmethod, func: builtin("__new__", -1, (a) => {
+            if (a.length < 3) fail(E.TypeError, "function takes exactly 2 arguments (" + (a.length - 1) + " given)");
+            return makeEg(a[0], a[1], a[2]);
+        }) });
+        E.BaseExceptionGroup.dict.set("__init__", builtin("__init__", -1, () => null));
+        E.BaseExceptionGroup.dict.set("derive", builtin("derive", 2, (a) => makeEg(E.BaseExceptionGroup, a[0].dict.get("message"), a[1])));
+        E.BaseExceptionGroup.dict.set("__str__", builtin("__str__", 1, (a) => { const n = a[0].dict.get("exceptions").items.length; return a[0].dict.get("message") + " (" + n + " sub-exception" + (n === 1 ? "" : "s") + ")"; }));
+        E.BaseExceptionGroup.dict.set("__repr__", builtin("__repr__", 1, (a) => {
+            const items = a[0].args.items;
+            const excsRepr = items.length >= 2 ? repr(items[1]) : repr(list(a[0].dict.get("exceptions").items.slice()));
+            return typeOf(a[0]).name + "(" + repr(a[0].dict.get("message")) + ", " + excsRepr + ")";
+        }));
+        E.BaseExceptionGroup.dict.set("subgroup", builtin("subgroup", 2, (a) => egSplitRec(a[0], egCondFn(a[1]))[0]));
+        E.BaseExceptionGroup.dict.set("split", builtin("split", 2, (a) => tuple(egSplitRec(a[0], egCondFn(a[1])))));
+        // except* helpers (PEP 654).
+        const checkStarSpec = (spec) => {
+            if (isType(spec)) {
+                if (!isSubclass(spec, E.BaseException)) fail(E.TypeError, "catching classes that do not inherit from BaseException is not allowed");
+                if (isSubclass(spec, E.BaseExceptionGroup)) fail(E.TypeError, "catching ExceptionGroup with except* is not allowed. Use except instead.");
+                return;
+            }
+            if (spec !== null && typeof spec === "object" && spec.cls === T.tuple) {
+                for (const item of spec.items) checkStarSpec(item);
+                return;
+            }
+            fail(E.TypeError, "catching classes that do not inherit from BaseException is not allowed");
+        };
+        const collectLeaves = (e, out) => {
+            if (isInstance(e, E.BaseExceptionGroup)) {
+                const xs = e.dict.get("exceptions").items;
+                for (let i = 0; i < xs.length; i++) collectLeaves(xs[i], out);
+            } else {
+                out.add(e);
+            }
+        };
+        R.eg_split = function (unmatched, spec) {
+            checkStarSpec(spec);
+            if (unmatched === null) return [null, null];
+            if (isInstance(unmatched, E.BaseExceptionGroup)) {
+                return egSplitRec(unmatched, (e) => R.excmatch(e, spec));
+            }
+            if (R.excmatch(unmatched, spec)) {
+                const wrapped = makeEg(E.BaseExceptionGroup, "", tuple([unmatched]));
+                copyEgMeta(unmatched, wrapped);
+                return [wrapped, null];
+            }
+            return [null, unmatched];
+        };
+        R.eg_record = function (reraised, raised, matched, thrown) {
+            const e = rt.normexc(thrown);
+            if (e === matched) reraised.push(e);
+            else raised.push(e);
+            return null;
+        };
+        R.eg_finish = function (orig, unmatched, reraised, raised) {
+            let kept = null;
+            if (reraised.length === 0) {
+                kept = unmatched;
+            } else if (unmatched === null && reraised.length === 1) {
+                kept = reraised[0];
+            } else if (isInstance(orig, E.BaseExceptionGroup)) {
+                const want = new Set();
+                if (unmatched !== null) collectLeaves(unmatched, want);
+                for (let i = 0; i < reraised.length; i++) collectLeaves(reraised[i], want);
+                const origLeaves = new Set();
+                collectLeaves(orig, origLeaves);
+                let allOrig = true;
+                for (const x of origLeaves) if (!want.has(x)) { allOrig = false; break; }
+                kept = allOrig ? orig : egSplitRec(orig, (e) => want.has(e))[0];
+            } else {
+                kept = reraised[0];
+            }
+            if (raised.length === 0) {
+                if (kept === null) return null;
+                throw kept;
+            }
+            const all = raised.slice();
+            if (kept !== null) all.push(kept);
+            if (all.length === 1) throw all[0];
+            const combined = makeEg(E.BaseExceptionGroup, "", list(all));
+            combined.context = orig;
+            throw combined;
+        };
+    }
     for (const n of ["BaseExceptionGroup", "ExceptionGroup"]) B.set(n, E[n]);
     // `object` and friends double as constructors through `construct`.
     rt.constructors.set(ObjectType, (args, kw, cls) => { if (cls === ObjectType) { if (args.length || (kw && kw.size)) fail(E.TypeError, "object() takes no arguments"); return { cls: ObjectType, dict: new Map() }; } return null; });
@@ -1862,6 +2427,7 @@
         } else {
             t = rt.typeOf(obj);
         }
+        if (!rt.getPlan(t)) { const v = getattr(obj, name); R.mself = false; return v; }
         const attr = rt.lookupType(t, name);
         if (attr !== undefined && attr !== null && typeof attr === "object" && (attr.cls === T.function || attr.cls === T.builtin_function_or_method)) {
             const own = obj !== null && typeof obj === "object" && obj.dict !== undefined && obj.dict !== null ? obj.dict.get(name) : undefined;
@@ -1888,6 +2454,7 @@
         } else {
             t = rt.typeOf(obj);
         }
+        if (!rt.getPlan(t)) { const v = getattr(obj, name); R.mself = false; return v; }
         const attr = rt.lookupType(t, name);
         if (attr !== undefined && attr !== null && typeof attr === "object") {
             const ac = attr.cls;
@@ -1969,11 +2536,11 @@
     const target = (it) => it.wrapped !== undefined ? it.wrapped : it;
     function finished(value) { R.yfret = value; return STOP; }
     R.yfstep = function (it, mode, v) {
-        const gen = it.cls === T.generator;
+        const gen = it.cls === T.generator || it.cls === T.coroutine || it.cls === T.coroutine_wrapper || it.cls === T.async_generator_asend;
         if (mode === 0) {
             if (v === null || v === undefined) {
                 if (gen) {
-                    if (it.done) return finished(null);
+                    if (it.cls === T.generator && it.done) return finished(null);
                     const r = it.next();
                     return r === STOP ? finished(it.returned) : r;
                 }
@@ -2012,7 +2579,7 @@
         }
     };
     function closeSub(it) {
-        if (it.cls === T.generator) { it.close(); return; }
+        if (it.cls === T.generator || it.cls === T.coroutine || it.cls === T.coroutine_wrapper || it.cls === T.async_generator_asend) { it.close(); return; }
         let close;
         try { close = getattr(target(it), "close"); }
         catch (e) { if (e !== null && typeof e === "object" && e.cls !== undefined && isInstance(e, E.AttributeError)) return; throw e; }
@@ -2061,7 +2628,7 @@
     R.BHASATTR = rt.builtins.get("hasattr");
     const isinstanceCode = R.BISINSTANCE.code;
     R.isinst = function (v, t) {
-        if (t !== null && typeof t === "object" && t.isType === true) {
+        if (t !== null && typeof t === "object" && t.isType === true && t.cls === rt.TypeType) {
             // `v`'s exact type is `t`: true without the MRO walk.
             const tv = typeof v;
             const c = tv === "object" ? (v === null ? T.NoneType : v.cls) : tv === "bigint" ? T.int : tv === "string" ? T.str : tv === "number" ? T.float : tv === "boolean" ? T.bool : undefined;

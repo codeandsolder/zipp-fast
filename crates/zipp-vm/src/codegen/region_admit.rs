@@ -603,7 +603,10 @@ pub(crate) fn region_can_compile(
     // so a change that looked like it would unblock a region unblocked nothing.
     // Behaviour is unchanged when the flag is off (`dump` is false, and every
     // rejection returns immediately exactly as before).
-    let dump = crate::env_var_os("ZIPP_JITDUMP").is_some();
+    let dump = {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| crate::env_var_os("ZIPP_JITDUMP").is_some())
+    };
     let mut ok = true;
     // The back-edge must be an unconditional jump to the header (canonical
     // while/for shape). This guarantees no fall-through past `end`, so the only
@@ -1999,12 +2002,33 @@ pub(crate) struct HeapHelpers {
     pub(crate) acc_lanes: Option<&'static super::AccLanePlan>,
     /// `HeapHelperAddrs::priv_lanes`.
     pub(crate) priv_lanes: Option<&'static super::PrivLanePlan>,
+    /// Snapshot of `Heap::atoms_raw` / `Heap::atoms_words` at compile time.
+    pub(crate) atoms_raw: u64,
+    pub(crate) atoms_words: u64,
     /// First global inline-cache site id for this region; the k-th heap op uses
     /// `ic_base_idx + k`.
     pub(crate) ic_base_idx: u32,
     /// The address of the entry count a Tier C body counts down before it
     /// asks for Tier O (`Jit::opt_tier_up`), 0 for none.
     pub(crate) opt_tier_up: u64,
+}
+
+impl HeapHelpers {
+    /// Whether `bits` is a heap string marked in `Heap::atoms` at compile time.
+    pub(crate) fn is_atom_bits(&self, bits: u64) -> bool {
+        let v = crate::value::Value::from_bits(bits);
+        if !v.is_heap() || self.atoms_raw == 0 {
+            return false;
+        }
+        let idx = v.heap_index() as usize;
+        let word = idx >> 6;
+        if (word as u64) >= self.atoms_words {
+            return false;
+        }
+        // SAFETY: `atoms_raw` / `atoms_words` snapshot `Heap::atoms` after
+        // `jit_build_const_strs` and no allocation runs during compilation.
+        unsafe { (*(self.atoms_raw as *const u64).add(word) >> (idx & 63)) & 1 != 0 }
+    }
 }
 
 env_off_switch! {

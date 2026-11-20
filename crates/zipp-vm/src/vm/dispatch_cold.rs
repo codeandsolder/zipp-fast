@@ -3782,6 +3782,7 @@ impl<'p> Vm<'p> {
                             unreachable!("object kind changed across write barrier")
                         };
                         m.define(&ks, v, crate::heap::PropAttr::data());
+                        self.heap.bump_version(oi);
                     } else {
                         self.set_prop(o, &ks, v, false)?;
                     }
@@ -4441,10 +4442,16 @@ impl<'p> Vm<'p> {
                 heap_helper_addrs.acc_lanes = self.build_acc_lane_plan(func_id);
                 heap_helper_addrs.priv_lanes = self.build_priv_lane_plan(func_id);
                 let const_strs = self.jit_build_const_strs(func_id);
+                heap_helper_addrs.atoms_raw = self.heap.atoms_raw;
+                heap_helper_addrs.atoms_words = self.heap.atoms_words;
                 // Tier-C leaf-inline plan for the whole function (from the live
                 // ICs). Built BEFORE the &mut self.jit borrow. Opt out with
                 // ZIPP_NO_TIERC_LEAF (region leaf inlining is unaffected).
-                let mut leaf_plan = if crate::env_var_os("ZIPP_NO_TIERC_LEAF").is_none() {
+                let tierc_leaf_on = {
+                    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                    *ON.get_or_init(|| crate::env_var_os("ZIPP_NO_TIERC_LEAF").is_none())
+                };
+                let mut leaf_plan = if tierc_leaf_on {
                     self.build_leaf_inline_plan(
                         func_id,
                         0,
@@ -4501,9 +4508,36 @@ impl<'p> Vm<'p> {
                     }
                     opt_callees.class_epoch = self.mi_class_epoch;
                     for fid in crate::codegen::opt_plan_callee_ids(&cross_plan, &class_read, &opt_callees.getters) {
-                        if (fid as usize) < self.main_func_count {
+                        if self.is_main_func(fid) {
                             let callee: &'p crate::bytecode::FuncProto = self.func(fid as usize);
-                            opt_callees.bodies.insert(fid, (callee, self.build_prop_shape_plan(fid)));
+                            if callee.code.len() <= 64
+                                && !callee.is_generator
+                                && !callee.is_async
+                                && callee.rest_reg.is_none()
+                                && callee.arguments_reg.is_none()
+                                && callee.eval_sites.is_empty()
+                            {
+                                let c_prop = self.build_prop_shape_plan(fid);
+                                let c_strs = self.jit_build_const_strs(fid);
+                                let mut c_poly = rustc_hash::FxHashMap::default();
+                                for (cip, cinstr) in callee.code.iter().enumerate() {
+                                    if matches!(cinstr, Instr::GetProp { .. }) {
+                                        let ways = self.ic_own_data_ways(fid, cip);
+                                        if ways.len() >= 2 {
+                                            c_poly.insert(cip, ways);
+                                        }
+                                    }
+                                }
+                                opt_callees.bodies.insert(
+                                    fid,
+                                    crate::codegen::OptCallee {
+                                        proto: callee,
+                                        prop_shape: c_prop,
+                                        const_strs: c_strs,
+                                        poly: c_poly,
+                                    },
+                                );
+                            }
                         }
                     }
                 } else if crate::codegen::tierc_class_const_enabled() {
@@ -4519,6 +4553,19 @@ impl<'p> Vm<'p> {
                     }
                     opt_callees.class_epoch = self.mi_class_epoch;
                 }
+                if crate::codegen::direct_ic_miss_enabled() && !self.jit.metered() {
+                    for (ip, instr) in proto_ref.code.iter().enumerate() {
+                        let is_set = match instr {
+                            Instr::GetProp { .. } => false,
+                            Instr::SetProp { .. } => true,
+                            _ => continue,
+                        };
+                        if self.ic_site_is_rotating_own(func_id, ip, is_set) {
+                            self.jit.preseed_direct_miss_site(func_id, ip as u32);
+                        }
+                    }
+                }
+                let prop_key_ids = self.build_prop_key_ids(func_id);
                 self.jit.compile(
                     func_id,
                     proto_ref,
@@ -4536,8 +4583,213 @@ impl<'p> Vm<'p> {
                     &prop_shape,
                     &class_read,
                     &opt_callees,
+                    &prop_key_ids,
                 );
             }
         }
+    }
+
+    /// The OSR loop-region compile trigger on a back-edge, out of `dispatch_body`:
+    /// it runs once per loop header on crossing the threshold, while `dispatch_body`
+    /// runs on every instruction. Inline, its ~25 heavy planning locals inflated
+    /// `dispatch_body::<false, false>`'s stack frame and register spills across
+    /// every opcode. Returns `Some(resume_ip)` if the newly compiled region ran.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn jit_compile_osr_on_backedge(
+        &mut self,
+        func_id: u32,
+        t: usize,
+        ip: usize,
+        base: usize,
+    ) -> Option<usize> {
+        let region_end = {
+            let proto = self.func(func_id as usize);
+            let last = proto.code.len() - 1;
+            let mut e = ip.min(last);
+            for p in (ip + 1)..=last {
+                if matches!(proto.code[p], Instr::Jump { target } if target as usize == t) {
+                    e = p;
+                }
+            }
+            e
+        };
+        let region_globals_ok = {
+            let proto = self.func(func_id as usize);
+            let s = t;
+            let e = region_end;
+            proto.code[s..=e].iter().all(|ins| match *ins {
+                Instr::LoadGlobal { idx, .. } | Instr::LoadGlobalOrUndefined { idx, .. } => {
+                    self.global_slot_directly_routable(idx)
+                }
+                Instr::StoreGlobal { idx, .. }
+                | Instr::StoreGlobalStrict { idx, .. }
+                | Instr::StoreGlobalResolved { idx, .. } => {
+                    self.global_store_slot_directly_routable(idx)
+                }
+                _ => true,
+            })
+        };
+        if !region_globals_ok {
+            self.jit.region_defer_globals(func_id, t as u32);
+            return None;
+        }
+        let region_call_mix_ok = {
+            let proto = self.func(func_id as usize);
+            let s = t;
+            let e = region_end;
+            let mut fallback = 0usize;
+            for (off, ins) in proto.code[s..=e].iter().enumerate() {
+                match ins {
+                    Instr::CallMethod { name, argc, .. } => {
+                        let key = proto
+                            .string_constants
+                            .get(*name as usize)
+                            .map(|x| x.as_str());
+                        if *argc == 1
+                            && matches!(
+                                key,
+                                Some("push")
+                                    | Some("charCodeAt")
+                                    | Some("indexOf")
+                                    | Some("get")
+                                    | Some("has")
+                            )
+                        {
+                            continue;
+                        }
+                        if (*argc == 2
+                            || (*argc == 1 && crate::codegen::substring1_intrinsic_enabled()))
+                            && matches!(key, Some("substring") | Some("slice"))
+                        {
+                            continue;
+                        }
+                        if matches!(key, Some("set") | Some("delete") | Some("add")) {
+                            continue;
+                        }
+                        if (*argc == 1 || *argc == 2)
+                            && key.is_some_and(|k| crate::codegen::dv_get_kind(k).is_some())
+                        {
+                            continue;
+                        }
+                        if *argc == 0 && key == Some("next") {
+                            continue;
+                        }
+                        if *argc == 0 && key == Some("pop") {
+                            continue;
+                        }
+                        if crate::codegen::call_inline_enabled()
+                            && ((*argc <= 4 && key == Some("call"))
+                                || (*argc <= 2 && key == Some("apply")))
+                        {
+                            continue;
+                        }
+                    }
+                    Instr::Call { .. } => {}
+                    _ => continue,
+                }
+                let site = (func_id as usize)
+                    .checked_sub(0)
+                    .and_then(|f| self.site_ics.get(f))
+                    .and_then(|x| x.as_ref())
+                    .and_then(|slots| slots.get(s + off))
+                    .and_then(super::ic::SiteCell::site_ref);
+                if let Some(site) = site {
+                    if site.n == 0 && site.misses >= 4 {
+                        fallback += 1;
+                    }
+                }
+            }
+            fallback == 0 || (e - s + 1) >= fallback * 20
+        };
+        if !region_call_mix_ok {
+            self.jit.blacklist_region(func_id, t as u32);
+            return None;
+        }
+        let pending: Vec<u32> = {
+            let proto = self.func(func_id as usize);
+            proto.code[t..=region_end]
+                .iter()
+                .filter_map(|ins| match *ins {
+                    Instr::LoadConst { idx, .. } => {
+                        let c = proto.constants[idx as usize];
+                        if c.is_heap() && (c.heap_index() & STRING_CONST_BIT) != 0 {
+                            Some(idx)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut const_strs: rustc_hash::FxHashMap<u32, u64> = rustc_hash::FxHashMap::default();
+        for idx in pending {
+            if const_strs.contains_key(&idx) {
+                continue;
+            }
+            const_strs.insert(idx, self.jit_const_str_bits(func_id, idx));
+        }
+        let (mut cross_plan, cross_pending, cross_baked) =
+            self.build_cross_call_plan(func_id, Some(base), false);
+        if !cross_pending.is_empty() && self.jit.cross_defer_allowed(func_id, t as u32) {
+            self.jit.region_defer(func_id, t as u32);
+            return None;
+        }
+        let ta_plan = self.build_ta_pin_plan(func_id, t as u32, region_end as u32, base);
+        let mut leaf_plan = self.build_leaf_inline_plan(func_id, t as u32, region_end as u32);
+        let computed_leaf_plan =
+            self.build_dense_computed_leaf_plan(func_id, t as u32, region_end as u32, base);
+        let method_plan =
+            self.build_method_inline_plan(func_id, t as u32, region_end as u32, base, false);
+        if self.heap.nursery_on() {
+            for plan in method_plan.values() {
+                for shape in &plan.shapes {
+                    let stores = shape.body.iter().any(|op| {
+                        matches!(
+                            op,
+                            crate::bytecode::Instr::SetProp { obj: 0, .. }
+                                | crate::bytecode::Instr::SuperSet { .. }
+                        )
+                    });
+                    if stores {
+                        let v = crate::value::Value::from_bits(shape.recv_bits);
+                        if v.is_heap() {
+                            self.heap.register_scan_root(v.heap_index());
+                        }
+                    }
+                }
+            }
+        }
+        let proto: *const crate::bytecode::FuncProto = self.func(func_id as usize);
+        // SAFETY: program functions are immutable during run.
+        let proto_ref = unsafe { &*proto };
+        let mut heap_helper_addrs = self.jit_heap_helper_addrs();
+        heap_helper_addrs.acc_lanes = self.build_acc_lane_plan(func_id);
+        self.plan_new_lanes(func_id, &mut cross_plan, &mut leaf_plan);
+        self.jit.note_cross_baked(func_id, &cross_baked);
+        self.jit.note_cross_pending(func_id, &cross_pending);
+        #[cfg(feature = "python")]
+        self.py_native_call_sites(func_id);
+        self.jit.compile_region(
+            func_id,
+            proto_ref,
+            t as u32,
+            region_end as u32,
+            &self.globals,
+            &self.heap,
+            jit_globals_base as *const () as usize,
+            heap_helper_addrs,
+            self.program.global_count,
+            FIELD_POOL as u32,
+            &const_strs,
+            &ta_plan,
+            &leaf_plan,
+            &computed_leaf_plan,
+            &method_plan,
+            &cross_plan,
+        );
+        self.try_run_osr(func_id, t as u32, base)
     }
 }

@@ -182,7 +182,8 @@ impl<'p> Vm<'p> {
                     seq_shape: self.py_rt.as_deref().map_or(crate::shape::DICT, |p| p.seq_shape),
                 };
                 let mut steps = 0;
-                let h = native_hash(&self.heap, &kinds, t, &mut steps);
+                let cache = self.py_rt.as_deref().map(|p| &*p.str_hashes);
+                let h = native_hash_cached(&self.heap, cache, &kinds, t, &mut steps);
                 self.charge_steps(steps as i64);
                 h.map_or(Value::UNDEFINED, |h| self.make_bigint(i128::from(h)))
             }
@@ -265,7 +266,8 @@ impl<'p> Vm<'p> {
         let mut steps = 0;
         let found = {
             let t = table_at(&self.heap, storage)?;
-            let (at, _) = native_lookup(&self.heap, &t.kinds, t, key, &mut steps)?;
+            let cache = self.py_rt.as_deref().map(|p| &*p.str_hashes);
+            let (at, _) = native_lookup_cached(&self.heap, cache, &t.kinds, t, key, &mut steps)?;
             at.map(|i| if t.is_set() { Value::TRUE } else { t.value_at(i).unwrap_or(Value::UNDEFINED) })
         };
         self.charge_steps(steps as i64);
@@ -273,36 +275,69 @@ impl<'p> Vm<'p> {
     }
 
     /// `d[k] = v` / `s.add(k)` of a table `storage` for a key of a native
+    /// kind: `Some(Ok((new_length, inserted)))`, `Some(Err(()))` when the
+    /// table is full, `None` when `storage` is not a table or guest code is
+    /// needed (nothing changed).
+    #[inline(never)]
+    pub(crate) fn py_table_set_ex(&mut self, storage: Value, key: Value, val: Value) -> Option<Result<(usize, bool), ()>> {
+        let mut steps = 0;
+        // Probe while the table stays in place on the heap: existing-key
+        // replacement (the dominant dict workload) writes the value directly
+        // without detaching/re-attaching the table or running key barriers.
+        let (is_set, kinds, len, probe) = {
+            let t = table_at(&self.heap, storage)?;
+            let cache = self.py_rt.as_deref().map(|p| &*p.str_hashes);
+            let p = native_lookup_cached(&self.heap, cache, &t.kinds, t, key, &mut steps)?;
+            (t.is_set(), t.kinds, t.len(), p)
+        };
+        let idx = storage.heap_index();
+        match probe {
+            (Some(at), _) => {
+                if !is_set {
+                    if let HeapObj::PyTable(tb) = self.heap.get_mut(idx) {
+                        tb.set_value(at, val);
+                    }
+                    if val.is_heap() {
+                        self.heap.write_barrier_val(idx, val);
+                    }
+                }
+                self.charge_steps(steps as i64);
+                Some(Ok((len, false)))
+            }
+            (None, h) => {
+                self.pt_flat_key(key);
+                let mut t = self.pt_take(idx);
+                let r = if is_set {
+                    add_hashed(&self.heap, &kinds, &mut t, h, key, Value::UNDEFINED, &mut steps)
+                } else {
+                    add_hashed(&self.heap, &kinds, &mut t, h, key, val, &mut steps)
+                };
+                let new_len = t.len();
+                self.pt_put(idx, t);
+                self.charge_steps(steps as i64);
+                match r {
+                    Ok((_, inserted)) => {
+                        if !is_set && val.is_heap() {
+                            self.heap.write_barrier_val(idx, val);
+                        }
+                        if inserted {
+                            self.store_barrier(crate::heap::gcoracle::COLL_INSERT, idx, key);
+                        }
+                        Some(Ok((new_len, inserted)))
+                    }
+                    Err(Stop::Full) => Some(Err(())),
+                    Err(Stop::Guest(_)) => None,
+                }
+            }
+        }
+    }
+
+    /// `d[k] = v` / `s.add(k)` of a table `storage` for a key of a native
     /// kind: `Some(Ok(new length))`, `Some(Err(()))` when the table is full
     /// (the runtime raises MemoryError), `None` when `storage` is not a
-    /// table or guest code is needed (nothing changed). The caller writes
-    /// the length into the record's `size`. The fused `PySetItem` calls
-    /// this with a dict record's `map`.
-    #[inline(never)]
+    /// table or guest code is needed (nothing changed).
     pub(crate) fn py_table_set(&mut self, storage: Value, key: Value, val: Value) -> Option<Result<usize, ()>> {
-        table_at(&self.heap, storage)?;
-        let idx = storage.heap_index();
-        self.pt_flat_key(key);
-        let mut t = self.pt_take(idx);
-        let mut steps = 0;
-        let kinds = t.kinds;
-        let r = if t.is_set() {
-            native_add(&self.heap, &kinds, &mut t, key, &mut steps).map(|_| ())
-        } else {
-            native_set_item(&self.heap, &kinds, &mut t, key, val, &mut steps).map(|_| ())
-        };
-        let len = t.len();
-        self.pt_put(idx, t);
-        self.charge_steps(steps as i64);
-        match r {
-            Ok(()) => {
-                self.heap.write_barrier_val(idx, val);
-                self.store_barrier(crate::heap::gcoracle::COLL_INSERT, idx, key);
-                Some(Ok(len))
-            }
-            Err(Stop::Full) => Some(Err(())),
-            Err(Stop::Guest(_)) => None,
-        }
+        self.py_table_set_ex(storage, key, val).map(|r| r.map(|(n, _)| n))
     }
 
     /// The length of a table `storage` (`None`: not a table). For the fused
@@ -318,7 +353,8 @@ impl<'p> Vm<'p> {
         let mut steps = 0;
         let at = {
             let t = table_at(&self.heap, storage)?;
-            native_lookup(&self.heap, &t.kinds, t, key, &mut steps)?.0
+            let cache = self.py_rt.as_deref().map(|p| &*p.str_hashes);
+            native_lookup_cached(&self.heap, cache, &t.kinds, t, key, &mut steps)?.0
         };
         self.charge_steps(steps as i64);
         let Some(i) = at else {

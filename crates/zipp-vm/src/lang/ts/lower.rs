@@ -115,10 +115,7 @@ pub(crate) fn iife(param: &Name, body: Vec<Stmt>, arg: Expr, span: Span) -> Stmt
             items: vec![Pattern::Ident(param.clone())],
             simple: true,
         },
-        body: FnBody {
-            directives: Vec::new(),
-            stmts: body,
-        },
+        body: FnBody::new(Vec::new(), body),
         is_async: false,
         is_generator: false,
         span,
@@ -175,10 +172,10 @@ pub(crate) fn live_export(ns: &Name, name: &Name, at: u32) -> Stmt {
             items: vec![Pattern::Ident(v.clone())],
             simple: true,
         },
-        body: ArrowBody::Block(FnBody {
-            directives: Vec::new(),
-            stmts: vec![Stmt::Expr(assign(target_of(ident(name)), ident(&v)))],
-        }),
+        body: ArrowBody::Block(FnBody::new(
+            Vec::new(),
+            vec![Stmt::Expr(assign(target_of(ident(name)), ident(&v)))],
+        )),
         is_async: false,
         span: Span::new(at, at),
     }));

@@ -54,6 +54,212 @@ impl InstanceofMemo {
     };
 }
 
+/// Slots of `Vm::instanceof_pair_memo`, direct-mapped by `(v_key, c_idx)`.
+#[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+pub(crate) const INSTANCEOF_PAIR_SLOTS: usize = 4096;
+
+/// Cached `(v_proto_or_class, ctor) -> bool` answer for `instanceof_fast`,
+/// valid while every guarded prototype hop / constructor / class chain
+/// (`Heap::chain_epoch`, `Vm::fn_props_gen`, `Vm::class_proto_epoch`) is
+/// unchanged.
+#[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct InstanceofPairMemo {
+    pub(crate) v_key: u32,
+    pub(crate) ci: u32,
+    pub(crate) chain_epoch: u32,
+    pub(crate) fn_props_gen: u32,
+    pub(crate) class_proto_epoch: u32,
+    pub(crate) result: bool,
+    pub(crate) _pad: [u8; 11],
+}
+
+#[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+impl InstanceofPairMemo {
+    pub(crate) const EMPTY: InstanceofPairMemo = InstanceofPairMemo {
+        v_key: u32::MAX,
+        ci: u32::MAX,
+        chain_epoch: 0,
+        fn_props_gen: 0,
+        class_proto_epoch: 0,
+        result: false,
+        _pad: [0; 11],
+    };
+}
+
+/// Slots of `Vm::es5_proto_memo`, direct-mapped by `(first_proto, key_id)`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const ES5_PROTO_MEMO_SLOTS: usize = 16384;
+
+/// Cached ES5 prototype-chain lookup result (`vals_ptr` + `slot`, or
+/// `slot == u32::MAX` for proved absence) keyed by `(first_proto, key_id)`
+/// (canonical VM-wide property name ID) and guarded in O(1) by `Heap::chain_epoch`.
+/// `#[repr(C)]`, 32 bytes (power of two) for direct x86-64 JIT probing.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct Es5ProtoMemo {
+    pub(crate) first_proto: u32,
+    pub(crate) key_id: u32,
+    pub(crate) chain_epoch: u32,
+    pub(crate) slot: u32,
+    pub(crate) vals_ptr: u64,
+    pub(crate) _pad: u64,
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+impl Es5ProtoMemo {
+    pub(crate) const EMPTY: Es5ProtoMemo = Es5ProtoMemo {
+        first_proto: u32::MAX,
+        key_id: 0,
+        chain_epoch: 0,
+        slot: u32::MAX,
+        vals_ptr: 0,
+        _pad: 0,
+    };
+}
+
+/// Slots of `Vm::dict_prop_memo`, direct-mapped by `(idx, key_id)`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const DICT_PROP_MEMO_SLOTS: usize = 16384;
+
+/// Cached own DATA property slot for dictionary-mode (`shape::DICT`) objects
+/// (`NodePath`, `Scope`, `Parser`, `Printer`, `File`, `opts`), guarded by
+/// `Heap::version_of(idx)`. `writable == 1` iff own writable data slot.
+/// `#[repr(C)]`, 32 bytes for direct x86-64 probing.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct DictPropMemo {
+    pub(crate) idx: u32,
+    pub(crate) key_id: u32,
+    pub(crate) ver: u32,
+    pub(crate) slot: u32,
+    pub(crate) vals_ptr: u64,
+    pub(crate) writable: u64,
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+impl DictPropMemo {
+    pub(crate) const EMPTY: DictPropMemo = DictPropMemo {
+        idx: u32::MAX,
+        key_id: 0,
+        ver: 0,
+        slot: u32::MAX,
+        vals_ptr: 0,
+        writable: 0,
+    };
+}
+
+/// Buckets of `Vm::shape_prop_memo` (2-way set associative by `(shape, key_id)`).
+/// Each bucket holds 2 consecutive 16B `ShapePropMemo` ways (32 bytes total).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const SHAPE_PROP_MEMO_BUCKETS: usize = 32768;
+
+/// Total slots of `Vm::shape_prop_memo` (`SHAPE_PROP_MEMO_BUCKETS * 2`).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const SHAPE_PROP_MEMO_SLOTS: usize = SHAPE_PROP_MEMO_BUCKETS * 2;
+
+/// Sentinel `ShapePropMemo::slot` for a proved-absent key on a default/null
+/// prototype plain object (`FID_MIRROR_NONE`).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const SHAPE_PROP_ABSENT: u32 = 0x8000_0000;
+
+/// Sentinel `ShapePropMemo::slot` when `shape` lacks the key and `es5_proto_memo`
+/// should be probed next on `proto_of[idx]`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const SHAPE_PROP_ES5_PROTO: u32 = 0x8000_0001;
+
+/// Sentinel `ShapePropMemo::slot` when `shape` lacks the key on a class instance
+/// and `class_prop_memo` should be probed next by `(class_id, key_id)`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const SHAPE_PROP_CLASS_MISS: u32 = 0x8000_0002;
+
+/// Slots of `Vm::class_prop_memo`, direct-mapped by `(class_id, key_id)`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const CLASS_PROP_MEMO_SLOTS: usize = 16384;
+
+/// Cached class-chain method or proved-absent lookup result (`value_bits`)
+/// keyed by `(class_id, key_id)`, guarded by `version_of(class_id)`,
+/// `Vm::class_proto_epoch`, and (when `check_chain != 0`) `Heap::chain_epoch`.
+/// `#[repr(C)]`, 32 bytes for direct x86-64 JIT probing.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct ClassPropMemo {
+    pub(crate) class_id: u32,
+    pub(crate) key_id: u32,
+    pub(crate) class_ver: u32,
+    pub(crate) chain_epoch: u32,
+    pub(crate) class_epoch: u32,
+    pub(crate) check_chain: u32,
+    pub(crate) value_bits: u64,
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+impl ClassPropMemo {
+    pub(crate) const EMPTY: ClassPropMemo = ClassPropMemo {
+        class_id: u32::MAX,
+        key_id: 0,
+        class_ver: 0,
+        chain_epoch: 0,
+        class_epoch: 0,
+        check_chain: 0,
+        value_bits: 0,
+    };
+}
+
+/// Direct-mapped megamorphic `(shape, key_id) -> (slot, writable)` cache probed
+/// inline from x86-64 `mega_get_prop_stub` / `mega_set_prop_stub`. Shared across
+/// all functions in the VM via canonical property key IDs. `#[repr(C)]`, 16 bytes.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct ShapePropMemo {
+    pub(crate) shape: u32,
+    pub(crate) key_id: u32,
+    pub(crate) slot: u32,
+    pub(crate) writable: u32,
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+impl ShapePropMemo {
+    pub(crate) const EMPTY: ShapePropMemo = ShapePropMemo {
+        shape: 0,
+        key_id: 0,
+        slot: u32::MAX,
+        writable: 0,
+    };
+}
+
+/// Cached `%Function.prototype%` slot indices and pristine native `Value` bits
+/// for `.call`, `.apply`, and `.bind`, guarded by `version_of(fn_proto)`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[derive(Clone, Copy)]
+pub(crate) struct CiPristine {
+    pub(crate) ver: u32,
+    pub(crate) call_slot: u32,
+    pub(crate) apply_slot: u32,
+    pub(crate) bind_slot: u32,
+    pub(crate) call_bits: u64,
+    pub(crate) apply_bits: u64,
+    pub(crate) bind_bits: u64,
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+impl CiPristine {
+    pub(crate) const EMPTY: CiPristine = CiPristine {
+        ver: u32::MAX,
+        call_slot: u32::MAX,
+        apply_slot: u32::MAX,
+        bind_slot: u32::MAX,
+        call_bits: 0,
+        apply_bits: 0,
+        bind_bits: 0,
+    };
+}
+
 /// Hard cap on simultaneous JS frames. Throws a catchable RangeError rather
 /// than growing unbounded. 100k is far beyond any non-pathological recursion
 /// and the flat register file makes each frame cheap.
@@ -617,11 +823,11 @@ pub(crate) enum Resume {
 }
 
 /// `Vm::step_tokens`' size, a power of two.
-pub(crate) const STEP_TOKEN_SLOTS: usize = 64;
+pub(crate) const STEP_TOKEN_SLOTS: usize = 512;
 
 /// B214 latch: `ZIPP_NO_MICROTASK_ROOT=1` restores the pre-B214 whole-task
 /// GC suspension (the pricing comparator; it re-opens the TLA starvation).
-pub(crate) const COLL_PROOF_SLOTS: usize = 16;
+pub(crate) const COLL_PROOF_SLOTS: usize = 128;
 
 /// B215 latch: `ZIPP_NO_COLL_PROOF_CACHE=1` disables the receiver-half
 /// proof cache (every lookup runs the full intrinsic proof).
@@ -834,7 +1040,6 @@ impl DenseClosureHomes {
             .is_some_and(|present| present & mask != 0)
     }
 
-    #[cfg(test)]
     #[inline]
     fn len(&self) -> usize {
         self.len
@@ -980,13 +1185,17 @@ impl ClosureHomeTable {
         self.get(key).is_some()
     }
 
-    #[cfg(test)]
     #[inline]
     fn len(&self) -> usize {
         match self {
             Self::Dense(table) => table.len(),
             Self::Map(table) => table.len(),
         }
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     fn retain<F: FnMut(&u32, &mut Value) -> bool>(&mut self, keep: F) {
@@ -1889,7 +2098,8 @@ pub struct Vm<'p> {
     /// Where `o[k]` last found the flat string key `k` among the plain object
     /// `o`'s own properties: a direct-mapped table of (receiver, key, slot)
     /// that predicts the slot, which every use verifies (`keyed_memo_slot`).
-    pub(crate) keyed_slot_memo: Box<[indexing_date::KeyedSlotMemo]>,
+    /// Allocated lazily on first keyed put so small VMs pay zero boot cost.
+    pub(crate) keyed_slot_memo: Vec<indexing_date::KeyedSlotMemo>,
     /// Where a shaped object holds a named key, or that it does not
     /// (`Vm::own_pos`): a direct-mapped table keyed by (shape, key bytes).
     pub(crate) own_slot_cache: Box<[std::cell::Cell<ic::OwnSlot>]>,
@@ -1905,7 +2115,7 @@ pub struct Vm<'p> {
     /// per-site cache for the hot call/property paths. See `vm/ic.rs` for the
     /// guard model; intentionally NOT a GC root (entries are validated or
     /// re-read against live, guard-checked objects before any use).
-    site_ics: Vec<Option<Box<[ic::SiteCell]>>>,
+    site_ics: Vec<Option<ic::IcTable>>,
     /// The Python runtime's registry (`vm::py_rt`), once it bound itself.
     #[cfg(feature = "python")]
     py_rt: Option<Box<py_rt::PyRt>>,
@@ -2490,7 +2700,7 @@ pub struct Vm<'p> {
     /// the coll_* helpers every mutation routes through. Holds NO `Value`s
     /// (u32 hash tags -> u32 slot positions): GC only needs the sweep-time
     /// hygiene retain in gc.rs.
-    collection_index: rustc_hash::FxHashMap<u32, collections::CollIndex>,
+    collection_index: crate::slot_table::SlotTable<collections::CollIndex>,
     /// Monotone counter minting a fresh private brand per class evaluation (1 = first;
     /// 0 = unbranded).
     next_private_brand: u64,
@@ -2809,8 +3019,8 @@ pub struct Vm<'p> {
     /// `Function.prototype`, `Array.prototype`), built by `setup_globals`. Used as
     /// the [[Prototype]] for plain objects / functions / arrays so their methods
     /// resolve as values and `getPrototypeOf` returns them. 0 until set up.
-    obj_proto: u32,
-    fn_proto: u32,
+    pub(crate) obj_proto: u32,
+    pub(crate) fn_proto: u32,
     /// The `Function` constructor object — identified in `construct` /
     /// `call_ctor_as_function` so `new Function(args, body)` / `Function(...)`
     /// compile and return a real function (via `do_eval` of a function literal).
@@ -2863,9 +3073,14 @@ pub struct Vm<'p> {
     /// version cache sound here, exactly as the string-method doc warns).
     /// Pure cache: entries self-validate, nothing invalidates them.
     coll_intrinsic_memo: [[Option<(u32, u32, u64)>; COLL_MEMO_NAMES]; 2],
-    /// The same memo for %WeakMap.prototype%'s get/set/has/delete
-    /// (`weakmap_method_is_intrinsic`).
-    weakmap_intrinsic_memo: [Option<(u32, u32, u64)>; 4],
+    /// The same memo for %WeakMap.prototype%'s get/set/has/delete and
+    /// %WeakSet.prototype%'s has (`weakmap_method_is_intrinsic` / `weak_collection_method_is_intrinsic`).
+    weakmap_intrinsic_memo: [Option<(u32, u32, u64)>; 5],
+    /// Memo for `%ArrayIteratorPrototype%.next`: `(arr_iter_proto_ver, data_slot)`.
+    /// Reading `map.val_at(data_slot)` while `version_of(arr_iter_proto) == ver`
+    /// observes in-place data overwrites with zero string lookup.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    arr_iter_next_memo: (u32, u32),
     /// B191: boot-time snapshots of %String.prototype% / %Array.prototype%'s
     /// own method slots (`name` → the installed native's Value bits, captured
     /// at the end of `setup_globals`, when the native heap slots are pinned
@@ -3174,6 +3389,11 @@ pub struct Vm<'p> {
     /// ids outside every range (entry script / eval code) use the Vm-wide
     /// `import_meta` singleton.
     module_func_ranges: Vec<(u32, u32, u32)>,
+    /// Unified-function-id ranges of main-program nested functions installed
+    /// past `main_func_count` by `LazySession` when pre-parser-skipped bodies
+    /// compile on demand. Merged when contiguous so this holds only a few entries.
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    lazy_func_ranges: Vec<(u32, u32)>,
     /// The lazily-created `import.meta` object (for NON-loader code: the entry
     /// script / direct `run_module` pipeline; host-defined, ordinary extensible
     /// null-proto). 0 = not yet allocated. Loader-loaded modules each get a
@@ -3515,9 +3735,91 @@ pub struct Vm<'p> {
     /// slot's version (a `prototype` assignment bumps it) and
     /// `fn_props_gen` (every `fn_props` write moves it) are what they were.
     instanceof_memo: Box<[InstanceofMemo]>,
+    /// Direct-mapped `(v_proto_or_class, ctor) -> bool` result cache for
+    /// `instanceof_fast`, guarded by `Heap::chain_epoch`, `fn_props_gen`, and
+    /// `class_proto_epoch`.
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    instanceof_pair_memo: Box<[InstanceofPairMemo]>,
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    pub(crate) instanceof_pair_memo_raw: u64,
     /// Moved by every write to `fn_props`, which keeps a function's own
     /// properties without bumping its version (`instanceof_memo`).
     fn_props_gen: u32,
+    /// Non-zero once any `fn_props` write ever defines/sets an own `"call"`,
+    /// `"apply"`, or `"bind"` property on a callable; read directly by
+    /// `emit_fn_call_dyn_stub`, `try_fn_call_apply_inline`, and
+    /// `fn_call_apply_pristine` to skip per-call `fn_props` probes.
+    pub(crate) fn_props_has_call: u8,
+    pub(crate) fn_props_has_apply: u8,
+    pub(crate) fn_props_has_bind: u8,
+    /// Direct-mapped `(first_proto, func, name) -> (vals_ptr, slot)` memo for
+    /// polymorphic ES5 prototype-chain reads and proved absences (`jit_get_prop_miss`
+    /// and `jit_get_prop_leaf`), allocated lazily on first ES5 prototype miss.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) es5_proto_memo: Vec<Es5ProtoMemo>,
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) es5_proto_memo_raw: u64,
+    /// Direct-mapped `(idx, packed) -> (ver, vals_ptr, slot)` memo for
+    /// dictionary-mode (`shape::DICT`) own DATA reads (`jit_get_prop_miss` and
+    /// `mega_get_prop_stub`), allocated lazily on first DICT miss.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) dict_prop_memo: Vec<DictPropMemo>,
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) dict_prop_memo_raw: u64,
+    /// Direct-mapped `(shape, packed) -> slot` memo for megamorphic shaped
+    /// `GetProp` misses (>32 AST shapes), probed inline from `mega_get_prop_stub`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) shape_prop_memo: Vec<ShapePropMemo>,
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) shape_prop_memo_raw: u64,
+    /// Direct-mapped `(class_id, key_id) -> value_bits` memo for class methods
+    /// and proved-absent properties across all receiver shapes of a class,
+    /// probed inline from `mega_get_prop_stub`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) class_prop_memo: Vec<ClassPropMemo>,
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) class_prop_memo_raw: u64,
+    /// Canonical VM-wide property-name -> `u32` ID (`1..`) so megamorphic
+    /// `(shape, key_id)` / `(first_proto, key_id)` / `(idx, key_id)` memos are
+    /// shared across every function in the program without per-function thrashing.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) prop_key_map: rustc_hash::FxHashMap<Box<str>, u32>,
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) prop_key_cache: Vec<Vec<u32>>,
+    /// Cached raw base of `Vm::keyed_slot_memo` (0 while empty; fixed 16384-slot
+    /// buffer once allocated) for direct x86-64 `keyed_memo_get_stub` probing.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) keyed_slot_memo_raw: u64,
+    /// Write-through non-empty flags for `deferred_ns_state` and
+    /// `module_namespaces` so x86-64 stubs guard them in 1 byte load.
+    pub(crate) deferred_ns_nonempty: u8,
+    pub(crate) mod_ns_nonempty: u8,
+    /// Snapshot of pristine `%Function.prototype%` (`shape`, `"call"` slot,
+    /// `FN_CALL` native bits) and `Array`/`Array.isArray` bits recorded at the
+    /// end of `setup_globals` for native `fn.call` and `Array.isArray` stubs.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn_proto_shape: u32,
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn_proto_call_slot: u32,
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn_call_native_bits: u64,
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) array_ctor_bits: u64,
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) array_is_array_bits: u64,
+    /// Snapshot of `heap.version_of(obj_proto)` at the end of `setup_globals`,
+    /// guarding `SHAPE_PAIR_ABSENT_SLOT` inline shape-way hits in `emit_ic_probe`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) obj_proto_setup_ver: u32,
+    /// Snapshot of `Symbol.iterator` Value bits and pristine
+    /// `%Array.prototype%[Symbol.iterator]` slot pointer & version for inline
+    /// `arr[Symbol.iterator]` resolution in `emit_keyed_memo_get_stub`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) sym_iterator_bits: u64,
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) arr_proto_iter_slot_ptr: u64,
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) arr_proto_iter_ver: u32,
     /// Ordinary functions whose `prototype` was made non-writable
     /// (`Object.defineProperty(f, "prototype", {writable: false})`,
     /// `Object.freeze(f)`). Each also has a `fn_proto_override` entry (its
@@ -3542,6 +3844,13 @@ pub struct Vm<'p> {
     htmldda_idx: u32,
     /// VM-construction-latched same-binary ablation for `htmldda_idx`.
     htmldda_scalar_enabled: bool,
+    /// Upper bound of special non-plain-object setup indices (`fn_proto`,
+    /// `symbol_ctor`, `bigint_ctor`, and the singleton `htmldda_idx`), or
+    /// `u32::MAX` when the scalar HTMLDDA lane is disabled. Any heap object
+    /// with `idx > typeof_special_max`, non-DICT JS shape, and plain/class fid
+    /// mirror word is guaranteed `typeof === "object"` without an FFI call.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    typeof_special_max: u32,
     /// The `Proxy` constructor object (no `.prototype`). 0 until setup.
     proxy_ctor: u32,
     /// The `Temporal` namespace object + `Temporal.Duration`/`PlainDate` ctors/protos.
@@ -3670,6 +3979,11 @@ pub struct Vm<'p> {
     /// The `globalThis` object (an empty Object at this heap index); property
     /// access on it is routed to the global slots by name. 0 until `setup_globals`.
     global_this: u32,
+    /// Pre-boxed `Value::heap(global_this).bits()` (or `Value::UNDEFINED.bits()`
+    /// while `global_this == 0`), read directly by `cross3_dyn_stub` for sloppy
+    /// plain calls.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) global_this_bits: u64,
     /// `Math.random()` PRNG state (xorshift64*). Deterministically seeded, so a
     /// program's random sequence is reproducible run-to-run (and JIT-on == off).
     rng_state: u64,
@@ -3727,6 +4041,9 @@ pub struct Vm<'p> {
     /// number of string constants across compiled regions.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     jit_const_strings: Vec<Value>,
+    /// Prefix of `jit_const_strings` already promoted to OLD by prior GCs.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    jit_const_strings_old: usize,
     /// Method-inlining (MI) eligibility memo, indexed by unified `func_id`:
     /// `i32::MIN` = not yet computed; `-1` = ineligible (the off-frame evaluator
     /// declines this body's SHAPE — fall to the frame call); `≥ 0` = the
@@ -3735,15 +4052,16 @@ pub struct Vm<'p> {
     /// Sound because a FuncProto's code is immutable for the program's life.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     mi_cache: Vec<i32>,
-    /// B82 `%Function.prototype%` SLOT memo for the `f.call`/`f.apply` target
-    /// splice: `(fn_proto version when computed, own "call" slot, own "apply"
-    /// slot)`, `u32::MAX` = no such own key. Slot INDEXES are version-guarded
-    /// (a key add/remove/descriptor change bumps `version_of(fn_proto)`), so
-    /// the memo skips the per-call key scan; the slot's VALUE is re-read on
-    /// every call (an in-place overwrite bumps nothing — the fn-bits re-read
-    /// precedent), so `Function.prototype.call = g` falls back immediately.
+    /// B82 `%Function.prototype%` SLOT memo for the `f.call`/`f.apply`/`f.bind`
+    /// fast paths: `(fn_proto version when computed, own "call" slot, own
+    /// "apply" slot, own "bind" slot)`, `u32::MAX` = no such own key. Slot
+    /// INDEXES are version-guarded (a key add/remove/descriptor change bumps
+    /// `version_of(fn_proto)`), so the memo skips the per-call key scan; the
+    /// slot's VALUE is re-read on every call (an in-place overwrite bumps
+    /// nothing — the fn-bits re-read precedent), so `Function.prototype.call = g`
+    /// falls back immediately.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-    ci_pristine: (u32, u32, u32),
+    ci_pristine: CiPristine,
     /// The PROTOTYPE half of the pristine `ta.length` proof
     /// (`ta_length_is_intrinsic`), memoized in two parts. The shared part,
     /// `ta_len_base`, is `(version of %TypedArray%.prototype%, its own
@@ -3783,6 +4101,13 @@ pub struct Vm<'p> {
     /// it). Exceeding it throws RangeError — a tighter bound than MAX_FRAMES.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     reg_capacity: usize,
+    /// One-past-the-end byte address of the pinned register buffer
+    /// (`regs.as_ptr().add(reg_capacity) as usize`), 0 until `reserve_jit_regs`
+    /// runs. Lets Tier-C / region prologues perform the leaf-inline headroom
+    /// check (`regs_end - base >= needed * 8`) inline instead of calling
+    /// `jit_regs_fits`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    regs_end_raw: usize,
     /// High-water mark: the largest `regs.len()` ever reached (and thus
     /// initialized). A native self-call window at or below this can be exposed
     /// with `set_len` instead of a zero-filling `resize` — its slots already hold
@@ -3808,6 +4133,18 @@ pub struct Vm<'p> {
     /// objects. This is an index only, never a root; the weak phase validates
     /// each slot's current variant and prunes dead/reused entries.
     weak_containers: rustc_hash::FxHashSet<u32>,
+    /// WeakMap/WeakSet entries written or updated since the last GC: `(container_idx, pos)`
+    /// where `pos == usize::MAX` requests a full scan of that container on the next minor.
+    /// Entries untouched since the last GC have OLD keys and OLD values, so minor GC
+    /// skips them completely (still scanned in full on major GC).
+    weak_young_entries: Vec<(u32, usize)>,
+    /// Subset of `weak_containers` that are `WeakRef` or `FinalizationRegistry` (typically
+    /// tiny/empty), so minor GC never walks long-lived `WeakMap`s in `weak_containers`.
+    weak_nonmap_containers: Vec<u32>,
+    /// Slots inserted into `key_str_cache` since the last GC (minor-GC delta roots).
+    key_str_fresh: Vec<u32>,
+    /// Prototype object slots inserted into `prototypes` since the last GC (minor-GC delta roots).
+    prototypes_fresh: Vec<u32>,
     /// WeakRef targets kept through the current ECMAScript job by
     /// AddToKeptObjects (constructor and successful deref). Cleared only at a
     /// main-script or microtask boundary.
@@ -3844,6 +4181,20 @@ pub struct Vm<'p> {
     pub(crate) node_host: Value,
     #[cfg(feature = "node")]
     pub(crate) node_cjs: Value,
+    /// Raw byte output buffer for PHP (`lang/php/vm/php_natives.rs`) when not
+    /// streaming directly to OS stdout (tests, HTTP SAPI responses, embedders).
+    #[cfg(feature = "php")]
+    pub(crate) php_output: Vec<u8>,
+    /// Canonical paths already included in this PHP VM (`include_once`/`require_once`).
+    #[cfg(feature = "php")]
+    pub(crate) php_included: rustc_hash::FxHashSet<String>,
+    /// Buffered stdout/stderr and native handle tables for Rust programs (`lang/rust/vm/rust_natives.rs`).
+    #[cfg(feature = "rust")]
+    pub(crate) rust_output: Vec<u8>,
+    #[cfg(feature = "rust")]
+    pub(crate) rust_stderr: Vec<u8>,
+    #[cfg(feature = "rust")]
+    pub(crate) rust_state: Option<Box<rust_natives::RustVmState>>,
     /// `WebAssembly`'s runtime, made on first use (vm/webassembly).
     #[cfg(feature = "webassembly")]
     pub(crate) wasm: Option<Box<webassembly::WasmRuntime>>,
@@ -3979,6 +4330,12 @@ pub(crate) use engine::file_url;
 pub(crate) use engine::large_programs_run_jit;
 pub(crate) mod host_api;
 mod indexing_date;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) use construct::instanceof_memo_on as instanceof_memo_enabled;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) use indexing_date::{
+    KSM_ABSENT_MASK, KSM_ABSENT_NULL_PROTO, KSM_IMMUTABLE_KEY, KSM_PURE_SHAPE,
+};
 /// Step budget, cooperative abort, and the optional execution trace. Off by
 /// default: the hook it adds to the inner dispatch loop is not something a
 /// `zipp js file.js` run should pay for.
@@ -4103,6 +4460,14 @@ pub(crate) mod prof;
 #[path = "../lang/js/node/mod.rs"]
 pub(crate) mod node;
 
+// ── PHP's half of the VM ── private natives (`__zipp_php_*`).
+#[cfg(feature = "php")]
+#[path = "../lang/php/vm/php_natives.rs"]
+mod php_natives;
+// ── Rust's half of the VM ── private natives (`__zipp_rs_*`).
+#[cfg(feature = "rust")]
+#[path = "../lang/rust/vm/rust_natives.rs"]
+mod rust_natives;
 // ── Python's half of the VM ── its instructions' semantics, runtime
 // tables and library natives. The files live with the rest of the language
 // in `lang/python/vm/`; they are modules of `vm` because they implement the
@@ -4205,6 +4570,94 @@ impl<'p> Vm<'p> {
             self.console_order.push(ConsoleStream::Stdout);
             self.output.push(line);
         }
+    }
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+impl<'p> Vm<'p> {
+    /// Canonical VM-wide property key ID (`1..`) for `(func_id, name_idx)` so
+    /// megamorphic `(shape, key_id)` / `(first_proto, key_id)` / `(idx, key_id)`
+    /// memos are shared across every function in the VM.
+    #[inline(always)]
+    pub(crate) fn prop_key_id(&mut self, func_id: u32, name_idx: u32) -> u32 {
+        let f = func_id as usize;
+        let n = name_idx as usize;
+        if let Some(id) = self
+            .prop_key_cache
+            .get(f)
+            .and_then(|v| v.get(n))
+            .copied()
+            .filter(|&id| id != 0)
+        {
+            return id;
+        }
+        self.prop_key_id_slow(func_id, name_idx)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn prop_key_id_slow(&mut self, func_id: u32, name_idx: u32) -> u32 {
+        let f = func_id as usize;
+        let n = name_idx as usize;
+        let existing = {
+            let key: &str = self.func(f).string_constants[n].as_str();
+            self.prop_key_map.get(key).copied()
+        };
+        let id = if let Some(id) = existing {
+            id
+        } else {
+            let owned: Box<str> = Box::from(self.func(f).string_constants[n].as_str());
+            let next = (self.prop_key_map.len() as u32).saturating_add(1);
+            self.prop_key_map.insert(owned, next);
+            next
+        };
+        if self.prop_key_cache.len() <= f {
+            self.prop_key_cache.resize_with(f + 1, Vec::new);
+        }
+        let slot = &mut self.prop_key_cache[f];
+        if slot.len() <= n {
+            slot.resize(n + 1, 0);
+        }
+        slot[n] = id;
+        id
+    }
+
+    /// Precompute canonical VM-wide property key IDs for every `GetProp`,
+    /// `SetProp`, and `CallMethod` string constant in `func_id`, returning a
+    /// dense slice indexed by `name_idx` (`0` for unused non-property constants).
+    pub(crate) fn build_prop_key_ids(&mut self, func_id: u32) -> Vec<u32> {
+        let f = func_id as usize;
+        let code_len = self.func(f).code.len();
+        let mut max_name: usize = 0;
+        let mut has_prop = false;
+        for ip in 0..code_len {
+            let name = match self.func(f).code[ip] {
+                crate::bytecode::Instr::GetProp { name, .. }
+                | crate::bytecode::Instr::SetProp { name, .. }
+                | crate::bytecode::Instr::CallMethod { name, .. } => name as usize,
+                _ => continue,
+            };
+            has_prop = true;
+            if name >= max_name {
+                max_name = name + 1;
+            }
+        }
+        if !has_prop {
+            return Vec::new();
+        }
+        let mut out = vec![0u32; max_name];
+        for ip in 0..code_len {
+            let name = match self.func(f).code[ip] {
+                crate::bytecode::Instr::GetProp { name, .. }
+                | crate::bytecode::Instr::SetProp { name, .. }
+                | crate::bytecode::Instr::CallMethod { name, .. } => name,
+                _ => continue,
+            };
+            if out[name as usize] == 0 {
+                out[name as usize] = self.prop_key_id(func_id, name);
+            }
+        }
+        out
     }
 }
 

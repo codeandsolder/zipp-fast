@@ -55,14 +55,27 @@ pub(crate) const JIT_RECURSE_DEPTH_OFFSET: usize =
 /// from the closure and therefore remains unchanged.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[inline(always)]
-fn catch_effectful_jit_u64<F>(effectful: F) -> u64
+pub(crate) fn catch_effectful_jit_u64<F>(effectful: F) -> u64
 where
     F: FnOnce() -> u64,
 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(effectful)) {
-        Ok(bits) => bits,
-        Err(_) => std::process::abort(),
+    // Zero-cost unwind guard: on the normal non-panicking path `AbortOnUnwind`
+    // is a ZST forgotten with zero instructions (eliminating `catch_unwind`'s
+    // `__rust_try` indirect call and Windows SEH `_NLG_Return2` setup across
+    // all 41 effectful JIT helpers), while any panic still aborts fail-stop
+    // before crossing the JIT ABI.
+    struct AbortOnUnwind;
+    impl Drop for AbortOnUnwind {
+        #[cold]
+        #[inline(never)]
+        fn drop(&mut self) {
+            std::process::abort();
+        }
     }
+    let guard = AbortOnUnwind;
+    let bits = effectful();
+    core::mem::forget(guard);
+    bits
 }
 
 #[cfg(all(test, feature = "jit", target_arch = "x86_64"))]
@@ -327,15 +340,18 @@ pub(crate) extern "win64" fn jit_dense_computed_leaf_guard(
     packed: u64,
     callee_bits: u64,
 ) -> u64 {
-    // No Rust panic may cross a native-code FFI boundary. A malformed/stale
-    // plan is an ordinary guard miss, never process termination.
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+    // Zero-cost unwind guard: on normal non-panicking paths no SEH frame setup
+    // runs; any impossible invariant panic aborts fail-stop before crossing FFI.
+    catch_effectful_jit_u64(|| unsafe {
         let vm = &mut *(vm as *mut Vm);
         let recv = Value::from_bits(recv_bits);
         if !recv.is_heap() {
             return 0;
         }
         let recv_idx = recv.heap_index();
+        if recv_idx as usize >= vm.heap.len() {
+            return 0;
+        }
         let recv_ver = (packed >> 32) as u32;
         let index = packed as u32 as usize;
         if vm.heap.version_of(recv_idx) != recv_ver
@@ -356,8 +372,7 @@ pub(crate) extern "win64" fn jit_dense_computed_leaf_guard(
             return 0;
         }
         ((vm.heap.version_of(callee.heap_index()) as u64) << 1) | 1
-    }))
-    .unwrap_or(0)
+    })
 }
 
 /// Guarded direct captured `RegExp.prototype.exec` / `test` helper. The
@@ -742,36 +757,57 @@ pub(crate) extern "win64" fn jit_coll_lookup(
         return crate::codegen::SELF_CALL_DEOPT;
     }
     let idx = recv.heap_index();
-    // The same call on a WeakMap / WeakSet (`m.get(k)` cannot know which it
-    // will meet): served through its own intrinsic proof. Declining it bailed
-    // the compiled body to the interpreter on every call, so a function doing
-    // `bridge(wm.get(this))` ran its rest interpreted.
-    if let Some(id) = match (vm.heap.get(idx), op) {
-        (crate::heap::HeapObj::WeakMap { .. }, 0) => Some(crate::vm::native::WM_GET),
-        (crate::heap::HeapObj::WeakMap { .. }, 1) => Some(crate::vm::native::WM_HAS),
-        (crate::heap::HeapObj::WeakSet(_), 2) => Some(crate::vm::native::WS_HAS),
-        _ => None,
-    } {
-        let name = if id == crate::vm::native::WM_GET { "get" } else { "has" };
-        if !vm.weak_collection_method_is_intrinsic(idx, name, id) {
-            return crate::codegen::SELF_CALL_DEOPT;
+    match (vm.heap.get(idx), op) {
+        (crate::heap::HeapObj::WeakMap { .. }, 0) => {
+            if !vm.weak_collection_method_is_intrinsic(idx, "get", crate::vm::native::WM_GET) {
+                return crate::codegen::SELF_CALL_DEOPT;
+            }
+            let key = Value::from_bits(key_bits);
+            if key.is_heap() && key.heap_index() as usize >= vm.heap.len() {
+                return crate::codegen::SELF_CALL_DEOPT;
+            }
+            return vm.weak_lookup_proven_fast(idx, key, 0);
         }
-        return jit_weak_coll(vm as *mut Vm as *mut core::ffi::c_void, recv_bits, key_bits, 0, id);
+        (crate::heap::HeapObj::WeakMap { .. }, 1 | 3) => {
+            if !vm.weak_collection_method_is_intrinsic(idx, "has", crate::vm::native::WM_HAS) {
+                return crate::codegen::SELF_CALL_DEOPT;
+            }
+            let key = Value::from_bits(key_bits);
+            if key.is_heap() && key.heap_index() as usize >= vm.heap.len() {
+                return crate::codegen::SELF_CALL_DEOPT;
+            }
+            return vm.weak_lookup_proven_fast(idx, key, 1);
+        }
+        (crate::heap::HeapObj::WeakSet(_), 2 | 3) => {
+            if !vm.weak_collection_method_is_intrinsic(idx, "has", crate::vm::native::WS_HAS) {
+                return crate::codegen::SELF_CALL_DEOPT;
+            }
+            let key = Value::from_bits(key_bits);
+            if key.is_heap() && key.heap_index() as usize >= vm.heap.len() {
+                return crate::codegen::SELF_CALL_DEOPT;
+            }
+            return vm.weak_lookup_proven_fast(idx, key, 2);
+        }
+        (crate::heap::HeapObj::Map { .. }, 0) => {
+            if !vm.collection_method_is_intrinsic_id(idx, 0, "get", 4) {
+                return crate::codegen::SELF_CALL_DEOPT;
+            }
+            return coll_lookup_proven(vm, idx, key_bits, 0);
+        }
+        (crate::heap::HeapObj::Map { .. }, 1 | 3) => {
+            if !vm.collection_method_is_intrinsic_id(idx, 2, "has", 4) {
+                return crate::codegen::SELF_CALL_DEOPT;
+            }
+            return coll_lookup_proven(vm, idx, key_bits, 1);
+        }
+        (crate::heap::HeapObj::Set(_), 2 | 3) => {
+            if !vm.collection_method_is_intrinsic_id(idx, 2, "has", 3) {
+                return crate::codegen::SELF_CALL_DEOPT;
+            }
+            return coll_lookup_proven(vm, idx, key_bits, 2);
+        }
+        _ => crate::codegen::SELF_CALL_DEOPT,
     }
-    let (name, kind) = match op {
-        0 => ("get", 4),
-        1 => ("has", 4),
-        2 => ("has", 3),
-        _ => return crate::codegen::SELF_CALL_DEOPT,
-    };
-    // Kind+name dispatch is insufficient: own shadows, custom prototypes and
-    // writable Map/Set prototype slots are observable. Re-read the complete
-    // main-realm intrinsic proof on every call and fail closed to ordinary
-    // Get+Call before performing the lookup.
-    if !vm.collection_method_is_intrinsic(idx, name, kind) {
-        return crate::codegen::SELF_CALL_DEOPT;
-    }
-    coll_lookup_proven(vm, idx, key_bits, op)
 }
 
 /// The Map/Set lookups compiled code calls once a captured callee's bits ARE
@@ -858,17 +894,7 @@ pub(crate) extern "win64" fn jit_coll_mutate_direct(
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[inline]
 fn coll_lookup_proven(vm: &mut Vm, idx: u32, key_bits: u64, op: u64) -> u64 {
-    let found = vm.coll_find(idx, Value::from_bits(key_bits));
-    match op {
-        0 => match found {
-            Some(i) => match vm.heap.get(idx) {
-                crate::heap::HeapObj::Map { vals, .. } => vals[i].bits(),
-                _ => Value::UNDEFINED.bits(),
-            },
-            None => Value::UNDEFINED.bits(),
-        },
-        _ => Value::bool(found.is_some()).bits(),
-    }
+    vm.coll_lookup_proven_fast(idx, Value::from_bits(key_bits), op)
 }
 
 /// Win64 helper for guarded `Map.prototype.set` / `clear` in Tier C.
@@ -923,7 +949,14 @@ pub(crate) extern "win64" fn jit_coll_mutate(
         return jit_weak_coll(vm as *mut Vm as *mut core::ffi::c_void, recv_bits, key_bits, val_bits, id);
     }
     let (name, kind) = coll_mutate_name(op);
-    if !vm.collection_method_is_intrinsic(idx, name, kind) {
+    let nid = match op {
+        0 => 1usize, // set
+        1 => 5,      // clear
+        2 => 3,      // add
+        3 | 4 => 4,  // delete
+        _ => return crate::codegen::SELF_CALL_DEOPT,
+    };
+    if !vm.collection_method_is_intrinsic_id(idx, nid, name, kind) {
         return crate::codegen::SELF_CALL_DEOPT;
     }
     coll_mutate_proven(vm, idx, key_bits, val_bits, op)
@@ -955,7 +988,7 @@ fn coll_mutate_proven(vm: &mut Vm, idx: u32, key_bits: u64, val_bits: u64, op: u
     {
         return crate::codegen::SELF_CALL_DEOPT;
     }
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    catch_effectful_jit_u64(|| {
         let args = [key, val];
         let args = match op {
             0 => &args[..2],
@@ -969,15 +1002,9 @@ fn coll_mutate_proven(vm: &mut Vm, idx: u32, key_bits: u64, val_bits: u64, op: u
         };
         match result {
             Ok(Some(result)) => result.bits(),
-            // Brand/name were proved and these arms never throw. Once the
-            // effectful implementation started, never replay an impossible
-            // outcome as ordinary bytecode.
             Ok(None) | Err(_) => std::process::abort(),
         }
-    })) {
-        Ok(bits) => bits,
-        Err(_) => std::process::abort(),
-    }
+    })
 }
 
 /// Selectors for [`jit_captured_method`]: the member name a split call's
@@ -1335,7 +1362,7 @@ pub(crate) extern "win64" fn jit_str_upper_case(vm: *mut core::ffi::c_void, recv
     {
         return crate::codegen::SELF_CALL_DEOPT;
     }
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    catch_effectful_jit_u64(|| {
         // All live native values remain in vm.regs and are traced by maybe_gc.
         vm.maybe_gc();
         if idx as usize >= vm.heap.len()
@@ -1348,12 +1375,7 @@ pub(crate) extern "win64" fn jit_str_upper_case(vm: *mut core::ffi::c_void, recv
             Ok(Some(result)) => result.bits(),
             Ok(None) | Err(_) => std::process::abort(),
         }
-    })) {
-        Ok(bits) => bits,
-        // GC or string allocation may have committed. Never turn that state
-        // into a replay sentinel across the FFI boundary.
-        Err(_) => std::process::abort(),
-    }
+    })
 }
 
 /// Win64 helper for a generic `f(args…)` (`Call`) inside a compiled OSR region:
@@ -2613,41 +2635,29 @@ pub(crate) extern "win64" fn jit_get_index(
                     .map_or(crate::codegen::SELF_CALL_DEOPT, Value::bits);
             }
         } else if let HeapObj::Array(items) = vm.heap.get(aidx) {
-            if let Some(&v) = usize::try_from(key.as_int()).ok().and_then(|i| items.get(i)) {
-                if !v.is_hole()
-                    && (vm.arr_props.is_empty() || !vm.arr_props.contains_key(&aidx))
-                    && (vm.arguments_objs.is_empty() || !vm.arguments_objs.contains_key(&aidx))
-                {
-                    // The store answered alone: let emitted reads of this
-                    // array answer from it too (`Heap::arr_mirror`). Not an
-                    // array with a virtual length: an emitted `.length` reads
-                    // a live entry's length as the JS length
-                    // (`emit_arr_mirror_len`).
-                    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-                    if vm.array_js_len.is_empty() || !vm.array_js_len.contains_key(&aidx) {
-                        // SAFETY: the shared view above is not used again.
-                        let vm = unsafe { &mut *(raw as *mut Vm) };
-                        vm.heap.repair_arr_mirror(aidx);
+            if let Ok(i) = usize::try_from(key.as_int()) {
+                let plain_arr = (vm.arr_props.is_empty() || !vm.arr_props.has(aidx))
+                    && (vm.arguments_objs.is_empty() || !vm.arguments_objs.has(aidx));
+                if plain_arr {
+                    if let Some(&v) = items.get(i) {
+                        if !v.is_hole() {
+                            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                            if vm.array_js_len.is_empty() || !vm.array_js_len.has(aidx) {
+                                // SAFETY: the shared view above is not used again.
+                                let vm = unsafe { &mut *(raw as *mut Vm) };
+                                vm.heap.repair_arr_mirror(aidx);
+                            }
+                            return v.bits();
+                        }
+                    } else if !vm.array_proto_has_index && vm.proto_of.raw_bits(aidx) == 0 {
+                        return Value::UNDEFINED.bits();
                     }
-                    return v.bits();
                 }
             }
         }
     }
     // A key built by concatenation is a rope until something reads it. The
     // arm below wants its bytes in place, and a loop over more than 32 fresh
-    // keys left the region once a key and was evicted. Flattened where it is,
-    // as the string helpers above flatten their operands: the slot keeps its
-    // identity and no heap object is allocated.
-    if key.is_heap() && jit_strkey_lane_enabled() {
-        // SAFETY: exclusive view for this statement only; the running region
-        // holds no conflicting borrow, and a rope is pinned by nothing (a
-        // region pins the bytes of flat strings).
-        let vm = unsafe { &mut *(vm as *mut Vm) };
-        if matches!(vm.heap.get(arr.heap_index()), HeapObj::Object(_)) {
-            vm.heap.flatten(key.heap_index());
-        }
-    }
     // SAFETY: read-only view; the running region holds no conflicting borrow.
     let vm_raw = vm as *mut Vm;
     let vm = unsafe { &*(vm as *const Vm) };
@@ -2670,36 +2680,99 @@ pub(crate) extern "win64" fn jit_get_index(
             && !(!vm.module_namespaces.is_empty() && vm.module_namespaces.contains_key(&oidx))
             && !(!vm.deferred_ns_state.is_empty() && vm.deferred_ns_state.contains_key(&oidx));
         // The slot this key had on this receiver last time, verified
-        // (`Vm::keyed_memo_slot`).
+        // (`Vm::keyed_memo_get`) BEFORE checking/flattening ropes so hot
+        // flat-string memo hits never touch `Heap::objs[oidx]` or `Heap::objs[kidx]`.
         if plain_receiver {
-            if let Some(i) = vm.keyed_memo_slot(oidx, kidx, false) {
-                if let HeapObj::Object(m) = vm.heap.get(oidx) {
-                    return m.val_at(i).bits();
-                }
+            if let Some(v) = vm.keyed_memo_get(oidx, kidx) {
+                return v.bits();
             }
         }
-        // ("@@…" is escaped as a key — `key_of` — so it takes the slow path.)
-        if let Some(std::borrow::Cow::Borrowed(b)) = vm
-            .heap
-            .str_wtf8_cow(kidx)
-            .filter(|b| !b.starts_with(b"@@"))
+        // Only flatten rope keys on a memo miss when `kidx` is not already a
+        // settled non-empty flat string (`FID_MIRROR_STR`).
+        if jit_strkey_lane_enabled()
+            && vm.heap.hot_mirror_of(kidx).fid != crate::heap::FID_MIRROR_STR
+            && matches!(vm.heap.get(oidx), HeapObj::Object(_))
         {
-            if let Ok(k) = std::str::from_utf8(b) {
-                if plain_receiver {
-                    if let HeapObj::Object(m) = vm.heap.get(oidx) {
-                        if let Some(i) = m.pos(k) {
-                            if !m.attr_at(i).accessor {
-                                let v = m.val_at(i);
-                                if !v.is_uninitialized() {
-                                    // SAFETY: the helper's own pointer, as for
-                                    // the flatten above; the shared view is
-                                    // not used again on this path.
-                                    unsafe { (*vm_raw).keyed_memo_put(oidx, kidx, i) };
-                                    return v.bits();
-                                }
+            // SAFETY: exclusive view for this flatten only; `vm` shared ref is
+            // re-read below via `vm_raw` after mutation finishes.
+            unsafe { (*vm_raw).heap.flatten(kidx) };
+        }
+        let vm = unsafe { &*(vm_raw as *const Vm) };
+        // Symbol property lookup (`o[Symbol.iterator]` etc.) without bailing
+        // to the interpreter (Babel's `_createForOfIteratorHelper` hits this
+        // hundreds of thousands of times on arrays, sets, maps, strings, and
+        // plain objects).
+        if let HeapObj::Symbol { prop_key, .. } = vm.heap.get(kidx) {
+            if prop_key == "@@iterator" && vm.builtin_iter_fast(arr, false) {
+                match vm.heap.get(oidx) {
+                    HeapObj::Array(_)
+                        if !(!vm.arguments_objs.is_empty()
+                            && vm.arguments_objs.contains_key(&oidx)) =>
+                    {
+                        return vm.default_array_iter.bits();
+                    }
+                    HeapObj::Set(_) => return vm.default_set_iter.bits(),
+                    HeapObj::Map { .. } => return vm.default_map_iter.bits(),
+                    HeapObj::Str(_) | HeapObj::Cons { .. } => {
+                        return vm.default_string_iter.bits();
+                    }
+                    _ => {}
+                }
+            }
+            if matches!(vm.heap.get(oidx), HeapObj::Array(_)) {
+                if let Some(v) = vm.array_symbol_proto_get(oidx, kidx) {
+                    return v.bits();
+                }
+            } else if plain_receiver {
+                if let HeapObj::Object(m) = vm.heap.get(oidx) {
+                    if let Some(i) = crate::vm::ic::own_pos_in(&vm.own_slot_cache, m, prop_key) {
+                        if !m.attr_at(i).accessor {
+                            let v = m.val_at(i);
+                            if !v.is_uninitialized() {
+                                return v.bits();
                             }
-                        } else if let Some(v) = jit_string_key_miss(vm, oidx, m, k) {
-                            return v.bits();
+                        }
+                    } else if let Some(v) = jit_string_key_miss(vm, oidx, m, prop_key) {
+                        return v.bits();
+                    }
+                }
+            }
+            return crate::codegen::SELF_CALL_DEOPT;
+        }
+        // ("@@…" is escaped as a key — `key_of` — so it takes the slow path.)
+        if let HeapObj::Str(js) = vm.heap.get(kidx) {
+            let b = js.as_bytes();
+            if !b.starts_with(b"@@") {
+                if let Ok(k) = std::str::from_utf8(b) {
+                    if plain_receiver {
+                        if let HeapObj::Object(m) = vm.heap.get(oidx) {
+                            let pos = if m.shape() != crate::shape::DICT {
+                                crate::vm::ic::own_pos_in(&vm.own_slot_cache, m, k)
+                            } else if m.is_indexed() {
+                                m.pos_tagged(k, crate::heap::prop_tag_from_hash(js.seeded_hash()))
+                            } else {
+                                m.pos(k)
+                            };
+                            if let Some(i) = pos {
+                                if !m.attr_at(i).accessor {
+                                    let v = m.val_at(i);
+                                    if !v.is_uninitialized() {
+                                        // SAFETY: the helper's own pointer, as for
+                                        // the flatten above; the shared view is
+                                        // not used again on this path.
+                                        unsafe { (*vm_raw).keyed_memo_put(oidx, kidx, i) };
+                                        return v.bits();
+                                    }
+                                }
+                            } else if let Some(v) = jit_string_key_miss(vm, oidx, m, k) {
+                                if v.is_undefined() {
+                                    // SAFETY: the helper's own pointer, as for
+                                    // `keyed_memo_put` above; shared `vm` is not
+                                    // used again on this path.
+                                    unsafe { (*vm_raw).keyed_memo_put_absent(oidx, kidx) };
+                                }
+                                return v.bits();
+                            }
                         }
                     }
                 }
@@ -3209,6 +3282,13 @@ unsafe fn ta_cache_fill(vm: *mut core::ffi::c_void, obj_bits: u64, slot: *mut u6
     let vm = unsafe { &*(vm as *const Vm) };
     let v = Value::from_bits(obj_bits);
     if !v.is_heap() || !matches!(vm.heap.get(v.heap_index()), HeapObj::TypedArray { .. }) {
+        // Record a lightweight 2-word declined marker (`obj_bits`, `count = 0`)
+        // so repeated Int-indexed reads of the same non-TA object in a loop
+        // (`str[i]`, `arr[i]`) skip `jit_get_index_ta_fill` on later iterations.
+        unsafe {
+            *slot = obj_bits;
+            *slot.add(2) = 0;
+        }
         return;
     }
     for (k, word) in vm.ta_cache_record(obj_bits).into_iter().enumerate() {
@@ -4791,6 +4871,12 @@ pub(crate) extern "win64" fn jit_concat(
     // snapshots after this helper, as it must after any allocation or user
     // coercion `add_values` can run.
     vm.maybe_gc();
+    #[cfg(not(feature = "safe-sandbox"))]
+    if b.is_int() && a.is_heap() {
+        if let Some(idx) = vm.heap.concat_memo_get(a.heap_index(), b.as_int()) {
+            return Value::heap(idx).bits();
+        }
+    }
     match vm.add_values(a, b) {
         Ok(v) => v.bits(),
         // `add_values` can run user coercion code (an object operand's
@@ -5313,7 +5399,7 @@ mod icstats {
 ///
 /// ABI: rcx=vm, rdx=caller window, r8=&args[0..argc],
 /// r9=(func_id<<32)|ip.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[cfg(all(test, feature = "jit", target_arch = "x86_64"))]
 #[inline]
 fn catch_own_method_preflight<F>(preflight: F) -> Option<(u64, u64, u64)>
 where
@@ -5334,16 +5420,15 @@ pub(crate) extern "win64" fn jit_cross_own_method_call(
     args: *const u64,
     packed_fip: u64,
 ) -> u64 {
-    // SAFETY: generated code supplies the live VM. Pointer/window details are
-    // validated without dereferencing by the pure preflight itself.
-    let vm = unsafe { &mut *(vm as *mut Vm) };
-    let preflight = catch_own_method_preflight(|| {
-        vm.jit_cross_own_method_preflight(caller_base_ptr, args, packed_fip)
-    });
-    let Some((packed, callee_bits, recv_bits)) = preflight else {
-        return crate::codegen::SELF_CALL_DEOPT;
-    };
-    let entered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    catch_effectful_jit_u64(|| {
+        // SAFETY: generated code supplies the live VM. Pointer/window details are
+        // validated without dereferencing by the pure preflight itself.
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        let Some((packed, callee_bits, recv_bits)) =
+            vm.jit_cross_own_method_preflight(caller_base_ptr, args, packed_fip)
+        else {
+            return crate::codegen::SELF_CALL_DEOPT;
+        };
         vm.jit_cross_call_impl::<false>(
             caller_base_ptr,
             args,
@@ -5351,14 +5436,7 @@ pub(crate) extern "win64" fn jit_cross_own_method_call(
             callee_bits,
             Some(Value::from_bits(recv_bits)),
         )
-    }));
-    match entered {
-        Ok(bits) => bits,
-        // Post-entry state may contain arbitrary JS effects. Replaying the
-        // original CallMethod would duplicate them, so corrupt/invariant panic
-        // is process-fatal just like an uncaught panic across the JIT ABI.
-        Err(_) => std::process::abort(),
-    }
+    })
 }
 
 #[cfg(all(test, feature = "jit", target_arch = "x86_64"))]
@@ -5485,6 +5563,12 @@ pub(crate) extern "win64" fn jit_cross_method_call(
 
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub use icstats::dump as ic_stats;
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+pub(crate) fn icstats_enabled() -> bool {
+    icstats::enabled()
+}
 
 /// `ZIPP_ICSTATS=1` — B82 call/apply splice counters. `call`/`apply` count the
 /// region-call helper serving a `f.call(…)`/`f.apply(…)` TARGET off-frame
@@ -5960,6 +6044,535 @@ env_off_switch! {
     fn jit_acc_route_enabled() = "ZIPP_NO_ACC_ROUTE"
 }
 
+/// Read-only `'static` slot holding `Value::UNDEFINED.bits()`, used as the
+/// `vals_ptr` target of identity/chain `IcEntry` ways that cache proved-absent
+/// `GetProp` reads (`o.missing === undefined`) without entering `jit_get_prop_miss`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+static UNDEFINED_BITS_SLOT: u64 = Value::UNDEFINED.bits();
+
+/// Whether `key` is a plain non-exotic property name eligible for writable
+/// inline overwrite via `mega_set_prop_stub`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline(always)]
+fn is_plain_set_key(key: &str) -> bool {
+    key != "__proto__"
+        && key != "caller"
+        && key != "arguments"
+        && !key
+            .as_bytes()
+            .first()
+            .is_some_and(|b| b.is_ascii_digit() || *b == b'-' || *b == b'#')
+}
+
+/// Direct-mapped slot index into `Vm::es5_proto_memo` (16384 slots).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline(always)]
+fn es5_proto_memo_slot(first_proto: u32, key_id: u32) -> usize {
+    let h = first_proto.wrapping_mul(0x9E37_79B1) ^ key_id.wrapping_mul(0xC2B2_AE35);
+    (h.wrapping_mul(0x27D4_EB2F) >> 18) as usize & (crate::vm::ES5_PROTO_MEMO_SLOTS - 1)
+}
+
+/// Probe `Vm::es5_proto_memo` for a proved-absent or inherited DATA property
+/// along an ES5 prototype chain starting at `first_proto`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline(always)]
+fn es5_proto_memo_get(vm: &Vm, first_proto: u32, key_id: u32) -> Option<u64> {
+    if vm.es5_proto_memo.is_empty() {
+        return None;
+    }
+    let e = vm.es5_proto_memo[es5_proto_memo_slot(first_proto, key_id)];
+    if e.first_proto != first_proto
+        || e.key_id != key_id
+        || e.chain_epoch != vm.heap.chain_epoch
+    {
+        return None;
+    }
+    if e.slot == u32::MAX {
+        return Some(Value::UNDEFINED.bits());
+    }
+    // SAFETY: every hop from `first_proto` through the holder was marked via
+    // `guard_version`, so while `chain_epoch` matches, the holder map has not
+    // grown, shrunk, redefined, been re-prototyped, or been swept.
+    let v = unsafe { *(e.vals_ptr as *const Value).add(e.slot as usize) };
+    (!v.is_uninitialized()).then(|| v.bits())
+}
+
+/// Guard every prototype hop in `chain_hops` and store the resolved ES5
+/// prototype-chain lookup (`slot == u32::MAX` for proved absence, else live
+/// holder `vals_ptr` + `slot`) into `Vm::es5_proto_memo`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn es5_proto_memo_put(
+    vm: &mut Vm,
+    first_proto: u32,
+    key_id: u32,
+    chain_hops: &[u32],
+    vals_ptr: u64,
+    slot: u32,
+) {
+    if chain_hops.is_empty() {
+        return;
+    }
+    for &h in chain_hops {
+        vm.heap.guard_version(h);
+    }
+    if vm.es5_proto_memo.is_empty() {
+        vm.es5_proto_memo = vec![crate::vm::Es5ProtoMemo::EMPTY; crate::vm::ES5_PROTO_MEMO_SLOTS];
+        vm.es5_proto_memo_raw = vm.es5_proto_memo.as_ptr() as u64;
+    }
+    let idx = es5_proto_memo_slot(first_proto, key_id);
+    vm.es5_proto_memo[idx] = crate::vm::Es5ProtoMemo {
+        first_proto,
+        key_id,
+        chain_epoch: vm.heap.chain_epoch,
+        slot,
+        vals_ptr,
+        _pad: 0,
+    };
+}
+
+/// Direct-mapped slot index into `Vm::dict_prop_memo` (16384 slots).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline(always)]
+fn dict_prop_memo_slot(idx: u32, key_id: u32) -> usize {
+    let h = idx.wrapping_mul(0x9E37_79B1) ^ key_id.wrapping_mul(0xC2B2_AE35);
+    (h.wrapping_mul(0x27D4_EB2F) >> 18) as usize & (crate::vm::DICT_PROP_MEMO_SLOTS - 1)
+}
+
+/// Probe `Vm::dict_prop_memo` for an own DATA property on dictionary-mode
+/// object `idx`, guarded by `Heap::version_of(idx)`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline(always)]
+fn dict_prop_memo_get(vm: &Vm, idx: u32, key_id: u32) -> Option<u64> {
+    if vm.dict_prop_memo.is_empty() {
+        return None;
+    }
+    let e = vm.dict_prop_memo[dict_prop_memo_slot(idx, key_id)];
+    if e.idx != idx
+        || e.key_id != key_id
+        || (e.slot as i32) < 0
+        || e.ver != vm.heap.version_of(idx)
+    {
+        return None;
+    }
+    // SAFETY: `version_of(idx) == e.ver` proves `idx` is the same dictionary
+    // `HeapObj::Object` whose `ObjMap` has not grown, shrunk, redefined, been
+    // freed, or had its `vals` buffer reallocated since `dict_prop_memo_put`.
+    let v = unsafe { *(e.vals_ptr as *const Value).add(e.slot as usize) };
+    (!v.is_uninitialized()).then(|| v.bits())
+}
+
+/// Store an own DATA slot of a verified dictionary-mode object (`ic_obj_ok`,
+/// `!class_proto`, non-accessor) into `Vm::dict_prop_memo`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn dict_prop_memo_put(
+    vm: &mut Vm,
+    idx: u32,
+    key_id: u32,
+    ver: u32,
+    vals_ptr: u64,
+    slot: u32,
+    writable: bool,
+) {
+    if vm.dict_prop_memo.is_empty() {
+        vm.dict_prop_memo = vec![crate::vm::DictPropMemo::EMPTY; crate::vm::DICT_PROP_MEMO_SLOTS];
+        vm.dict_prop_memo_raw = vm.dict_prop_memo.as_ptr() as u64;
+    }
+    let s = dict_prop_memo_slot(idx, key_id);
+    vm.dict_prop_memo[s] = crate::vm::DictPropMemo {
+        idx,
+        key_id,
+        ver,
+        slot,
+        vals_ptr,
+        writable: u64::from(writable),
+    };
+}
+
+/// 2-way bucket base index into `Vm::shape_prop_memo` (32768 buckets × 2 ways = 65536 slots).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline(always)]
+fn shape_prop_memo_bucket(shape: u32, key_id: u32) -> usize {
+    let h = shape.wrapping_mul(0x9E37_79B1) ^ key_id.wrapping_mul(0xC2B2_AE35);
+    ((h.wrapping_mul(0x27D4_EB2F) >> 17) as usize & (crate::vm::SHAPE_PROP_MEMO_BUCKETS - 1)) * 2
+}
+
+/// Record a canonical megamorphic `(shape, key_id) -> (slot, writable)` entry
+/// into its 2-way MRU bucket for inline x86-64 `mega_get_prop_stub` /
+/// `mega_set_prop_stub` hits (own data slot, `SHAPE_PROP_ABSENT`,
+/// `SHAPE_PROP_ES5_PROTO`, or `SHAPE_PROP_CLASS_MISS`).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn shape_prop_memo_put(vm: &mut Vm, shape: u32, key_id: u32, slot: u32, writable: bool) {
+    if shape == crate::shape::DICT {
+        return;
+    }
+    if vm.shape_prop_memo.is_empty() {
+        vm.shape_prop_memo = vec![crate::vm::ShapePropMemo::EMPTY; crate::vm::SHAPE_PROP_MEMO_SLOTS];
+        vm.shape_prop_memo_raw = vm.shape_prop_memo.as_ptr() as u64;
+    }
+    let entry = crate::vm::ShapePropMemo {
+        shape,
+        key_id,
+        slot,
+        writable: u32::from(writable && slot < crate::vm::SHAPE_PROP_ABSENT),
+    };
+    let b = shape_prop_memo_bucket(shape, key_id);
+    let e0 = vm.shape_prop_memo[b];
+    if e0.shape == shape && e0.key_id == key_id {
+        vm.shape_prop_memo[b] = entry;
+        return;
+    }
+    // MRU shift: promote/insert into way 0, preserving previous way 0 in way 1.
+    vm.shape_prop_memo[b] = entry;
+    vm.shape_prop_memo[b + 1] = e0;
+}
+
+/// Direct-mapped slot index into `Vm::class_prop_memo` (16384 slots).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline(always)]
+fn class_prop_memo_slot(class_id: u32, key_id: u32) -> usize {
+    let h = class_id.wrapping_mul(0x9E37_79B1) ^ key_id.wrapping_mul(0xC2B2_AE35);
+    (h.wrapping_mul(0x27D4_EB2F) >> 18) as usize & (crate::vm::CLASS_PROP_MEMO_SLOTS - 1)
+}
+
+/// Probe `Vm::class_prop_memo` for a class method or proved-absent property
+/// keyed by `(class_id, key_id)`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline(always)]
+fn class_prop_memo_get(vm: &Vm, class_id: u32, key_id: u32) -> Option<u64> {
+    if vm.class_prop_memo.is_empty() {
+        return None;
+    }
+    let e = vm.class_prop_memo[class_prop_memo_slot(class_id, key_id)];
+    if e.class_id != class_id
+        || e.key_id != key_id
+        || e.class_epoch != vm.class_proto_epoch
+        || e.class_ver != vm.heap.version_of(class_id)
+    {
+        return None;
+    }
+    if e.check_chain != 0 && e.chain_epoch != vm.heap.chain_epoch {
+        return None;
+    }
+    Some(e.value_bits)
+}
+
+/// Record a canonical `(class_id, key_id) -> value_bits` entry into
+/// `Vm::class_prop_memo` (guarding every prototype hop in `hops` for `ClassMiss`).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn class_prop_memo_put(
+    vm: &mut Vm,
+    class_id: u32,
+    key_id: u32,
+    hops: &[(u32, u32)],
+    value_bits: u64,
+) {
+    let check_chain = u32::from(!hops.is_empty());
+    for &(h, _) in hops {
+        vm.heap.guard_version(h);
+    }
+    if vm.class_prop_memo.is_empty() {
+        vm.class_prop_memo = vec![crate::vm::ClassPropMemo::EMPTY; crate::vm::CLASS_PROP_MEMO_SLOTS];
+        vm.class_prop_memo_raw = vm.class_prop_memo.as_ptr() as u64;
+    }
+    let s = class_prop_memo_slot(class_id, key_id);
+    vm.class_prop_memo[s] = crate::vm::ClassPropMemo {
+        class_id,
+        key_id,
+        class_ver: vm.heap.version_of(class_id),
+        chain_epoch: if check_chain != 0 { vm.heap.chain_epoch } else { 0 },
+        class_epoch: vm.class_proto_epoch,
+        check_chain,
+        value_bits,
+    };
+}
+
+/// Populate the canonical x86-64 megamorphic property memos (`shape_prop_memo`,
+/// `class_prop_memo`, `es5_proto_memo`, `dict_prop_memo`) for a `CallMethod`
+/// receiver/key so subsequent polymorphic/megamorphic method calls resolve
+/// inline via `mega_prop_full(r8d = -1)` + `cross3_dyn_stub` without Rust FFI.
+/// Returns `Some(callee)` when resolved to a plain user `Func`/`Closure`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+pub(crate) fn warm_mega_method_memo(
+    vm: &mut Vm,
+    recv: Value,
+    func_id: u32,
+    name: u32,
+    key: &str,
+) -> Option<Value> {
+    if !recv.is_heap()
+        || vm.deferred_ns_nonempty != 0
+        || is_private_key(key)
+        || matches!(
+            key,
+            "call"
+                | "apply"
+                | "bind"
+                | "hasOwnProperty"
+                | "propertyIsEnumerable"
+                | "isPrototypeOf"
+        )
+    {
+        return None;
+    }
+    let idx = recv.heap_index();
+    if !vm.ic_obj_ok(idx) {
+        return None;
+    }
+    let mir = vm.heap.hot_mirror_of(idx);
+    if (mir.fid & 0x8000_0000) == 0 {
+        return None;
+    }
+    let key_id = vm.prop_key_id(func_id, name);
+    if key_id == 0 {
+        return None;
+    }
+    let recv_shape = match vm.heap.get(idx) {
+        HeapObj::Object(m) => m.shape(),
+        _ => return None,
+    };
+    match vm.ic_walk(recv, key) {
+        crate::vm::ic::Walked::OwnData { slot } => {
+            let (_, m) = vm.ic_recv_map(recv)?;
+            let v = m.val_at(slot);
+            vm.ic_plain_fn(v)?;
+            let w = m.attr_at(slot).writable;
+            if recv_shape != crate::shape::DICT {
+                shape_prop_memo_put(vm, recv_shape, key_id, slot as u32, w);
+            } else {
+                let ver = vm.heap.version_of(idx);
+                let vals_ptr = m.vals_ptr_raw() as u64;
+                dict_prop_memo_put(vm, idx, key_id, ver, vals_ptr, slot as u32, w);
+            }
+            Some(v)
+        }
+        crate::vm::ic::Walked::ClassMethod { class, callee } => {
+            vm.ic_plain_fn(callee)?;
+            if (mir.fid & 0x7FFF_FFFF) == class {
+                class_prop_memo_put(vm, class, key_id, &[], callee.bits());
+                if recv_shape != crate::shape::DICT {
+                    shape_prop_memo_put(
+                        vm,
+                        recv_shape,
+                        key_id,
+                        crate::vm::SHAPE_PROP_CLASS_MISS,
+                        false,
+                    );
+                } else {
+                    let ver = vm.heap.version_of(idx);
+                    dict_prop_memo_put(
+                        vm,
+                        idx,
+                        key_id,
+                        ver,
+                        0,
+                        crate::vm::SHAPE_PROP_CLASS_MISS,
+                        false,
+                    );
+                }
+            }
+            Some(callee)
+        }
+        crate::vm::ic::Walked::ChainData { hops, slot, .. } => {
+            let n = hops.1 as usize;
+            if n == 0 {
+                return None;
+            }
+            let first_proto = hops.0[0].0;
+            let holder = hops.0[n - 1].0;
+            let (v, vals_ptr) = match vm.heap.get(holder) {
+                HeapObj::Object(hm) => (hm.val_at(slot as usize), hm.vals_ptr_raw() as u64),
+                _ => return None,
+            };
+            vm.ic_plain_fn(v)?;
+            let first_proto_custom = vm
+                .proto_of
+                .get(&idx)
+                .is_some_and(|pv| pv.is_heap() && pv.heap_index() == first_proto);
+            if first_proto_custom
+                && vm.realm_global_objs.is_empty()
+                && mir.fid == crate::heap::FID_MIRROR_NONE
+            {
+                let mut chain_hops = [0u32; 8];
+                for i in 0..n {
+                    chain_hops[i] = hops.0[i].0;
+                }
+                es5_proto_memo_put(vm, first_proto, key_id, &chain_hops[..n], vals_ptr, slot);
+                if recv_shape != crate::shape::DICT {
+                    shape_prop_memo_put(
+                        vm,
+                        recv_shape,
+                        key_id,
+                        crate::vm::SHAPE_PROP_ES5_PROTO,
+                        false,
+                    );
+                } else {
+                    let ver = vm.heap.version_of(idx);
+                    dict_prop_memo_put(
+                        vm,
+                        idx,
+                        key_id,
+                        ver,
+                        0,
+                        crate::vm::SHAPE_PROP_ES5_PROTO,
+                        false,
+                    );
+                }
+            }
+            Some(v)
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
+        crate::vm::ic::Walked::ChainDeepData {
+            first_hop,
+            holder,
+            slot,
+            ..
+        } => {
+            let first_proto = first_hop;
+            let (v, vals_ptr) = match vm.heap.get(holder) {
+                HeapObj::Object(hm) => (hm.val_at(slot as usize), hm.vals_ptr_raw() as u64),
+                _ => return None,
+            };
+            vm.ic_plain_fn(v)?;
+            let first_proto_custom = vm
+                .proto_of
+                .get(&idx)
+                .is_some_and(|pv| pv.is_heap() && pv.heap_index() == first_proto);
+            if first_proto_custom
+                && vm.realm_global_objs.is_empty()
+                && mir.fid == crate::heap::FID_MIRROR_NONE
+            {
+                let mut chain_hops = Vec::with_capacity(12);
+                let mut cur = first_proto;
+                let mut found = false;
+                for _ in 0..64 {
+                    chain_hops.push(cur);
+                    if cur == holder {
+                        found = true;
+                        break;
+                    }
+                    if let Some(nv) = vm.proto_of.get(&cur) {
+                        if nv.is_heap() {
+                            cur = nv.heap_index();
+                            continue;
+                        }
+                    }
+                    break;
+                }
+                if found {
+                    es5_proto_memo_put(vm, first_proto, key_id, &chain_hops, vals_ptr, slot);
+                    if recv_shape != crate::shape::DICT {
+                        shape_prop_memo_put(
+                            vm,
+                            recv_shape,
+                            key_id,
+                            crate::vm::SHAPE_PROP_ES5_PROTO,
+                            false,
+                        );
+                    } else {
+                        let ver = vm.heap.version_of(idx);
+                        dict_prop_memo_put(
+                            vm,
+                            idx,
+                            key_id,
+                            ver,
+                            0,
+                            crate::vm::SHAPE_PROP_ES5_PROTO,
+                            false,
+                        );
+                    }
+                }
+            }
+            Some(v)
+        }
+        _ => None,
+    }
+}
+
+/// Cache a proved-absent `GetProp` read (`Value::UNDEFINED`) in either the
+/// site's 32-way shape-pair IC (`SHAPE_PAIR_ABSENT_SLOT`) or its identity/chain
+/// IC (`UNDEFINED_BITS_SLOT`), and promote thrashing shaped absent-property
+/// sites (`node.leadingComments`, `node.extra`, `node.decorators`, ...) to
+/// shape-way mode. Returns `Value::UNDEFINED.bits()`, or `SELF_CALL_DEOPT` when
+/// the direct-miss gate just triggered a one-shot recompile.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn jit_fill_absent_ic(
+    vm: &mut Vm,
+    site_idx: u32,
+    idx: u32,
+    obj_bits: u64,
+    sh: u32,
+    plain_default_obj: bool,
+    key: &str,
+    key_id: u32,
+    raw_proto: u64,
+) -> u64 {
+    let proto_absent_ok = vm.obj_proto != 0
+        && vm.obj_proto_setup_ver != u32::MAX
+        && vm.heap.version_of(vm.obj_proto) == vm.obj_proto_setup_ver
+        && vm.realm_global_objs.is_empty()
+        && (raw_proto == 0 || vm.obj_proto_lacks_key(key));
+    let shape_absent_ok = plain_default_obj
+        && sh != crate::shape::DICT
+        && sh != crate::shape::EMPTY
+        && crate::codegen::shape_ways_enabled()
+        && proto_absent_ok;
+    if shape_absent_ok {
+        shape_prop_memo_put(vm, sh, key_id, crate::vm::SHAPE_PROP_ABSENT, false);
+    } else if sh == crate::shape::DICT
+        && proto_absent_ok
+        && vm.heap.hot_mirror_of(idx).fid == crate::heap::FID_MIRROR_NONE
+    {
+        let ver = vm.heap.version_of(idx);
+        dict_prop_memo_put(vm, idx, key_id, ver, 0, crate::vm::SHAPE_PROP_ABSENT, false);
+    }
+    if vm.jit.direct_miss_active(site_idx) {
+        if shape_absent_ok {
+            vm.heap.refresh_mirror(idx);
+            vm.jit
+                .fill_shape_pair(site_idx, sh, crate::codegen::SHAPE_PAIR_ABSENT_SLOT);
+        }
+        return Value::UNDEFINED.bits();
+    }
+    if !vm.jit.ic_thrashing(site_idx) {
+        let ver = vm.heap.version_of(idx);
+        let undef_ptr = &UNDEFINED_BITS_SLOT as *const u64 as u64;
+        let entry = if raw_proto != 0 {
+            crate::codegen::IcEntry::own(obj_bits, undef_ptr, ver, 0)
+        } else if vm.obj_proto != 0 && !vm.proto_of.has(vm.obj_proto) {
+            crate::codegen::IcEntry::chain(
+                obj_bits,
+                undef_ptr,
+                ver,
+                0,
+                &[(vm.obj_proto, vm.heap.version_of(vm.obj_proto))],
+            )
+        } else {
+            None
+        };
+        if let Some(e) = entry {
+            vm.jit.set_ic(site_idx, e);
+        }
+        return Value::UNDEFINED.bits();
+    }
+    if shape_absent_ok {
+        jit_shape_slot_put(vm, site_idx, sh, crate::codegen::SHAPE_PAIR_ABSENT_SLOT);
+        if jit_direct_miss_gate(vm, site_idx) == crate::codegen::DirectMissGate::Recompile {
+            return crate::codegen::SELF_CALL_DEOPT;
+        }
+    }
+    if crate::codegen::ic_refill_gate_enabled() {
+        vm.jit.ic_rot_bump(site_idx);
+    }
+    Value::UNDEFINED.bits()
+}
+
 /// Record a `(site, shape) -> slot` memo entry and its site.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[inline]
@@ -6368,6 +6981,274 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
     if matches!(key.as_bytes().first(), Some(b'#')) || !vm.deferred_ns_state.is_empty() {
         return crate::codegen::SELF_CALL_DEOPT;
     }
+    let key_id = vm.prop_key_id(func_id, name_idx);
+    let plain_set_key = is_plain_set_key(key);
+    // ── fast cross-site (shape, key) memo via hot mirror ──
+    // Checked BEFORE `jit_class_read_hit`, `vm.heap.get(idx)` (cold DRAM
+    // miss), `RegExpMethod::from_name`, `ic_obj_ok`, and `jit_acc_route`. A
+    // settled non-DICT plain mirror proves `idx` is an ordinary shaped object
+    // (never Str/RegExp/TypedArray/DataView/module_ns/exotic/ctor). Serves
+    // BOTH hot own-data hits (Direct/thrashing) AND proved-absent properties
+    // on default-prototype plain objects (`node.extra`, `opts.xxx`).
+    let mir = vm.heap.hot_mirror_of(idx);
+    // Class-instance method/miss memo hit directly from the hot mirror (or
+    // identity+version for DICT class instances), ahead of `own_slot_probe`
+    // and any `Box<ObjMap>` dereference.
+    if mir.fid >= crate::heap::FID_MIRROR_CLASS && mir.fid != crate::heap::FID_MIRROR_NONE {
+        if let Some((bits, class, nhops, hops)) =
+            jit_class_read_hit_mirror(vm, idx, mir, site_idx, func_id, name_idx)
+        {
+            // Self-heal canonical memos on hash collision so the next access
+            // hits inline in `emit_mega_get_prop_stub`.
+            class_prop_memo_put(vm, class, key_id, &hops[..nhops as usize], bits);
+            if mir.shape != crate::shape::DICT {
+                shape_prop_memo_put(vm, mir.shape, key_id, crate::vm::SHAPE_PROP_CLASS_MISS, false);
+            } else {
+                let ver = vm.heap.version_of(idx);
+                dict_prop_memo_put(vm, idx, key_id, ver, 0, crate::vm::SHAPE_PROP_CLASS_MISS, false);
+            }
+            return bits;
+        }
+    }
+    if mir.shape != crate::shape::DICT && crate::heap::fid_mirror_plain(mir.fid) {
+        match vm.own_slot_probe(mir.shape, key) {
+            crate::vm::ic::OwnSlotProbe::Data(slot, writable) => {
+                shape_prop_memo_put(vm, mir.shape, key_id, slot, writable && plain_set_key);
+                if vm.jit.direct_miss_active(site_idx) {
+                    if crate::codegen::shape_ways_enabled() {
+                        vm.jit.fill_shape_pair(site_idx, mir.shape, slot);
+                    }
+                    // SAFETY: settled mirror shape proves `vals` is live and holds `slot`.
+                    return unsafe { *(mir.vals as *const Value).add(slot as usize) }.bits();
+                } else if vm.jit.ic_thrashing(site_idx) && !vm.jit.direct_miss_gate_ready(site_idx) {
+                    if crate::codegen::ic_refill_gate_enabled() {
+                        vm.jit.ic_rot_bump(site_idx);
+                    }
+                    // SAFETY: settled mirror shape proves `vals` is live and holds `slot`.
+                    return unsafe { *(mir.vals as *const Value).add(slot as usize) }.bits();
+                }
+            }
+            crate::vm::ic::OwnSlotProbe::Miss if mir.fid == crate::heap::FID_MIRROR_NONE => {
+                let raw_proto = vm.proto_of.raw_bits(idx);
+                if raw_proto == 0 {
+                    if vm.obj_proto_lacks_key(key) {
+                        return jit_fill_absent_ic(
+                            vm,
+                            site_idx,
+                            idx,
+                            obj_bits,
+                            mir.shape,
+                            true,
+                            key,
+                            key_id,
+                            0,
+                        );
+                    }
+                } else if !Value::from_bits(raw_proto).is_heap() {
+                    return jit_fill_absent_ic(
+                        vm,
+                        site_idx,
+                        idx,
+                        obj_bits,
+                        mir.shape,
+                        true,
+                        key,
+                        key_id,
+                        raw_proto,
+                    );
+                } else if idx != vm.global_this && vm.realm_global_objs.is_empty() {
+                    let first_proto = Value::from_bits(raw_proto).heap_index();
+                    if let Some(bits) = es5_proto_memo_get(vm, first_proto, key_id) {
+                        shape_prop_memo_put(
+                            vm,
+                            mir.shape,
+                            key_id,
+                            crate::vm::SHAPE_PROP_ES5_PROTO,
+                            false,
+                        );
+                        return bits;
+                    }
+                }
+            }
+            crate::vm::ic::OwnSlotProbe::Miss
+                if mir.fid >= crate::heap::FID_MIRROR_CLASS
+                    && mir.fid != crate::heap::FID_MIRROR_NONE =>
+            {
+                let class_id = mir.fid & !crate::heap::FID_MIRROR_CLASS;
+                if let Some(bits) = class_prop_memo_get(vm, class_id, key_id) {
+                    shape_prop_memo_put(
+                        vm,
+                        mir.shape,
+                        key_id,
+                        crate::vm::SHAPE_PROP_CLASS_MISS,
+                        false,
+                    );
+                    return bits;
+                }
+            }
+            _ => {}
+        }
+    } else if mir.shape == crate::shape::DICT
+        && crate::heap::fid_mirror_plain(mir.fid)
+        && !icstats::enabled()
+    {
+        // O(1) version-guarded memo for dictionary-mode own DATA properties
+        // (avoids `Heap::objs[idx]`, `Box<ObjMap>`, and `ObjMap::pos` hashing).
+        if let Some(bits) = dict_prop_memo_get(vm, idx, key_id) {
+            return bits;
+        }
+        // Fast single-read path for dictionary-mode objects (plain, `Object.create(null)`,
+        // AND DICT class instances), primitive strings, and `RegExp.lastIndex`
+        // — avoids `jit_class_read_hit`, `RegExpMethod::from_name`, `jit_acc_route`,
+        // `jit_shape_slot`, and repeated `Heap::objs[idx]` loads.
+        enum DictRead {
+            Hit {
+                bits: u64,
+                vals_ptr: u64,
+                slot: u32,
+                cacheable: bool,
+                writable: bool,
+            },
+            UnsettledShaped(u32),
+            ClassMiss,
+            PlainMiss,
+            Str,
+            RegExpLastIndex(u64),
+            Other,
+        }
+        let dict_read = match vm.heap.get(idx) {
+            HeapObj::Object(map) if vm.ic_obj_ok(idx) => {
+                let sh = map.shape();
+                if sh != crate::shape::DICT {
+                    DictRead::UnsettledShaped(sh)
+                } else {
+                    match map.pos(key) {
+                        Some(s) if !map.attr_at(s).accessor => {
+                            let v = map.val_at(s);
+                            let attr = map.attr_at(s);
+                            DictRead::Hit {
+                                bits: v.bits(),
+                                vals_ptr: map.vals_ptr_raw() as u64,
+                                slot: s as u32,
+                                cacheable: !v.is_uninitialized(),
+                                writable: !map.class_proto && attr.writable && plain_set_key,
+                            }
+                        }
+                        None if map.class.is_some() => DictRead::ClassMiss,
+                        None if !map.is_ctor => DictRead::PlainMiss,
+                        _ => DictRead::Other,
+                    }
+                }
+            }
+            HeapObj::Str(_) | HeapObj::Cons { .. } => DictRead::Str,
+            HeapObj::RegExp(re) if key == "lastIndex" => {
+                DictRead::RegExpLastIndex(re.last_index.bits())
+            }
+            _ => DictRead::Other,
+        };
+        match dict_read {
+            DictRead::UnsettledShaped(sh) => {
+                vm.heap.refresh_mirror(idx);
+                let mir2 = vm.heap.hot_mirror_of(idx);
+                if mir2.shape == sh && crate::heap::fid_mirror_plain(mir2.fid) {
+                    if let crate::vm::ic::OwnSlotProbe::Data(slot, writable) =
+                        vm.own_slot_probe(sh, key)
+                    {
+                        shape_prop_memo_put(vm, sh, key_id, slot, writable && plain_set_key);
+                        if vm.jit.direct_miss_active(site_idx) {
+                            if crate::codegen::shape_ways_enabled() {
+                                vm.jit.fill_shape_pair(site_idx, sh, slot);
+                            }
+                            // SAFETY: refreshed mirror shape proves `vals` is live and holds `slot`.
+                            return unsafe { *(mir2.vals as *const Value).add(slot as usize) }.bits();
+                        } else if vm.jit.ic_thrashing(site_idx)
+                            && !vm.jit.direct_miss_gate_ready(site_idx)
+                        {
+                            if crate::codegen::ic_refill_gate_enabled() {
+                                vm.jit.ic_rot_bump(site_idx);
+                            }
+                            return unsafe { *(mir2.vals as *const Value).add(slot as usize) }.bits();
+                        }
+                    }
+                }
+            }
+            DictRead::Hit {
+                bits,
+                vals_ptr,
+                slot,
+                cacheable,
+                writable,
+            } => {
+                let version = vm.heap.version_of(idx);
+                if cacheable {
+                    dict_prop_memo_put(vm, idx, key_id, version, vals_ptr, slot, writable);
+                }
+                if !vm.jit.direct_miss_active(site_idx) && !vm.jit.ic_thrashing(site_idx) {
+                    if let Some(entry) =
+                        crate::codegen::IcEntry::own(obj_bits, vals_ptr, version, slot)
+                    {
+                        vm.jit.set_ic(site_idx, entry);
+                    }
+                }
+                return bits;
+            }
+            DictRead::ClassMiss => {
+                return jit_class_read_fill(vm, obj, key, site_idx, func_id, name_idx);
+            }
+            DictRead::PlainMiss => {
+                let raw_proto = vm.proto_of.raw_bits(idx);
+                if raw_proto == 0 {
+                    if vm.obj_proto_lacks_key(key) {
+                        return jit_fill_absent_ic(
+                            vm,
+                            site_idx,
+                            idx,
+                            obj_bits,
+                            crate::shape::DICT,
+                            false,
+                            key,
+                            key_id,
+                            0,
+                        );
+                    }
+                } else if !Value::from_bits(raw_proto).is_heap() {
+                    return jit_fill_absent_ic(
+                        vm,
+                        site_idx,
+                        idx,
+                        obj_bits,
+                        crate::shape::DICT,
+                        false,
+                        key,
+                        key_id,
+                        raw_proto,
+                    );
+                } else if idx != vm.global_this && vm.realm_global_objs.is_empty() {
+                    let first_proto = Value::from_bits(raw_proto).heap_index();
+                    if let Some(bits) = es5_proto_memo_get(vm, first_proto, key_id) {
+                        let ver = vm.heap.version_of(idx);
+                        dict_prop_memo_put(
+                            vm,
+                            idx,
+                            key_id,
+                            ver,
+                            0,
+                            crate::vm::SHAPE_PROP_ES5_PROTO,
+                            false,
+                        );
+                        return bits;
+                    }
+                }
+            }
+            DictRead::Str => {
+                if let Some(bits) = vm.str_proto_method_memo_bits(key) {
+                    return bits;
+                }
+            }
+            DictRead::RegExpLastIndex(bits) => return bits,
+            DictRead::Other => {}
+        }
+    }
     // A class method this site read before (`o.m` read ahead of its call's
     // arguments, `ray.origin.sub(this.center)`): the memo's answer, ahead of
     // the key scan and the shape memo.
@@ -6381,9 +7262,13 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
     // its intrinsic is answered from the memo, ahead of the general walk
     // below; anything else continues to it.
     match vm.heap.get(idx) {
+        HeapObj::Object(_) => {}
         HeapObj::Str(_) | HeapObj::Cons { .. } => {
             if let Some(bits) = vm.str_proto_method_memo_bits(key) {
                 return bits;
+            }
+            if let Some(v) = vm.shapeless_read(obj, key) {
+                return v.bits();
             }
         }
         // A RegExp's `lastIndex` is a non-configurable own data property whose
@@ -6399,7 +7284,15 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
                 return bits;
             }
         }
-        _ => {}
+        // Any other shapeless heap receiver (`Iterator.next`, `Array` methods,
+        // `Func`/`Closure`/`Native` `.bind`/`.apply`/`.prototype`/own data,
+        // `Class` statics, `Map`/`Set` `.size`/methods, `Promise.then`): answer
+        // directly without falling through `PROP_VIA_IC` -> `ic_get_prop`.
+        _ => {
+            if let Some(v) = vm.shapeless_read(obj, key) {
+                return v.bits();
+            }
+        }
     }
 
     // RegExp/String direct calls are lowered as an exact Get before argument
@@ -6472,11 +7365,15 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
     // accessor (`jit_acc_route_note`): the walk below would end in the same
     // route, after a key scan and a chain probe.
     if !vm.jit_acc_route.is_empty() {
-        if let HeapObj::Object(map) = vm.heap.get(idx) {
-            let sh = map.shape();
-            if sh != crate::shape::DICT && vm.jit_acc_route.contains(&(site_idx, sh)) {
-                return crate::codegen::PROP_VIA_IC;
-            }
+        let sh = if mir.shape != crate::shape::DICT {
+            mir.shape
+        } else if let HeapObj::Object(map) = vm.heap.get(idx) {
+            map.shape()
+        } else {
+            crate::shape::DICT
+        };
+        if sh != crate::shape::DICT && vm.jit_acc_route.contains(&(site_idx, sh)) {
+            return crate::codegen::PROP_VIA_IC;
         }
     }
     // ── shape memo ──────────────────────────────────────────────────────────
@@ -6496,19 +7393,28 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
         vm.jit_shape_slot
             .get(&(site_idx, sh))
             .copied()
-            .filter(|_| sh != crate::shape::DICT)
+            .filter(|&slot| sh != crate::shape::DICT && slot != crate::codegen::SHAPE_PAIR_ABSENT_SLOT)
             .and_then(|slot| {
                 let s = slot as usize;
                 // Revalidate bounds, the exact live key and descriptor before
                 // carrying any Value/pointer out of the shared heap view.
                 (map.key_get(s).is_some_and(|k| k == key)
                     && map.attr_get(s).is_some_and(|a| !a.accessor))
-                .then(|| (map.val_at(s), map.vals_ptr() as u64, slot, sh))
+                .then(|| {
+                    (
+                        map.val_at(s),
+                        map.vals_ptr() as u64,
+                        slot,
+                        sh,
+                        map.attr_at(s).writable && plain_set_key,
+                    )
+                })
             })
     } else {
         None
     };
-    if let Some((val, vals_ptr, slot, sh)) = shape_hit {
+    if let Some((val, vals_ptr, slot, sh, writable)) = shape_hit {
+        shape_prop_memo_put(vm, sh, key_id, slot, writable);
         match jit_direct_miss_gate(vm, site_idx) {
             crate::codegen::DirectMissGate::Recompile => {
                 // Own data reads are side-effect-free. The parked native frame
@@ -6548,7 +7454,7 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
         return val.bits();
     }
     let (val, vals_ptr, slot) = match vm.heap.get(idx) {
-        HeapObj::Object(map) => match map.pos(key) {
+        HeapObj::Object(map) => match crate::vm::ic::own_pos_in(&vm.own_slot_cache, map, key) {
             // An accessor slot stores the GETTER, not a data value — route to
             // the interpreter-IC slow helper, which frame-calls it. B114: fill
             // an ACCESSOR way first, so this receiver's next access dispatches
@@ -6614,16 +7520,147 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
             None if map.is_ctor => return crate::codegen::PROP_VIA_IC,
             None => {
                 const MAX: usize = crate::codegen::JIT_IC_MAX_HOPS;
+                let recv_sh = map.shape();
+                let recv_plain = map.class.is_none();
+                let first_proto_custom =
+                    recv_plain && vm.proto_of.get_copied(idx).is_some_and(|p| p.is_heap());
                 let mut cur = idx;
                 let mut hops: [(u32, u32); MAX] = [(0, 0); MAX];
+                let mut all_hops: [u32; 64] = [0; 64];
                 let mut n_hops = 0usize;
                 loop {
                     let next = match vm.proto_of.get(&cur) {
                         Some(p) if p.is_heap() => p.heap_index(),
                         // Explicit null prototype: a true chain miss.
-                        Some(_) => return Value::UNDEFINED.bits(),
+                        Some(p) => {
+                            if n_hops == 0 {
+                                return jit_fill_absent_ic(
+                                    vm,
+                                    site_idx,
+                                    idx,
+                                    obj_bits,
+                                    recv_sh,
+                                    recv_plain,
+                                    key,
+                                    key_id,
+                                    p.bits(),
+                                );
+                            }
+                            if first_proto_custom && vm.realm_global_objs.is_empty() {
+                                es5_proto_memo_put(
+                                    vm,
+                                    all_hops[0],
+                                    key_id,
+                                    &all_hops[..n_hops],
+                                    0,
+                                    u32::MAX,
+                                );
+                                if recv_plain {
+                                    if recv_sh != crate::shape::DICT {
+                                        shape_prop_memo_put(
+                                            vm,
+                                            recv_sh,
+                                            key_id,
+                                            crate::vm::SHAPE_PROP_ES5_PROTO,
+                                            false,
+                                        );
+                                    } else {
+                                        let ver = vm.heap.version_of(idx);
+                                        dict_prop_memo_put(
+                                            vm,
+                                            idx,
+                                            key_id,
+                                            ver,
+                                            0,
+                                            crate::vm::SHAPE_PROP_ES5_PROTO,
+                                            false,
+                                        );
+                                    }
+                                }
+                            }
+                            if n_hops <= MAX
+                                && !vm.jit.direct_miss_active(site_idx)
+                                && !vm.jit.ic_thrashing(site_idx)
+                            {
+                                let undef_ptr = &UNDEFINED_BITS_SLOT as *const u64 as u64;
+                                if let Some(e) = crate::codegen::IcEntry::chain(
+                                    obj_bits,
+                                    undef_ptr,
+                                    vm.heap.version_of(idx),
+                                    0,
+                                    &hops[..n_hops],
+                                ) {
+                                    vm.jit.set_ic(site_idx, e);
+                                }
+                            }
+                            return Value::UNDEFINED.bits();
+                        }
                         None => {
                             if vm.obj_proto == 0 || cur == vm.obj_proto {
+                                if n_hops == 1 && hops[0].0 == vm.obj_proto && !vm.proto_of.has(idx) {
+                                    return jit_fill_absent_ic(
+                                        vm,
+                                        site_idx,
+                                        idx,
+                                        obj_bits,
+                                        recv_sh,
+                                        recv_plain,
+                                        key,
+                                        key_id,
+                                        0,
+                                    );
+                                }
+                                if first_proto_custom
+                                    && n_hops >= 1
+                                    && vm.realm_global_objs.is_empty()
+                                {
+                                    es5_proto_memo_put(
+                                        vm,
+                                        all_hops[0],
+                                        key_id,
+                                        &all_hops[..n_hops],
+                                        0,
+                                        u32::MAX,
+                                    );
+                                    if recv_plain {
+                                        if recv_sh != crate::shape::DICT {
+                                            shape_prop_memo_put(
+                                                vm,
+                                                recv_sh,
+                                                key_id,
+                                                crate::vm::SHAPE_PROP_ES5_PROTO,
+                                                false,
+                                            );
+                                        } else {
+                                            let ver = vm.heap.version_of(idx);
+                                            dict_prop_memo_put(
+                                                vm,
+                                                idx,
+                                                key_id,
+                                                ver,
+                                                0,
+                                                crate::vm::SHAPE_PROP_ES5_PROTO,
+                                                false,
+                                            );
+                                        }
+                                    }
+                                }
+                                if n_hops >= 1
+                                    && n_hops <= MAX
+                                    && !vm.jit.direct_miss_active(site_idx)
+                                    && !vm.jit.ic_thrashing(site_idx)
+                                {
+                                    let undef_ptr = &UNDEFINED_BITS_SLOT as *const u64 as u64;
+                                    if let Some(e) = crate::codegen::IcEntry::chain(
+                                        obj_bits,
+                                        undef_ptr,
+                                        vm.heap.version_of(idx),
+                                        0,
+                                        &hops[..n_hops],
+                                    ) {
+                                        vm.jit.set_ic(site_idx, e);
+                                    }
+                                }
                                 return Value::UNDEFINED.bits();
                             }
                             vm.obj_proto
@@ -6632,21 +7669,10 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
                     if n_hops >= 64 || !vm.ic_obj_ok(next) {
                         return crate::codegen::PROP_VIA_IC;
                     }
-                    match vm.heap.get(next) {
+                    let found_data = match vm.heap.get(next) {
                         HeapObj::Object(m2) if !m2.is_ctor && m2.class.is_none() => {
-                            if let Some(i) = m2.pos(key) {
+                            if let Some(i) = crate::vm::ic::own_pos_in(&vm.own_slot_cache, m2, key) {
                                 if m2.attr_at(i).accessor {
-                                    // Inherited getter: frame-called by the
-                                    // interpreter-IC slow helper. B114: fill an
-                                    // ACCESSOR way under the same guards a
-                                    // chain-DATA hit would take — receiver
-                                    // identity + receiver version + every hop's
-                                    // version down to the holder (shadowing
-                                    // adds, holder redefinition/delete and
-                                    // setPrototypeOf all bump one of them).
-                                    // Site-gated: as the own-accessor fill
-                                    // above (a too-deep chain never fills, so
-                                    // it neither marks nor evicts).
                                     let gate = if n_hops < MAX {
                                         vm.jit.acc_way_gate(site_idx)
                                     } else {
@@ -6672,40 +7698,80 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
                                             vm.jit.set_ic(site_idx, e);
                                         }
                                     }
-                                    let sh = map.shape();
-                                    jit_acc_route_note(vm, site_idx, sh);
+                                    jit_acc_route_note(vm, site_idx, recv_sh);
                                     return crate::codegen::PROP_VIA_IC;
                                 }
-                                let v = m2.val_at(i);
-                                // A chain DATA hit within JIT_IC_MAX_HOPS fills
-                                // a hop-version-guarded way (receiver identity
-                                // + receiver version + every hop's version —
-                                // shadowing adds, hop key changes/deletes and
-                                // setPrototypeOf all bump one of them). Deeper
-                                // holders return UNCACHED (rare).
-                                if n_hops < MAX && !vm.jit.direct_miss_active(site_idx) {
-                                    hops[n_hops] = (next, vm.heap.version_of(next));
-                                    if let Some(e) = crate::codegen::IcEntry::chain(
-                                        obj_bits,
-                                        m2.vals_ptr_raw() as u64,
-                                        vm.heap.version_of(idx),
-                                        i as u32,
-                                        &hops[..=n_hops],
-                                    ) {
-                                        if vm.jit.ic_thrashing(site_idx)
-                                            && crate::codegen::ic_refill_gate_enabled()
-                                        {
-                                            vm.jit.ic_rot_bump(site_idx);
-                                        } else {
-                                            vm.jit.set_ic(site_idx, e);
-                                        }
-                                    }
-                                }
-                                return v.bits();
+                                Some((m2.val_at(i), m2.vals_ptr_raw() as u64, i as u32))
+                            } else {
+                                None
                             }
                         }
                         _ => return crate::codegen::PROP_VIA_IC, // exotic link
+                    };
+                    if let Some((v, holder_vals, holder_slot)) = found_data {
+                        all_hops[n_hops] = next;
+                        if first_proto_custom
+                            && !v.is_uninitialized()
+                            && vm.realm_global_objs.is_empty()
+                        {
+                            es5_proto_memo_put(
+                                vm,
+                                all_hops[0],
+                                key_id,
+                                &all_hops[..=n_hops],
+                                holder_vals,
+                                holder_slot,
+                            );
+                            if recv_plain {
+                                if recv_sh != crate::shape::DICT {
+                                    shape_prop_memo_put(
+                                        vm,
+                                        recv_sh,
+                                        key_id,
+                                        crate::vm::SHAPE_PROP_ES5_PROTO,
+                                        false,
+                                    );
+                                } else {
+                                    let ver = vm.heap.version_of(idx);
+                                    dict_prop_memo_put(
+                                        vm,
+                                        idx,
+                                        key_id,
+                                        ver,
+                                        0,
+                                        crate::vm::SHAPE_PROP_ES5_PROTO,
+                                        false,
+                                    );
+                                }
+                            }
+                        }
+                        // A chain DATA hit within JIT_IC_MAX_HOPS fills
+                        // a hop-version-guarded way (receiver identity
+                        // + receiver version + every hop's version —
+                        // shadowing adds, hop key changes/deletes and
+                        // setPrototypeOf all bump one of them). Deeper
+                        // holders return UNCACHED (rare).
+                        if n_hops < MAX && !vm.jit.direct_miss_active(site_idx) {
+                            hops[n_hops] = (next, vm.heap.version_of(next));
+                            if let Some(e) = crate::codegen::IcEntry::chain(
+                                obj_bits,
+                                holder_vals,
+                                vm.heap.version_of(idx),
+                                holder_slot,
+                                &hops[..=n_hops],
+                            ) {
+                                if vm.jit.ic_thrashing(site_idx)
+                                    && crate::codegen::ic_refill_gate_enabled()
+                                {
+                                    vm.jit.ic_rot_bump(site_idx);
+                                } else {
+                                    vm.jit.set_ic(site_idx, e);
+                                }
+                            }
+                        }
+                        return v.bits();
                     }
+                    all_hops[n_hops] = next;
                     if n_hops < MAX {
                         hops[n_hops] = (next, vm.heap.version_of(next));
                     }
@@ -6865,11 +7931,34 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
     // of the same layout skips the scan above. Only for an OWN data property on
     // a shaped object — a proto-chain or class resolution depends on more than
     // the receiver's own layout and is already guarded by hop versions.
-    if let HeapObj::Object(map) = vm.heap.get(idx) {
-        let sh = map.shape();
-        if sh != crate::shape::DICT && map.attr_get(slot as usize).is_some_and(|a| !a.accessor) {
-            jit_shape_slot_put(vm, site_idx, sh, slot);
+    let (shaped_own_sh, shaped_writable, dict_cache_writable) = match vm.heap.get(idx) {
+        HeapObj::Object(map)
+            if map.attr_get(slot as usize).is_some_and(|a| !a.accessor) =>
+        {
+            let attr = map.attr_at(slot as usize);
+            let w = !map.class_proto && attr.writable && plain_set_key;
+            let sh = map.shape();
+            if sh != crate::shape::DICT {
+                (sh, w, None)
+            } else if !val.is_uninitialized() {
+                (crate::shape::DICT, false, Some(w))
+            } else {
+                (crate::shape::DICT, false, None)
+            }
         }
+        _ => (crate::shape::DICT, false, None),
+    };
+    if shaped_own_sh != crate::shape::DICT {
+        shape_prop_memo_put(vm, shaped_own_sh, key_id, slot, shaped_writable);
+        jit_shape_slot_put(vm, site_idx, shaped_own_sh, slot);
+        if mir.shape == crate::shape::DICT {
+            vm.heap.refresh_mirror(idx);
+        }
+        if vm.jit.direct_miss_active(site_idx) && crate::codegen::shape_ways_enabled() {
+            vm.jit.fill_shape_pair(site_idx, shaped_own_sh, slot);
+        }
+    } else if let Some(w) = dict_cache_writable {
+        dict_prop_memo_put(vm, idx, key_id, version, vals_ptr, slot, w);
     }
     val.bits()
 }
@@ -6969,10 +8058,17 @@ pub(crate) extern "win64" fn jit_get_prop_leaf(
     // loop calling `(a, o) => a.x * o.x + a.y * o.y + a.z * o.z`.
     let way = leaf_read_way(packed);
     if let Some(m) = vm.jit_leaf_reads.get(way) {
-        if m.packed == packed && vm.deferred_ns_state.is_empty() && vm.ic_obj_ok(idx) {
-            if let HeapObj::Object(map) = vm.heap.get(idx) {
-                if map.shape() == m.shape {
-                    return map.val_at(m.slot as usize).bits();
+        if m.packed == packed && vm.deferred_ns_state.is_empty() {
+            let mir = vm.heap.hot_mirror_of(idx);
+            if mir.shape == m.shape && mir.shape != crate::shape::DICT && crate::heap::fid_mirror_plain(mir.fid) {
+                // SAFETY: settled mirror shape matches the memoized own-data slot.
+                return unsafe { *(mir.vals as *const Value).add(m.slot as usize) }.bits();
+            }
+            if mir.shape == crate::shape::DICT && vm.ic_obj_ok(idx) {
+                if let HeapObj::Object(map) = vm.heap.get(idx) {
+                    if map.shape() == m.shape {
+                        return map.val_at(m.slot as usize).bits();
+                    }
                 }
             }
         }
@@ -6984,16 +8080,67 @@ pub(crate) extern "win64" fn jit_get_prop_leaf(
     let key = &vm.func(func_id as usize).string_constants[name_idx as usize];
     // Same exclusions as the interpreter IC: a private name needs brand checks, and
     // an exotic receiver has live semantics layered over its ObjMap.
-    if matches!(key.as_bytes().first(), Some(b'#'))
-        || !vm.deferred_ns_state.is_empty()
-        || !vm.ic_obj_ok(idx)
-    {
+    if matches!(key.as_bytes().first(), Some(b'#')) || !vm.deferred_ns_state.is_empty() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let key_id = vm.prop_key_id(func_id, name_idx);
+    // Fast polymorphic hot-mirror own-data/absent lookup ahead of `ic_obj_ok`
+    // and `Box<ObjMap>` deref (handles TypeScript/Babel AST leaf helpers called
+    // across dozens of distinct shapes).
+    let mir = vm.heap.hot_mirror_of(idx);
+    if mir.shape != crate::shape::DICT && crate::heap::fid_mirror_plain(mir.fid) {
+        match vm.own_slot_probe(mir.shape, key) {
+            crate::vm::ic::OwnSlotProbe::Data(slot, _) => {
+                if leaf_read_memo_enabled() {
+                    if vm.jit_leaf_reads.is_empty() {
+                        vm.jit_leaf_reads =
+                            vec![LeafRead::default(); LEAF_READ_WAYS].into_boxed_slice();
+                    }
+                    vm.jit_leaf_reads[way] = LeafRead {
+                        packed,
+                        shape: mir.shape,
+                        slot,
+                    };
+                }
+                // SAFETY: settled mirror shape proves `vals` is live and holds `slot`.
+                return unsafe { *(mir.vals as *const Value).add(slot as usize) }.bits();
+            }
+            crate::vm::ic::OwnSlotProbe::Miss if mir.fid == crate::heap::FID_MIRROR_NONE => {
+                let raw_proto = vm.proto_of.raw_bits(idx);
+                if raw_proto == 0 {
+                    if vm.obj_proto_lacks_key(key) {
+                        return Value::UNDEFINED.bits();
+                    }
+                } else if !Value::from_bits(raw_proto).is_heap() {
+                    return Value::UNDEFINED.bits();
+                } else if idx != vm.global_this && vm.realm_global_objs.is_empty() {
+                    let first_proto = Value::from_bits(raw_proto).heap_index();
+                    if let Some(bits) = es5_proto_memo_get(vm, first_proto, key_id) {
+                        shape_prop_memo_put(
+                            vm,
+                            mir.shape,
+                            key_id,
+                            crate::vm::SHAPE_PROP_ES5_PROTO,
+                            false,
+                        );
+                        return bits;
+                    }
+                }
+            }
+            _ => {}
+        }
+    } else if mir.shape == crate::shape::DICT && crate::heap::fid_mirror_plain(mir.fid) {
+        if let Some(bits) = dict_prop_memo_get(vm, idx, key_id) {
+            return bits;
+        }
+    }
+    if !vm.ic_obj_ok(idx) {
         return crate::codegen::SELF_CALL_DEOPT;
     }
     // Own data property — the case this exists for.
     match vm.heap.get(idx) {
         HeapObj::Object(map) => {
-            if let Some(s) = map.pos(key) {
+            if let Some(s) = crate::vm::ic::own_pos_in(&vm.own_slot_cache, map, key) {
                 if map.attr_at(s).accessor {
                     return crate::codegen::SELF_CALL_DEOPT; // getter runs user code
                 }
@@ -7023,34 +8170,78 @@ pub(crate) extern "win64" fn jit_get_prop_leaf(
                 // matching guard in `jit_get_prop_miss`).
                 return crate::codegen::SELF_CALL_DEOPT;
             }
+            let first_proto_custom = vm.proto_of.get_copied(idx).is_some_and(|p| p.is_heap());
             let mut cur = idx;
-            let mut hops = 0u32;
+            let mut all_hops: [u32; 64] = [0; 64];
+            let mut hops = 0usize;
             loop {
                 let next = match vm.proto_of.get(&cur) {
                     Some(p) if p.is_heap() => p.heap_index(),
-                    Some(_) => return Value::UNDEFINED.bits(), // explicit null proto
+                    Some(_) => {
+                        if first_proto_custom && hops >= 1 && vm.realm_global_objs.is_empty() {
+                            es5_proto_memo_put(
+                                vm,
+                                all_hops[0],
+                                key_id,
+                                &all_hops[..hops],
+                                0,
+                                u32::MAX,
+                            );
+                        }
+                        return Value::UNDEFINED.bits(); // explicit null proto
+                    }
                     None => {
                         if vm.obj_proto == 0 || cur == vm.obj_proto {
+                            if first_proto_custom && hops >= 1 && vm.realm_global_objs.is_empty() {
+                                es5_proto_memo_put(
+                                    vm,
+                                    all_hops[0],
+                                    key_id,
+                                    &all_hops[..hops],
+                                    0,
+                                    u32::MAX,
+                                );
+                            }
                             return Value::UNDEFINED.bits(); // chain end, absent
                         }
                         vm.obj_proto
                     }
                 };
-                hops += 1;
-                if hops > 64 || !vm.ic_obj_ok(next) {
+                if hops >= 64 || !vm.ic_obj_ok(next) {
                     return crate::codegen::SELF_CALL_DEOPT;
                 }
-                match vm.heap.get(next) {
+                let found_data = match vm.heap.get(next) {
                     HeapObj::Object(m2) if !m2.is_ctor && m2.class.is_none() => {
-                        if let Some(i) = m2.pos(key) {
+                        if let Some(i) = crate::vm::ic::own_pos_in(&vm.own_slot_cache, m2, key) {
                             if m2.attr_at(i).accessor {
                                 return crate::codegen::SELF_CALL_DEOPT;
                             }
-                            return m2.val_at(i).bits();
+                            Some((m2.val_at(i), m2.vals_ptr_raw() as u64, i as u32))
+                        } else {
+                            None
                         }
                     }
                     _ => return crate::codegen::SELF_CALL_DEOPT, // exotic link
+                };
+                if let Some((v, holder_vals, holder_slot)) = found_data {
+                    all_hops[hops] = next;
+                    if first_proto_custom
+                        && !v.is_uninitialized()
+                        && vm.realm_global_objs.is_empty()
+                    {
+                        es5_proto_memo_put(
+                            vm,
+                            all_hops[0],
+                            key_id,
+                            &all_hops[..=hops],
+                            holder_vals,
+                            holder_slot,
+                        );
+                    }
+                    return v.bits();
                 }
+                all_hops[hops] = next;
+                hops += 1;
                 cur = next;
             }
         }
@@ -7109,40 +8300,97 @@ const ADD_WAY_SITES_MAX: usize = 1 << 20;
 pub(crate) struct ClassRead {
     func: u32,
     name: u32,
-    /// `shape::DICT` (0) marks an empty memo.
+    /// `shape::DICT` (0) means identity-keyed (`recv_idx` + `recv_ver`) when
+    /// `class != u32::MAX`, else empty memo (`class == 0 && ver == 0 && recv_ver == 0 && nhops == 0` -> check `valid`).
     recv_shape: u32,
+    recv_idx: u32,
+    recv_ver: u32,
     class: u32,
     ver: u32,
     epoch: u32,
+    nhops: u8,
+    valid: bool,
+    hops: [(u32, u32); 5],
     value: u64,
 }
 
-/// The method a site's memo names for the class instance `idx`, if every
-/// guard still holds.
+/// Fast hot-mirror / identity-version check for a class instance's cached
+/// method or proved-absent read (`Walked::ClassMethod` / `Walked::ClassMiss`),
+/// avoiding `Box<ObjMap>` dereferences and 12-level class inheritance walks.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn jit_class_read_hit_mirror(
+    vm: &Vm,
+    idx: u32,
+    mir: crate::heap::HotMirror,
+    site_idx: u32,
+    func: u32,
+    name: u32,
+) -> Option<(u64, u32, u8, [(u32, u32); 5])> {
+    let m = vm.jit_class_reads.get(site_idx as usize)?;
+    if !m.valid || m.func != func || m.name != name {
+        return None;
+    }
+    if mir.fid != (crate::heap::FID_MIRROR_CLASS | m.class) {
+        return None;
+    }
+    if m.recv_shape != crate::shape::DICT {
+        if mir.shape != m.recv_shape {
+            return None;
+        }
+    } else if idx != m.recv_idx || vm.heap.version_of(idx) != m.recv_ver {
+        return None;
+    }
+    if vm.heap.version_of(m.class) != m.ver || vm.class_proto_epoch != m.epoch {
+        return None;
+    }
+    if m.nhops != 0 {
+        for &(h_idx, h_ver) in &m.hops[..m.nhops as usize] {
+            if vm.heap.version_of(h_idx) != h_ver {
+                return None;
+            }
+        }
+    }
+    Some((m.value, m.class, m.nhops, m.hops))
+}
+
+/// The method/absent-read a site's memo names for the class instance `idx`, if
+/// every guard still holds (fallback when mirror was stale/invalidated).
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[inline]
 fn jit_class_read_hit(vm: &Vm, idx: u32, site_idx: u32, func: u32, name: u32) -> Option<u64> {
     let m = vm.jit_class_reads.get(site_idx as usize)?;
-    if m.recv_shape == crate::shape::DICT || m.func != func || m.name != name {
+    if !m.valid || m.func != func || m.name != name {
         return None;
     }
-    match vm.heap.get(idx) {
-        HeapObj::Object(map)
-            if map.class == Some(m.class)
-                && map.shape() == m.recv_shape
-                && vm.heap.version_of(m.class) == m.ver
-                && vm.class_proto_epoch == m.epoch =>
-        {
-            Some(m.value)
-        }
-        _ => None,
+    if vm.heap.version_of(m.class) != m.ver || vm.class_proto_epoch != m.epoch {
+        return None;
     }
+    let matched = if m.recv_shape != crate::shape::DICT {
+        matches!(
+            vm.heap.get(idx),
+            HeapObj::Object(map) if map.class == Some(m.class) && map.shape() == m.recv_shape
+        )
+    } else {
+        idx == m.recv_idx && vm.heap.version_of(idx) == m.recv_ver
+    };
+    if !matched {
+        return None;
+    }
+    if m.nhops != 0 {
+        for &(h_idx, h_ver) in &m.hops[..m.nhops as usize] {
+            if vm.heap.version_of(h_idx) != h_ver {
+                return None;
+            }
+        }
+    }
+    Some(m.value)
 }
 
 /// A class instance's read of a key it does not own: a method on its class
-/// chain is the read's value (and the site's memo); anything else (a
-/// getter, which has to run, an absent key, an uncacheable chain) takes the
-/// interpreter-IC slow helper.
+/// chain (`Walked::ClassMethod`) or a proved-absent key (`Walked::ClassMiss`)
+/// is answered directly and memoised for both shaped and DICT class instances;
+/// getters and exotic chains still route to the interpreter-IC slow helper.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 fn jit_class_read_fill(vm: &mut Vm, obj: Value, key: &str, site_idx: u32, func: u32, name: u32) -> u64 {
     let idx = obj.heap_index();
@@ -7153,11 +8401,43 @@ fn jit_class_read_fill(vm: &mut Vm, obj: Value, key: &str, site_idx: u32, func: 
         },
         _ => return crate::codegen::PROP_VIA_IC,
     };
-    let callee = match vm.ic_walk(obj, key) {
-        crate::vm::ic::Walked::ClassMethod { class: c, callee } if c == class => callee,
+    let (value_bits, nhops, hops) = match vm.ic_walk(obj, key) {
+        crate::vm::ic::Walked::ClassMethod { class: c, callee } if c == class => {
+            (callee.bits(), 0u8, [(0u32, 0u32); 5])
+        }
+        crate::vm::ic::Walked::ClassMiss {
+            class: c,
+            nhops,
+            hops,
+        } if c == class && nhops as usize <= 5 => (Value::UNDEFINED.bits(), nhops, hops),
         _ => return crate::codegen::PROP_VIA_IC,
     };
-    if recv_shape != crate::shape::DICT && class_read_memo_enabled() {
+    let key_id = vm.prop_key_id(func, name);
+    class_prop_memo_put(vm, class, key_id, &hops[..nhops as usize], value_bits);
+    if recv_shape != crate::shape::DICT {
+        shape_prop_memo_put(
+            vm,
+            recv_shape,
+            key_id,
+            crate::vm::SHAPE_PROP_CLASS_MISS,
+            false,
+        );
+    } else {
+        let ver = vm.heap.version_of(idx);
+        dict_prop_memo_put(
+            vm,
+            idx,
+            key_id,
+            ver,
+            0,
+            crate::vm::SHAPE_PROP_CLASS_MISS,
+            false,
+        );
+    }
+    if class_read_memo_enabled() {
+        if recv_shape != crate::shape::DICT {
+            vm.heap.refresh_mirror(idx);
+        }
         let s = site_idx as usize;
         if vm.jit_class_reads.len() <= s {
             vm.jit_class_reads.resize(s + 1, ClassRead::default());
@@ -7166,13 +8446,18 @@ fn jit_class_read_fill(vm: &mut Vm, obj: Value, key: &str, site_idx: u32, func: 
             func,
             name,
             recv_shape,
+            recv_idx: idx,
+            recv_ver: vm.heap.version_of(idx),
             class,
             ver: vm.heap.version_of(class),
             epoch: vm.class_proto_epoch,
-            value: callee.bits(),
+            nhops,
+            valid: true,
+            hops,
+            value: value_bits,
         };
     }
-    callee.bits()
+    value_bits
 }
 
 env_off_switch! {
@@ -7393,6 +8678,10 @@ fn jit_add_way_hit(
         _ => return false,
     }
     vm.heap.bump_version(idx);
+    // The append is complete and `ic_obj_ok(idx)` passed above, so settle the
+    // hot mirror immediately (matching interpreter `ic_set_prop`) so the first
+    // read on constructor-built objects hits native shape ways without a miss.
+    vm.heap.refresh_mirror(idx);
     true
 }
 
@@ -7456,6 +8745,66 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
         let guardable = matches!(vm.heap.get(idx), HeapObj::Object(m) if m.shape_guardable());
         icstats::set_miss(guardable);
     }
+    let key_id = vm.prop_key_id(func_id, name_idx);
+    // Fast cross-site (shape, key) writable-slot memo via the hot mirror for
+    // Direct or thrashing sites (`store_barrier` already ran above; `class_proto`
+    // and exotics are pinned to DICT so never match).
+    let mir = vm.heap.hot_mirror_of(idx);
+    if mir.shape != crate::shape::DICT && crate::heap::fid_mirror_plain(mir.fid) {
+        if let Some(slot) = vm.own_writable_slot_cached(mir.shape, key) {
+            shape_prop_memo_put(vm, mir.shape, key_id, slot, true);
+            if vm.jit.direct_miss_active(site_idx) {
+                if crate::codegen::shape_ways_enabled() {
+                    vm.jit.fill_shape_pair(site_idx, mir.shape, slot);
+                }
+                // SAFETY: settled mirror shape proves `vals` is the live column
+                // holding writable data `slot`; `store_barrier` ran above.
+                unsafe { *(mir.vals as *mut Value).add(slot as usize) = Value::from_bits(val_bits) };
+                return 0;
+            } else if vm.jit.ic_thrashing(site_idx) && !vm.jit.direct_miss_gate_ready(site_idx) {
+                if crate::codegen::ic_refill_gate_enabled() {
+                    vm.jit.ic_rot_bump(site_idx);
+                }
+                // SAFETY: settled mirror shape proves `vals` is the live column
+                // holding writable data `slot`; `store_barrier` ran above.
+                unsafe { *(mir.vals as *mut Value).add(slot as usize) = Value::from_bits(val_bits) };
+                return 0;
+            }
+        }
+    } else if mir.shape == crate::shape::DICT
+        && crate::heap::fid_mirror_plain(mir.fid)
+        && !icstats::enabled()
+    {
+        // Fast single-lookup overwrite path for dictionary-mode objects
+        // (`store_barrier`, exotic keys, and `ic_obj_ok` already ran above).
+        if let HeapObj::Object(map) = vm.heap.get_mut(idx) {
+            if !map.class_proto && map.shape() == crate::shape::DICT {
+                if let Some(s) = map.pos(key) {
+                    let attr = map.attr_at(s);
+                    if !attr.accessor && attr.writable {
+                        map.set_val_at(s, Value::from_bits(val_bits));
+                        let vals_ptr = map.vals_ptr_raw() as u64;
+                        let version = vm.heap.version_of(idx);
+                        dict_prop_memo_put(vm, idx, key_id, version, vals_ptr, s as u32, true);
+                        if !vm.jit.direct_miss_active(site_idx) {
+                            if let Some(e) =
+                                crate::codegen::IcEntry::own(obj_bits, vals_ptr, version, s as u32)
+                            {
+                                if vm.jit.ic_thrashing(site_idx)
+                                    && crate::codegen::ic_refill_gate_enabled()
+                                {
+                                    vm.jit.ic_rot_bump(site_idx);
+                                } else {
+                                    vm.jit.set_ic(site_idx, e);
+                                }
+                            }
+                        }
+                        return 0;
+                    }
+                }
+            }
+        }
+    }
     // Store-side shape memo. The memo contains only `(site, shape) -> slot`;
     // every use re-reads the LIVE object, exact key and descriptor before the
     // write. A delete/redefine drops the object to DICT, an append transitions
@@ -7467,9 +8816,11 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
                 .get(&(site_idx, sh))
                 .copied()
                 .filter(|&slot| {
-                    let s = slot as usize;
-                    map.key_get(s).is_some_and(|k| k == key)
-                        && map.attr_get(s).is_some_and(|a| !a.accessor && a.writable)
+                    slot != crate::codegen::SHAPE_PAIR_ABSENT_SLOT && {
+                        let s = slot as usize;
+                        map.key_get(s).is_some_and(|k| k == key)
+                            && map.attr_get(s).is_some_and(|a| !a.accessor && a.writable)
+                    }
                 })
                 .map(|slot| (sh, slot))
         }
@@ -7503,6 +8854,7 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
         // the value-grain barrier through `jit_shape_set_barrier`, so no
         // persistent scan root is needed — and none would be possible, since
         // a shape way serves receivers unknown at fill time.
+        shape_prop_memo_put(vm, shape, key_id, slot, true);
         if gate == crate::codegen::DirectMissGate::Direct && crate::codegen::shape_ways_enabled() {
             vm.heap.refresh_mirror(idx);
             // B188: pack into the 4-pair form (32 shapes per site).
@@ -7536,7 +8888,7 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
         // records when it makes the class's member tables stale — never an
         // own way whose hits would store with no call at all.
         HeapObj::Object(map) if map.class_proto => return crate::codegen::PROP_VIA_IC,
-        HeapObj::Object(map) => match map.pos(key) {
+        HeapObj::Object(map) => match crate::vm::ic::own_pos_in(&vm.own_slot_cache, map, key) {
             // An accessor's SETTER must run (user code) — the interpreter-IC
             // slow helper frame-calls it. B114: fill an OWN accessor way first
             // (identity + version, like every Set way — the probe walks no
@@ -7629,7 +8981,7 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
                     }
                     match vm.heap.get(next) {
                         HeapObj::Object(m2) if !m2.is_ctor && m2.class.is_none() => {
-                            if let Some(i) = m2.pos(key) {
+                            if let Some(i) = crate::vm::ic::own_pos_in(&vm.own_slot_cache, m2, key) {
                                 if m2.attr_at(i).accessor {
                                     // Inherited setter governs the write —
                                     // frame-called by the slow helper.
@@ -7676,6 +9028,9 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
     };
     if added {
         vm.heap.bump_version(idx);
+        // `ic_obj_ok(idx)` passed above; settle the hot mirror immediately so
+        // subsequent reads on append-built objects hit native shape ways.
+        vm.heap.refresh_mirror(idx);
         // The append is proved: the site's next one onto an object of the same
         // shape and chain takes the add way. Its identity way is useless for
         // the new objects a constructor appends to, so it fills none.
@@ -7711,15 +9066,30 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
     }
     // Record only a live OWN writable data slot. The shape fixes key→slot;
     // descriptor changes force DICT, and the helper rechecks attrs on every hit.
-    if let HeapObj::Object(map) = vm.heap.get(idx) {
-        let sh = map.shape();
-        if sh != crate::shape::DICT
-            && map.key_get(slot as usize).is_some_and(|k| k == key)
-            && map
-                .attr_get(slot as usize)
-                .is_some_and(|a| !a.accessor && a.writable)
+    let post_write = match vm.heap.get(idx) {
+        HeapObj::Object(map)
+            if !map.class_proto
+                && map.key_get(slot as usize).is_some_and(|k| k == key)
+                && map
+                    .attr_get(slot as usize)
+                    .is_some_and(|a| !a.accessor && a.writable) =>
         {
+            Some(map.shape())
+        }
+        _ => None,
+    };
+    if let Some(sh) = post_write {
+        if sh != crate::shape::DICT {
+            shape_prop_memo_put(vm, sh, key_id, slot, true);
             jit_shape_slot_put(vm, site_idx, sh, slot);
+            if mir.shape == crate::shape::DICT {
+                vm.heap.refresh_mirror(idx);
+            }
+            if vm.jit.direct_miss_active(site_idx) && crate::codegen::shape_ways_enabled() {
+                vm.jit.fill_shape_pair(site_idx, sh, slot);
+            }
+        } else {
+            dict_prop_memo_put(vm, idx, key_id, version, vals_ptr, slot, true);
         }
     }
     0
@@ -9481,6 +10851,15 @@ pub(crate) extern "win64" fn jit_iter_next(
     }
     // SAFETY: `regs` is this activation's window, inside `vm.regs`' buffer.
     let base = unsafe { (regs as *const u64).offset_from(vm.regs.as_ptr() as *const u64) } as usize;
+    // A frame-free body (`lazy_frame_free`) owns no frame on `vm.frames`: only
+    // the dense-array fast path above runs natively; any non-dense iterable
+    // bails before touching user code so `jit_cross3_finish` materializes the
+    // frame and its deferred `finally` handlers first.
+    if vm.frames.last().is_none_or(|f| f.base != base) {
+        vm.osr_deopt_exempt = true;
+        iterstats::deopt();
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
     // A generator is the exception: the interpreter steps one as a frame of its
     // own loop (`gen_enter_inline`), and from here each step copies its window
     // in and out, which cost a loop more than compiling it saved (11% of

@@ -20,6 +20,17 @@ pub(super) enum ScopeKind {
     Class,
 }
 
+/// Key distinguishing scopes that share or nest within the same defining AST
+/// node (e.g. PEP 695 type-parameter scopes and lazy bound/default/value thunks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum ScopeKey {
+    Node(u32, u32),
+    TypeParams(u32, u32),
+    TypeBound(u32, u32),
+    TypeDefault(u32, u32),
+    TypeAliasValue(u32, u32),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SymKind {
     /// A plain register-resident local.
@@ -50,6 +61,7 @@ pub(super) struct Scope {
     /// array at runtime.
     pub free_order: Vec<String>,
     pub is_generator: bool,
+    pub is_async: bool,
     /// Names a `del` statement unbinds somewhere in this scope.
     pub deleted: BTreeSet<String>,
     /// The scope defines `super`/`__class__` uses (methods) — needs the
@@ -83,7 +95,7 @@ pub(super) struct Scope {
     pub inline: bool,
     /// Source range (start, end) of the defining node, the emitter's key
     /// into the table.
-    pub offset: (u32, u32),
+    pub offset: ScopeKey,
     pub parent: Option<usize>,
     pub children: Vec<usize>,
 }
@@ -94,14 +106,14 @@ pub(super) struct SymTable {
     /// offset alone is ambiguous: an unparenthesized generator expression
     /// starts where its element does, and the element may be a
     /// comprehension or a lambda.
-    pub by_offset: BTreeMap<(u32, u32), usize>,
+    pub by_offset: BTreeMap<ScopeKey, usize>,
 }
 
 /// Raw facts gathered by the first pass, resolved by the second.
 struct Raw {
     kind: ScopeKind,
     name: String,
-    offset: (u32, u32),
+    offset: ScopeKey,
     parent: Option<usize>,
     bound: BTreeSet<String>,
     used: BTreeSet<String>,
@@ -109,6 +121,7 @@ struct Raw {
     nonlocals: BTreeSet<String>,
     params: Vec<String>,
     is_generator: bool,
+    is_async: bool,
     is_comprehension: bool,
     deleted: BTreeSet<String>,
     uses_class_cell: bool,
@@ -128,7 +141,7 @@ type R<T> = Result<T, String>;
 
 pub(super) fn analyse(module: &[ast::Stmt], name: &str) -> R<SymTable> {
     let mut b = Builder {
-        raws: vec![Raw::new(ScopeKind::Module, name, (0, 0), None)],
+        raws: vec![Raw::new(ScopeKind::Module, name, ScopeKey::Node(0, 0), None)],
         current: 0,
     };
     b.stmts(module)?;
@@ -141,7 +154,7 @@ fn range_key(node: &impl Ranged) -> (u32, u32) {
 }
 
 impl Raw {
-    fn new(kind: ScopeKind, name: &str, offset: (u32, u32), parent: Option<usize>) -> Self {
+    fn new(kind: ScopeKind, name: &str, offset: ScopeKey, parent: Option<usize>) -> Self {
         Raw {
             kind,
             name: name.to_owned(),
@@ -153,6 +166,7 @@ impl Raw {
             nonlocals: BTreeSet::new(),
             params: Vec::new(),
             is_generator: false,
+            is_async: false,
             is_comprehension: false,
             deleted: BTreeSet::new(),
             uses_class_cell: false,
@@ -172,16 +186,87 @@ impl Builder {
     fn use_(&mut self, name: &str) {
         self.raws[self.current].used.insert(name.to_owned());
     }
-    fn enter(&mut self, kind: ScopeKind, name: &str, offset: (u32, u32)) -> usize {
+    fn enter_key(&mut self, kind: ScopeKind, name: &str, key: ScopeKey) -> usize {
         let parent = self.current;
         let id = self.raws.len();
-        self.raws.push(Raw::new(kind, name, offset, Some(parent)));
+        self.raws.push(Raw::new(kind, name, key, Some(parent)));
         self.raws[parent].children.push(id);
         self.current = id;
         id
     }
+    fn enter(&mut self, kind: ScopeKind, name: &str, offset: (u32, u32)) -> usize {
+        self.enter_key(kind, name, ScopeKey::Node(offset.0, offset.1))
+    }
     fn leave(&mut self, id: usize) {
         self.current = self.raws[id].parent.expect("nested scope has a parent");
+    }
+    fn analyse_type_params(&mut self, tps: &[ast::TypeParam]) -> R<()> {
+        let mut seen = BTreeSet::new();
+        for tp in tps {
+            let name = match tp {
+                ast::TypeParam::TypeVar(tv) => tv.name.as_str(),
+                ast::TypeParam::ParamSpec(ps) => ps.name.as_str(),
+                ast::TypeParam::TypeVarTuple(tvt) => tvt.name.as_str(),
+            };
+            if !seen.insert(name) {
+                return Err(format!("duplicate type parameter '{name}'"));
+            }
+            self.bind(name);
+            match tp {
+                ast::TypeParam::TypeVar(tv) => {
+                    if let Some(b) = &tv.bound {
+                        let k = range_key(b.as_ref());
+                        let bid = self.enter_key(ScopeKind::Function, "<type-bound>", ScopeKey::TypeBound(k.0, k.1));
+                        self.expr(b)?;
+                        self.leave(bid);
+                    }
+                    if let Some(d) = &tv.default {
+                        let k = range_key(d.as_ref());
+                        let did = self.enter_key(ScopeKind::Function, "<type-default>", ScopeKey::TypeDefault(k.0, k.1));
+                        self.expr(d)?;
+                        self.leave(did);
+                    }
+                }
+                ast::TypeParam::ParamSpec(ps) => {
+                    if let Some(d) = &ps.default {
+                        let k = range_key(d.as_ref());
+                        let did = self.enter_key(ScopeKind::Function, "<type-default>", ScopeKey::TypeDefault(k.0, k.1));
+                        self.expr(d)?;
+                        self.leave(did);
+                    }
+                }
+                ast::TypeParam::TypeVarTuple(tvt) => {
+                    if let Some(d) = &tvt.default {
+                        let k = range_key(d.as_ref());
+                        let did = self.enter_key(ScopeKind::Function, "<type-default>", ScopeKey::TypeDefault(k.0, k.1));
+                        self.expr(d)?;
+                        self.leave(did);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    fn fn_annotations(&mut self, args: &ast::Arguments, returns: Option<&ast::Expr>) -> R<()> {
+        for a in args
+            .posonlyargs
+            .iter()
+            .chain(&args.args)
+            .chain(&args.kwonlyargs)
+        {
+            if let Some(ann) = &a.def.annotation {
+                self.expr(ann)?;
+            }
+        }
+        for a in [&args.vararg, &args.kwarg].into_iter().flatten() {
+            if let Some(ann) = &a.annotation {
+                self.expr(ann)?;
+            }
+        }
+        if let Some(ret) = returns {
+            self.expr(ret)?;
+        }
+        Ok(())
     }
     fn stmts(&mut self, body: &[ast::Stmt]) -> R<()> {
         for s in body {
@@ -196,55 +281,88 @@ impl Builder {
                     self.expr(d)?;
                 }
                 self.arg_defaults(&f.args)?;
-                // Annotations are expressions of the defining scope.
-                for a in f
-                    .args
-                    .posonlyargs
-                    .iter()
-                    .chain(&f.args.args)
-                    .chain(&f.args.kwonlyargs)
-                {
-                    if let Some(ann) = &a.def.annotation {
-                        self.expr(ann)?;
-                    }
-                }
-                for a in [&f.args.vararg, &f.args.kwarg].into_iter().flatten() {
-                    if let Some(ann) = &a.annotation {
-                        self.expr(ann)?;
-                    }
-                }
-                if let Some(ret) = &f.returns {
-                    self.expr(ret)?;
-                }
                 self.bind(f.name.as_str());
-                self.function(
-                    f.name.as_str(),
-                    &f.args,
-                    &f.body,
-                    range_key(f),
-                )?;
+                if !f.type_params.is_empty() {
+                    let rk = range_key(f);
+                    let tp_id = self.enter_key(
+                        ScopeKind::Function,
+                        f.name.as_str(),
+                        ScopeKey::TypeParams(rk.0, rk.1),
+                    );
+                    self.raws[tp_id].params = vec![".d".to_owned(), ".kn".to_owned(), ".kv".to_owned()];
+                    self.bind(".d");
+                    self.bind(".kn");
+                    self.bind(".kv");
+                    self.analyse_type_params(&f.type_params)?;
+                    self.fn_annotations(&f.args, f.returns.as_deref())?;
+                    self.function(f.name.as_str(), &f.args, &f.body, rk, false)?;
+                    self.leave(tp_id);
+                } else {
+                    // Annotations are expressions of the defining scope.
+                    self.fn_annotations(&f.args, f.returns.as_deref())?;
+                    self.function(f.name.as_str(), &f.args, &f.body, range_key(f), false)?;
+                }
             }
             ast::Stmt::AsyncFunctionDef(f) => {
-                return Err(unsupported(f, "async functions"));
+                for d in &f.decorator_list {
+                    self.expr(d)?;
+                }
+                self.arg_defaults(&f.args)?;
+                self.bind(f.name.as_str());
+                if !f.type_params.is_empty() {
+                    let rk = range_key(f);
+                    let tp_id = self.enter_key(
+                        ScopeKind::Function,
+                        f.name.as_str(),
+                        ScopeKey::TypeParams(rk.0, rk.1),
+                    );
+                    self.raws[tp_id].params = vec![".d".to_owned(), ".kn".to_owned(), ".kv".to_owned()];
+                    self.bind(".d");
+                    self.bind(".kn");
+                    self.bind(".kv");
+                    self.analyse_type_params(&f.type_params)?;
+                    self.fn_annotations(&f.args, f.returns.as_deref())?;
+                    self.function(f.name.as_str(), &f.args, &f.body, rk, true)?;
+                    self.leave(tp_id);
+                } else {
+                    self.fn_annotations(&f.args, f.returns.as_deref())?;
+                    self.function(f.name.as_str(), &f.args, &f.body, range_key(f), true)?;
+                }
             }
             ast::Stmt::ClassDef(c) => {
                 for d in &c.decorator_list {
                     self.expr(d)?;
                 }
-                for b in &c.bases {
-                    self.expr(b)?;
-                }
-                for k in &c.keywords {
-                    self.expr(&k.value)?;
-                }
                 self.bind(c.name.as_str());
-                let id = self.enter(
-                    ScopeKind::Class,
-                    c.name.as_str(),
-                    range_key(c),
-                );
-                self.stmts(&c.body)?;
-                self.leave(id);
+                if !c.type_params.is_empty() {
+                    let rk = range_key(c);
+                    let tp_id = self.enter_key(
+                        ScopeKind::Function,
+                        c.name.as_str(),
+                        ScopeKey::TypeParams(rk.0, rk.1),
+                    );
+                    self.analyse_type_params(&c.type_params)?;
+                    for b in &c.bases {
+                        self.expr(b)?;
+                    }
+                    for k in &c.keywords {
+                        self.expr(&k.value)?;
+                    }
+                    let id = self.enter(ScopeKind::Class, c.name.as_str(), rk);
+                    self.stmts(&c.body)?;
+                    self.leave(id);
+                    self.leave(tp_id);
+                } else {
+                    for b in &c.bases {
+                        self.expr(b)?;
+                    }
+                    for k in &c.keywords {
+                        self.expr(&k.value)?;
+                    }
+                    let id = self.enter(ScopeKind::Class, c.name.as_str(), range_key(c));
+                    self.stmts(&c.body)?;
+                    self.leave(id);
+                }
             }
             ast::Stmt::Return(r) => {
                 if let Some(v) = &r.value {
@@ -375,8 +493,34 @@ impl Builder {
             }
             ast::Stmt::Expr(e) => self.expr(&e.value)?,
             ast::Stmt::Pass(_) | ast::Stmt::Break(_) | ast::Stmt::Continue(_) => {}
-            ast::Stmt::AsyncFor(x) => return Err(unsupported(x, "async for")),
-            ast::Stmt::AsyncWith(x) => return Err(unsupported(x, "async with")),
+            ast::Stmt::AsyncFor(f) => {
+                if !self.raws[self.current].is_async {
+                    return Err(format!(
+                        "'async for' outside async function (at offset {})",
+                        u32::from(f.range().start())
+                    ));
+                }
+                self.raws[self.current].has_loop = true;
+                self.expr(&f.iter)?;
+                self.target(&f.target)?;
+                self.stmts(&f.body)?;
+                self.stmts(&f.orelse)?;
+            }
+            ast::Stmt::AsyncWith(w) => {
+                if !self.raws[self.current].is_async {
+                    return Err(format!(
+                        "'async with' outside async function (at offset {})",
+                        u32::from(w.range().start())
+                    ));
+                }
+                for item in &w.items {
+                    self.expr(&item.context_expr)?;
+                    if let Some(v) = &item.optional_vars {
+                        self.target(v)?;
+                    }
+                }
+                self.stmts(&w.body)?;
+            }
             ast::Stmt::Match(x) => {
                 self.expr(&x.subject)?;
                 for case in &x.cases {
@@ -387,8 +531,53 @@ impl Builder {
                     self.stmts(&case.body)?;
                 }
             }
-            ast::Stmt::TypeAlias(x) => return Err(unsupported(x, "type aliases")),
-            ast::Stmt::TryStar(x) => return Err(unsupported(x, "except* groups")),
+            ast::Stmt::TypeAlias(t) => {
+                self.target(&t.name)?;
+                let alias_name = match t.name.as_ref() {
+                    ast::Expr::Name(n) => n.id.as_str(),
+                    _ => "<type>",
+                };
+                let rk = range_key(t);
+                if !t.type_params.is_empty() {
+                    let tp_id = self.enter_key(
+                        ScopeKind::Function,
+                        alias_name,
+                        ScopeKey::TypeParams(rk.0, rk.1),
+                    );
+                    self.analyse_type_params(&t.type_params)?;
+                    let vid = self.enter_key(
+                        ScopeKind::Function,
+                        alias_name,
+                        ScopeKey::TypeAliasValue(rk.0, rk.1),
+                    );
+                    self.expr(&t.value)?;
+                    self.leave(vid);
+                    self.leave(tp_id);
+                } else {
+                    let vid = self.enter_key(
+                        ScopeKind::Function,
+                        alias_name,
+                        ScopeKey::TypeAliasValue(rk.0, rk.1),
+                    );
+                    self.expr(&t.value)?;
+                    self.leave(vid);
+                }
+            }
+            ast::Stmt::TryStar(t) => {
+                self.stmts(&t.body)?;
+                for h in &t.handlers {
+                    let ast::ExceptHandler::ExceptHandler(h) = h;
+                    if let Some(ty) = &h.type_ {
+                        self.expr(ty)?;
+                    }
+                    if let Some(name) = &h.name {
+                        self.bind(name.as_str());
+                    }
+                    self.stmts(&h.body)?;
+                }
+                self.stmts(&t.orelse)?;
+                self.stmts(&t.finalbody)?;
+            }
         }
         Ok(())
     }
@@ -462,8 +651,10 @@ impl Builder {
         args: &ast::Arguments,
         body: &[ast::Stmt],
         offset: (u32, u32),
+        is_async: bool,
     ) -> R<()> {
         let id = self.enter(ScopeKind::Function, name, offset);
+        self.raws[id].is_async = is_async;
         let mut params = Vec::new();
         for a in args
             .posonlyargs
@@ -553,7 +744,7 @@ impl Builder {
         }
         for (i, g) in generators.iter().enumerate() {
             if g.is_async {
-                return Err(unsupported(&g.iter, "async comprehensions"));
+                self.raws[id].is_async = true;
             }
             if i > 0 {
                 self.expr(&g.iter)?;
@@ -566,7 +757,18 @@ impl Builder {
         for e in elts {
             self.expr(e)?;
         }
+        let became_async = self.raws[id].is_async;
         self.leave(id);
+        if became_async && kind != "<genexpr>" {
+            if self.raws[self.current].is_comprehension {
+                self.raws[self.current].is_async = true;
+            } else if !self.raws[self.current].is_async {
+                return Err(format!(
+                    "asynchronous comprehension outside of an asynchronous function (at offset {})",
+                    offset.0
+                ));
+            }
+        }
         Ok(())
     }
     fn expr(&mut self, e: &ast::Expr) -> R<()> {
@@ -707,7 +909,17 @@ impl Builder {
                 &c.generators,
                 &[&c.elt],
             )?,
-            ast::Expr::Await(x) => return Err(unsupported(x, "await")),
+            ast::Expr::Await(a) => {
+                if self.raws[self.current].is_comprehension {
+                    self.raws[self.current].is_async = true;
+                } else if !self.raws[self.current].is_async {
+                    return Err(format!(
+                        "'await' outside async function (at offset {})",
+                        u32::from(a.range().start())
+                    ));
+                }
+                self.expr(&a.value)?;
+            }
             ast::Expr::Yield(y) => {
                 self.raws[self.current].is_generator = true;
                 if let Some(v) = &y.value {
@@ -715,6 +927,12 @@ impl Builder {
                 }
             }
             ast::Expr::YieldFrom(y) => {
+                if self.raws[self.current].is_async {
+                    return Err(format!(
+                        "'yield from' inside async function (at offset {})",
+                        u32::from(y.range().start())
+                    ));
+                }
                 self.raws[self.current].is_generator = true;
                 self.expr(&y.value)?;
             }
@@ -839,6 +1057,7 @@ fn resolve(raws: Vec<Raw>) -> R<SymTable> {
         .iter()
         .map(|raw| {
             fast && raw.is_comprehension
+                && !raw.is_async
                 && raw.name != "<genexpr>"
                 && raw.children.is_empty()
                 && (!raw.uses_class_cell || raw.super_self.is_some())
@@ -968,6 +1187,7 @@ fn resolve(raws: Vec<Raw>) -> R<SymTable> {
             params: raw.params,
             free_order,
             is_generator: raw.is_generator,
+            is_async: raw.is_async,
             deleted: std::mem::take(&mut deleted[id]),
             uses_class_cell: raw.uses_class_cell,
             super_self: raw.super_self,

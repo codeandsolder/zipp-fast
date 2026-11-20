@@ -1,0 +1,35 @@
+ga_attrs 10 99 777 fallback:dyn_ok hi bob:10
+ga_has True True False DEF
+ga_log ['x', 'cls_val', 'secret', 'dyn_ok', 'greet', 'x']
+meta_ga from_meta
+wr_ref True True True True 1
+wr_reject_list True
+wr_proxy 10 15 True
+wr_proxy_set 15
+wvd 2 True True ['a', 'b']
+wkd 2 first True
+ws 2 True
+fin_before True True
+fin_after False ['cleaned'] None
+ns namespace(a=1, b='two') True namespace(a=1, b='THREE') False
+mp 42 True 1
+mp_readonly True
+types_checks True True True True True True True
+new_class DynCls 123
+enum_int True 201 True True 200 <Status.OK: 200>
+enum_str True True POST get/index get <HttpMethod.GET: 'get'>
+enum_flag True True True 5
+enum_mixin True ALPHA True
+abc_reg True True
+numbers_tower True True True True True False True True True True
+frac_init Fraction(3, 4) 3/4 Fraction(-1, 4) Fraction(5, 4) Fraction(1, 4) Fraction(1, 2)
+frac_ops 1/2 1 15/16 3/2 2 1/3 (4, Fraction(1, 3)) 9/4
+frac_methods True False (3, 4) 311/99
+frac_round 2 4 6/5 -3 -2 -2
+frac_cmp True True True True True False
+frac_hash True True hit_float hit_int
+sd default:3.5 int:42 str:HI seq:3 seq:2 int:2 True
+cached_prop 36 36 999 36 2
+batched_ok [('A', 'B'), ('C', 'D'), ('E',)]
+batched_strict_ok [('A', 'B'), ('C', 'D')]
+batched_strict_err True

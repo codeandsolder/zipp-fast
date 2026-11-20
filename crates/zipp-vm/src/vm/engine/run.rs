@@ -673,11 +673,31 @@ impl<'p> Vm<'p> {
         let (treg, idx, ver) = self.step_tokens[slot];
         if treg as usize == reg && self.heap.version_of(idx) == ver {
             if let Some(shape) = self.iter_result_shape {
+                #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+                {
+                    let mir = self.heap.hot_mirror_of(idx);
+                    if mir.shape == shape && mir.vals != 0 {
+                        // SAFETY: settled mirror shape matches `iter_result_shape`
+                        // (two data slots: `value` at 0, `done` at 1), and `vals`
+                        // is live while `version_of(idx) == ver`.
+                        unsafe {
+                            let p = mir.vals as *mut Value;
+                            *p = v;
+                            *p.add(1) = Value::bool(done);
+                        }
+                        if v.is_heap() {
+                            self.heap.write_barrier_val(idx, v);
+                        }
+                        return Value::heap(idx);
+                    }
+                }
                 if let HeapObj::Object(m) = self.heap.get_mut(idx) {
                     if m.shape() == shape {
                         m.set_val_at(0, v);
                         m.set_val_at(1, Value::bool(done));
-                        self.heap.write_barrier_val(idx, v);
+                        if v.is_heap() {
+                            self.heap.write_barrier_val(idx, v);
+                        }
                         return Value::heap(idx);
                     }
                 }
@@ -1184,7 +1204,7 @@ impl<'p> Vm<'p> {
         // JIT off has none of: the two calls were a twentieth of a Proxy trap
         // made from interpreted code.
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-        if self.jit_enabled {
+        if self.jit_enabled && self.jit.fn_state(func_id) == crate::codegen::FN_COMPILED {
             if let Some(r) =
                 self.call_compiled_windowed(callee, this, WinArgs::Slice(args), func_id, closure)
             {
@@ -1275,7 +1295,7 @@ impl<'p> Vm<'p> {
             callee,
         });
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-        if self.jit_enabled {
+        if self.jit_enabled && self.jit.fn_state(func_id) == crate::codegen::FN_COMPILED {
             if let Some(r) = self.frame_run_compiled(func_id, stop_depth) {
                 return r;
             }

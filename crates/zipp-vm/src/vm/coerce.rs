@@ -488,10 +488,12 @@ impl<'p> Vm<'p> {
             }
         }
         Some(
-            Value::heap(
+            Value::heap(if output.is_empty() {
+                crate::heap::INTERN_EMPTY
+            } else {
                 self.heap
-                    .alloc(HeapObj::Str(crate::heap::JsStr::from_ascii(output))),
-            )
+                    .alloc(HeapObj::Str(crate::heap::JsStr::from_ascii(output)))
+            })
             .bits(),
         )
     }
@@ -955,14 +957,30 @@ impl<'p> Vm<'p> {
         if !v.is_heap() {
             return Ok(false);
         }
+        let mut idx = v.heap_index();
         // %Array.prototype% is itself an Array exotic object.
-        if self.arr_proto != 0 && v.heap_index() == self.arr_proto {
+        if self.arr_proto != 0 && idx == self.arr_proto {
             return Ok(true);
         }
-        let mut idx = v.heap_index();
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        if self.heap.arr_mirror_live(idx) {
+            return Ok(true);
+        }
+        // Any settled plain/class object, function, closure, or non-empty flat
+        // string has a non-CLEAR hot mirror and is neither an Array nor a Proxy.
+        #[cfg(feature = "jit")]
+        {
+            let mir = self.heap.hot_mirror_of(idx);
+            if mir.shape != crate::shape::DICT || mir.fid != crate::heap::FID_MIRROR_NONE {
+                return Ok(false);
+            }
+        }
         for _ in 0..1000 {
             match self.heap.get(idx) {
-                HeapObj::Array(_) => return Ok(!self.arguments_objs.contains_key(&idx)),
+                HeapObj::Array(_) => {
+                    return Ok(self.arguments_objs.is_empty()
+                        || !self.arguments_objs.contains_key(&idx));
+                }
                 HeapObj::Proxy {
                     target, revoked, ..
                 } => {
@@ -1427,7 +1445,7 @@ impl<'p> Vm<'p> {
     /// Whether `v` is an OBJECT for abstract-equality purposes — a heap value
     /// that is not a string/symbol/bigint primitive. (Boxed wrappers count as
     /// objects; they ToPrimitive to their wrapped value.)
-    fn is_eq_object(&self, v: Value) -> bool {
+    pub(crate) fn is_eq_object(&self, v: Value) -> bool {
         v.is_heap()
             && !matches!(
                 self.heap.get(v.heap_index()),
@@ -1865,10 +1883,12 @@ impl<'p> Vm<'p> {
                                 out.extend_from_slice(bb);
                                 out.extend_from_slice(cb);
                                 pairstats::fast_str();
-                                return Ok(Value::heap(
+                                return Ok(Value::heap(if total == 0 {
+                                    crate::heap::INTERN_EMPTY
+                                } else {
                                     self.heap
-                                        .alloc(HeapObj::Str(crate::heap::JsStr::from_ascii(out))),
-                                ));
+                                        .alloc(HeapObj::Str(crate::heap::JsStr::from_ascii(out)))
+                                }));
                             }
                         }
                     }
@@ -2139,6 +2159,9 @@ impl<'p> Vm<'p> {
         let total_bytes = s.len().checked_add(add.len())?;
         if total_units > MAX_STRING_UNITS || total_bytes > MAX_STRING_BYTES {
             return None;
+        }
+        if total_units == 0 {
+            return Some(Value::heap(crate::heap::INTERN_EMPTY));
         }
         crate::heap::wtf8_push(&mut s, &add);
         Some(Value::heap(
@@ -2683,38 +2706,60 @@ impl<'p> Vm<'p> {
         self.truthy(v)
     }
 
-    #[inline]
+    #[inline(always)]
     pub(crate) fn truthy(&self, v: Value) -> bool {
         if let Some(t) = v.truthy_primitive() {
             return t;
         }
-        // An object with a settled shape, or a function, from its hot mirror:
-        // the JIT's probes rely on a mirror with a shape or a callee naming a
-        // live object or function, and no string or BigInt ever has one
-        // (`Heap::refresh_mirror`; `free_slot` clears it). The heap slot's
-        // read below is a second cache line per object, and on a 32 MB L3 a
-        // miss to memory; the property reads that usually come next go
-        // through the mirror's line. `document.all`, the one falsy object,
-        // is asked for by index.
+        // An object with a settled shape, a function, a non-empty flat string,
+        // or a settled dense array answers `true` from its mirrors without
+        // touching `Heap::objs`. Any user-allocated index past
+        // `typeof_special_max` cannot be `document.all` (`[[IsHTMLDDA]]`).
         #[cfg(feature = "jit")]
         {
             let idx = v.heap_index();
-            let mir = self.heap.hot_mirror_of(idx);
-            if (mir.shape != crate::shape::DICT || mir.fid != crate::heap::FID_MIRROR_NONE)
-                && !self.is_htmldda_index(idx)
-            {
-                return true;
+            let not_htmldda = {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    idx > self.typeof_special_max || !self.is_htmldda_index(idx)
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    !self.is_htmldda_index(idx)
+                }
+            };
+            if not_htmldda {
+                if self.heap.has_non_interned_falsy == 0 && idx != crate::heap::INTERN_EMPTY {
+                    return true;
+                }
+                let mir = self.heap.hot_mirror_of(idx);
+                if mir.shape != crate::shape::DICT
+                    || mir.fid != crate::heap::FID_MIRROR_NONE
+                    || mir.vals != 0
+                {
+                    return true;
+                }
+                #[cfg(target_arch = "x86_64")]
+                if self.heap.arr_mirror_live(idx) {
+                    return true;
+                }
             }
         }
+        self.truthy_heap_slow(v.heap_index())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn truthy_heap_slow(&self, idx: u32) -> bool {
         // Heap: empty string is falsy; 0n is falsy; everything else truthy.
-        if let Some(empty) = self.heap.str_is_empty(v.heap_index()) {
+        if let Some(empty) = self.heap.str_is_empty(idx) {
             return !empty;
         }
-        if let HeapObj::BigInt(n) = self.heap.get(v.heap_index()) {
+        if let HeapObj::BigInt(n) = self.heap.get(idx) {
             return *n != 0;
         }
         // An [[IsHTMLDDA]] exotic (`document.all`) is falsy.
-        if self.is_htmldda_index(v.heap_index()) {
+        if self.is_htmldda_index(idx) {
             return false;
         }
         true

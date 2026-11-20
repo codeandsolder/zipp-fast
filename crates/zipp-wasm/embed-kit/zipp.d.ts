@@ -23,7 +23,7 @@ export type ZippSource =
 /** The `zipp.meta` record a release module carries. */
 export interface ZippMeta {
   format: 1;
-  variant: "javascript" | "lite" | "javascript-typescript" | "javascript-python" | "javascript-python-base" | "torch-package";
+  variant: "javascript" | "lite" | "javascript-typescript" | "javascript-python" | "javascript-python-base" | "javascript-php" | "javascript-rust" | "torch-package";
   version: string;
   commit: string | null;
   languages: string[];

@@ -1,6 +1,6 @@
 [package]
 name = "zipp-wasm"
-version = "0.0.36"
+version = "0.0.37"
 edition = "2021"
 license = "Apache-2.0"
 description = "WebAssembly embedding of the zipp JavaScript engine: a persistent VM a browser host can keep alive across re-entries."
@@ -89,3 +89,7 @@ python-js-interop = ["python", "zipp-vm/python-js-interop"]
 # The Python frontend without the torch package (the `python` artifact): a
 # host adds torch at run time with zipp_torch.wasm (`addPythonPackage`).
 python-base = ["python", "zipp-vm/python-no-torch"]
+# `Engine.initSource(source, "php")`: the PHP 8.x frontend (`lang/php`).
+php = ["zipp-vm/php"]
+# `Engine.initSource(source, "rust")`: the Rust frontend (`lang/rust`).
+rust = ["zipp-vm/rust"]

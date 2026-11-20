@@ -765,6 +765,56 @@ impl ScriptState {
         .unwrap_or_default()
     }
 
+    /// Drain raw byte output emitted by a PHP program (`echo`, `print`, inline
+    /// HTML) when running in buffered / HTTP SAPI mode.
+    #[cfg(feature = "php")]
+    pub fn take_php_output(&mut self) -> Vec<u8> {
+        self.with_vm(|vm| std::mem::take(&mut vm.php_output))
+            .unwrap_or_default()
+    }
+
+    /// Drain buffered stdout bytes emitted by a Rust program (`println!`, `print!`,
+    /// `std::io::stdout()`) when not streaming directly to OS stdout.
+    #[cfg(feature = "rust")]
+    pub fn take_rust_output(&mut self) -> Vec<u8> {
+        self.with_vm(|vm| std::mem::take(&mut vm.rust_output))
+            .unwrap_or_default()
+    }
+
+    /// Drain buffered stderr bytes emitted by a Rust program (`eprintln!`, `dbg!`,
+    /// panics) when not streaming directly to OS stderr.
+    #[cfg(feature = "rust")]
+    pub fn take_rust_stderr(&mut self) -> Vec<u8> {
+        self.with_vm(|vm| std::mem::take(&mut vm.rust_stderr))
+            .unwrap_or_default()
+    }
+
+    /// Snapshot the mutable Rust VFS overlay (`writes`, `deleted`, `dirs`) so
+    /// hosts can persist generated files (e.g. JWT keyfiles, local uploads)
+    /// across reloads.
+    #[cfg(feature = "rust")]
+    pub fn snapshot_rust_vfs_overlay(
+        &mut self,
+    ) -> (Vec<(String, Vec<u8>)>, Vec<String>, Vec<String>) {
+        self.with_vm(|vm| {
+            let Some(st) = vm.rust_state.as_deref() else {
+                return (Vec::new(), Vec::new(), Vec::new());
+            };
+            let mut writes: Vec<(String, Vec<u8>)> = st
+                .vfs_writes
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            writes.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut deleted: Vec<String> = st.vfs_deleted.iter().cloned().collect();
+            deleted.sort();
+            let mut dirs: Vec<String> = st.vfs_dirs.iter().cloned().collect();
+            dirs.sort();
+            (writes, deleted, dirs)
+        })
+        .unwrap_or_default()
+    }
+
     /// Take the `console.error`/`console.warn` lines produced so far.
     pub fn take_errput(&mut self) -> Vec<String> {
         self.with_vm(|vm| {

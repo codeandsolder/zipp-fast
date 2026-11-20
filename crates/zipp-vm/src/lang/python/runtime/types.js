@@ -1522,7 +1522,7 @@
             if (o.isType) {
                 const cg = rt.classDunder(o, "__getitem__") || rt.classDunder(o, "__class_getitem__");
                 if (cg !== undefined) return call(cg, [k], null);
-                return o; // generic aliases: list[int] -> list
+                fail(E.TypeError, "type '" + o.name + "' is not subscriptable");
             }
             const m = typeMethod(o, "__getitem__");
             if (m !== undefined) { if (m.isBase) return baseGetitem(o, k); return call(descrGet(m, o, c), [k], null); }
@@ -1692,6 +1692,8 @@
         if (c === T.method) return "<bound method " + (v.func.qualname || v.func.name) + " of " + repr(v.self) + ">";
         if (c === T.module) return "<module '" + v.name + "'" + (v.file ? " from '" + v.file + "'" : " (built-in)") + ">";
         if (c === T.generator) return "<generator object " + v.qualname + " at 0x" + rt.ident(v).toString(16).padStart(8, "0") + ">";
+        if (c === T.coroutine) return "<coroutine object " + v.qualname + " at 0x" + rt.ident(v).toString(16).padStart(8, "0") + ">";
+        if (c === T.async_generator) return "<async_generator object " + v.qualname + " at 0x" + rt.ident(v).toString(16).padStart(8, "0") + ">";
         if (c === T.bytes) return rt.bytesRepr(v);
         if (c === T.cell) return "<cell>";
         if (c === T.dict_keys || c === T.dict_values || c === T.dict_items) { const parts = []; const it = v.iter(); for (;;) { const x = it.next(); if (x === STOP) break; parts.push(repr(x)); } return c.name + "([" + parts.join(", ") + "])"; }
@@ -1755,7 +1757,7 @@
     }
     rt.setStrRepr(str, repr);
     rt.str = str; rt.repr = repr;
-    R.strjoin = function (parts) { let out = ""; for (const p of parts) out += p; return rt.checkedText(out); };
+    R.strjoin = function (parts) { let out = ""; for (const p of parts) out += typeof p === "string" ? p : typeof p === "bigint" ? "" + p : R.fmt(p, "", 0); return rt.checkedText(out); };
 
     // ---- attributes of primitives and other special objects --------------------------------------------------------
     rt.specialAttr = function (obj, t, name) {
@@ -1770,10 +1772,11 @@
                     case "__defaults__": return obj.defaults.length ? tuple(obj.defaults.slice()) : null;
                     case "__dict__": return rt.instanceDict(obj);
                     case "__globals__": return dictFromMap(obj.globals);
-                    case "__code__": return { cls: T.code, name: obj.name, argcount: obj.positional, varnames: obj.argnames };
+                    case "__code__": return { cls: T.code, name: obj.name, argcount: obj.positional, varnames: obj.argnames, flags: (obj.isgen ? 0x20 : 0) | (obj.iscoro ? 0x80 : 0) | (obj.isagen ? 0x200 : 0) };
                     case "__wrapped__": return obj.dict.get("__wrapped__");
                     case "__annotations__": return dictFromMap(obj.annotations || new Map());
                     case "__kwdefaults__": return obj.kwdefaults === null ? null : dictFromMap(obj.kwdefaults);
+                    case "__type_params__": return obj.type_params || tuple([]);
                 }
             } else if (c === T.builtin_function_or_method) {
                 if (name === "__name__" || name === "__qualname__") return obj.name;
@@ -1786,10 +1789,22 @@
             } else if (c === T.generator) {
                 if (name === "__name__") return obj.name;
                 if (name === "__qualname__") return obj.qualname;
+                if (name === "gi_running") return obj.running;
+            } else if (c === T.coroutine) {
+                if (name === "__name__") return obj.name;
+                if (name === "__qualname__") return obj.qualname;
+                if (name === "cr_running") return obj.running;
+                if (name === "cr_await" || name === "cr_frame") return null;
+            } else if (c === T.async_generator) {
+                if (name === "__name__") return obj.name;
+                if (name === "__qualname__") return obj.qualname;
+                if (name === "ag_running") return obj.running;
+                if (name === "ag_frame") return null;
             } else if (c === T.code) {
                 if (name === "co_name") return obj.name;
                 if (name === "co_argcount") return BigInt(obj.argcount);
                 if (name === "co_varnames") return tuple(obj.varnames.slice());
+                if (name === "co_flags") return BigInt(obj.flags || 0);
             } else if (c === T.property) {
                 if (name === "fget") return obj.fget; if (name === "fset") return obj.fset; if (name === "fdel") return obj.fdel; if (name === "__doc__") return obj.doc;
             } else if (c === T.slice) {

@@ -1752,6 +1752,7 @@ impl<'p> Vm<'p> {
             }
             if let Some(p) = self.prototypes.remove(&tvi) {
                 self.prototypes.insert(oidx, p);
+                self.prototypes_fresh.push(p);
             }
             if let Some(v) = self.fn_proto_override.remove(&tvi) {
                 self.fn_proto_override.insert(oidx, v);

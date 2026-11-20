@@ -72,6 +72,129 @@ pub struct Lexer<'s> {
     /// them all over past that.
     few: Vec<super::ast::Name>,
     names: rustc_hash::FxHashSet<super::ast::Name>,
+    /// Direct-mapped L1 intern cache for large sources (`len >= 16 KiB`),
+    /// avoiding L2 misses in `names` for hot repeated local/property identifiers.
+    intern_l1: Vec<Option<super::ast::Name>>,
+}
+
+/// ASCII lookup table: non-zero iff byte is valid `IdentifierStart` (`a-z`, `A-Z`, `_`, `$`).
+const ASCII_ID_START: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut i = 0usize;
+    while i < 128 {
+        let b = i as u8;
+        if b.is_ascii_alphabetic() || b == b'_' || b == b'$' {
+            t[i] = 1;
+        }
+        i += 1;
+    }
+    t
+};
+
+/// ASCII lookup table: non-zero iff byte is valid `IdentifierPart` (`a-z`, `A-Z`, `0-9`, `_`, `$`).
+const ASCII_ID_CONT: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut i = 0usize;
+    while i < 128 {
+        let b = i as u8;
+        if b.is_ascii_alphanumeric() || b == b'_' || b == b'$' {
+            t[i] = 1;
+        }
+        i += 1;
+    }
+    t
+};
+
+const INTERN_L1_SLOTS: usize = 512;
+
+fn keyword_name(kw: Keyword) -> super::ast::Name {
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<Box<[super::ast::Name]>> = OnceLock::new();
+    let tbl = TABLE.get_or_init(|| {
+        let mut v = Vec::with_capacity(Keyword::COUNT);
+        for i in 0..Keyword::COUNT {
+            // SAFETY: Keyword is #[repr(u8)] with contiguous discriminants 0..COUNT.
+            // Build safely via match over all variants by index:
+            let s = match i {
+                0 => "",
+                1 => "break",
+                2 => "case",
+                3 => "catch",
+                4 => "class",
+                5 => "const",
+                6 => "continue",
+                7 => "debugger",
+                8 => "default",
+                9 => "delete",
+                10 => "do",
+                11 => "else",
+                12 => "enum",
+                13 => "export",
+                14 => "extends",
+                15 => "false",
+                16 => "finally",
+                17 => "for",
+                18 => "function",
+                19 => "if",
+                20 => "import",
+                21 => "in",
+                22 => "instanceof",
+                23 => "new",
+                24 => "null",
+                25 => "return",
+                26 => "super",
+                27 => "switch",
+                28 => "this",
+                29 => "throw",
+                30 => "true",
+                31 => "try",
+                32 => "typeof",
+                33 => "var",
+                34 => "void",
+                35 => "while",
+                36 => "with",
+                37 => "implements",
+                38 => "interface",
+                39 => "let",
+                40 => "package",
+                41 => "private",
+                42 => "protected",
+                43 => "public",
+                44 => "static",
+                45 => "yield",
+                46 => "async",
+                47 => "await",
+                48 => "as",
+                49 => "from",
+                50 => "get",
+                51 => "of",
+                52 => "set",
+                53 => "target",
+                54 => "meta",
+                55 => "accessor",
+                _ => "",
+            };
+            v.push(super::ast::Name::from(s));
+        }
+        v.into_boxed_slice()
+    });
+    debug_assert_eq!(&*tbl[kw as usize], kw.as_str());
+    tbl[kw as usize].clone()
+}
+
+#[inline(always)]
+fn intern_l1_slot(bytes: &[u8]) -> usize {
+    let n = bytes.len();
+    let mut h = (n as u32).wrapping_mul(0x9E37_79B9);
+    if n >= 4 {
+        let lo = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let hi = u32::from_le_bytes([bytes[n - 4], bytes[n - 3], bytes[n - 2], bytes[n - 1]]);
+        h ^= lo.wrapping_mul(0x85EB_CA6B) ^ hi.wrapping_mul(0xC2B2_AE35);
+    } else if n > 0 {
+        let w = (bytes[0] as u32) | ((bytes[n >> 1] as u32) << 8) | ((bytes[n - 1] as u32) << 16);
+        h ^= w.wrapping_mul(0x85EB_CA6B);
+    }
+    ((h ^ (h >> 16)) as usize) & (INTERN_L1_SLOTS - 1)
 }
 
 /// How many identifiers a lexer keeps in its scanned list before it hashes
@@ -102,6 +225,7 @@ impl<'s> Lexer<'s> {
     }
 
     pub fn new(src: &'s str) -> Lexer<'s> {
+        let large = src.len() >= 16_384;
         let mut lx = Lexer {
             src: src.as_bytes(),
             pos: 0,
@@ -111,7 +235,13 @@ impl<'s> Lexer<'s> {
             exact: None,
             input_start: 0,
             few: Vec::new(),
-            names: rustc_hash::FxHashSet::default(),
+            names: if large {
+                let cap = (src.len() / 256).clamp(256, 16_384);
+                rustc_hash::FxHashSet::with_capacity_and_hasher(cap, Default::default())
+            } else {
+                rustc_hash::FxHashSet::default()
+            },
+            intern_l1: if large { vec![None; INTERN_L1_SLOTS] } else { Vec::new() },
         };
         // A leading BOM is whitespace, not part of the first token.
         if lx.src.starts_with(&[0xEF, 0xBB, 0xBF]) {
@@ -124,6 +254,33 @@ impl<'s> Lexer<'s> {
             lx.skip_to_line_end();
         }
         lx
+    }
+
+    /// Construct a lexer starting at byte offset `start` of `src`, keeping
+    /// exact file-relative byte offsets while sizing its intern tables for the
+    /// remaining slice `src.len() - start` rather than the whole file.
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    pub fn new_at(src: &'s str, start: u32) -> Lexer<'s> {
+        let start = (start as usize).min(src.len());
+        let body_len = src.len() - start;
+        let large = body_len >= 16_384;
+        Lexer {
+            src: src.as_bytes(),
+            pos: start,
+            saw_newline: false,
+            legacy_escape: false,
+            html_comments: true,
+            exact: None,
+            input_start: start,
+            few: Vec::new(),
+            names: if large {
+                let cap = (body_len / 256).clamp(256, 16_384);
+                rustc_hash::FxHashSet::with_capacity_and_hasher(cap, Default::default())
+            } else {
+                rustc_hash::FxHashSet::default()
+            },
+            intern_l1: if large { vec![None; INTERN_L1_SLOTS] } else { Vec::new() },
+        }
     }
 
     pub fn pos(&self) -> u32 {
@@ -464,12 +621,15 @@ impl<'s> Lexer<'s> {
                 }
             }
             _ => {
-                let (c, _) = if b < 0x80 {
-                    (b as char, 1)
-                } else {
-                    self.char_at(self.pos)
-                };
-                if Self::is_id_start(c) || b == b'\\' {
+                if ASCII_ID_START[b as usize] != 0 {
+                    let (name, kw, had_escape) = self.read_ident_and_kw()?;
+                    TokenKind::Ident {
+                        name,
+                        kw,
+                        had_escape,
+                        private: false,
+                    }
+                } else if b == b'\\' || (b >= 0x80 && Self::is_id_start(self.char_at(self.pos).0)) {
                     let (name, had_escape) = self.read_ident_name()?;
                     let kw = if had_escape {
                         Keyword::None
@@ -504,29 +664,61 @@ impl<'s> Lexer<'s> {
     /// The escaped form is a different token for keyword purposes — `await`
     /// spells the identifier `await`, not the keyword — so the flag has to
     /// survive to the parser.
+    /// Fast path for ASCII-start identifiers: scans with `ASCII_ID_CONT`,
+    /// classifies keywords before interning (serving all 57 JS keywords from
+    /// the static table with zero hash probes), and falls back to
+    /// `read_ident_name` only on escapes or non-ASCII continuation bytes.
+    #[inline]
+    fn read_ident_and_kw(&mut self) -> LResult<(super::ast::Name, Keyword, bool)> {
+        let start = self.pos;
+        let bytes = self.src;
+        let len = bytes.len();
+        let mut end = start + 1;
+        while end < len && ASCII_ID_CONT[bytes[end] as usize] != 0 {
+            end += 1;
+        }
+        if end == len || (bytes[end] < 0x80 && bytes[end] != b'\\') {
+            self.pos = end;
+            #[cfg(not(feature = "safe-sandbox"))]
+            let s = unsafe { std::str::from_utf8_unchecked(&bytes[start..end]) };
+            #[cfg(feature = "safe-sandbox")]
+            let s = std::str::from_utf8(&bytes[start..end]).expect("ASCII is UTF-8");
+            let kw = Keyword::classify(s);
+            if kw != Keyword::None {
+                return Ok((keyword_name(kw), kw, false));
+            }
+            return Ok((self.intern(s), Keyword::None, false));
+        }
+        let (name, had_escape) = self.read_ident_name()?;
+        let kw = if had_escape {
+            Keyword::None
+        } else {
+            Keyword::classify(&name)
+        };
+        Ok((name, kw, had_escape))
+    }
+
     fn read_ident_name(&mut self) -> LResult<(super::ast::Name, bool)> {
         // The common spelling, ASCII with no escape, is its own source bytes:
         // look it up without building it a char at a time. An escape or a
         // non-ASCII character takes the general loop below from the start.
         let start = self.pos;
+        let bytes = self.src;
+        let len = bytes.len();
         let mut end = start;
-        while let Some(&b) = self.src.get(end) {
-            if b.is_ascii_alphanumeric() || b == b'_' || b == b'$' {
-                end += 1;
-            } else {
-                break;
-            }
+        while end < len && ASCII_ID_CONT[bytes[end] as usize] != 0 {
+            end += 1;
         }
-        let plain_end = self.src.get(end).is_none_or(|&b| b < 0x80 && b != b'\\');
-        if end > start && plain_end && !self.src[start].is_ascii_digit() {
+        let plain_end = end == len || (bytes[end] < 0x80 && bytes[end] != b'\\');
+        if end > start && plain_end && !bytes[start].is_ascii_digit() {
             self.pos = end;
             // Every byte in `start..end` passed the ASCII test above, and ASCII
             // is UTF-8: validating it again was 2% of loading a bundle.
             #[cfg(not(feature = "safe-sandbox"))]
             // SAFETY: as above.
-            let s = unsafe { std::str::from_utf8_unchecked(&self.src[start..end]) };
+            let s = unsafe { std::str::from_utf8_unchecked(&bytes[start..end]) };
             #[cfg(feature = "safe-sandbox")]
-            let s = std::str::from_utf8(&self.src[start..end]).expect("ASCII is UTF-8");
+            let s = std::str::from_utf8(&bytes[start..end]).expect("ASCII is UTF-8");
             return Ok((self.intern(s), false));
         }
         let mut out = String::new();
@@ -585,6 +777,23 @@ impl<'s> Lexer<'s> {
 
     /// This lexer's one allocation of the identifier `s`.
     pub(crate) fn intern(&mut self, s: &str) -> super::ast::Name {
+        if !self.intern_l1.is_empty() {
+            let slot = intern_l1_slot(s.as_bytes());
+            if let Some(n) = &self.intern_l1[slot] {
+                if &**n == s {
+                    return n.clone();
+                }
+            }
+            if let Some(n) = self.names.get(s) {
+                let n = n.clone();
+                self.intern_l1[slot] = Some(n.clone());
+                return n;
+            }
+            let n = super::ast::Name::from(s);
+            self.names.insert(n.clone());
+            self.intern_l1[slot] = Some(n.clone());
+            return n;
+        }
         if self.names.is_empty() {
             if let Some(n) = self.few.iter().find(|n| &***n == s) {
                 return n.clone();

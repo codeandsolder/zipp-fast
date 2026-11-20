@@ -840,72 +840,131 @@ fn units_of(bytes: &[u8]) -> impl Iterator<Item = u16> + '_ {
 
 /// `strHash` of the flattened str at `idx`, for the `hash()` builtin
 /// (`vm::py_str`): [`hash_str_units`] over its units, an ASCII str's bytes
-/// being its units. Beside [`hash_str`] rather than through it, so the
-/// tables' key hashing stays that function's one caller.
-pub(crate) fn str_hash_value(heap: &Heap, idx: u32) -> Option<i64> {
-    match heap.get(idx) {
-        HeapObj::Str(s) if s.is_ascii() => Some(hash_str_units(s.as_bytes().iter().map(|&c| u16::from(c)))),
-        HeapObj::Str(s) => Some(hash_str_units(units_of(s.as_bytes()))),
-        _ => None,
+/// being its units. Uses the optional direct-mapped string hash cache when
+/// provided (`PyRt::str_hashes`).
+pub(crate) fn str_hash_value_cached(
+    heap: &Heap,
+    cache: Option<&[std::cell::Cell<super::py_rt::StrHashEntry>]>,
+    idx: u32,
+) -> Option<i64> {
+    if let HeapObj::Str(s) = heap.get(idx) {
+        if let Some(c) = cache {
+            let ver = heap.version_of(idx);
+            let slot = (idx as usize).wrapping_mul(0x9E37_79B1) & (c.len() - 1);
+            let e = c[slot].get();
+            if e.idx == idx && e.ver == ver {
+                return Some(e.hash);
+            }
+            let h = if s.is_ascii() {
+                hash_str_units(s.as_bytes().iter().map(|&b| u16::from(b)))
+            } else {
+                hash_str_units(units_of(s.as_bytes()))
+            };
+            c[slot].set(super::py_rt::StrHashEntry { idx, ver, hash: h });
+            return Some(h);
+        }
+        return if s.is_ascii() {
+            Some(hash_str_units(s.as_bytes().iter().map(|&b| u16::from(b))))
+        } else {
+            Some(hash_str_units(units_of(s.as_bytes())))
+        };
     }
+    None
 }
 
-/// `strHash` of the string at `idx`.
-fn hash_str(heap: &Heap, idx: u32, steps: &mut u64) -> Option<i64> {
+/// `strHash` of the flattened str at `idx`, without cache.
+#[allow(dead_code)]
+pub(crate) fn str_hash_value(heap: &Heap, idx: u32) -> Option<i64> {
+    str_hash_value_cached(heap, None, idx)
+}
+
+/// `strHash` of the string at `idx`, checking `cache` for flat strings.
+fn hash_str(
+    heap: &Heap,
+    cache: Option<&[std::cell::Cell<super::py_rt::StrHashEntry>]>,
+    idx: u32,
+    steps: &mut u64,
+) -> Option<i64> {
     if let HeapObj::Str(s) = heap.get(idx) {
+        let b = s.as_bytes();
+        *steps += 1 + b.len() as u64 / 16;
+        if let Some(c) = cache {
+            let ver = heap.version_of(idx);
+            let slot = (idx as usize).wrapping_mul(0x9E37_79B1) & (c.len() - 1);
+            let e = c[slot].get();
+            if e.idx == idx && e.ver == ver {
+                return Some(e.hash);
+            }
+            let h = if s.is_ascii() {
+                hash_str_units(b.iter().map(|&ch| u16::from(ch)))
+            } else {
+                hash_str_units(units_of(b))
+            };
+            c[slot].set(super::py_rt::StrHashEntry { idx, ver, hash: h });
+            return Some(h);
+        }
         if s.is_ascii() {
-            let b = s.as_bytes();
-            *steps += 1 + b.len() as u64 / 16;
             return Some(hash_str_units(b.iter().map(|&c| u16::from(c))));
         }
+        return Some(hash_str_units(units_of(b)));
     }
     let bytes = heap.str_wtf8_cow(idx)?;
     *steps += 1 + bytes.len() as u64 / 16;
     Some(hash_str_units(units_of(&bytes)))
 }
 
-/// CPython's tuple hash (xxHash-based), over the items' hashes.
-fn hash_tuple(lanes: &[i64]) -> i64 {
-    const P1: u64 = 11_400_714_785_074_694_791;
-    const P2: u64 = 14_029_467_366_897_019_727;
-    const P5: u64 = 2_870_177_450_012_600_261;
-    let mut acc = P5;
-    for &lane in lanes {
-        acc = acc.wrapping_add((lane as u64).wrapping_mul(P2));
-        acc = acc.rotate_left(31);
-        acc = acc.wrapping_mul(P1);
-    }
-    acc = acc.wrapping_add(lanes.len() as u64 ^ (P5 ^ 3_527_539));
-    if acc == u64::MAX {
-        1_546_275_796
-    } else {
-        acc as i64
-    }
-}
-
 /// Python's `hash(v)` as the runtime computes it, for a key needing no
 /// guest code; `None` for any other value (the runtime hashes it).
 pub(crate) fn native_hash(heap: &Heap, kinds: &PyKinds, v: Value, steps: &mut u64) -> Option<i64> {
-    hash_in(heap, kinds, v, 0, steps)
+    hash_in(heap, None, kinds, v, 0, steps)
 }
 
-fn hash_in(heap: &Heap, kinds: &PyKinds, v: Value, depth: u32, steps: &mut u64) -> Option<i64> {
+/// [`native_hash`] with the VM's direct-mapped string hash cache.
+pub(crate) fn native_hash_cached(
+    heap: &Heap,
+    cache: Option<&[std::cell::Cell<super::py_rt::StrHashEntry>]>,
+    kinds: &PyKinds,
+    v: Value,
+    steps: &mut u64,
+) -> Option<i64> {
+    hash_in(heap, cache, kinds, v, 0, steps)
+}
+
+fn hash_in(
+    heap: &Heap,
+    cache: Option<&[std::cell::Cell<super::py_rt::StrHashEntry>]>,
+    kinds: &PyKinds,
+    v: Value,
+    depth: u32,
+    steps: &mut u64,
+) -> Option<i64> {
     *steps += 1;
     Some(match classify(heap, kinds, v)? {
         Kind::Float(x) => hash_f64(x),
         Kind::Int(n) => hash_i128(n),
         Kind::Big(b) => hash_big(b),
-        Kind::Str(idx) => hash_str(heap, idx, steps)?,
+        Kind::Str(idx) => hash_str(heap, cache, idx, steps)?,
         Kind::None => NONE_HASH,
         Kind::Tuple(items) => {
             if depth >= MAX_DEPTH {
                 return None;
             }
-            let mut lanes = Vec::with_capacity(items.len());
+            const P1: u64 = 11_400_714_785_074_694_791;
+            const P2: u64 = 14_029_467_366_897_019_727;
+            const P5: u64 = 2_870_177_450_012_600_261;
+            let mut acc = P5;
             for &x in items {
-                lanes.push(hash_in(heap, kinds, x, depth + 1, steps)?);
+                let lane = hash_in(heap, cache, kinds, x, depth + 1, steps)?;
+                acc = acc.wrapping_add((lane as u64).wrapping_mul(P2));
+                acc = acc.rotate_left(31);
+                acc = acc.wrapping_mul(P1);
             }
-            hash_tuple(&lanes)
+            acc = acc.wrapping_add(items.len() as u64 ^ (P5 ^ 3_527_539));
+            if acc == u64::MAX {
+                1_546_275_796
+            } else {
+                acc as i64
+            }
         }
         Kind::Frozen(_) => {
             let mut text = Vec::new();
@@ -1068,14 +1127,15 @@ fn eq_in(heap: &Heap, kinds: &PyKinds, a: Value, b: Value, depth: u32, steps: &m
 
 /// Look up a native key: (its position if present, its hash); `None`
 /// when the key or a same-hash stored key needs guest code.
-pub(crate) fn native_lookup(
+pub(crate) fn native_lookup_cached(
     heap: &Heap,
+    cache: Option<&[std::cell::Cell<super::py_rt::StrHashEntry>]>,
     kinds: &PyKinds,
     t: &PyTable,
     key: Value,
     steps: &mut u64,
 ) -> Option<(Option<usize>, i64)> {
-    let h = native_hash(heap, kinds, key, steps)?;
+    let h = native_hash_cached(heap, cache, kinds, key, steps)?;
     let mut work = 0;
     let found = t.lookup(h, &mut |k| native_eq(heap, kinds, k, key, &mut work), steps);
     *steps += work;
@@ -1085,9 +1145,19 @@ pub(crate) fn native_lookup(
     }
 }
 
+pub(crate) fn native_lookup(
+    heap: &Heap,
+    kinds: &PyKinds,
+    t: &PyTable,
+    key: Value,
+    steps: &mut u64,
+) -> Option<(Option<usize>, i64)> {
+    native_lookup_cached(heap, None, kinds, t, key, steps)
+}
+
 /// Look up `key` of hash `h` natively, and insert it (with `val`) when
 /// absent: `Ok((position, inserted))`.
-fn add_hashed(
+pub(crate) fn add_hashed(
     heap: &Heap,
     kinds: &PyKinds,
     t: &mut PyTable,

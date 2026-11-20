@@ -1,0 +1,9 @@
+[package]
+name = "zipp-phpparse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ZIPP's own PHP 8.x front end: dual-mode HTML/PHP lexer, AST, and recursive-descent parser."
+
+[dependencies]
+zipp-numparse = { path = "../../../../../zipp-numparse" }

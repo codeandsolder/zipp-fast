@@ -33,6 +33,12 @@ compile_error!("zipp-vm features `safe-sandbox` and `jit` are mutually exclusive
 #[cfg(all(feature = "wasm-lite", feature = "python"))]
 compile_error!("ZIPP Lite omits Python; build the python variant separately");
 
+#[cfg(all(feature = "wasm-lite", feature = "php"))]
+compile_error!("ZIPP Lite omits PHP; build the php variant separately");
+
+#[cfg(all(feature = "wasm-lite", feature = "rust"))]
+compile_error!("ZIPP Lite omits Rust; build the rust variant separately");
+
 /// Rust's bare WASM target has no process environment. Lite resolves native
 /// benchmark switches to their existing absent-variable defaults, removing
 /// cached checks and unreachable alternatives. (An earlier full-build attempt
@@ -969,7 +975,14 @@ fn run_with_policy(
     // source-rewrite-and-reparse any more: the parser produces `Target::Call`
     // directly and the compiler emits the runtime ReferenceError. A syntax
     // error is reported where it is, as a frame of the script.
-    let ast = front::parse_auto_located(src).map_err(|f| f.located(src, script_name))?;
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    let skip_fn_bodies = !front::pure_script_goal()
+        && compile::run_lazy() == compile::RunLazy::Large
+        && src.len() >= 64 * 1024;
+    #[cfg(any(feature = "meter-only", feature = "safe-sandbox"))]
+    let skip_fn_bodies = false;
+    let ast = front::parse_auto_located_for_run(src, skip_fn_bodies)
+        .map_err(|f| f.located(src, script_name))?;
     let (program, lazy) = compile_main_for_run(&ast, src)?;
     let outcome = run_program(&program, lazy, base_dir, disable_external_code, leave_heap, script_name);
     if leave_heap {
@@ -996,9 +1009,6 @@ fn compile_main_for_run<'a>(
     }
     let min_functions = match compile::run_lazy() {
         compile::RunLazy::Off => return Ok((compile::compile_main_program(ast, src)?, None)),
-        compile::RunLazy::Large if vm::large_programs_run_jit() => {
-            return Ok((compile::compile_main_program(ast, src)?, None))
-        }
         compile::RunLazy::Large => compile::LAZY_MIN_FUNCTIONS,
         compile::RunLazy::All => 0,
     };

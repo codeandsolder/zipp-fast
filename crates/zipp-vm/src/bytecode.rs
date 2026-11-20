@@ -5567,6 +5567,100 @@ pub struct Program {
     /// first import rather than up front (see [`PyLazy`]).
     #[cfg_attr(not(feature = "python"), allow(dead_code))]
     pub python_lazy: Option<Box<PyLazy>>,
+    /// Set only on the PHP frontend's runtime program: the VM then binds the
+    /// reserved `__zipp_php_*` private natives by slot.
+    #[cfg_attr(not(feature = "php"), allow(dead_code))]
+    pub php_natives: bool,
+    /// Set only on a PHP program: file context, OPcache compiler callback,
+    /// optional VFS, and optional HTTP SAPI request payload (see [`PhpCtx`]).
+    #[cfg_attr(not(feature = "php"), allow(dead_code))]
+    pub php_ctx: Option<Box<PhpCtx>>,
+    /// Set only on the Rust frontend's runtime program: the VM then binds the
+    /// reserved `__zipp_rs_*` private natives by slot.
+    #[cfg_attr(not(feature = "rust"), allow(dead_code))]
+    pub rust_natives: bool,
+    /// Set only on a Rust program: file context, argv, optional VFS, FS/net
+    /// capability flags, and run mode (see [`RustCtx`]).
+    #[cfg_attr(not(feature = "rust"), allow(dead_code))]
+    pub rust_ctx: Option<Box<RustCtx>>,
+}
+
+/// Runtime context owned by a compiled Rust [`Program`].
+#[derive(Clone)]
+#[cfg_attr(not(feature = "rust"), allow(dead_code))]
+pub struct RustCtx {
+    pub file: String,
+    pub base_dir: String,
+    pub argv: Vec<String>,
+    pub vfs: Option<std::sync::Arc<std::collections::HashMap<String, Vec<u8>>>>,
+    pub allow_vfs_write: bool,
+    pub allow_native_fs: bool,
+    pub allow_net: bool,
+    pub stream_stdout: bool,
+    pub mode: String,
+    pub pkg_env: Vec<(String, String)>,
+}
+
+#[cfg_attr(not(feature = "rust"), allow(dead_code))]
+impl std::fmt::Debug for RustCtx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RustCtx")
+            .field("file", &self.file)
+            .field("base_dir", &self.base_dir)
+            .field("allow_native_fs", &self.allow_native_fs)
+            .field("allow_net", &self.allow_net)
+            .field("mode", &self.mode)
+            .finish()
+    }
+}
+
+/// Mutable in-memory VFS overlay shared across sandboxed PHP requests (for compiled
+/// templates, sessions, runtime writes, `mkdir`, `unlink`, etc. in WASM/sandbox).
+#[derive(Default, Debug)]
+#[cfg_attr(not(feature = "php"), allow(dead_code))]
+pub struct PhpVfsOverlay {
+    pub writes: std::collections::HashMap<String, Vec<u8>>,
+    pub deleted: std::collections::HashSet<String>,
+    pub dirs: std::collections::HashSet<String>,
+    pub total_bytes: usize,
+}
+
+/// Runtime context owned by a compiled PHP [`Program`].
+#[derive(Clone)]
+#[cfg_attr(not(feature = "php"), allow(dead_code))]
+pub struct PhpCtx {
+    pub file: String,
+    pub base_dir: String,
+    pub rt_slot: u32,
+    pub argv: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub sapi_request_json: Option<String>,
+    pub vfs: Option<std::sync::Arc<std::collections::HashMap<String, Vec<u8>>>>,
+    pub vfs_overlay: Option<std::sync::Arc<std::sync::Mutex<PhpVfsOverlay>>>,
+    pub allow_native_fs: bool,
+    pub stream_stdout: bool,
+    /// Stat-validated OPcache lookup (`(cache_key, mtime_nanos, file_len, base_func_id)`):
+    /// returns `Some(Vec<FuncProto>)` on hit without reading the source file from disk.
+    #[cfg_attr(
+        any(not(feature = "php"), feature = "safe-sandbox", target_arch = "wasm32"),
+        allow(dead_code)
+    )]
+    pub lookup_cached_by_stat: fn(&str, u128, u64, u32) -> Option<Vec<FuncProto>>,
+    /// Dynamically compile a PHP file or `eval` source into relocatable `FuncProto`s
+    /// starting at `base_func_id` (top-level body last).
+    pub compile_unit:
+        fn(Option<&str>, &str, &str, u32, u32, Option<(u128, u64)>) -> Result<Vec<FuncProto>, String>,
+}
+
+#[cfg_attr(not(feature = "php"), allow(dead_code))]
+impl std::fmt::Debug for PhpCtx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PhpCtx")
+            .field("file", &self.file)
+            .field("base_dir", &self.base_dir)
+            .field("allow_native_fs", &self.allow_native_fs)
+            .finish()
+    }
 }
 
 /// The modules of a Python program that compile on first import: the

@@ -8,11 +8,13 @@ use super::*;
 /// Same-binary escape hatch for the guarded pure cyclic field-read reducer.
 /// Read only while compiling a hot loop; there is no per-iteration switch cost.
 pub(crate) fn field_read_stream_enabled() -> bool {
-    crate::env_var_os("ZIPP_NO_FIELD_READ_STREAM").is_none()
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::env_var_os("ZIPP_NO_FIELD_READ_STREAM").is_none())
 }
 
 fn field_sum_stream_enabled() -> bool {
-    crate::env_var_os("ZIPP_NO_FIELD_SUM_STREAM").is_none()
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::env_var_os("ZIPP_NO_FIELD_SUM_STREAM").is_none())
 }
 
 /// The helper's own bytecode screen (`vm::field_stream`), as an admission
@@ -287,7 +289,7 @@ mod field_stream_pack_tests {
 /// including the deopt exit, since `flush_exit` writes every home back.
 #[allow(clippy::too_many_arguments)]
 fn emit_regalloc_ic_probe(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     heap: &HeapHelpers,
     ic_site: u32,
     obj: u16,
@@ -397,7 +399,7 @@ fn emit_regalloc_ic_probe(
 /// ordinary probe's miss tail.
 #[allow(clippy::too_many_arguments)]
 fn emit_regalloc_ic_direct(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     heap: &HeapHelpers,
     ic_site: u32,
     obj: u16,
@@ -447,7 +449,7 @@ fn emit_regalloc_ic_direct(
 /// already reserved, the path is the cold one, and an unconditional sequence has
 /// no "is this home live here" question for a reviewer — or for the next arm
 /// that reaches for a register.
-fn emit_probe_spill(ops: &mut dynasmrt::x64::Assembler, spill_off: i32, save: bool) {
+fn emit_probe_spill(ops: &mut crate::codegen::X64Asm, spill_off: i32, save: bool) {
     for k in 0..4i32 {
         let x = 2 + k as u8;
         if save {
@@ -605,13 +607,7 @@ pub(crate) fn compile_region_regalloc(
             eprintln!("[jit] DOUBLE region [{start},{end}] B94 split receiver r{sr} lg={lg:?}");
         }
     }
-    let mut ops = match dynasmrt::x64::Assembler::new() {
-        Ok(a) => a,
-        Err(_) => {
-            decline_emit("regalloc-emit: assembler alloc failed");
-            return None;
-        }
-    };
+    let mut ops = crate::codegen::new_x64_asm();
     let (s, e) = (start as usize, end as usize);
 
     let in_region: Vec<_> = (s..=e).map(|_| ops.new_dynamic_label()).collect();
@@ -1833,9 +1829,9 @@ pub(crate) fn compile_region_regalloc(
     );
     emit_region_restore_n(&mut ops, xmm_off, frame);
 
-    let buf = match ops.finalize() {
-        Ok(b) => b,
-        Err(_) => {
+    let buf = match crate::codegen::finalize_code(ops) {
+        Some(b) => b,
+        None => {
             decline_emit("regalloc-emit: assembler finalize failed");
             return None;
         }

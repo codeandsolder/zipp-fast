@@ -155,7 +155,7 @@ pub(crate) fn int_length_pin_kind(kind: u8) -> bool {
 ///
 /// Byte-identical to the pre-wave prologue whenever no bool shares a home:
 /// every bool is then in `live_in_bools` and nothing is emitted.
-pub(crate) fn emit_bool_home_zero(ops: &mut dynasmrt::x64::Assembler, plan: &RegionPlan) {
+pub(crate) fn emit_bool_home_zero(ops: &mut crate::codegen::X64Asm, plan: &RegionPlan) {
     let loaded: FxHashSet<u8> = plan.live_in_bools.iter().map(|&(_, g)| g).collect();
     // W28: a type-split register's bool gpr is neither entry-loaded nor
     // flushed, and its range's opening def dominates every read of it — so the
@@ -1337,13 +1337,7 @@ pub(crate) fn compile_region_int_maybe_cold(
         decline_emit("int-emit: type-split plan");
         return None;
     }
-    let mut ops = match dynasmrt::x64::Assembler::new() {
-        Ok(a) => a,
-        Err(_) => {
-            decline_emit("int-emit: assembler alloc failed");
-            return None;
-        }
-    };
+    let mut ops = crate::codegen::new_x64_asm();
     let (s, e) = (start as usize, end as usize);
     // Where the interpreter resumes for an exit taken before `ip` runs. The
     // identity for an ordinary region; for a spliced body the ip that replays
@@ -2476,7 +2470,10 @@ pub(crate) fn compile_region_int_maybe_cold(
                         // Regression-only fault injection for the otherwise
                         // defensive atomic-decline path. It changes emitted
                         // code only in an explicitly marked child process.
-                        | if crate::env_var_os("ZIPP_TEST_FORCE_INT_PUSH3_DECLINE").is_some() {
+                        | if {
+                            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                            *ON.get_or_init(|| crate::env_var_os("ZIPP_TEST_FORCE_INT_PUSH3_DECLINE").is_some())
+                        } {
                             1 << 31
                         } else {
                             0
@@ -2789,9 +2786,9 @@ pub(crate) fn compile_region_int_maybe_cold(
     dynasm!(ops ; => entry_bail ; mov DWORD [rsi], rip_entry);
     emit_region_restore_n(&mut ops, xmm_off, frame);
 
-    let buf = match ops.finalize() {
-        Ok(b) => b,
-        Err(_) => {
+    let buf = match crate::codegen::finalize_code(ops) {
+        Some(b) => b,
+        None => {
             decline_emit("int-emit: assembler finalize failed");
             return None;
         }

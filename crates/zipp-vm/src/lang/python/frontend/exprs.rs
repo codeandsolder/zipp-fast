@@ -251,7 +251,13 @@ impl<'a> Emitter<'a> {
             }
             ast::Expr::Subscript(s) => {
                 let value = self.expr(&s.value, depth + 1)?;
-                let index = self.expr(&s.slice, depth + 1)?;
+                let index = match s.slice.as_ref() {
+                    ast::Expr::Starred(st) => {
+                        let inner = self.expr(&st.value, depth + 1)?;
+                        self.helper("unpack_type", &[inner])?
+                    }
+                    slice => self.expr(slice, depth + 1)?,
+                };
                 if matches!(s.slice.as_ref(), ast::Expr::Slice(_)) {
                     return self.helper("getitem", &[value, index]);
                 }
@@ -361,6 +367,9 @@ impl<'a> Emitter<'a> {
                 if !self.proto.is_generator {
                     return Err(self.error(expr, "'yield from' outside function"));
                 }
+                if self.scope().is_async {
+                    return Err(self.error(expr, "'yield from' inside async function"));
+                }
                 let value = self.expr(&y.value, depth + 1)?;
                 let iter = self.helper("iter", &[value])?;
                 self.yield_from(expr, iter)
@@ -369,8 +378,21 @@ impl<'a> Emitter<'a> {
                 expr,
                 "starred expression is only valid in calls, literals and assignment",
             )),
-            ast::Expr::Await(_) => Err(self.error(expr, "'await' is not supported")),
+            ast::Expr::Await(a) => {
+                if !self.scope().is_async {
+                    return Err(self.error(expr, "'await' outside async function"));
+                }
+                let value = self.expr(&a.value, depth + 1)?;
+                self.await_value(expr, value)
+            }
         }
+    }
+
+    /// `await value` (PEP 492): obtain the awaitable's iterator via `R.awaititer`
+    /// and delegate through the generator's `yield_from` machinery.
+    pub fn await_value(&mut self, node: &impl ast::Ranged, value: Reg) -> R<Reg> {
+        let iter = self.helper("awaititer", &[value])?;
+        self.yield_from(node, iter)
     }
 
     /// `yield value`. When the expression's value is `used`, a resume by
@@ -379,10 +401,13 @@ impl<'a> Emitter<'a> {
         if !self.proto.is_generator {
             return Err(self.error(node, "'yield' outside function"));
         }
-        let value = match &y.value {
+        let mut value = match &y.value {
             Some(v) => self.expr(v, depth + 1)?,
             None => self.none()?,
         };
+        if self.scope().is_async {
+            value = self.helper("ayield", &[value])?;
+        }
         let dst = self.alloc()?;
         self.emit(Instr::Yield { dst, val: value })?;
         self.forget_line();
@@ -403,7 +428,7 @@ impl<'a> Emitter<'a> {
     /// a `close()` of the delegating generator (a return completion through
     /// the Yield) closes it. The runtime's `yfstep` performs one step and
     /// returns STOP with the subiterator's return value in `yfret`.
-    fn yield_from(&mut self, node: &ast::Expr, iter: Reg) -> R<Reg> {
+    fn yield_from(&mut self, node: &impl ast::Ranged, iter: Reg) -> R<Reg> {
         let sent = self.none()?;
         let mode = self.small_int(0)?;
         let one = self.small_int(1)?;
@@ -1301,6 +1326,10 @@ impl<'a> Emitter<'a> {
         // there, since that join starts from "".
         let fjoin = self.fast && !values.is_empty() && values.len() <= FJOIN_MAX && !(values.len() == 1 && known(&values[0]));
         let first_raw = self.fast && (fjoin || (values.len() > 1 && known(&values[1])));
+        // The last non-constant part in an `R.FJOIN` call may defer plain
+        // `{x}` formatting into `R.FJOIN` itself (its fallback calls `R.fmt`)
+        // without changing evaluation or formatting order.
+        let last_expr = values.iter().rposition(|v| !matches!(v, ast::Expr::Constant(_)));
         let mut parts = Vec::new();
         for (k, v) in values.iter().enumerate() {
             let raw_int = match k {
@@ -1314,7 +1343,17 @@ impl<'a> Emitter<'a> {
                     ast::Constant::Str(s) => parts.push(self.string(s)?),
                     _ => return Err(self.error(v, "unexpected f-string part")),
                 },
-                ast::Expr::FormattedValue(f) => parts.push(self.fvalue(f, raw_int, depth)?),
+                ast::Expr::FormattedValue(f) => {
+                    let defer_fmt = fjoin
+                        && last_expr == Some(k)
+                        && f.format_spec.is_none()
+                        && f.conversion.to_byte().is_none();
+                    if defer_fmt {
+                        parts.push(self.expr(&f.value, depth)?);
+                    } else {
+                        parts.push(self.fvalue(f, raw_int, depth)?);
+                    }
+                }
                 other => parts.push(self.expr(other, depth)?),
             }
         }
@@ -1508,10 +1547,13 @@ impl<'a> Emitter<'a> {
         let key = self.string_index(&format!("k{}:{}", c.args.len(), names.join(",")));
         let at = self.emit(Instr::PyCallEntry { dst: entry, f, name: key, slow: 0 })?;
         let (arg_base, argc) = self.arguments(&regs)?;
-        self.emit(Instr::CallWithThis { dst, callee: entry, this_v: f, arg_base, argc, name: crate::bytecode::NO_NAME })?;
+        // When `f["k<n>:<names>"]` exists, `bindArgs` set it to `f["c<argc>"]`
+        // (and `setFuncDefaults` clears both together), so `PyCall` dispatches
+        // the exact same positional entry with full IC, LeafBody, and JIT support.
+        let at2 = self.emit(Instr::PyCall { dst, f, arg_base, argc, slow: 0 })?;
         let npos = c.args.len();
         let names: Vec<String> = names.into_iter().map(str::to_owned).collect();
-        self.defer_cold(Vec::new(), vec![at], move |e| {
+        self.defer_cold(Vec::new(), vec![at, at2], move |e| {
             let args = e.array(&regs[..npos])?;
             let record = e.alloc()?;
             e.emit(Instr::NewMap { dst: record, src: None })?;
@@ -2250,8 +2292,10 @@ impl<'a> Emitter<'a> {
         // With fast paths on, an exact list, tuple or range is passed as
         // itself for the comprehension to index or count in place (a list
         // or tuple display always makes an exact one: `seqiter` would
-        // answer it unchanged).
-        let outer_iter = if self.fast && is_sequence_display(&generators[0].iter) {
+        // answer it unchanged). An async outermost clause uses `R.aiter`.
+        let outer_iter = if generators[0].is_async {
+            self.helper("aiter", &[outer])?
+        } else if self.fast && is_sequence_display(&generators[0].iter) {
             outer
         } else {
             self.helper(if self.fast { "seqiter" } else { "iter" }, &[outer])?
@@ -2265,19 +2309,15 @@ impl<'a> Emitter<'a> {
             format!("{}.<locals>.{kind}", self.qualname)
         };
         let (func_id, child) = self.compile_child(node, kind, qualname.clone(), None, |e| {
-            let acc = match kind {
+            let (acc, items) = match kind {
                 "<listcomp>" => {
                     let arr = e.array(&[])?;
-                    Some(e.seq_of(arr, false)?)
+                    let acc = e.seq_of(arr, false)?;
+                    (Some(acc), e.fast.then_some(arr))
                 }
-                "<setcomp>" => Some(e.helper("set", &[])?),
-                "<dictcomp>" => Some(e.helper("dict", &[])?),
-                _ => None,
-            };
-            // A list accumulates by an inline push onto its (private) items.
-            let items = match (kind, acc) {
-                ("<listcomp>", Some(acc)) if e.fast => Some(e.prop(acc, "items")?),
-                _ => None,
+                "<setcomp>" => (Some(e.helper("set", &[])?), None),
+                "<dictcomp>" => (Some(e.helper("dict", &[])?), None),
+                _ => (None, None),
             };
             e.comp_loop(generators, 0, elts, acc, items, None, depth + 1)?;
             let result = match acc {
@@ -2294,7 +2334,11 @@ impl<'a> Emitter<'a> {
         )?;
         let args = self.array(&[outer_iter])?;
         let null = self.none()?;
-        self.call_value(f, args, null)
+        let res = self.call_value(f, args, null)?;
+        if child.is_async && kind != "<genexpr>" {
+            return self.await_value(node, res);
+        }
+        Ok(res)
     }
 
     /// The scope of a comprehension the symbol table marked inline (see
@@ -2305,7 +2349,7 @@ impl<'a> Emitter<'a> {
     /// registers, and names from further out are cells there already.
     fn inlinable(&self, node: &ast::Expr, kind: &str) -> Option<usize> {
         let range = ast::Ranged::range(node);
-        let key = (u32::from(range.start()), u32::from(range.end()));
+        let key = super::symtable::ScopeKey::Node(u32::from(range.start()), u32::from(range.end()));
         let id = *self.table.by_offset.get(&key)?;
         let scope = &self.table.scopes[id];
         (scope.inline && scope.name == kind).then_some(id)
@@ -2323,18 +2367,14 @@ impl<'a> Emitter<'a> {
         outer: Outer,
         depth: usize,
     ) -> R<Reg> {
-        let acc = match kind {
+        let (acc, items) = match kind {
             "<listcomp>" => {
                 let arr = self.array(&[])?;
-                self.seq_of(arr, false)?
+                let acc = self.seq_of(arr, false)?;
+                (acc, Some(arr))
             }
-            "<setcomp>" => self.helper("set", &[])?,
-            _ => self.helper("dict", &[])?,
-        };
-        let items = if kind == "<listcomp>" {
-            Some(self.prop(acc, "items")?)
-        } else {
-            None
+            "<setcomp>" => (self.helper("set", &[])?, None),
+            _ => (self.helper("dict", &[])?, None),
         };
         let saved_scope = std::mem::replace(&mut self.scope, scope);
         let saved_locals = std::mem::take(&mut self.locals);
@@ -2425,32 +2465,63 @@ impl<'a> Emitter<'a> {
         depth: usize,
     ) -> R<()> {
         let g = &generators[index];
-        let steps = if index == 0 {
-            match first {
-                Some(d) => Steps::Display(d),
-                None => {
-                    // The outermost iterable arrives as `.0`, already
-                    // through `seqiter` (or `iter`).
-                    let outer = self.load_name(".0")?;
-                    Steps::Iter(self.seq_stepper(outer, false)?)
-                }
-            }
+        let (head, exits) = if g.is_async {
+            let ait = if index == 0 {
+                self.load_name(".0")?
+            } else {
+                let value = self.expr(&g.iter, depth)?;
+                self.helper("aiter", &[value])?
+            };
+            let head = self.here();
+            let ereg = self.alloc()?;
+            let push = self.emit(Instr::PushHandler {
+                catch_target: 0,
+                catch_reg: ereg,
+            })?;
+            self.enter_handler(Some(push));
+            let aw = self.helper("anext_awaitable", &[ait])?;
+            let item = self.await_value(&g.iter, aw)?;
+            self.emit(Instr::PopHandler)?;
+            self.leave_handler();
+            let got = self.jump()?;
+            let catch = self.here();
+            self.patch(push, catch)?;
+            let is_stop = self.helper("is_stop_async", &[ereg])?;
+            let exit = self.jump_if_true(is_stop)?;
+            self.emit(Instr::Throw { src: ereg })?;
+            let after = self.here();
+            self.patch(got, after)?;
+            self.assign(&g.target, item, depth)?;
+            (head, vec![exit])
         } else {
-            // An inner clause's iterable is evaluated here, in the loop's
-            // own code, each time the clauses outside it step.
-            match self.range_call(&g.iter) {
-                Some(args) => Steps::Iter(self.range_stepper(args, depth)?),
-                None => match self.display_steps(&g.iter, depth)? {
+            let steps = if index == 0 {
+                match first {
                     Some(d) => Steps::Display(d),
                     None => {
-                        let value = self.expr(&g.iter, depth)?;
-                        Steps::Iter(self.seq_stepper(value, true)?)
+                        // The outermost iterable arrives as `.0`, already
+                        // through `seqiter` (or `iter`).
+                        let outer = self.load_name(".0")?;
+                        Steps::Iter(self.seq_stepper(outer, false)?)
                     }
-                },
-            }
+                }
+            } else {
+                // An inner clause's iterable is evaluated here, in the loop's
+                // own code, each time the clauses outside it step.
+                match self.range_call(&g.iter) {
+                    Some(args) => Steps::Iter(self.range_stepper(args, depth)?),
+                    None => match self.display_steps(&g.iter, depth)? {
+                        Some(d) => Steps::Display(d),
+                        None => {
+                            let value = self.expr(&g.iter, depth)?;
+                            Steps::Iter(self.seq_stepper(value, true)?)
+                        }
+                    },
+                }
+            };
+            let head = self.here();
+            let exits = self.steps_header(&steps, &g.target, depth)?;
+            (head, exits)
         };
-        let head = self.here();
-        let exits = self.steps_header(&steps, &g.target, depth)?;
         let mut skips = Vec::new();
         for cond in &g.ifs {
             skips.extend(self.branch(cond, false, depth)?);
@@ -2460,6 +2531,7 @@ impl<'a> Emitter<'a> {
             breaks: Vec::new(),
             continues: Vec::new(),
             handler_depth: self.handler_depth,
+            except_star_depth: self.except_star_depth,
         });
         if index + 1 < generators.len() {
             self.comp_loop(generators, index + 1, elts, acc, items, None, depth)?;
@@ -2483,7 +2555,10 @@ impl<'a> Emitter<'a> {
                     self.helper("accumulate", &[acc, v])?;
                 }
                 (None, _) => {
-                    let v = self.expr(elts[0], depth)?;
+                    let mut v = self.expr(elts[0], depth)?;
+                    if self.scope().is_async {
+                        v = self.helper("ayield", &[v])?;
+                    }
                     let dst = self.alloc()?;
                     self.emit(Instr::Yield { dst, val: v })?;
                 }

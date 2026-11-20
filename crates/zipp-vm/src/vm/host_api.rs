@@ -135,6 +135,9 @@ pub(crate) const JIT_HTMLDDA_IDX_OFFSET: usize = core::mem::offset_of!(Vm<'stati
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_HTMLDDA_SCALAR_ENABLED_OFFSET: usize =
     core::mem::offset_of!(Vm<'static>, htmldda_scalar_enabled);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_TYPEOF_SPECIAL_MAX_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, typeof_special_max);
 
 /// VM-relative bases pinned by Tier-C whole-function entry code. These are
 /// explicit mirrors rather than offsets into `Vec`: Rust does not expose a
@@ -178,6 +181,10 @@ pub(crate) const JIT_PROTO_LEN_OFFSET: usize = core::mem::offset_of!(Vm<'static>
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_PROTO_COUNT_OFFSET: usize = core::mem::offset_of!(Vm<'static>, proto_of)
     + core::mem::offset_of!(crate::slot_table::ProtoTable, count);
+/// `Heap::chain_epoch` for inline stamped prototype-method guards (`emit_proto_read_guard`).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_CHAIN_EPOCH_OFFSET: usize = core::mem::offset_of!(Vm<'static>, heap)
+    + core::mem::offset_of!(crate::heap::Heap, chain_epoch);
 
 /// VM-relative byte offsets of the heap's shape/vals mirror bases (B178).
 /// The shape-way probes load the base pointers through the live VM argument
@@ -283,6 +290,21 @@ pub(crate) const JIT_ARRAY_SNAPSHOT_EPOCH_OFFSET: usize = core::mem::offset_of!(
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_GEN_RAW_OFFSET: usize =
     core::mem::offset_of!(Vm<'static>, heap) + core::mem::offset_of!(crate::heap::Heap, gen_raw);
+/// VM-relative offset of `Heap::concat_memo_raw` (inline string+int memo probe).
+#[cfg(all(not(feature = "safe-sandbox"), feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_CONCAT_MEMO_RAW_OFFSET: usize = core::mem::offset_of!(Vm<'static>, heap)
+    + core::mem::offset_of!(crate::heap::Heap, concat_memo_raw);
+#[cfg(all(not(feature = "safe-sandbox"), feature = "jit", target_arch = "x86_64"))]
+const _: () = {
+    use crate::heap::ConcatMemoEntry as E;
+    assert!(core::mem::size_of::<E>() == 20);
+    assert!(core::mem::offset_of!(E, left_idx) == 0);
+    assert!(core::mem::offset_of!(E, left_ver) == 4);
+    assert!(core::mem::offset_of!(E, int) == 8);
+    assert!(core::mem::offset_of!(E, res_idx) == 12);
+    assert!(core::mem::offset_of!(E, res_ver) == 16);
+    assert!(JIT_CONCAT_MEMO_RAW_OFFSET % core::mem::align_of::<u64>() == 0);
+};
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 const _: () = assert!(JIT_GEN_RAW_OFFSET % core::mem::align_of::<u64>() == 0);
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -303,6 +325,8 @@ pub(crate) const JIT_REGS_LEN_OFFSET: usize = core::mem::offset_of!(Vm<'static>,
     + core::mem::offset_of!(crate::vm::RegisterFile, logical_len);
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_REGS_HW_OFFSET: usize = core::mem::offset_of!(Vm<'static>, regs_hw);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_REGS_END_OFFSET: usize = core::mem::offset_of!(Vm<'static>, regs_end_raw);
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 const _: () = {
     use crate::vm::RegisterFile as R;
@@ -341,18 +365,158 @@ pub(crate) const JIT_GC_REQUESTED_OFFSET: usize = core::mem::offset_of!(Vm<'stat
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_GC_STRESS_OFFSET: usize = core::mem::offset_of!(Vm<'static>, gc_stress);
 /// B199: raw base of the live cross-entry table, derived through the VM per
-/// access (growth re-caches it). Records are 16 bytes: entry @+0 (0 = none),
-/// mask_gen @+8 — the lane addresses `[base + fid*16 (+8)]` with the fid a
-/// baked constant displacement.
+/// access (growth re-caches it). Records are 32 bytes: entry @+0 (0 = none),
+/// mask_gen @+8, dyn_flags @+12, uninit_mask @+16, reg_count @+24,
+/// param_count @+26, fid @+28 — static lanes address `[base + fid*32 (+8)]`
+/// and `cross3_dyn_stub` shifts `fid << 5`.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_CROSS_TABLE_RAW_OFFSET: usize = core::mem::offset_of!(Vm<'static>, jit)
     + core::mem::offset_of!(crate::codegen::Jit, cross_table_raw);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_CROSS_TABLE_LEN_OFFSET: usize = core::mem::offset_of!(Vm<'static>, jit)
+    + core::mem::offset_of!(crate::codegen::Jit, cross_table_len);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_GLOBAL_THIS_BITS_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, global_this_bits);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_FN_PROTO_IDX_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, fn_proto);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_FN_PROTO_SHAPE_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, fn_proto_shape);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_FN_PROTO_CALL_SLOT_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, fn_proto_call_slot);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_FN_CALL_NATIVE_BITS_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, fn_call_native_bits);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_FN_PROPS_HAS_CALL_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, fn_props_has_call);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_ARRAY_CTOR_BITS_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, array_ctor_bits);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_ARRAY_IS_ARRAY_BITS_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, array_is_array_bits);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_OBJ_PROTO_IDX_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, obj_proto);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_OBJ_PROTO_SETUP_VER_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, obj_proto_setup_ver);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_SYM_ITERATOR_BITS_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, sym_iterator_bits);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_ARR_PROTO_ITER_SLOT_PTR_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, arr_proto_iter_slot_ptr);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_ARR_PROTO_ITER_VER_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, arr_proto_iter_ver);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_DEFAULT_ARRAY_ITER_BITS_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, default_array_iter);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_HAS_TYPED_ARRAY_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, heap) + core::mem::offset_of!(crate::heap::Heap, has_typed_array);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_HAS_NON_INTERNED_FALSY_OFFSET: usize = core::mem::offset_of!(Vm<'static>, heap)
+    + core::mem::offset_of!(crate::heap::Heap, has_non_interned_falsy);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_GLOBAL_THIS_IDX_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, global_this);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_KEYED_MEMO_RAW_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, keyed_slot_memo_raw);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_SHAPE_PROP_MEMO_RAW_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, shape_prop_memo_raw);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_DICT_PROP_MEMO_RAW_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, dict_prop_memo_raw);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_ES5_PROTO_MEMO_RAW_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, es5_proto_memo_raw);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_CLASS_PROP_MEMO_RAW_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, class_prop_memo_raw);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_DEFERRED_NS_NONEMPTY_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, deferred_ns_nonempty);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_MOD_NS_NONEMPTY_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, mod_ns_nonempty);
+#[cfg(all(feature = "jit", target_arch = "x86_64", not(feature = "safe-sandbox")))]
+pub(crate) const JIT_INSTANCEOF_PAIR_MEMO_RAW_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, instanceof_pair_memo_raw);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_FN_PROPS_GEN_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, fn_props_gen);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_ARR_PROTO_IDX_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, arr_proto);
+#[cfg(all(feature = "jit", target_arch = "x86_64", not(feature = "safe-sandbox")))]
+const _: () = {
+    use crate::vm::InstanceofPairMemo as I;
+    assert!(core::mem::size_of::<I>() == 32);
+    assert!(core::mem::offset_of!(I, v_key) == 0);
+    assert!(core::mem::offset_of!(I, ci) == 4);
+    assert!(core::mem::offset_of!(I, chain_epoch) == 8);
+    assert!(core::mem::offset_of!(I, fn_props_gen) == 12);
+    assert!(core::mem::offset_of!(I, class_proto_epoch) == 16);
+    assert!(core::mem::offset_of!(I, result) == 20);
+};
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const _: () = {
+    use crate::vm::indexing_date::KeyedSlotMemo as K;
+    use crate::vm::{ClassPropMemo as C, DictPropMemo as D, Es5ProtoMemo as E, ShapePropMemo as S};
+    assert!(core::mem::size_of::<K>() == 32);
+    assert!(core::mem::offset_of!(K, owner) == 0);
+    assert!(core::mem::offset_of!(K, key) == 4);
+    assert!(core::mem::offset_of!(K, slot) == 8);
+    assert!(core::mem::offset_of!(K, kver) == 12);
+    assert!(core::mem::offset_of!(K, over) == 16);
+    assert!(core::mem::offset_of!(K, by_object) == 20);
+    assert!(core::mem::offset_of!(K, flags) == 21);
+    assert!(core::mem::size_of::<S>() == 16);
+    assert!(core::mem::offset_of!(S, shape) == 0);
+    assert!(core::mem::offset_of!(S, key_id) == 4);
+    assert!(core::mem::offset_of!(S, slot) == 8);
+    assert!(core::mem::offset_of!(S, writable) == 12);
+    assert!(core::mem::size_of::<D>() == 32);
+    assert!(core::mem::offset_of!(D, idx) == 0);
+    assert!(core::mem::offset_of!(D, key_id) == 4);
+    assert!(core::mem::offset_of!(D, ver) == 8);
+    assert!(core::mem::offset_of!(D, slot) == 12);
+    assert!(core::mem::offset_of!(D, vals_ptr) == 16);
+    assert!(core::mem::offset_of!(D, writable) == 24);
+    assert!(core::mem::size_of::<E>() == 32);
+    assert!(core::mem::offset_of!(E, first_proto) == 0);
+    assert!(core::mem::offset_of!(E, key_id) == 4);
+    assert!(core::mem::offset_of!(E, chain_epoch) == 8);
+    assert!(core::mem::offset_of!(E, slot) == 12);
+    assert!(core::mem::offset_of!(E, vals_ptr) == 16);
+    assert!(core::mem::size_of::<C>() == 32);
+    assert!(core::mem::offset_of!(C, class_id) == 0);
+    assert!(core::mem::offset_of!(C, key_id) == 4);
+    assert!(core::mem::offset_of!(C, class_ver) == 8);
+    assert!(core::mem::offset_of!(C, chain_epoch) == 12);
+    assert!(core::mem::offset_of!(C, class_epoch) == 16);
+    assert!(core::mem::offset_of!(C, check_chain) == 20);
+    assert!(core::mem::offset_of!(C, value_bits) == 24);
+};
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 const _: () = {
     use crate::codegen::CrossEntryRec as R;
     assert!(core::mem::offset_of!(R, entry) == 0);
     assert!(core::mem::offset_of!(R, mask_gen) == 8);
-    assert!(core::mem::size_of::<R>() == 16);
+    assert!(core::mem::offset_of!(R, dyn_flags) == 12);
+    assert!(core::mem::offset_of!(R, uninit_mask) == 16);
+    assert!(core::mem::offset_of!(R, reg_count) == 24);
+    assert!(core::mem::offset_of!(R, param_count) == 26);
+    assert!(core::mem::offset_of!(R, fid) == 28);
+    assert!(core::mem::size_of::<R>() == 32);
 };
 
 /// VM-relative byte offsets of the three call-environment blocker bytes
@@ -2142,6 +2306,21 @@ pub trait HostCtx {
     /// Runs the guest re-entrantly inside the host call; the guest cannot make
     /// a nested host call while it does.
     fn call_global_numbers(&mut self, name: &str, args: &[f64]) -> Result<f64, String>;
+    /// Instructions still available under the running VM's step budget
+    /// (`u64::MAX` when no finite budget is attached or `instrument` is off).
+    /// Lets any synchronous host plugin (database, regex, compression, etc.)
+    /// bound its work to the VM's remaining instruction budget.
+    fn steps_remaining(&self) -> u64 {
+        u64::MAX
+    }
+    /// Deduct `n` work units from the running VM's unified instruction budget.
+    /// Returns `Err` with the VM's budget-exhausted message if charging `n`
+    /// crosses a finite ceiling (and marks the VM's budget exhausted so the
+    /// guest cannot catch its way past it).
+    fn charge_steps(&mut self, n: u64) -> Result<(), String> {
+        let _ = n;
+        Ok(())
+    }
 }
 
 /// The context-taking twin of [`crate::embed::HostCall`]: the same string
@@ -2333,5 +2512,28 @@ impl<'p> HostCtx for Vm<'p> {
             .map_err(|t| self.take_host_throw(t))?;
         self.to_number_strict(v)
             .map_err(|t| self.take_host_throw(t))
+    }
+
+    fn steps_remaining(&self) -> u64 {
+        #[cfg(feature = "instrument")]
+        {
+            self.host_steps_remaining()
+        }
+        #[cfg(not(feature = "instrument"))]
+        {
+            u64::MAX
+        }
+    }
+
+    fn charge_steps(&mut self, n: u64) -> Result<(), String> {
+        #[cfg(feature = "instrument")]
+        {
+            self.host_charge_steps(n)
+        }
+        #[cfg(not(feature = "instrument"))]
+        {
+            let _ = n;
+            Ok(())
+        }
     }
 }

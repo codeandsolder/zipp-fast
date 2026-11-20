@@ -80,16 +80,32 @@ fn jit_wanted(program: &Program) -> bool {
     if crate::env_var_os("ZIPP_NOJIT").is_some() {
         return false;
     }
-    program.python_natives
+    if program.python_natives
+        || program.php_natives
+        || program.rust_natives
         || program.functions.len() < JIT_LARGE_PROGRAM_FUNCS
         || crate::env_var_os("ZIPP_JIT_LARGE").is_some()
+    {
+        return true;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::env_var_os("ZIPP_NO_JIT_LARGE").is_none()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
 }
 
 /// Whether a VM over a JavaScript program of [`JIT_LARGE_PROGRAM_FUNCS`] or
-/// more functions starts with its JIT on (`ZIPP_JIT_LARGE`, see
-/// [`jit_wanted`]).
+/// more functions starts with its JIT on (see [`jit_wanted`]).
+#[allow(dead_code)]
 pub(crate) fn large_programs_run_jit() -> bool {
-    #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    return crate::env_var_os("ZIPP_NOJIT").is_none()
+        && crate::env_var_os("ZIPP_NO_JIT_LARGE").is_none();
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
     return crate::env_var_os("ZIPP_NOJIT").is_none() && crate::env_var_os("ZIPP_JIT_LARGE").is_some();
     #[cfg(not(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64"))))]
     false
@@ -157,6 +173,30 @@ impl<'p> Vm<'p> {
     #[inline]
     pub(crate) fn loader_module_func(&self, func_id: u32) -> bool {
         module_func_range_contains(&self.module_func_ranges, func_id)
+    }
+
+    /// Whether `func_id` belongs to the main program (either initially compiled
+    /// under `main_func_count`, or a nested function of a pre-parser-skipped
+    /// main-program body lazily installed at runtime).
+    #[inline(always)]
+    pub(crate) fn is_main_func(&self, func_id: u32) -> bool {
+        if (func_id as usize) < self.main_func_count {
+            return true;
+        }
+        #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+        if !self.lazy_func_ranges.is_empty() {
+            return self.is_lazy_main_func_cold(func_id);
+        }
+        false
+    }
+
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    #[cold]
+    #[inline(never)]
+    fn is_lazy_main_func_cold(&self, func_id: u32) -> bool {
+        self.lazy_func_ranges
+            .iter()
+            .any(|&(start, end)| func_id >= start && func_id < end)
     }
 
     /// Whether `func_id` belongs to immutable code the native tiers may compile.
@@ -294,7 +334,8 @@ impl<'p> Vm<'p> {
                 crate::bytecode::STATIC_KEY_PLAN_VM_MAX_SITES,
                 crate::bytecode::STATIC_KEY_PLAN_MAX_RETAINED_BYTES,
             ));
-        Vm {
+        #[allow(unused_mut)]
+        let mut vm = Vm {
             program,
             eval_funcs: Vec::new(),
             funcs: program.functions.iter().collect(),
@@ -332,11 +373,7 @@ impl<'p> Vm<'p> {
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             mi_recv: rustc_hash::FxHashMap::default(),
             idx_key_scratch: String::new(),
-            keyed_slot_memo: vec![
-                crate::vm::indexing_date::KeyedSlotMemo::EMPTY;
-                crate::vm::indexing_date::KEYED_SLOT_MEMO_SLOTS
-            ]
-            .into_boxed_slice(),
+            keyed_slot_memo: Vec::new(),
             own_slot_cache: (0..crate::vm::ic::OWN_SLOT_CACHE_SLOTS)
                 .map(|_| std::cell::Cell::new(crate::vm::ic::OwnSlot::EMPTY))
                 .collect(),
@@ -485,7 +522,7 @@ impl<'p> Vm<'p> {
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             lazy_handlers: Vec::new(),
             regex_program_audit_scratch: std::cell::RefCell::new(Vec::new()),
-            collection_index: rustc_hash::FxHashMap::default(),
+            collection_index: crate::slot_table::SlotTable::default(),
             next_private_brand: 1,
             method_brand: crate::slot_table::SlotTable::default(),
             ctor_owner: crate::slot_table::SlotTable::default(),
@@ -535,6 +572,8 @@ impl<'p> Vm<'p> {
             module_source_slots: std::collections::HashMap::new(),
             module_metas: Default::default(),
             module_func_ranges: Vec::new(),
+            #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+            lazy_func_ranges: Vec::new(),
             import_meta: 0,
             can_block: crate::env_var("ZIPP_CAN_BLOCK").map_or(true, |v| v != "0"),
             module_loading: std::collections::HashSet::new(),
@@ -601,7 +640,9 @@ impl<'p> Vm<'p> {
             str_proto: 0,
             map_proto: 0,
             coll_intrinsic_memo: [[None; crate::vm::COLL_MEMO_NAMES]; 2],
-            weakmap_intrinsic_memo: [None; 4],
+            weakmap_intrinsic_memo: [None; 5],
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            arr_iter_next_memo: (0, u32::MAX),
             str_proto_baseline: rustc_hash::FxHashMap::default(),
             arr_proto_baseline: rustc_hash::FxHashMap::default(),
             str_intrinsic_memo: [None; crate::vm::STR_MEMO_NAMES],
@@ -721,12 +762,70 @@ impl<'p> Vm<'p> {
             realm_ctor_main: Default::default(),
             fn_proto_override: rustc_hash::FxHashMap::default(),
             instanceof_memo: vec![crate::vm::InstanceofMemo::EMPTY; crate::vm::INSTANCEOF_MEMO_SLOTS].into_boxed_slice(),
+            #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+            instanceof_pair_memo: {
+                let b = vec![
+                    crate::vm::InstanceofPairMemo::EMPTY;
+                    crate::vm::INSTANCEOF_PAIR_SLOTS
+                ]
+                .into_boxed_slice();
+                b
+            },
+            #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+            instanceof_pair_memo_raw: 0,
             fn_props_gen: 0,
+            fn_props_has_call: 0,
+            fn_props_has_apply: 0,
+            fn_props_has_bind: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            es5_proto_memo: Vec::new(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            es5_proto_memo_raw: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            dict_prop_memo: Vec::new(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            dict_prop_memo_raw: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            shape_prop_memo: Vec::new(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            shape_prop_memo_raw: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            class_prop_memo: Vec::new(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            class_prop_memo_raw: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            prop_key_map: rustc_hash::FxHashMap::default(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            prop_key_cache: Vec::new(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            keyed_slot_memo_raw: 0,
+            deferred_ns_nonempty: 0,
+            mod_ns_nonempty: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            fn_proto_shape: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            fn_proto_call_slot: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            fn_call_native_bits: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            array_ctor_bits: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            array_is_array_bits: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            obj_proto_setup_ver: u32::MAX,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            sym_iterator_bits: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            arr_proto_iter_slot_ptr: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            arr_proto_iter_ver: u32::MAX,
             fn_proto_readonly: rustc_hash::FxHashSet::default(),
             objproto_method_memo: [(crate::shape::DICT, 0, 0); 3],
             is_htmldda: Default::default(),
             htmldda_idx: u32::MAX,
             htmldda_scalar_enabled: crate::env_var_os("ZIPP_NO_HTMLDDA_SCALAR").is_none(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            typeof_special_max: u32::MAX,
             proxy_ctor: 0,
             temporal_ns: 0,
             duration_ctor: 0,
@@ -779,6 +878,8 @@ impl<'p> Vm<'p> {
             set_iter_proto: 0,
             string_iter_proto: 0,
             global_this: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            global_this_bits: Value::UNDEFINED.bits(),
             rng_state: 0x9E37_79B9_7F4A_7C15, // fixed seed (golden-ratio constant)
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit: {
@@ -786,6 +887,15 @@ impl<'p> Vm<'p> {
                 // A Python program compiles only its Python-emitted bodies;
                 // see `Jit::set_python_program`.
                 jit.set_python_program(program.python_natives, &program.functions);
+                #[cfg(feature = "php")]
+                jit.set_php_program(program.php_natives, &program.functions);
+                #[cfg(feature = "rust")]
+                jit.set_rust_program(program.rust_natives, &program.functions);
+                jit.set_large_program_thresholds(
+                    program.functions.len(),
+                    program.python_natives,
+                    program.php_natives || program.rust_natives,
+                );
                 jit
             },
             #[cfg(all(feature = "jit", target_arch = "aarch64"))]
@@ -809,11 +919,13 @@ impl<'p> Vm<'p> {
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_const_strings: Vec::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            jit_const_strings_old: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             mi_cache: Vec::new(),
             // The sentinel version never equals a live object's, so the first
             // use recomputes against the real `%Function.prototype%`.
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-            ci_pristine: (u32::MAX, u32::MAX, u32::MAX),
+            ci_pristine: crate::vm::CiPristine::EMPTY,
             ta_len_base: (0, 0, 0),
             ta_len_kind_ver: [0; 12],
             ta_len_kinds: 0,
@@ -823,6 +935,8 @@ impl<'p> Vm<'p> {
             ta_species_memo: [(u32::MAX, u32::MAX, u32::MAX, 0, 0); 12],
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             reg_capacity: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            regs_end_raw: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             regs_hw: 0,
             // 0 until set_gc_floor() runs after setup; until then nothing is
@@ -834,6 +948,10 @@ impl<'p> Vm<'p> {
             gc_lock: std::rc::Rc::new(std::cell::Cell::new(0)),
             gc_stress: crate::env_var_os("ZIPP_GC_STRESS").is_some(),
             weak_containers: Default::default(),
+            weak_young_entries: Vec::new(),
+            weak_nonmap_containers: Vec::new(),
+            key_str_fresh: Vec::new(),
+            prototypes_fresh: Vec::new(),
             kept_alive: std::collections::HashSet::new(),
             host_result_roots: Vec::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -852,6 +970,16 @@ impl<'p> Vm<'p> {
             node_host: Value::UNDEFINED,
             #[cfg(feature = "node")]
             node_cjs: Value::UNDEFINED,
+            #[cfg(feature = "php")]
+            php_output: Vec::new(),
+            #[cfg(feature = "php")]
+            php_included: rustc_hash::FxHashSet::default(),
+            #[cfg(feature = "rust")]
+            rust_output: Vec::new(),
+            #[cfg(feature = "rust")]
+            rust_stderr: Vec::new(),
+            #[cfg(feature = "rust")]
+            rust_state: None,
             #[cfg(feature = "webassembly")]
             wasm: None,
             #[cfg(feature = "webassembly")]
@@ -861,7 +989,12 @@ impl<'p> Vm<'p> {
             #[cfg(feature = "webassembly")]
             wasm_layer: Value::UNDEFINED,
             uncaught_timer_throw: None,
+        };
+        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+        {
+            vm.instanceof_pair_memo_raw = vm.instanceof_pair_memo.as_ptr() as u64;
         }
+        vm
     }
 
     /// Whether the fused array kernels and the off-frame method inliner may
@@ -1057,7 +1190,7 @@ impl<'p> Vm<'p> {
     /// only the VM-owned hash directory and each index's flat bucket Vec.
     fn collection_index_resident_bytes(&self) -> usize {
         self.collection_index.values().fold(
-            Self::hash_map_resident_bytes(&self.collection_index),
+            self.collection_index.resident_bytes(),
             |n, index| n.saturating_add(index.resident_bytes()),
         )
     }

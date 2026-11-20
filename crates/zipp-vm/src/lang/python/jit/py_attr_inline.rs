@@ -62,33 +62,65 @@ pub(crate) struct PyAttrInline {
     pub method: u64,
 }
 
+/// Metadata about the Python runtime's sequence shapes and planned inline
+/// `math.sqrt` sites, passed alongside the attribute plan for one region
+/// compile.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PyRegionExtras {
+    pub seq_shape: u32,
+    pub t_list_bits: u64,
+    pub t_tuple_bits: u64,
+    pub store_lane: bool,
+    pub sqrt_sites: FxHashMap<u32, PySqrtInline>,
+}
+
+/// Plan for an inline `math.sqrt(x)` `PyCall` site (`strop == 11`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PySqrtInline {
+    pub f_bits: u64,
+    pub f_shape: u32,
+    pub hver: u32,
+    pub entry_slot: u32,
+    pub entry_bits: u64,
+    pub strop_slot: u32,
+}
+
+/// Combined plan for one `compile_py_region` call.
+pub(crate) struct PyCompilePlan {
+    pub attrs: FxHashMap<u32, PyAttrInline>,
+    pub extras: PyRegionExtras,
+}
+
 thread_local! {
     /// The plan `Vm::py_attr_inline_plan` made for the compile that follows
     /// it: the planning JIT's address, the function and its sites. Kept out
     /// of `Jit` (and so out of `Vm`) on purpose; any compile takes it, and
     /// only the same JIT's compile of the same function uses it.
-    static PENDING: std::cell::RefCell<Option<(usize, u32, FxHashMap<u32, PyAttrInline>)>> = const { std::cell::RefCell::new(None) };
+    static PENDING: std::cell::RefCell<Option<(usize, u32, PyCompilePlan)>> = const { std::cell::RefCell::new(None) };
     /// The plan of the body being compiled, for `emit_py_op` (set only for
     /// the duration of one `compile_py_region`).
-    static PLAN: std::cell::RefCell<Option<FxHashMap<u32, PyAttrInline>>> = const { std::cell::RefCell::new(None) };
+    static PLAN: std::cell::RefCell<Option<PyCompilePlan>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Hand the compile that follows the plan for `func_id` of the JIT at
 /// `jit` (replacing any plan not taken).
-pub(crate) fn set_py_attr_plan(jit: usize, func_id: u32, plan: FxHashMap<u32, PyAttrInline>) {
-    PENDING.with(|p| *p.borrow_mut() = (!plan.is_empty()).then_some((jit, func_id, plan)));
+pub(crate) fn set_py_attr_plan(jit: usize, func_id: u32, plan: PyCompilePlan) {
+    let useful = !plan.attrs.is_empty()
+        || plan.extras.seq_shape != crate::shape::DICT
+        || !plan.extras.sqrt_sites.is_empty();
+    PENDING.with(|p| *p.borrow_mut() = useful.then_some((jit, func_id, plan)));
 }
 
 /// Take the pending plan: `Some` when it is for `func_id` of the JIT at
 /// `jit`.
-pub(crate) fn take_py_attr_plan(jit: usize, func_id: u32) -> Option<FxHashMap<u32, PyAttrInline>> {
+pub(crate) fn take_py_attr_plan(jit: usize, func_id: u32) -> Option<PyCompilePlan> {
     PENDING
         .with(|p| p.borrow_mut().take())
         .and_then(|(j, f, plan)| (j == jit && f == func_id).then_some(plan))
 }
 
 /// Run `f` with `plan` as the current body's plan.
-pub(crate) fn with_py_attr_plan<R>(plan: Option<FxHashMap<u32, PyAttrInline>>, f: impl FnOnce() -> R) -> R {
+pub(crate) fn with_py_attr_plan<R>(plan: Option<PyCompilePlan>, f: impl FnOnce() -> R) -> R {
     PLAN.with(|p| *p.borrow_mut() = plan);
     let r = f();
     PLAN.with(|p| *p.borrow_mut() = None);
@@ -97,7 +129,21 @@ pub(crate) fn with_py_attr_plan<R>(plan: Option<FxHashMap<u32, PyAttrInline>>, f
 
 fn plan_at(ip: usize) -> Option<PyAttrInline> {
     let ip = u32::try_from(ip).ok()?;
-    PLAN.with(|p| p.borrow().as_ref().and_then(|m| m.get(&ip).copied()))
+    PLAN.with(|p| p.borrow().as_ref().and_then(|m| m.attrs.get(&ip).copied()))
+}
+
+pub(super) fn seq_plan() -> Option<(u32, u64, u64, bool)> {
+    PLAN.with(|p| {
+        p.borrow().as_ref().and_then(|m| {
+            let e = &m.extras;
+            (e.seq_shape != crate::shape::DICT).then_some((e.seq_shape, e.t_list_bits, e.t_tuple_bits, e.store_lane))
+        })
+    })
+}
+
+pub(super) fn sqrt_plan_at(ip: usize) -> Option<PySqrtInline> {
+    let ip = u32::try_from(ip).ok()?;
+    PLAN.with(|p| p.borrow().as_ref().and_then(|m| m.extras.sqrt_sites.get(&ip).copied()))
 }
 
 /// The mirror shape of layout-mode storage of layout `l`.
@@ -108,7 +154,7 @@ fn layout_shape(l: u32) -> u32 {
 /// Heap-tag and bounds-check the value in `rax`, leaving its heap index in
 /// r10 and `&mirror[idx]` addressable as `[r9 + r10 * 8]` (the 16-byte
 /// record: r9 = base + idx * 8); jump to `miss` otherwise. Clobbers r10, r9.
-fn mirror_of_rax(ops: &mut dynasmrt::x64::Assembler, miss: dynasmrt::DynamicLabel) {
+fn mirror_of_rax(ops: &mut crate::codegen::X64Asm, miss: dynasmrt::DynamicLabel) {
     use crate::vm::host_api::{JIT_HOT_MIRROR_LEN_OFFSET, JIT_HOT_MIRROR_RAW_OFFSET};
     dynasm!(ops
         ; mov r10, rax
@@ -136,12 +182,12 @@ pub(crate) const PY_METHOD_SETTLE: u64 = 1 << 63;
 /// `Vm::jit_py_attr_miss`, which runs the step exactly as `Vm::jit_py_op`
 /// does. `false` (nothing emitted) when the body's plan lacks the site.
 pub(crate) fn emit_py_attr_site(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     func_id: u32,
     ip: usize,
     instr: &Instr,
     labels: &PyLabels,
-    refetch: &mut dyn FnMut(&mut dynasmrt::x64::Assembler),
+    refetch: &mut dyn FnMut(&mut crate::codegen::X64Asm),
     done: dynasmrt::DynamicLabel,
 ) -> bool {
     let miss = ops.new_dynamic_label();
@@ -197,14 +243,14 @@ env_off_switch! {
 /// to `settle`, any other failed guard to `miss`. `false` (nothing emitted)
 /// without a method plan for the site.
 pub(crate) fn emit_py_method_inline(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     ip: usize,
     instr: &Instr,
     miss: dynasmrt::DynamicLabel,
     settle: dynasmrt::DynamicLabel,
     done: dynasmrt::DynamicLabel,
 ) -> bool {
-    use crate::vm::host_api::{JIT_HOT_VALS_OFF, JIT_VERSIONS_RAW_OFFSET};
+    use crate::vm::host_api::{JIT_HOT_FID_OFF, JIT_HOT_VALS_OFF, JIT_VERSIONS_RAW_OFFSET};
     let Some(p) = plan_at(ip) else {
         return false;
     };
@@ -216,18 +262,28 @@ pub(crate) fn emit_py_method_inline(
     }
     let vals_off = JIT_HOT_VALS_OFF as i32;
     let ver_off = (p.ver_slot as i32) * 8;
-    // 1. The receiver: the planned shape; r8 = its vals, `cls` = vals[0].
+    // 1. The receiver: either a primitive non-empty flat `str` (sentinel
+    //    `shape::DICT`, checked via `FID_MIRROR_STR`) or a record of the
+    //    planned shape (`r8 = vals`, `cls = vals[0]`).
     dynasm!(ops ; mov rax, [rbx + dreg(obj)]);
     mirror_of_rax(ops, miss);
-    dynasm!(ops
-        ; cmp DWORD [r9 + r10 * 8], p.inst_shape as i32
-        ; jne => miss
-        ; mov r8, [r9 + r10 * 8 + vals_off]
-        ; mov rax, [r8]
-        ; mov rcx, QWORD p.cls_bits as i64
-        ; cmp rax, rcx
-        ; jne => miss
-    );
+    if p.inst_shape == crate::shape::DICT {
+        dynasm!(ops
+            ; cmp DWORD [r9 + r10 * 8 + JIT_HOT_FID_OFF as i32], crate::heap::FID_MIRROR_STR as i32
+            ; jne => miss
+            ; mov rax, QWORD p.cls_bits as i64
+        );
+    } else {
+        dynasm!(ops
+            ; cmp DWORD [r9 + r10 * 8], p.inst_shape as i32
+            ; jne => miss
+            ; mov r8, [r9 + r10 * 8 + vals_off]
+            ; mov rax, [r8]
+            ; mov rcx, QWORD p.cls_bits as i64
+            ; cmp rax, rcx
+            ; jne => miss
+        );
+    }
     // 2. The class: shape, `ver`, heap version (as an attribute site).
     mirror_of_rax(ops, miss);
     let cls_off = ops.new_dynamic_label();
@@ -272,7 +328,7 @@ pub(crate) fn emit_py_method_inline(
 /// mirror jumps to `settle`, any other failed guard to `miss`. `false`
 /// (nothing emitted) without a plan.
 fn emit_py_attr_inline(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     ip: usize,
     instr: &Instr,
     miss: dynasmrt::DynamicLabel,
@@ -366,5 +422,306 @@ fn emit_py_attr_inline(
         ; je => settle
         ; jmp => miss
     );
+    true
+}
+
+/// Inline `PyGetItem` for exact `list` and `tuple` records of `seq_shape`
+/// indexed by an immediate (small) int (positive or negative), reading straight
+/// through `hot_mirror` and `arr_mirror`. Jumps to `done` on hit; falls through
+/// to `miss` for dicts, out-of-range indices, holes, or dead mirrors.
+pub(super) fn emit_py_get_item_inline(
+    ops: &mut crate::codegen::X64Asm,
+    dst: u16,
+    o: u16,
+    k: u16,
+    seq: u16,
+    miss: dynasmrt::DynamicLabel,
+    done: dynasmrt::DynamicLabel,
+) -> bool {
+    use crate::vm::host_api::{
+        JIT_ARR_MIRROR_LEN_OFFSET, JIT_ARR_MIRROR_RAW_OFFSET, JIT_HOT_VALS_OFF,
+    };
+    let Some((seq_shape, _, t_tuple, _)) = seq_plan() else {
+        return false;
+    };
+    let cls_ok = ops.new_dynamic_label();
+    let nonneg = ops.new_dynamic_label();
+    let vals_off = JIT_HOT_VALS_OFF as i32;
+    dynasm!(ops ; mov rax, [rbx + dreg(o)]);
+    mirror_of_rax(ops, miss);
+    dynasm!(ops
+        ; cmp DWORD [r9 + r10 * 8], seq_shape as i32
+        ; jne => miss
+        ; mov r8, [r9 + r10 * 8 + vals_off]
+        ; mov rax, [r8]
+        ; cmp rax, [rbx + dreg(seq)]
+        ; je => cls_ok
+        ; mov rcx, QWORD t_tuple as i64
+        ; cmp rax, rcx
+        ; jne => miss
+        ; => cls_ok
+        ; mov rax, [r8 + 8]
+        ; mov r10, rax
+        ; shr r10, 48
+        ; cmp r10d, TAG_HEAP_HI as i32
+        ; jne => miss
+        ; mov ecx, eax
+        ; cmp ecx, DWORD [rdi + JIT_ARR_MIRROR_LEN_OFFSET as i32]
+        ; jae => miss
+        ; mov r9, [rdi + JIT_ARR_MIRROR_RAW_OFFSET as i32]
+        ; shl rcx, 4
+        ; add r9, rcx
+        ; mov r8, [r9]
+        ; test r8, r8
+        ; jz => miss
+    );
+    // Load small BigInt index `k` into rdx (reg 2); clobbers only rdx, r10.
+    py_load_small(ops, k, 2, miss);
+    dynasm!(ops
+        ; test rdx, rdx
+        ; jns => nonneg
+        ; add rdx, [r9 + 8]
+        ; js => miss
+        ; => nonneg
+        ; cmp rdx, [r9 + 8]
+        ; jae => miss
+        ; mov rax, [r8 + rdx * 8]
+        ; mov r10, QWORD crate::value::Value::HOLE.bits() as i64
+        ; cmp rax, r10
+        ; je => miss
+        ; mov r10, QWORD crate::value::Value::UNDEFINED.bits() as i64
+        ; cmp rax, r10
+        ; je => miss
+        ; mov [rbx + dreg(dst)], rax
+        ; jmp => done
+    );
+    true
+}
+
+/// Inline `PySetItem` for exact mutable `list` records of `seq_shape` (never
+/// tuples!) overwriting a present element at an in-bounds immediate int index.
+pub(super) fn emit_py_set_item_inline(
+    ops: &mut crate::codegen::X64Asm,
+    o: u16,
+    k: u16,
+    v: u16,
+    seq: u16,
+    miss: dynasmrt::DynamicLabel,
+    done: dynasmrt::DynamicLabel,
+) -> bool {
+    use crate::vm::host_api::{
+        JIT_ARR_MIRROR_LEN_OFFSET, JIT_ARR_MIRROR_RAW_OFFSET, JIT_HOT_VALS_OFF,
+    };
+    let Some((seq_shape, _, _, store_lane)) = seq_plan() else {
+        return false;
+    };
+    let nonneg = ops.new_dynamic_label();
+    let vals_off = JIT_HOT_VALS_OFF as i32;
+    dynasm!(ops ; mov rax, [rbx + dreg(o)]);
+    mirror_of_rax(ops, miss);
+    dynasm!(ops
+        ; cmp DWORD [r9 + r10 * 8], seq_shape as i32
+        ; jne => miss
+        ; mov r8, [r9 + r10 * 8 + vals_off]
+        ; mov rax, [r8]
+        ; cmp rax, [rbx + dreg(seq)]
+        ; jne => miss
+        ; mov rax, [r8 + 8]
+        ; mov r10, rax
+        ; shr r10, 48
+        ; cmp r10d, TAG_HEAP_HI as i32
+        ; jne => miss
+        ; mov ecx, eax
+        ; cmp ecx, DWORD [rdi + JIT_ARR_MIRROR_LEN_OFFSET as i32]
+        ; jae => miss
+        ; mov r9, [rdi + JIT_ARR_MIRROR_RAW_OFFSET as i32]
+        ; shl rcx, 4
+        ; add r9, rcx
+        ; mov r8, [r9]
+        ; test r8, r8
+        ; jz => miss
+    );
+    // Load small BigInt index `k` into r11 (reg 11); preserves rax, r8, r9.
+    py_load_small(ops, k, 11, miss);
+    dynasm!(ops
+        ; test r11, r11
+        ; jns => nonneg
+        ; add r11, [r9 + 8]
+        ; js => miss
+        ; => nonneg
+        ; cmp r11, [r9 + 8]
+        ; jae => miss
+        ; mov r10, QWORD crate::value::Value::HOLE.bits() as i64
+        ; cmp [r8 + r11 * 8], r10
+        ; je => miss
+        ; mov r10, [rbx + dreg(v)]
+        ; mov [r8 + r11 * 8], r10
+        ; mov r9, r10
+        ; shr r9, 48
+        ; cmp r9d, TAG_HEAP_HI as i32
+        ; jne => done
+        ; mov edx, eax
+        ; mov r8, r10
+    );
+    emit_heap_store_barrier(ops, store_lane, done);
+    true
+}
+
+/// Inline `PyUnpack` for exact `tuple` or `list` records of `seq_shape` whose
+/// live `arr_mirror` length equals `n`.
+pub(super) fn emit_py_unpack_inline(
+    ops: &mut crate::codegen::X64Asm,
+    dst: u16,
+    v: u16,
+    n: u32,
+    miss: dynasmrt::DynamicLabel,
+    done: dynasmrt::DynamicLabel,
+) -> bool {
+    use crate::vm::host_api::{
+        JIT_ARR_MIRROR_LEN_OFFSET, JIT_ARR_MIRROR_RAW_OFFSET, JIT_HOT_VALS_OFF,
+    };
+    let Some((seq_shape, t_list, t_tuple, _)) = seq_plan() else {
+        return false;
+    };
+    let cls_ok = ops.new_dynamic_label();
+    let vals_off = JIT_HOT_VALS_OFF as i32;
+    dynasm!(ops ; mov rax, [rbx + dreg(v)]);
+    mirror_of_rax(ops, miss);
+    dynasm!(ops
+        ; cmp DWORD [r9 + r10 * 8], seq_shape as i32
+        ; jne => miss
+        ; mov r8, [r9 + r10 * 8 + vals_off]
+        ; mov rax, [r8]
+        ; mov rcx, QWORD t_tuple as i64
+        ; cmp rax, rcx
+        ; je => cls_ok
+        ; mov rcx, QWORD t_list as i64
+        ; cmp rax, rcx
+        ; jne => miss
+        ; => cls_ok
+        ; mov rax, [r8 + 8]
+        ; mov r10, rax
+        ; shr r10, 48
+        ; cmp r10d, TAG_HEAP_HI as i32
+        ; jne => miss
+        ; mov ecx, eax
+        ; cmp ecx, DWORD [rdi + JIT_ARR_MIRROR_LEN_OFFSET as i32]
+        ; jae => miss
+        ; mov r9, [rdi + JIT_ARR_MIRROR_RAW_OFFSET as i32]
+        ; shl rcx, 4
+        ; add r9, rcx
+        ; cmp QWORD [r9], 0
+        ; je => miss
+        ; mov r10, QWORD (n as u64) as i64
+        ; cmp [r9 + 8], r10
+        ; jne => miss
+        ; mov [rbx + dreg(dst)], rax
+        ; jmp => done
+    );
+    true
+}
+
+/// Inline `PyLen` for exact `list` or `tuple` records of `seq_shape` with a
+/// live `arr_mirror`.
+pub(super) fn emit_py_len_inline(
+    ops: &mut crate::codegen::X64Asm,
+    dst: u16,
+    v: u16,
+    miss: dynasmrt::DynamicLabel,
+    done: dynasmrt::DynamicLabel,
+) -> bool {
+    use crate::vm::host_api::{
+        JIT_ARR_MIRROR_LEN_OFFSET, JIT_ARR_MIRROR_RAW_OFFSET, JIT_HOT_VALS_OFF,
+    };
+    let Some((seq_shape, t_list, t_tuple, _)) = seq_plan() else {
+        return false;
+    };
+    let cls_ok = ops.new_dynamic_label();
+    let vals_off = JIT_HOT_VALS_OFF as i32;
+    dynasm!(ops ; mov rax, [rbx + dreg(v)]);
+    mirror_of_rax(ops, miss);
+    dynasm!(ops
+        ; cmp DWORD [r9 + r10 * 8], seq_shape as i32
+        ; jne => miss
+        ; mov r8, [r9 + r10 * 8 + vals_off]
+        ; mov rax, [r8]
+        ; mov rcx, QWORD t_list as i64
+        ; cmp rax, rcx
+        ; je => cls_ok
+        ; mov rcx, QWORD t_tuple as i64
+        ; cmp rax, rcx
+        ; jne => miss
+        ; => cls_ok
+        ; mov rax, [r8 + 8]
+        ; mov r10, rax
+        ; shr r10, 48
+        ; cmp r10d, TAG_HEAP_HI as i32
+        ; jne => miss
+        ; mov ecx, eax
+        ; cmp ecx, DWORD [rdi + JIT_ARR_MIRROR_LEN_OFFSET as i32]
+        ; jae => miss
+        ; mov r9, [rdi + JIT_ARR_MIRROR_RAW_OFFSET as i32]
+        ; shl rcx, 4
+        ; add r9, rcx
+        ; cmp QWORD [r9], 0
+        ; je => miss
+        ; mov r8, [r9 + 8]
+    );
+    py_store_small(ops, dst, miss);
+    dynasm!(ops ; jmp => done);
+    true
+}
+
+/// Inline `PyCall` for a `math.sqrt(x)` site (`strop == 11`) on a non-negative
+/// float: checks the builtin record's identity, shape, version, entry and
+/// `strop == 11`, then runs `sqrtsd` directly without a C call or GC refetch.
+pub(super) fn emit_py_sqrt_inline(
+    ops: &mut crate::codegen::X64Asm,
+    ip: usize,
+    dst: u16,
+    f: u16,
+    arg_base: u16,
+    miss: dynasmrt::DynamicLabel,
+    done: dynasmrt::DynamicLabel,
+) -> bool {
+    use crate::vm::host_api::{JIT_HOT_VALS_OFF, JIT_VERSIONS_RAW_OFFSET};
+    let Some(p) = sqrt_plan_at(ip) else {
+        return false;
+    };
+    let vals_off = JIT_HOT_VALS_OFF as i32;
+    let entry_off = (p.entry_slot as i32) * 8;
+    let strop_off = (p.strop_slot as i32) * 8;
+    dynasm!(ops
+        ; mov rax, [rbx + dreg(f)]
+        ; mov rcx, QWORD p.f_bits as i64
+        ; cmp rax, rcx
+        ; jne => miss
+    );
+    mirror_of_rax(ops, miss);
+    dynasm!(ops
+        ; cmp DWORD [r9 + r10 * 8], p.f_shape as i32
+        ; jne => miss
+        ; mov rcx, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
+        ; cmp DWORD [rcx + r10 * 4], p.hver as i32
+        ; jne => miss
+        ; mov r8, [r9 + r10 * 8 + vals_off]
+        ; mov rax, [r8 + entry_off]
+        ; mov rcx, QWORD p.entry_bits as i64
+        ; cmp rax, rcx
+        ; jne => miss
+        ; mov rax, [r8 + strop_off]
+        ; mov rcx, QWORD crate::value::Value::int(11).bits() as i64
+        ; cmp rax, rcx
+        ; jne => miss
+    );
+    py_load_num(ops, arg_base, 0, miss);
+    dynasm!(ops
+        ; xorps xmm2, xmm2
+        ; ucomisd xmm0, xmm2
+        ; jb => miss
+        ; sqrtsd xmm0, xmm0
+    );
+    py_store_num(ops, dst);
+    dynasm!(ops ; jmp => done);
     true
 }

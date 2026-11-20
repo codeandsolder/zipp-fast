@@ -80,7 +80,7 @@ pub(crate) struct Meter {
 /// and fusion never spans one, so in practice there is nothing to drop.
 #[inline]
 pub(crate) fn emit_charge(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     m: &Meter,
     len: u32,
     stub: dynasmrt::DynamicLabel,
@@ -130,7 +130,7 @@ pub(crate) fn block_map_split(
 ///
 /// Returns whether a check was emitted; a `true` means CPU flags were clobbered.
 pub(crate) fn charge_block(
-    ops: &mut dynasmrt::x64::Assembler,
+    ops: &mut crate::codegen::X64Asm,
     bm: &BlockMap,
     ip: usize,
     exit_stubs: &mut rustc_hash::FxHashMap<u32, dynasmrt::DynamicLabel>,

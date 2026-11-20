@@ -354,6 +354,76 @@ pub const ANNEXB_REF_ERROR_NAME: &str = "__zipp_annexb_ref_error__";
 /// natives added by ongoing engine work.
 pub const HOST_CALL: u16 = 950;
 pub const HOST_CALL_NAME: &str = "__zippHostCall";
+
+// PHP frontend private natives (`Program::php_natives`). Bound by slot ONLY in
+// programs built by `lang::php`, so JavaScript programs never see them.
+#[cfg_attr(not(feature = "php"), allow(dead_code))]
+pub const PHP_OUTPUT: u16 = 2200;
+#[cfg_attr(not(feature = "php"), allow(dead_code))]
+pub const PHP_OUTPUT_NAME: &str = "__zipp_php_output";
+#[cfg_attr(not(feature = "php"), allow(dead_code))]
+pub const PHP_INCLUDE: u16 = 2201;
+#[cfg_attr(not(feature = "php"), allow(dead_code))]
+pub const PHP_INCLUDE_NAME: &str = "__zipp_php_include";
+#[cfg_attr(not(feature = "php"), allow(dead_code))]
+pub const PHP_FS: u16 = 2202;
+#[cfg_attr(not(feature = "php"), allow(dead_code))]
+pub const PHP_FS_NAME: &str = "__zipp_php_fs";
+#[cfg_attr(not(feature = "php"), allow(dead_code))]
+pub const PHP_CRYPTO: u16 = 2203;
+#[cfg_attr(not(feature = "php"), allow(dead_code))]
+pub const PHP_CRYPTO_NAME: &str = "__zipp_php_crypto";
+#[cfg_attr(not(feature = "php"), allow(dead_code))]
+pub const PHP_ENV: u16 = 2204;
+#[cfg_attr(not(feature = "php"), allow(dead_code))]
+pub const PHP_ENV_NAME: &str = "__zipp_php_env";
+#[cfg_attr(not(feature = "php"), allow(dead_code))]
+pub const PHP_SAPI: u16 = 2205;
+#[cfg_attr(not(feature = "php"), allow(dead_code))]
+pub const PHP_SAPI_NAME: &str = "__zipp_php_sapi";
+#[cfg_attr(not(feature = "php"), allow(dead_code))]
+pub const PHP_MAP_KV: u16 = 2206;
+#[cfg_attr(not(feature = "php"), allow(dead_code))]
+pub const PHP_MAP_KV_NAME: &str = "__zipp_php_map_kv";
+#[cfg_attr(not(feature = "php"), allow(dead_code))]
+pub const PHP_SQL: u16 = 2207;
+#[cfg_attr(not(feature = "php"), allow(dead_code))]
+pub const PHP_SQL_NAME: &str = "__zipp_php_sql";
+
+// Rust frontend private natives (`Program::rust_natives`). Bound by slot ONLY in
+// programs built by `lang::rust`, so JavaScript/Python/PHP programs never see them.
+#[cfg_attr(not(feature = "rust"), allow(dead_code))]
+pub const RS_IO: u16 = 2300;
+#[cfg_attr(not(feature = "rust"), allow(dead_code))]
+pub const RS_IO_NAME: &str = "__zipp_rs_io";
+#[cfg_attr(not(feature = "rust"), allow(dead_code))]
+pub const RS_FS: u16 = 2301;
+#[cfg_attr(not(feature = "rust"), allow(dead_code))]
+pub const RS_FS_NAME: &str = "__zipp_rs_fs";
+#[cfg_attr(not(feature = "rust"), allow(dead_code))]
+pub const RS_ENV: u16 = 2302;
+#[cfg_attr(not(feature = "rust"), allow(dead_code))]
+pub const RS_ENV_NAME: &str = "__zipp_rs_env";
+#[cfg_attr(not(feature = "rust"), allow(dead_code))]
+pub const RS_TIME: u16 = 2303;
+#[cfg_attr(not(feature = "rust"), allow(dead_code))]
+pub const RS_TIME_NAME: &str = "__zipp_rs_time";
+#[cfg_attr(not(feature = "rust"), allow(dead_code))]
+pub const RS_NET: u16 = 2304;
+#[cfg_attr(not(feature = "rust"), allow(dead_code))]
+pub const RS_NET_NAME: &str = "__zipp_rs_net";
+#[cfg_attr(not(feature = "rust"), allow(dead_code))]
+pub const RS_CRYPTO: u16 = 2305;
+#[cfg_attr(not(feature = "rust"), allow(dead_code))]
+pub const RS_CRYPTO_NAME: &str = "__zipp_rs_crypto";
+#[cfg_attr(not(feature = "rust"), allow(dead_code))]
+pub const RS_PROC: u16 = 2306;
+#[cfg_attr(not(feature = "rust"), allow(dead_code))]
+pub const RS_PROC_NAME: &str = "__zipp_rs_proc";
+#[cfg_attr(not(feature = "rust"), allow(dead_code))]
+pub const RS_SQLITE: u16 = 2307;
+#[cfg_attr(not(feature = "rust"), allow(dead_code))]
+pub const RS_SQLITE_NAME: &str = "__zipp_rs_sqlite";
 /// The Python runtime's native tensor loops (`vm::py_tensor`), bound to the
 /// reserved global below only in a program the Python frontend built
 /// (`Program::python_natives`): an ordinary JavaScript program never sees it.
@@ -377,6 +447,15 @@ pub const PY_COMPILE_NAME: &str = "__zipp_py_compile";
 pub const PY_VFS_READ: u16 = 1991;
 #[cfg_attr(not(feature = "python"), allow(dead_code))]
 pub const PY_VFS_READ_NAME: &str = "__zipp_py_vfs_read";
+/// Named native bridge call for installed Python packages
+/// (`__zipp_py_pkg_call(pkg, op, ...args)`): dispatches to a bridge registered
+/// with `python_packages::set_package_bridge(pkg, ...)` or falls back to the
+/// VM's sandboxed host hook under `app.<pkg>.<op>`. Bound like [`PY_TENSOR`],
+/// only in a Python program.
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_PKG_CALL: u16 = 1992;
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_PKG_CALL_NAME: &str = "__zipp_py_pkg_call";
 /// The Python runtime's string query (`vm::py_ops`): whether a string holds
 /// any UTF-16 surrogate unit, answered from the heap string's ASCII flag
 /// when it can be. Bound like [`PY_TENSOR`], only in a Python program.
@@ -1832,12 +1911,46 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         GLOBAL_ESCAPE => ("escape", 1),
         GLOBAL_UNESCAPE => ("unescape", 1),
         HOST_CALL => (HOST_CALL_NAME, 1),
+        #[cfg(feature = "php")]
+        PHP_OUTPUT => ("", 1),
+        #[cfg(feature = "php")]
+        PHP_INCLUDE => ("", 3),
+        #[cfg(feature = "php")]
+        PHP_FS => ("", 4),
+        #[cfg(feature = "php")]
+        PHP_CRYPTO => ("", 4),
+        #[cfg(feature = "php")]
+        PHP_ENV => ("", 0),
+        #[cfg(feature = "php")]
+        PHP_SAPI => ("", 2),
+        #[cfg(feature = "php")]
+        PHP_MAP_KV => ("", 1),
+        #[cfg(feature = "php")]
+        PHP_SQL => ("", 4),
+        #[cfg(feature = "rust")]
+        RS_IO => ("", 2),
+        #[cfg(feature = "rust")]
+        RS_FS => ("", 4),
+        #[cfg(feature = "rust")]
+        RS_ENV => ("", 3),
+        #[cfg(feature = "rust")]
+        RS_TIME => ("", 2),
+        #[cfg(feature = "rust")]
+        RS_NET => ("", 4),
+        #[cfg(feature = "rust")]
+        RS_CRYPTO => ("", 3),
+        #[cfg(feature = "rust")]
+        RS_PROC => ("", 2),
+        #[cfg(feature = "rust")]
+        RS_SQLITE => ("", 4),
         #[cfg(feature = "python")]
         PY_TENSOR => ("", 0),
         #[cfg(feature = "python")]
         PY_COMPILE => ("", 1),
         #[cfg(feature = "python")]
         PY_VFS_READ => ("", 1),
+        #[cfg(feature = "python")]
+        PY_PKG_CALL => ("", 2),
         #[cfg(feature = "python")]
         PY_STR => ("", 1),
         #[cfg(feature = "python")]

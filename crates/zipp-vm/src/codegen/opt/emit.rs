@@ -39,12 +39,13 @@ const X1: u8 = 1;
 const X2: u8 = 2;
 const X3: u8 = 3;
 
-type Asm = dynasmrt::x64::Assembler;
+type Asm = crate::codegen::X64Asm;
 
 struct Em<'a> {
     ops: Asm,
     f: &'a Func,
     a: &'a Alloc,
+    prop_key_ids: &'a [u32],
     slot_base: i32,
     stubs: Vec<DynamicLabel>,
     epilogue: DynamicLabel,
@@ -57,6 +58,62 @@ struct Em<'a> {
     ta_write: DynamicLabel,
     /// The 64-byte scratch of Tier C's cross-call lanes (`emit_cross3_invoke`).
     c3: i32,
+    /// Per-function lazy direct stubs shared across all ops in this body.
+    eq_stub: Option<DynamicLabel>,
+    truthy_stub: Option<DynamicLabel>,
+    loose_eq_stub: Option<DynamicLabel>,
+    is_array_stub: Option<DynamicLabel>,
+    keyed_get_stub: Option<DynamicLabel>,
+    mega_prop_stubs: Option<(DynamicLabel, DynamicLabel)>,
+    mega_set_stubs: Option<(DynamicLabel, DynamicLabel)>,
+    #[cfg(not(feature = "safe-sandbox"))]
+    instanceof_pair_stub: Option<DynamicLabel>,
+    cross3_dyn_stub: Option<DynamicLabel>,
+    fn_call_dyn_stub: Option<DynamicLabel>,
+    fn_get_call_stub: Option<DynamicLabel>,
+    /// Deferred non-deopt bail stubs: `(label, fs_id, ip)`.
+    plain_bails: Vec<(DynamicLabel, u32, u32)>,
+    /// Per-block cache of `(bytecode_reg, ssa_value)` already boxed into
+    /// `[rbx + 8*r]` by an earlier unconditional `write_state` in this block.
+    window_known: Vec<(u16, V)>,
+}
+
+impl Em<'_> {
+    fn invalidate_window_reg(&mut self, reg: u16) {
+        self.window_known.retain(|&(r, _)| r != reg);
+    }
+
+    fn add_plain_bail(&mut self, s: u32, ip: u32) -> DynamicLabel {
+        let lbl = self.ops.new_dynamic_label();
+        self.plain_bails.push((lbl, s, ip));
+        lbl
+    }
+
+    fn prop_key_id(&self, name: u32) -> u32 {
+        self.prop_key_ids.get(name as usize).copied().unwrap_or(0)
+    }
+
+    fn mega_prop_lbl(&mut self, direct: bool) -> DynamicLabel {
+        let (full, dict) = *self
+            .mega_prop_stubs
+            .get_or_insert_with(|| (self.ops.new_dynamic_label(), self.ops.new_dynamic_label()));
+        if direct { full } else { dict }
+    }
+
+    fn mega_set_lbl(&mut self, direct: bool) -> DynamicLabel {
+        let (full, dict) = *self
+            .mega_set_stubs
+            .get_or_insert_with(|| (self.ops.new_dynamic_label(), self.ops.new_dynamic_label()));
+        if direct { full } else { dict }
+    }
+
+    fn can_cross3_dyn(&self) -> bool {
+        crate::codegen::cross3_enabled()
+            && crate::codegen::cross3_dyn_enabled()
+            && crate::codegen::cross3_inline_enabled()
+            && crate::codegen::cross3_grow_enabled()
+            && crate::codegen::cross3_sloppy_enabled()
+    }
 }
 
 /// The cross-call lanes' scratch bytes.
@@ -74,13 +131,22 @@ impl Em<'_> {
         self.f.insts[v as usize].rep
     }
 
-    /// `v`'s GPR, loading a spilled one into `scratch`.
+    /// `v`'s GPR, loading a spilled one or materializing an immediate into `scratch`.
     fn gpr(&mut self, v: V, scratch: u8) -> u8 {
         match self.a.loc[v as usize] {
             Loc::Gpr(r) => r,
             Loc::Slot(s) => {
                 let off = self.slot(s);
                 dynasm!(self.ops ; mov Rq(scratch), [rsp + off]);
+                scratch
+            }
+            Loc::Imm => {
+                match self.f.insts[v as usize].op {
+                    Op::ConstI32(c) => dynasm!(self.ops ; mov Rd(scratch), c),
+                    Op::ConstBool(b) => dynasm!(self.ops ; mov Rd(scratch), i32::from(b)),
+                    Op::ConstTagged(bits) => dynasm!(self.ops ; mov Rq(scratch), QWORD bits as i64),
+                    _ => unreachable!("non-constant op allocated to Loc::Imm"),
+                }
                 scratch
             }
             Loc::Xmm(_) => unreachable!("value {v} is not in the GPR class"),
@@ -96,7 +162,7 @@ impl Em<'_> {
                 dynasm!(self.ops ; movsd Rx(scratch), QWORD [rsp + off]);
                 scratch
             }
-            Loc::Gpr(_) => unreachable!("value {v} is not in the XMM class"),
+            Loc::Gpr(_) | Loc::Imm => unreachable!("value {v} is not in the XMM class"),
         }
     }
 
@@ -105,7 +171,7 @@ impl Em<'_> {
         match self.a.loc[v as usize] {
             Loc::Gpr(r) => (r, None),
             Loc::Slot(s) => (R10, Some(self.slot(s))),
-            Loc::Xmm(_) => unreachable!(),
+            Loc::Xmm(_) | Loc::Imm => unreachable!(),
         }
     }
 
@@ -113,7 +179,7 @@ impl Em<'_> {
         match self.a.loc[v as usize] {
             Loc::Xmm(r) => (r, None),
             Loc::Slot(s) => (X3, Some(self.slot(s))),
-            Loc::Gpr(_) => unreachable!(),
+            Loc::Gpr(_) | Loc::Imm => unreachable!(),
         }
     }
 
@@ -134,7 +200,7 @@ impl Em<'_> {
     /// that declined (the interpreter makes the op) or threw (it unwinds)
     /// leaves the body at `ip`, the window already holding the state.
     fn call_out(&mut self, s: u32, helper: u64, ip: u32, packed: u64, argc: u16) {
-        self.write_state(s);
+        self.write_state_cond(s);
         self.call_written(helper, ip, packed, argc);
     }
 
@@ -143,17 +209,34 @@ impl Em<'_> {
     /// a lane that makes the call leaves its result in the window's `dst`
     /// register and jumps to the returned label; every miss falls through to
     /// the call-out's helper after them. A throw leaves the body at `ip`.
-    fn cross_lanes(&mut self, lane: CallLane, ip: u32) -> Option<(DynamicLabel, u16)> {
+    fn cross_lanes(&mut self, lane: CallLane, ip: u32, packed: u64, argc: u16) -> Option<(DynamicLabel, u16)> {
         use super::super::{emit_cross3_call, emit_cross3_method_call, Cross3Callee};
         let f = self.f;
-        let site = *f.cross.get(&ip)?;
         let heap = f.heap.as_ref()?;
-        let arms = !site.cross3.is_empty();
-        let own = site.cross3m.filter(|_| super::super::tierc_cross3m_enabled());
+        let site = f.cross.get(&ip).copied();
+        let dyn_ok = self.can_cross3_dyn() && argc <= 255;
+        let arms = site.is_some_and(|s| !s.cross3.is_empty() && (!dyn_ok || s.cross3.len() <= 1));
+        let own = site
+            .and_then(|s| s.cross3m)
+            .filter(|_| super::super::tierc_cross3m_enabled());
+        let class_guard = f.class_read.get(&ip).copied();
+        let proto_guard = site.and_then(|s| s.proto_read);
+        let class_method = site.is_some_and(|s| s.class_method);
+        let has_class_lane = class_method
+            && (arms || (dyn_ok && (class_guard.is_some() || proto_guard.is_some())));
+        let mega_key_id = match lane {
+            CallLane::Method { mega_ok: true, .. }
+                if dyn_ok && !crate::vm::icstats_enabled() =>
+            {
+                self.prop_key_id((packed >> 32) as u32)
+            }
+            _ => 0,
+        };
+        let has_method_lane = has_class_lane || mega_key_id != 0;
         let dst = match lane {
             CallLane::None => return None,
-            CallLane::Plain { dst, .. } if arms => dst,
-            CallLane::Method { dst, .. } if own.is_some() || (site.class_method && arms) => dst,
+            CallLane::Plain { dst, .. } if arms || dyn_ok => dst,
+            CallLane::Method { dst, .. } if own.is_some() || has_method_lane => dst,
             _ => return None,
         };
         let (cross_done, bail, over) = (
@@ -178,21 +261,53 @@ impl Em<'_> {
                 arg_base,
                 dst,
             } => {
-                for arm in site.cross3.iter() {
-                    emit_cross3_call(
-                        &mut self.ops,
-                        arm,
-                        Cross3Callee::Reg(callee),
-                        this,
-                        arg_base,
-                        dst,
-                        regs,
-                        c3,
-                        heap,
-                        bail,
-                        cross_done,
-                        false,
-                        None,
+                if arms {
+                    if let Some(site) = site {
+                        for arm in site.cross3.iter() {
+                            emit_cross3_call(
+                                &mut self.ops,
+                                arm,
+                                Cross3Callee::Reg(callee),
+                                this,
+                                arg_base,
+                                dst,
+                                regs,
+                                c3,
+                                heap,
+                                bail,
+                                cross_done,
+                                false,
+                                None,
+                            );
+                        }
+                    }
+                }
+                if dyn_ok {
+                    let stub = *self.cross3_dyn_stub.get_or_insert_with(|| self.ops.new_dynamic_label());
+                    let dyn_miss = self.ops.new_dynamic_label();
+                    dynasm!(self.ops
+                        ; mov rax, [rbx + 8 * callee as i32]
+                        ; lea r8, [rbx + 8 * arg_base as i32]
+                    );
+                    if let Some(t) = this {
+                        dynasm!(self.ops
+                            ; mov rdx, [rbx + 8 * t as i32]
+                            ; mov ecx, (0x100 | argc as i32)
+                        );
+                    } else {
+                        dynasm!(self.ops ; mov ecx, argc as i32);
+                    }
+                    dynasm!(self.ops
+                        ; call => stub
+                        ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => dyn_miss
+                        ; mov r10, QWORD crate::codegen::CALL_THREW as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov [rbx + 8 * dst as i32], rax
+                        ; jmp => cross_done
+                        ; => dyn_miss
                     );
                 }
             }
@@ -213,63 +328,149 @@ impl Em<'_> {
                         None,
                     );
                 }
-                if site.class_method && arms {
-                    // The method the receiver's class has, looked up and
-                    // not called, then called by the arm naming its fid.
+                if has_method_lane {
                     let lookup_miss = self.ops.new_dynamic_label();
-                    let fip = ((f.func_id as u64) << 32 | ip as u64) as i64;
-                    dynasm!(self.ops
-                        ; mov rcx, rdi
-                        ; mov rdx, [rbx + 8 * obj as i32]
-                        ; mov r8, QWORD fip
-                        ; mov rax, QWORD crate::vm::jit_method_callee as *const () as i64
-                        ; call rax
-                        ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
-                        ; cmp rax, r10
-                        ; je => lookup_miss
-                        ; mov [rsp + c3 + 48], rax
-                    );
-                    for arm in site.cross3.iter() {
-                        emit_cross3_call(
-                            &mut self.ops,
-                            arm,
-                            Cross3Callee::Stash,
-                            Some(obj),
-                            arg_base,
-                            dst,
-                            regs,
-                            c3,
-                            heap,
-                            bail,
-                            cross_done,
-                            false,
-                            None,
+                    let have_callee = self.ops.new_dynamic_label();
+                    let dyn_only = !(has_class_lane && arms);
+                    let have_mega = mega_key_id != 0;
+                    if let Some(lane) = has_class_lane.then_some(class_guard).flatten() {
+                        let guard_miss = if dyn_only && !have_mega {
+                            lookup_miss
+                        } else {
+                            self.ops.new_dynamic_label()
+                        };
+                        crate::codegen::proto_mem::emit_class_read_guard(&mut self.ops, obj, &lane, guard_miss);
+                        dynasm!(self.ops
+                            ; mov rax, QWORD lane.value as i64
+                            ; jmp => have_callee
+                        );
+                        if !dyn_only || have_mega {
+                            dynasm!(self.ops ; => guard_miss);
+                        }
+                    } else if let Some(plane) = has_class_lane.then_some(proto_guard).flatten() {
+                        let guard_miss = if dyn_only && !have_mega {
+                            lookup_miss
+                        } else {
+                            self.ops.new_dynamic_label()
+                        };
+                        crate::codegen::proto_mem::emit_proto_read_guard(&mut self.ops, obj, &plane, guard_miss);
+                        dynasm!(self.ops ; jmp => have_callee);
+                        if !dyn_only || have_mega {
+                            dynasm!(self.ops ; => guard_miss);
+                        }
+                    }
+                    if have_mega {
+                        let full_lbl = self.mega_prop_lbl(true);
+                        dynasm!(self.ops
+                            ; mov rdx, [rbx + 8 * obj as i32]
+                            ; mov ecx, mega_key_id as i32
+                            ; mov r8d, -1
+                            ; call => full_lbl
+                            ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
+                            ; cmp rax, r10
+                        );
+                        if dyn_only {
+                            dynasm!(self.ops ; je => lookup_miss);
+                        } else {
+                            dynasm!(self.ops ; jne => have_callee);
+                        }
+                    }
+                    if !dyn_only {
+                        let fip = ((f.func_id as u64) << 32 | ip as u64) as i64;
+                        dynasm!(self.ops
+                            ; mov rcx, rdi
+                            ; mov rdx, [rbx + 8 * obj as i32]
+                            ; mov r8, QWORD fip
+                            ; mov rax, QWORD crate::vm::jit_method_callee as *const () as i64
+                            ; call rax
+                            ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
+                            ; cmp rax, r10
+                            ; je => lookup_miss
+                        );
+                    }
+                    dynasm!(self.ops ; => have_callee);
+                    if !dyn_only {
+                        if let Some(site) = site {
+                            dynasm!(self.ops ; mov [rsp + c3 + 48], rax);
+                            for arm in site.cross3.iter() {
+                                emit_cross3_call(
+                                    &mut self.ops,
+                                    arm,
+                                    Cross3Callee::Stash,
+                                    Some(obj),
+                                    arg_base,
+                                    dst,
+                                    regs,
+                                    c3,
+                                    heap,
+                                    bail,
+                                    cross_done,
+                                    false,
+                                    None,
+                                );
+                            }
+                            if dyn_ok {
+                                dynasm!(self.ops ; mov rax, [rsp + c3 + 48]);
+                            }
+                        }
+                    }
+                    if dyn_ok {
+                        let stub = *self.cross3_dyn_stub.get_or_insert_with(|| self.ops.new_dynamic_label());
+                        dynasm!(self.ops
+                            ; mov rdx, [rbx + 8 * obj as i32]
+                            ; lea r8, [rbx + 8 * arg_base as i32]
+                            ; mov ecx, (0x100 | argc as i32)
+                            ; call => stub
+                            ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
+                            ; cmp rax, r10
+                            ; je => lookup_miss
+                            ; mov r10, QWORD crate::codegen::CALL_THREW as i64
+                            ; cmp rax, r10
+                            ; je => bail
+                            ; mov [rbx + 8 * dst as i32], rax
+                            ; jmp => cross_done
                         );
                     }
                     dynasm!(self.ops ; => lookup_miss);
                 }
             }
-            CallLane::None | CallLane::Prop { .. } => unreachable!(),
+            CallLane::None | CallLane::Prop { .. } | CallLane::SetProp { .. } => unreachable!(),
         }
         Some((cross_done, dst))
     }
 
     /// A slow property read's inline cache probe, Tier C's (`emit_ic_probe`
-    /// and its miss helper, which fills the site), over the window the frame
+    /// and its mega-prop / miss stub, which fills the site), over the window the frame
     /// state fills: a hit or a filled miss stores the value to the window's
     /// `dst` register and jumps to the returned label; anything else (an
     /// accessor, a receiver the cache does not take) falls through to the
     /// read's helper. r13 and r14 hold the cache's bases meanwhile, saved in
     /// the scratch.
-    fn prop_ic(&mut self, obj: u16, dst: u16, name: u32, ip: u32) -> Option<DynamicLabel> {
+    fn prop_ic(&mut self, obj: u16, dst: u16, name: u32, is_call: bool, ip: u32) -> Option<DynamicLabel> {
         use super::super::{emit_ic_probe, IcProbe, JIT_IC_STRIDE, JIT_IC_WAYS, PROP_VIA_IC};
         let (site, direct) = *self.f.ic_sites.get(&ip)?;
         let heap = self.f.heap?;
+        let key_id = self.prop_key_id(name);
+        let mega_lbl = (!crate::vm::icstats_enabled() && key_id != 0).then(|| self.mega_prop_lbl(direct));
         let (done, hit, decline) = (
             self.ops.new_dynamic_label(),
             self.ops.new_dynamic_label(),
             self.ops.new_dynamic_label(),
         );
+        if is_call {
+            let stub = *self.fn_get_call_stub.get_or_insert_with(|| self.ops.new_dynamic_label());
+            let miss = self.ops.new_dynamic_label();
+            dynasm!(self.ops
+                ; mov rax, [rbx + 8 * obj as i32]
+                ; call => stub
+                ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
+                ; cmp rax, r10
+                ; je => miss
+                ; mov [rbx + 8 * dst as i32], rax
+                ; jmp => done
+                ; => miss
+            );
+        }
         let off = (site as usize * JIT_IC_WAYS * JIT_IC_STRIDE) as i32;
         let packed = ((self.f.func_id as u64) << 32) | name as u64;
         let c3 = self.c3;
@@ -280,13 +481,26 @@ impl Em<'_> {
             ; mov r14, [rdi + crate::vm::host_api::JIT_IC_TABLE_RAW_OFFSET as i32]
         );
         emit_ic_probe(&mut self.ops, IcProbe::Get { dst }, obj, off, hit, None, direct);
+        if let Some(lbl) = mega_lbl {
+            dynasm!(self.ops
+                ; mov rdx, rax
+                ; mov r8d, site as i32
+                ; mov r9, QWORD packed as i64
+                ; mov ecx, key_id as i32
+                ; call => lbl
+            );
+        } else {
+            let miss_fn = heap.get_prop_miss;
+            dynasm!(self.ops
+                ; mov rcx, rdi
+                ; mov rdx, rax
+                ; mov r8d, site as i32
+                ; mov r9, QWORD packed as i64
+                ; mov rax, QWORD miss_fn as i64
+                ; call rax
+            );
+        }
         dynasm!(self.ops
-            ; mov rcx, rdi
-            ; mov rdx, rax                        // the receiver, as the probe left it
-            ; mov r8d, site as i32
-            ; mov r9, QWORD packed as i64
-            ; mov rax, QWORD heap.get_prop_miss as i64
-            ; call rax
             ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
             ; cmp rax, r10
             ; je => decline
@@ -305,12 +519,87 @@ impl Em<'_> {
         Some(done)
     }
 
+    /// A slow property store's inline cache probe (`emit_ic_probe(IcProbe::Set)`
+    /// + `mega_set_prop_stub` / `jit_set_prop_miss`), over the window the frame
+    /// state fills: a hit or committed miss jumps to the returned label; any
+    /// decline falls through to `jit_set_prop_slow`.
+    fn set_prop_ic(&mut self, obj: u16, val: u16, name: u32, ip: u32) -> Option<DynamicLabel> {
+        use super::super::{emit_ic_probe, IcProbe, JIT_IC_STRIDE, JIT_IC_WAYS, PROP_VIA_IC};
+        let (site, direct) = *self.f.ic_sites.get(&ip)?;
+        let heap = self.f.heap?;
+        let key_id = self.prop_key_id(name);
+        let mega_lbl = (!crate::vm::icstats_enabled() && key_id != 0).then(|| self.mega_set_lbl(direct));
+        let (done, hit, decline) = (
+            self.ops.new_dynamic_label(),
+            self.ops.new_dynamic_label(),
+            self.ops.new_dynamic_label(),
+        );
+        let off = (site as usize * JIT_IC_WAYS * JIT_IC_STRIDE) as i32;
+        let packed = ((self.f.func_id as u64) << 32) | name as u64;
+        let c3 = self.c3;
+        dynasm!(self.ops
+            ; mov [rsp + c3], r13
+            ; mov [rsp + c3 + 8], r14
+            ; mov r13, [rdi + crate::vm::host_api::JIT_VERSIONS_RAW_OFFSET as i32]
+            ; mov r14, [rdi + crate::vm::host_api::JIT_IC_TABLE_RAW_OFFSET as i32]
+        );
+        emit_ic_probe(
+            &mut self.ops,
+            IcProbe::Set {
+                val,
+                gen_lane: self.f.gen_lane,
+            },
+            obj,
+            off,
+            hit,
+            None,
+            direct,
+        );
+        if let Some(lbl) = mega_lbl {
+            dynasm!(self.ops
+                ; mov rdx, rax
+                ; mov r8, [rbx + 8 * val as i32]
+                ; mov r9, QWORD packed as i64
+                ; mov QWORD [rsp + 32], site as i32
+                ; mov ecx, key_id as i32
+                ; call => lbl
+            );
+        } else {
+            let miss_fn = heap.set_prop_miss;
+            dynasm!(self.ops
+                ; mov rcx, rdi
+                ; mov rdx, rax
+                ; mov r8, [rbx + 8 * val as i32]
+                ; mov r9, QWORD packed as i64
+                ; mov QWORD [rsp + 32], site as i32
+                ; mov rax, QWORD miss_fn as i64
+                ; call rax
+            );
+        }
+        dynasm!(self.ops
+            ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
+            ; cmp rax, r10
+            ; je => decline
+            ; mov r10, QWORD PROP_VIA_IC as i64
+            ; cmp rax, r10
+            ; je => decline
+            ; => hit
+            ; mov r13, [rsp + c3]
+            ; mov r14, [rsp + c3 + 8]
+            ; jmp => done
+            ; => decline
+            ; mov r13, [rsp + c3]
+            ; mov r14, [rsp + c3 + 8]
+        );
+        Some(done)
+    }
+
     /// `obj.<method>(args)` through Tier C's dedicated helper for it (`m`),
     /// over the window the frame state fills: an answer is stored to the
     /// window's `dst` register and jumps to the returned label; a decline
     /// (another receiver, a user method of the name) falls through, nothing
     /// done. `None` when the helpers are not at hand.
-    fn method_intr(&mut self, m: MethodIntr, obj: u16, arg_base: u16, dst: u16) -> Option<DynamicLabel> {
+    fn method_intr(&mut self, m: MethodIntr, obj: u16, arg_base: u16, dst: u16, ip: u32) -> Option<DynamicLabel> {
         let heap = self.f.heap?;
         let done = self.ops.new_dynamic_label();
         let decline = self.ops.new_dynamic_label();
@@ -333,9 +622,13 @@ impl Em<'_> {
                     MethodIntr::Push => heap.array_push,
                     _ => heap.char_code_at,
                 };
+                if matches!(m, MethodIntr::Push) {
+                    super::super::proto_mem::emit_guard_hot_mirror_clear(&mut self.ops, o, decline);
+                } else {
+                    super::super::proto_mem::emit_guard_hot_mirror_clear_or_str(&mut self.ops, o, decline);
+                }
                 dynasm!(self.ops
                     ; mov rcx, rdi
-                    ; mov rdx, [rbx + o]
                     ; mov r8, [rbx + a0]
                     ; mov rax, QWORD helper as i64
                     ; call rax
@@ -343,9 +636,9 @@ impl Em<'_> {
                 answer(self);
             }
             MethodIntr::Substring(mode) => {
+                super::super::proto_mem::emit_guard_hot_mirror_clear_or_str(&mut self.ops, o, decline);
                 dynasm!(self.ops
                     ; mov rcx, rdi
-                    ; mov rdx, [rbx + o]
                     ; lea r8, [rbx + a0]
                     ; mov r9d, mode
                     ; mov rax, QWORD heap.str_substring as i64
@@ -354,29 +647,21 @@ impl Em<'_> {
                 answer(self);
             }
             MethodIntr::Get | MethodIntr::Has => {
-                // `has` asks as a Set (op 2) when not a Map's.
-                let ops: &[i32] = if matches!(m, MethodIntr::Get) { &[0] } else { &[1, 2] };
-                for &op in ops {
-                    let next = self.ops.new_dynamic_label();
-                    dynasm!(self.ops
-                        ; mov rcx, rdi
-                        ; mov rdx, [rbx + o]
-                        ; mov r8, [rbx + a0]
-                        ; mov r9d, op
-                        ; mov rax, QWORD heap.coll_lookup as i64
-                        ; call rax
-                        ; mov r10, QWORD deopt
-                        ; cmp rax, r10
-                        ; je => next
-                        ; mov [rbx + d], rax
-                        ; jmp => done
-                        ; => next
-                    );
-                }
-                dynasm!(self.ops ; jmp => decline);
+                // 0 = Map/WeakMap.get, 3 = unified Map/WeakMap/Set/WeakSet.has.
+                let op: i32 = if matches!(m, MethodIntr::Get) { 0 } else { 3 };
+                super::super::proto_mem::emit_guard_hot_mirror_clear(&mut self.ops, o, decline);
+                dynasm!(self.ops
+                    ; mov rcx, rdi
+                    ; mov r8, [rbx + a0]
+                    ; mov r9d, op
+                    ; mov rax, QWORD heap.coll_lookup as i64
+                    ; call rax
+                );
+                answer(self);
             }
             MethodIntr::Mutate(op, argc) => {
                 // `delete` asks as a Set (op 4) when not a Map's.
+                super::super::proto_mem::emit_guard_hot_mirror_clear(&mut self.ops, o, decline);
                 let ops: &[i32] = if op == 3 { &[3, 4] } else { &[op] };
                 for &op in ops {
                     let next = self.ops.new_dynamic_label();
@@ -403,16 +688,82 @@ impl Em<'_> {
             }
             MethodIntr::Upper | MethodIntr::Pop => {
                 let helper = match m {
-                    MethodIntr::Upper => heap.str_upper_case as i64,
-                    _ => crate::vm::jit_array_pop as *const () as i64,
+                    MethodIntr::Upper => {
+                        super::super::proto_mem::emit_guard_hot_mirror_clear_or_str(&mut self.ops, o, decline);
+                        heap.str_upper_case as i64
+                    }
+                    _ => {
+                        super::super::proto_mem::emit_guard_hot_mirror_clear(&mut self.ops, o, decline);
+                        crate::vm::jit_array_pop as *const () as i64
+                    }
                 };
                 dynasm!(self.ops
                     ; mov rcx, rdi
-                    ; mov rdx, [rbx + o]
                     ; mov rax, QWORD helper
                     ; call rax
                 );
                 answer(self);
+            }
+            MethodIntr::StrArrBuiltin(packed) => {
+                super::super::proto_mem::emit_guard_hot_mirror_clear_or_str(&mut self.ops, o, decline);
+                dynasm!(self.ops
+                    ; mov rcx, rdi
+                    ; lea r8, [rbx + a0]
+                    ; mov r9d, packed as i32
+                    ; mov rax, QWORD crate::vm::jit_str_method as *const () as i64
+                    ; call rax
+                );
+                answer(self);
+            }
+            MethodIntr::ArrMutate(op, argc) => {
+                super::super::proto_mem::emit_guard_hot_mirror_clear(&mut self.ops, o, decline);
+                dynasm!(self.ops
+                    ; mov rcx, rdi
+                    ; lea r8, [rbx + a0]
+                    ; mov r9d, (op as i32) | ((argc as i32) << 8)
+                    ; mov rax, QWORD crate::vm::jit_array_mutate as *const () as i64
+                    ; call rax
+                );
+                answer(self);
+            }
+            MethodIntr::FnCall(argc) => {
+                if self.can_cross3_dyn() {
+                    let stub = *self.fn_call_dyn_stub.get_or_insert_with(|| self.ops.new_dynamic_label());
+                    let _ = self.cross3_dyn_stub.get_or_insert_with(|| self.ops.new_dynamic_label());
+                    let epilogue = self.epilogue;
+                    let threw = self.ops.new_dynamic_label();
+                    if argc == 0 {
+                        dynasm!(self.ops
+                            ; mov rax, [rbx + o]
+                            ; xor ecx, ecx
+                            ; call => stub
+                        );
+                    } else {
+                        dynasm!(self.ops
+                            ; mov rax, [rbx + o]
+                            ; mov rdx, [rbx + a0]
+                            ; lea r8, [rbx + a0 + 8]
+                            ; mov ecx, (0x100 | (argc - 1) as i32)
+                            ; call => stub
+                        );
+                    }
+                    dynasm!(self.ops
+                        ; mov r10, QWORD deopt
+                        ; cmp rax, r10
+                        ; je => decline
+                        ; mov r10, QWORD crate::codegen::CALL_THREW as i64
+                        ; cmp rax, r10
+                        ; je => threw
+                        ; mov [rbx + d], rax
+                        ; jmp => done
+                        ; => threw
+                        ; mov DWORD [rsi], ip as i32
+                        ; xor eax, eax
+                        ; jmp => epilogue
+                    );
+                } else {
+                    dynasm!(self.ops ; jmp => decline);
+                }
             }
         }
         dynasm!(self.ops ; => decline);
@@ -608,34 +959,92 @@ impl Em<'_> {
         }
     }
 
-    /// Frame state `s` into the window: each value it names boxed at its
-    /// register. Uses rax, rcx, rdx and xmm0; every value stays where it is.
+    fn imm_boxed_bits(&self, v: V) -> Option<u64> {
+        match self.f.insts[v as usize].op {
+            Op::ConstTagged(bits) => Some(bits),
+            Op::ConstI32(c) => Some(TAG_INT | u64::from(c as u32)),
+            Op::ConstBool(b) => Some(TAG_BOOL | u64::from(b)),
+            _ => None,
+        }
+    }
+
+    fn store_state_reg(&mut self, r: u16, v: V) {
+        let off = 8 * r as i32;
+        if let Some(bits) = self.imm_boxed_bits(v) {
+            dynasm!(self.ops
+                ; mov rax, QWORD bits as i64
+                ; mov [rbx + off], rax
+            );
+            return;
+        }
+        match self.rep(v) {
+            Rep::Tagged => {
+                let rv = self.gpr(v, RAX);
+                dynasm!(self.ops ; mov [rbx + off], Rq(rv));
+            }
+            rep @ (Rep::I32 | Rep::Bool) => {
+                let rv = self.gpr(v, RDX);
+                let tag = if rep == Rep::I32 { TAG_INT } else { TAG_BOOL };
+                dynasm!(self.ops
+                    ; mov eax, Rd(rv)
+                    ; mov rcx, QWORD tag as i64
+                    ; or rax, rcx
+                    ; mov [rbx + off], rax
+                );
+            }
+            Rep::F64 => {
+                let xv = self.xmm(v, X1);
+                self.box_f64(xv, RDX);
+                dynasm!(self.ops ; mov [rbx + off], rdx);
+            }
+            Rep::Void | Rep::Raw => unreachable!("a frame state names values"),
+        }
+    }
+
+    /// Ensure `(r, v)` is boxed into `[rbx + 8*r]`, reusing `window_known` when
+    /// already written earlier in this block.
+    fn ensure_window_reg(&mut self, r: u16, v: V) {
+        if self.window_known.contains(&(r, v)) {
+            return;
+        }
+        self.store_state_reg(r, v);
+        if let Some(slot) = self.window_known.iter_mut().find(|&&mut (kr, _)| kr == r) {
+            slot.1 = v;
+        } else {
+            self.window_known.push((r, v));
+        }
+    }
+
+    /// Unconditional frame state `s` into the window: skips any `(r, v)` already
+    /// boxed into `[rbx + 8*r]` earlier in the current basic block, and records
+    /// newly written entries into `window_known`.
     fn write_state(&mut self, s: u32) {
         let f = self.f;
         for &(r, v) in &f.states[s as usize].regs {
-            let off = 8 * r as i32;
-            match self.rep(v) {
-                Rep::Tagged => {
-                    let rv = self.gpr(v, RAX);
-                    dynasm!(self.ops ; mov [rbx + off], Rq(rv));
-                }
-                rep @ (Rep::I32 | Rep::Bool) => {
-                    let rv = self.gpr(v, RDX);
-                    let tag = if rep == Rep::I32 { TAG_INT } else { TAG_BOOL };
-                    dynasm!(self.ops
-                        ; mov eax, Rd(rv)
-                        ; mov rcx, QWORD tag as i64
-                        ; or rax, rcx
-                        ; mov [rbx + off], rax
-                    );
-                }
-                Rep::F64 => {
-                    let xv = self.xmm(v, X1);
-                    self.box_f64(xv, RDX);
-                    dynasm!(self.ops ; mov [rbx + off], rdx);
-                }
-                Rep::Void | Rep::Raw => unreachable!("a frame state names values"),
+            self.ensure_window_reg(r, v);
+        }
+    }
+
+    /// Conditional slow-path frame state `s` into the window: skips entries
+    /// already guaranteed by an earlier unconditional write in this block, and
+    /// invalidates any register whose cached value is conditionally overwritten.
+    fn write_state_cond(&mut self, s: u32) {
+        let f = self.f;
+        for &(r, v) in &f.states[s as usize].regs {
+            if self.window_known.contains(&(r, v)) {
+                continue;
             }
+            self.store_state_reg(r, v);
+            self.invalidate_window_reg(r);
+        }
+    }
+
+    /// Full frame state `s` into the window for out-of-line deopt/bail stubs
+    /// (never consults or updates per-block `window_known`).
+    fn write_state_full(&mut self, s: u32) {
+        let f = self.f;
+        for &(r, v) in &f.states[s as usize].regs {
+            self.store_state_reg(r, v);
         }
     }
 
@@ -681,22 +1090,7 @@ impl Em<'_> {
             self.stress_check(stub);
         }
         match i.op.clone() {
-            Op::Phi(_) => {}
-            Op::ConstI32(c) => {
-                let (d, st) = self.dst_gpr(v);
-                dynasm!(self.ops ; mov Rd(d), c);
-                self.done_gpr(d, st);
-            }
-            Op::ConstBool(b) => {
-                let (d, st) = self.dst_gpr(v);
-                dynasm!(self.ops ; mov Rd(d), i32::from(b));
-                self.done_gpr(d, st);
-            }
-            Op::ConstTagged(bits) => {
-                let (d, st) = self.dst_gpr(v);
-                dynasm!(self.ops ; mov Rq(d), QWORD bits as i64);
-                self.done_gpr(d, st);
-            }
+            Op::Phi(_) | Op::ConstI32(_) | Op::ConstBool(_) | Op::ConstTagged(_) => {}
             Op::ConstF64(x) => {
                 let (d, st) = self.dst_xmm(v);
                 if x.to_bits() == 0 {
@@ -884,23 +1278,41 @@ impl Em<'_> {
                     ; ja => falsy
                     ; jmp => truthy
                     ; => null_or_big
-                    ; mov rax, QWORD TAG_NULL as i64
-                    ; cmp Rq(ra), rax
-                    ; je => falsy
+                    // Both `null` (`0x7FFB_0000_0000_0000`) and `SmallBigInt(0)`
+                    // (`0x7FFB_8000_0000_0000`) have all 47 payload bits zero;
+                    // every non-zero `SmallBigInt` has a non-zero 47-bit payload.
+                    ; mov rax, Rq(ra)
+                    ; shl rax, 17
+                    ; jz => falsy
+                    ; jmp => truthy
                     // A heap value (an empty string, a zero BigInt and the
-                    // [[IsHTMLDDA]] object are falsy): `jit_truthy`, read-only,
-                    // with the volatile registers the allocator hands out
-                    // kept, so the test is no call position.
+                    // [[IsHTMLDDA]] object are falsy): fast zero-DRAM check
+                    // first (no register saves or call!), else `truthy_stub`
+                    // with volatile allocator registers preserved.
                     ; => heap
-                    ; mov rdx, Rq(ra)
+                    ; mov rax, Rq(ra)
+                    ; cmp BYTE [rdi + crate::vm::host_api::JIT_HTMLDDA_SCALAR_ENABLED_OFFSET as i32], 0
+                    ; je > heap_stub
+                    ; mov ecx, eax
+                    ; cmp ecx, DWORD [rdi + crate::vm::host_api::JIT_HTMLDDA_IDX_OFFSET as i32]
+                    ; je => falsy
+                    ; cmp ecx, crate::heap::INTERN_EMPTY as i32
+                    ; je => falsy
+                    ; cmp BYTE [rdi + crate::vm::host_api::JIT_HAS_NON_INTERNED_FALSY_OFFSET as i32], 0
+                    ; je => truthy
+                    ; heap_stub:
+                );
+                let tstub = *self.truthy_stub.get_or_insert_with(|| self.ops.new_dynamic_label());
+                dynasm!(self.ops
+                    ; mov rax, Rq(ra)
+                    ; mov r10, rax
+                    ; shr r10, 48
                     ; sub rsp, 80
                     ; mov [rsp + 32], r8
                     ; mov [rsp + 40], r9
                     ; movdqu [rsp + 48], xmm4
                     ; movdqu [rsp + 64], xmm5
-                    ; mov rcx, rdi
-                    ; mov rax, QWORD crate::vm::jit_truthy as *const () as i64
-                    ; call rax
+                    ; call => tstub
                     ; mov r8, [rsp + 32]
                     ; mov r9, [rsp + 40]
                     ; movdqu xmm4, [rsp + 48]
@@ -1211,6 +1623,64 @@ impl Em<'_> {
                 lane,
             } => {
                 let s = i.fs.expect("a call-out has a frame state");
+                if let CallLane::SetProp {
+                    obj,
+                    obj_v,
+                    val,
+                    val_v,
+                    name,
+                } = lane
+                {
+                    if self.f.ic_sites.contains_key(&ip) && self.f.heap.is_some() {
+                        self.ensure_window_reg(obj, obj_v);
+                        self.ensure_window_reg(val, val_v);
+                        let l = self.set_prop_ic(obj, val, name, ip).expect("checked ic_sites and heap");
+                        self.write_state_cond(s);
+                        self.call_written(helper, ip, packed, argc);
+                        dynasm!(self.ops ; => l);
+                        return;
+                    }
+                    self.write_state(s);
+                    self.call_written(helper, ip, packed, argc);
+                    return;
+                }
+                if let CallLane::Prop {
+                    obj,
+                    obj_v,
+                    dst,
+                    name,
+                    is_call,
+                } = lane
+                {
+                    if self.f.ic_sites.contains_key(&ip) && self.f.heap.is_some() {
+                        self.ensure_window_reg(obj, obj_v);
+                        let l = self.prop_ic(obj, dst, name, is_call, ip).expect("checked ic_sites and heap");
+                        self.write_state_cond(s);
+                        self.call_written(helper, ip, packed, argc);
+                        let join = self.ops.new_dynamic_label();
+                        dynasm!(self.ops
+                            ; jmp => join
+                            ; => l
+                            ; mov rax, [rbx + 8 * dst as i32]
+                            ; => join
+                        );
+                        self.invalidate_window_reg(dst);
+                        if i.rep != Rep::Void {
+                            let (d, st) = self.dst_gpr(v);
+                            dynasm!(self.ops ; mov Rq(d), rax);
+                            self.done_gpr(d, st);
+                        }
+                        return;
+                    }
+                    self.write_state(s);
+                    self.call_written(helper, ip, packed, argc);
+                    if i.rep != Rep::Void {
+                        let (d, st) = self.dst_gpr(v);
+                        dynasm!(self.ops ; mov Rq(d), rax);
+                        self.done_gpr(d, st);
+                    }
+                    return;
+                }
                 self.write_state(s);
                 // The lanes ahead of the helper, which leave their result in
                 // the window's `dst` register.
@@ -1220,14 +1690,10 @@ impl Em<'_> {
                     arg_base,
                     dst,
                     intr: Some(m),
+                    ..
                 } = lane
                 {
-                    if let Some(l) = self.method_intr(m, obj, arg_base, dst) {
-                        made.push((l, dst));
-                    }
-                }
-                if let CallLane::Prop { obj, dst, name } = lane {
-                    if let Some(l) = self.prop_ic(obj, dst, name, ip) {
+                    if let Some(l) = self.method_intr(m, obj, arg_base, dst, ip) {
                         made.push((l, dst));
                     }
                 }
@@ -1254,7 +1720,7 @@ impl Em<'_> {
                     };
                     made.push((l, dst));
                 }
-                made.extend(self.cross_lanes(lane, ip));
+                made.extend(self.cross_lanes(lane, ip, packed, argc));
                 self.call_written(helper, ip, packed, argc);
                 if let Some(&(_, dst)) = made.first() {
                     let join = self.ops.new_dynamic_label();
@@ -1266,6 +1732,7 @@ impl Em<'_> {
                         ; mov rax, [rbx + 8 * dst as i32]
                         ; => join
                     );
+                    self.invalidate_window_reg(dst);
                 }
                 if i.rep != Rep::Void {
                     let (d, st) = self.dst_gpr(v);
@@ -1305,6 +1772,7 @@ impl Em<'_> {
                         ; mov rax, [rbx + 8 * dst as i32]
                         ; => join
                     );
+                    self.invalidate_window_reg(dst);
                 }
                 let (d, st) = self.dst_gpr(v);
                 dynasm!(self.ops ; mov Rq(d), rax);
@@ -1353,6 +1821,9 @@ impl Em<'_> {
                 );
                 self.leave_on_sentinel(ip);
                 dynasm!(self.ops ; => stepped);
+                self.invalidate_window_reg(value_dst);
+                self.invalidate_window_reg(done_dst);
+                self.invalidate_window_reg(idx);
             }
             Op::Handler { helper, packed } => {
                 dynasm!(self.ops
@@ -1460,6 +1931,7 @@ impl Em<'_> {
                 let (d, st) = self.dst_gpr(v);
                 dynasm!(self.ops ; mov Rq(d), [rbx + 8 * r as i32]);
                 self.done_gpr(d, st);
+                self.invalidate_window_reg(r);
             }
             Op::AllocOut { helper, ip, a, b } => {
                 // The collector may run: the state roots every heap value.
@@ -1474,9 +1946,14 @@ impl Em<'_> {
                     ; call rax
                 );
                 self.leave_on_sentinel(ip);
-                let (d, st) = self.dst_gpr(v);
-                dynasm!(self.ops ; mov Rq(d), rax);
-                self.done_gpr(d, st);
+                if i.rep != Rep::Void {
+                    let (d, st) = self.dst_gpr(v);
+                    dynasm!(self.ops ; mov Rq(d), rax);
+                    self.done_gpr(d, st);
+                } else {
+                    // Void AllocOut (`jit_make_cell`) writes the new cell into `[rbx + 8*reg]`.
+                    self.window_known.clear();
+                }
             }
             Op::NewLane {
                 lane,
@@ -1500,6 +1977,7 @@ impl Em<'_> {
                     ; mov rax, [rbx + 8 * dst as i32]
                     ; => join
                 );
+                self.invalidate_window_reg(dst);
                 let (d, st) = self.dst_gpr(v);
                 dynasm!(self.ops ; mov Rq(d), rax);
                 self.done_gpr(d, st);
@@ -1541,6 +2019,32 @@ impl Em<'_> {
                 );
                 crate::codegen::emit_heap_store_barrier(&mut self.ops, f.gen_lane, done);
                 dynasm!(self.ops ; => miss);
+                let name = (packed >> 32) as u32;
+                let key_id = self.prop_key_id(name);
+                if let Some(&(ic_site, _)) = self
+                    .f
+                    .ic_sites
+                    .get(&ip)
+                    .filter(|_| !crate::vm::icstats_enabled() && key_id != 0)
+                {
+                    let mega_lbl = self.mega_set_lbl(true);
+                    let slow_call = self.ops.new_dynamic_label();
+                    let ro2 = self.gpr(obj, RDX);
+                    dynasm!(self.ops ; mov rdx, Rq(ro2));
+                    let rv2 = self.gpr(val, R11);
+                    let packed_fn = ((f.func_id as u64) << 32) | name as u64;
+                    dynasm!(self.ops
+                        ; mov r8, Rq(rv2)
+                        ; mov r9, QWORD packed_fn as i64
+                        ; mov QWORD [rsp + 32], ic_site as i32
+                        ; mov ecx, key_id as i32
+                        ; call => mega_lbl
+                        ; test rax, rax
+                        ; jz => done
+                        ; => slow_call
+                    );
+                    let _ = slow_call;
+                }
                 self.call_out(s, crate::vm::jit_set_prop_slow as *const () as u64, ip, packed, 0);
                 dynasm!(self.ops ; => done);
             }
@@ -1812,10 +2316,40 @@ impl Em<'_> {
                     ; mov Rq(d), [r11 + off]
                 );
                 if let Some((ip, packed)) = slow {
-                    // Another receiver: the whole `GetProp`.
+                    // Another receiver: probe megamorphic shape/ES5-proto/dict memo
+                    // inline before calling `jit_opt_get_prop_slow`.
                     let s = i.fs.expect("a read has a frame state");
                     let done = self.ops.new_dynamic_label();
+                    let slow_call = self.ops.new_dynamic_label();
                     dynasm!(self.ops ; jmp => done ; => miss);
+                    let name = (packed >> 32) as u32;
+                    let key_id = self.prop_key_id(name);
+                    if let Some(&(ic_site, _)) = self
+                        .f
+                        .ic_sites
+                        .get(&ip)
+                        .filter(|_| !crate::vm::icstats_enabled() && key_id != 0)
+                    {
+                        let mega_lbl = self.mega_prop_lbl(true);
+                        let ro2 = self.gpr(obj, RDX);
+                        let packed_fn = ((f.func_id as u64) << 32) | name as u64;
+                        dynasm!(self.ops
+                            ; mov rdx, Rq(ro2)
+                            ; mov r8d, ic_site as i32
+                            ; mov r9, QWORD packed_fn as i64
+                            ; mov ecx, key_id as i32
+                            ; call => mega_lbl
+                            ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
+                            ; cmp rax, r10
+                            ; je => slow_call
+                            ; mov r10, QWORD crate::codegen::PROP_VIA_IC as i64
+                            ; cmp rax, r10
+                            ; je => slow_call
+                            ; mov Rq(d), rax
+                            ; jmp => done
+                            ; => slow_call
+                        );
+                    }
                     self.call_out(s, crate::vm::jit_opt_get_prop_slow as *const () as u64, ip, packed, 0);
                     dynasm!(self.ops ; mov Rq(d), rax ; => done);
                 }
@@ -1876,13 +2410,17 @@ impl Em<'_> {
                 );
                 self.done_gpr(d, st);
             }
-            Op::GetPropPoly { obj, ways, ip, packed } => {
+            Op::GetPropPoly { obj, ways, slow } => {
                 let s = i.fs.expect("a read has a frame state");
                 let ro = self.gpr(obj, RDX);
                 let (d, st) = self.dst_gpr(v);
                 let hot_off = crate::vm::host_api::JIT_HOT_MIRROR_RAW_OFFSET as i32;
                 let hot_vals = crate::vm::host_api::JIT_HOT_VALS_OFF as i32;
-                let miss = self.ops.new_dynamic_label();
+                let miss = if slow.is_some() {
+                    self.ops.new_dynamic_label()
+                } else {
+                    stub.expect("a guard has a frame state")
+                };
                 let done = self.ops.new_dynamic_label();
                 let arms: Vec<DynamicLabel> = ways.iter().map(|_| self.ops.new_dynamic_label()).collect();
                 dynasm!(self.ops
@@ -1910,12 +2448,41 @@ impl Em<'_> {
                         ; jmp => done
                     );
                 }
-                dynasm!(self.ops ; => miss);
-                self.call_out(s, crate::vm::jit_opt_get_prop_slow as *const () as u64, ip, packed, 0);
-                dynasm!(self.ops
-                    ; mov Rq(d), rax
-                    ; => done
-                );
+                if let Some((ip, packed)) = slow {
+                    dynasm!(self.ops ; => miss);
+                    let name = (packed >> 32) as u32;
+                    let key_id = self.prop_key_id(name);
+                    if let Some(&(ic_site, _)) = self
+                        .f
+                        .ic_sites
+                        .get(&ip)
+                        .filter(|_| !crate::vm::icstats_enabled() && key_id != 0)
+                    {
+                        let mega_lbl = self.mega_prop_lbl(true);
+                        let slow_call = self.ops.new_dynamic_label();
+                        let ro2 = self.gpr(obj, RDX);
+                        let packed_fn = ((f.func_id as u64) << 32) | name as u64;
+                        dynasm!(self.ops
+                            ; mov rdx, Rq(ro2)
+                            ; mov r8d, ic_site as i32
+                            ; mov r9, QWORD packed_fn as i64
+                            ; mov ecx, key_id as i32
+                            ; call => mega_lbl
+                            ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
+                            ; cmp rax, r10
+                            ; je => slow_call
+                            ; mov r10, QWORD crate::codegen::PROP_VIA_IC as i64
+                            ; cmp rax, r10
+                            ; je => slow_call
+                            ; mov Rq(d), rax
+                            ; jmp => done
+                            ; => slow_call
+                        );
+                    }
+                    self.call_out(s, crate::vm::jit_opt_get_prop_slow as *const () as u64, ip, packed, 0);
+                    dynasm!(self.ops ; mov Rq(d), rax);
+                }
+                dynasm!(self.ops ; => done);
                 self.done_gpr(d, st);
             }
             Op::AddT(a, b) => {
@@ -1935,9 +2502,11 @@ impl Em<'_> {
                     ; call rax
                 );
                 self.leave_on_sentinel(ip);
-                let (d, st) = self.dst_gpr(v);
-                dynasm!(self.ops ; mov Rq(d), rax);
-                self.done_gpr(d, st);
+                if i.rep != Rep::Void {
+                    let (d, st) = self.dst_gpr(v);
+                    dynasm!(self.ops ; mov Rq(d), rax);
+                    self.done_gpr(d, st);
+                }
             }
             Op::UpvalSet(idx, x) => {
                 let s = i.fs.expect("a captured write has a frame state");
@@ -1975,7 +2544,7 @@ impl Em<'_> {
                     ; jmp => done
                     ; => slow
                 );
-                self.write_state(s);
+                self.write_state_cond(s);
                 let rx = self.gpr(x, R11);
                 dynasm!(self.ops
                     ; mov r8, Rq(rx)
@@ -2047,16 +2616,15 @@ impl Em<'_> {
                         ; jmp => full
                     );
                 }
-                // The pure helper (strings, holes, string keys), then the
-                // whole op.
+                // Probe `keyed_slot_memo` inline via `keyed_get_stub` before
+                // falling back to `jit_get_index`, then the whole op.
+                let kstub = *self.keyed_get_stub.get_or_insert_with(|| self.ops.new_dynamic_label());
                 dynasm!(self.ops ; => slow);
                 let ro = self.gpr(obj, RDX);
                 dynasm!(self.ops ; mov rdx, Rq(ro));
                 self.key_to_r8(key);
                 dynasm!(self.ops
-                    ; mov rcx, rdi
-                    ; mov rax, QWORD crate::vm::jit_get_index as *const () as i64
-                    ; call rax
+                    ; call => kstub
                     ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
                     ; cmp rax, r10
                     ; jne => got
@@ -2295,69 +2863,833 @@ impl Em<'_> {
                 let ra = self.gpr(x, RDX);
                 let rb = self.gpr(y, R11);
                 let (d, st) = self.dst_gpr(v);
-                let l: Vec<DynamicLabel> = (0..9).map(|_| self.ops.new_dynamic_label()).collect();
-                let (differ, mixed, a_int, a_done, b_int, b_done, is_true, is_false, heap2) =
-                    (l[0], l[1], l[2], l[3], l[4], l[5], l[6], l[7], l[8]);
-                let done = self.ops.new_dynamic_label();
+                let stub = *self.eq_stub.get_or_insert_with(|| self.ops.new_dynamic_label());
+                let (diff, do_stub, from_stub, is_eq, is_ne_lbl, done) = (
+                    self.ops.new_dynamic_label(),
+                    self.ops.new_dynamic_label(),
+                    self.ops.new_dynamic_label(),
+                    self.ops.new_dynamic_label(),
+                    self.ops.new_dynamic_label(),
+                    self.ops.new_dynamic_label(),
+                );
                 dynasm!(self.ops
                     ; mov rax, Rq(ra)
                     ; mov rcx, Rq(rb)
-                    ; cmp rax, rcx
-                    ; jne => differ
-                    ; mov rdx, QWORD QNAN as i64
-                    ; cmp rax, rdx
-                    ; je => is_false
-                    ; jmp => is_true
-                    ; => differ
                     ; mov rdx, rax
                     ; shr rdx, 48
-                    ; mov r11, rcx
-                    ; shr r11, 48
-                    ; cmp edx, 0x7FFD
-                    ; jne => mixed
-                    ; cmp r11d, 0x7FFD
-                    ; je => heap2
-                    ; => mixed
-                    ; cmp edx, 0x7FF9
-                    ; je => a_int
                     ; sub edx, 0x7FF9
+                    ; cmp rax, rcx
+                    ; jne => diff
                     ; cmp edx, 4
-                    ; jbe => is_false
-                    ; movq xmm0, rax
-                    ; jmp => a_done
-                    ; => a_int
-                    ; cvtsi2sd xmm0, eax
-                    ; => a_done
-                    ; cmp r11d, 0x7FF9
-                    ; je => b_int
-                    ; sub r11d, 0x7FF9
-                    ; cmp r11d, 4
-                    ; jbe => is_false
-                    ; movq xmm1, rcx
-                    ; jmp => b_done
-                    ; => b_int
-                    ; cvtsi2sd xmm1, ecx
-                    ; => b_done
-                    ; ucomisd xmm0, xmm1
-                    ; jne => is_false
-                    ; jp => is_false
-                    ; jmp => is_true
-                    // Two heap values: strings compare by content.
-                    ; => heap2
+                    ; jbe => is_eq
+                    ; call => stub
+                    ; jmp => from_stub
+                    ; => diff
+                    ; cmp edx, 4
+                    ; ja => do_stub
                     ; mov r8, rcx
-                    ; mov rdx, rax
-                    ; mov rcx, rdi
-                    ; mov rax, QWORD crate::vm::jit_strict_eq as *const () as i64
-                    ; call rax
-                    ; test eax, eax
-                    ; jz => is_false
-                    ; => is_true
+                    ; shr r8, 48
+                    ; sub r8d, 0x7FF9
+                    ; cmp r8d, 4
+                    ; ja => do_stub
+                    ; and edx, r8d
+                    ; test dl, 4
+                    ; jz => is_ne_lbl
+                    ; => do_stub
+                    ; call => stub
+                    ; => from_stub
+                );
+                if !eq {
+                    dynasm!(self.ops ; xor eax, 1);
+                }
+                dynasm!(self.ops
+                    ; mov Rd(d), eax
+                    ; jmp => done
+                    ; => is_eq
                     ; mov Rd(d), i32::from(eq)
                     ; jmp => done
-                    ; => is_false
+                    ; => is_ne_lbl
                     ; mov Rd(d), i32::from(!eq)
                     ; => done
                 );
+                self.done_gpr(d, st);
+            }
+            Op::StrictEqBits(eq, a, bits) => {
+                let ra = self.gpr(a, RDX);
+                let (d, st) = self.dst_gpr(v);
+                dynasm!(self.ops
+                    ; mov rcx, QWORD bits as i64
+                    ; cmp Rq(ra), rcx
+                );
+                if eq {
+                    dynasm!(self.ops ; sete al);
+                } else {
+                    dynasm!(self.ops ; setne al);
+                }
+                dynasm!(self.ops ; movzx eax, al ; mov Rd(d), eax);
+                self.done_gpr(d, st);
+            }
+            Op::IsAtomOrPrim(a) => {
+                let ra = self.gpr(a, RDX);
+                let (d, st) = self.dst_gpr(v);
+                let yes = self.ops.new_dynamic_label();
+                let no = self.ops.new_dynamic_label();
+                let done = self.ops.new_dynamic_label();
+                dynasm!(self.ops
+                    ; mov rax, Rq(ra)
+                    ; shr rax, 48
+                    ; cmp eax, 0x7FFD
+                    ; jne => yes
+                    ; mov ecx, Rd(ra)
+                    ; mov r10, rcx
+                    ; shr r10, 6
+                    ; cmp r10, [rdi + crate::vm::host_api::JIT_ATOMS_WORDS_OFFSET as i32]
+                    ; jae => no
+                    ; mov r11, [rdi + crate::vm::host_api::JIT_ATOMS_RAW_OFFSET as i32]
+                    ; mov r10, [r11 + r10 * 8]
+                    ; bt r10, rcx
+                    ; setc al
+                    ; movzx eax, al
+                    ; mov Rd(d), eax
+                    ; jmp => done
+                    ; => yes
+                    ; mov Rd(d), 1
+                    ; jmp => done
+                    ; => no
+                    ; xor Rd(d), Rd(d)
+                    ; => done
+                );
+                self.done_gpr(d, st);
+            }
+            Op::StrictEqAtom {
+                eq,
+                a,
+                atom_bits,
+                atom_ok,
+            } => {
+                let ra = self.gpr(a, RDX);
+                let rok = self.gpr(atom_ok, R11);
+                let (d, st) = self.dst_gpr(v);
+                let stub = *self.eq_stub.get_or_insert_with(|| self.ops.new_dynamic_label());
+                let is_eq = self.ops.new_dynamic_label();
+                let is_ne = self.ops.new_dynamic_label();
+                let done = self.ops.new_dynamic_label();
+                dynasm!(self.ops
+                    ; mov rcx, QWORD atom_bits as i64
+                    ; cmp Rq(ra), rcx
+                    ; je => is_eq
+                    ; test Rd(rok), Rd(rok)
+                    ; jnz => is_ne
+                    ; mov rax, Rq(ra)
+                    ; call => stub
+                );
+                if !eq {
+                    dynasm!(self.ops ; xor eax, 1);
+                }
+                dynasm!(self.ops
+                    ; mov Rd(d), eax
+                    ; jmp => done
+                    ; => is_eq
+                    ; mov Rd(d), i32::from(eq)
+                    ; jmp => done
+                    ; => is_ne
+                    ; mov Rd(d), i32::from(!eq)
+                    ; => done
+                );
+                self.done_gpr(d, st);
+            }
+            Op::BitNotI(a) => {
+                let ra = self.gpr(a, RDX);
+                let (d, st) = self.dst_gpr(v);
+                dynasm!(self.ops
+                    ; mov eax, Rd(ra)
+                    ; not eax
+                    ; mov Rd(d), eax
+                );
+                self.done_gpr(d, st);
+            }
+            Op::IsNullish { is_ne, a, ip } => {
+                let s = i.fs.expect("IsNullish has a frame state");
+                let bail = self.add_plain_bail(s, ip);
+                let ra = self.gpr(a, RDX);
+                let (d, st) = self.dst_gpr(v);
+                let is_null = self.ops.new_dynamic_label();
+                let not_null = self.ops.new_dynamic_label();
+                let done = self.ops.new_dynamic_label();
+                dynasm!(self.ops
+                    ; cmp BYTE [rdi + crate::vm::host_api::JIT_HTMLDDA_SCALAR_ENABLED_OFFSET as i32], 0
+                    ; je => bail
+                    ; mov rax, Rq(ra)
+                    ; mov rcx, QWORD Value::UNDEFINED.bits() as i64
+                    ; cmp rax, rcx
+                    ; je => is_null
+                    ; mov rcx, QWORD Value::NULL.bits() as i64
+                    ; cmp rax, rcx
+                    ; je => is_null
+                    ; mov rcx, rax
+                    ; shr rcx, 48
+                    ; cmp ecx, 0x7FFD
+                    ; jne => not_null
+                    ; cmp eax, DWORD [rdi + crate::vm::host_api::JIT_HTMLDDA_IDX_OFFSET as i32]
+                    ; je => is_null
+                    ; => not_null
+                    ; mov Rd(d), i32::from(is_ne)
+                    ; jmp => done
+                    ; => is_null
+                    ; mov Rd(d), i32::from(!is_ne)
+                    ; => done
+                );
+                self.done_gpr(d, st);
+            }
+            Op::LooseEq { is_ne, a, b, ip } => {
+                let s = i.fs.expect("LooseEq has a frame state");
+                let bail = self.add_plain_bail(s, ip);
+                let stub = *self.loose_eq_stub.get_or_insert_with(|| self.ops.new_dynamic_label());
+                let ra = self.gpr(a, RDX);
+                dynasm!(self.ops ; mov rax, Rq(ra));
+                let rb = self.gpr(b, R11);
+                dynasm!(self.ops
+                    ; mov r11, Rq(rb)
+                    ; mov rdx, rax
+                    ; mov r8, r11
+                    ; mov r9d, i32::from(is_ne)
+                    ; call => stub
+                    ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                );
+                let (d, st) = self.dst_gpr(v);
+                dynasm!(self.ops
+                    ; and eax, 1
+                    ; mov Rd(d), eax
+                );
+                self.done_gpr(d, st);
+            }
+            Op::IsArray { val, callee, this_v, ip } => {
+                let s = i.fs.expect("IsArray has a frame state");
+                let bail = self.add_plain_bail(s, ip);
+                let stub = *self.is_array_stub.get_or_insert_with(|| self.ops.new_dynamic_label());
+                let rv = self.gpr(val, RDX);
+                dynasm!(self.ops ; mov rax, Rq(rv));
+                let rc = self.gpr(callee, R10);
+                dynasm!(self.ops ; mov r10, Rq(rc));
+                let rt = self.gpr(this_v, R11);
+                dynasm!(self.ops
+                    ; mov r11, Rq(rt)
+                    ; mov rdx, rax
+                    ; mov r8, r10
+                    ; mov r9, r11
+                    ; call => stub
+                    ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                );
+                let (d, st) = self.dst_gpr(v);
+                dynasm!(self.ops
+                    ; and eax, 1
+                    ; mov Rd(d), eax
+                );
+                self.done_gpr(d, st);
+            }
+            Op::InstanceOf { val, ctor, ip, packed } => {
+                let s = i.fs.expect("InstanceOf has a frame state");
+                let done = self.ops.new_dynamic_label();
+                #[cfg(not(feature = "safe-sandbox"))]
+                if crate::vm::instanceof_memo_enabled() {
+                    let stub = *self.instanceof_pair_stub.get_or_insert_with(|| self.ops.new_dynamic_label());
+                    let miss = self.ops.new_dynamic_label();
+                    let rv = self.gpr(val, RDX);
+                    dynasm!(self.ops ; mov rax, Rq(rv));
+                    let rc = self.gpr(ctor, R11);
+                    dynasm!(self.ops
+                        ; mov r11, Rq(rc)
+                        ; mov rdx, rax
+                        ; mov r8, r11
+                        ; call => stub
+                        ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; jne => done
+                        ; => miss
+                    );
+                }
+                self.call_out(s, crate::vm::jit_instanceof_ic as *const () as u64, ip, packed, 0);
+                let (d, st) = self.dst_gpr(v);
+                dynasm!(self.ops
+                    ; => done
+                    ; mov Rq(d), rax
+                );
+                self.done_gpr(d, st);
+            }
+            Op::TypeOf(a) => {
+                let s = i.fs.expect("TypeOf has a frame state");
+                let heap = f.heap.expect("Tier O bodies have their helpers");
+                self.write_state(s);
+                let ra = self.gpr(a, RDX);
+                dynasm!(self.ops
+                    ; mov rdx, Rq(ra)
+                    ; mov rcx, rdi
+                    ; mov rax, QWORD heap.typeof_str as i64
+                    ; call rax
+                );
+                let (d, st) = self.dst_gpr(v);
+                dynasm!(self.ops ; mov Rq(d), rax);
+                self.done_gpr(d, st);
+            }
+            Op::TypeOfIs { a, code, neg } => {
+                let heap = f.heap.expect("Tier O bodies have their helpers");
+                let ra = self.gpr(a, RDX);
+                let (d, st) = self.dst_gpr(v);
+                let lit = crate::bytecode::TYPEOF_NAMES.get(code as usize).copied();
+                let ans = |name: &str| -> i32 { i32::from((lit == Some(name)) != neg) };
+                let (r_num, r_str, r_bool, r_undef, r_obj, r_fn) = (
+                    ans("number"),
+                    ans("string"),
+                    ans("boolean"),
+                    ans("undefined"),
+                    ans("object"),
+                    ans("function"),
+                );
+                let code_neg = (code as u32 | ((neg as u32) << 8)) as i32;
+                let (is_num, is_bool, is_undef, is_obj, is_str, is_fn, heap_val, helper_call, done) = (
+                    self.ops.new_dynamic_label(),
+                    self.ops.new_dynamic_label(),
+                    self.ops.new_dynamic_label(),
+                    self.ops.new_dynamic_label(),
+                    self.ops.new_dynamic_label(),
+                    self.ops.new_dynamic_label(),
+                    self.ops.new_dynamic_label(),
+                    self.ops.new_dynamic_label(),
+                    self.ops.new_dynamic_label(),
+                );
+                let hot_off = crate::vm::host_api::JIT_HOT_MIRROR_RAW_OFFSET as i32;
+                let hot_fid = crate::vm::host_api::JIT_HOT_FID_OFF as i32;
+                let hot_vals = crate::vm::host_api::JIT_HOT_VALS_OFF as i32;
+                let htmldda_on = crate::vm::host_api::JIT_HTMLDDA_SCALAR_ENABLED_OFFSET as i32;
+                let htmldda_idx = crate::vm::host_api::JIT_HTMLDDA_IDX_OFFSET as i32;
+                dynasm!(self.ops
+                    ; mov rax, Rq(ra)
+                    ; mov rdx, rax
+                    ; shr rdx, 48
+                    ; sub edx, 0x7FF9
+                    ; cmp edx, 4
+                    ; ja => is_num
+                    ; je => heap_val
+                    ; test edx, edx
+                    ; jz => is_num
+                    ; cmp edx, 1
+                    ; je => is_bool
+                    ; cmp edx, 3
+                    ; je => is_undef
+                    ; mov r8, QWORD TAG_NULL as i64
+                    ; cmp rax, r8
+                    ; je => is_obj
+                    ; jmp => helper_call
+                    ; => heap_val
+                    ; mov ecx, eax
+                    ; cmp BYTE [rdi + htmldda_on], 0
+                    ; je => helper_call
+                    ; cmp ecx, DWORD [rdi + htmldda_idx]
+                    ; je => is_undef
+                    ; mov r10, [rdi + hot_off]
+                    ; lea r10, [r10 + rcx * 8]
+                    ; mov r11d, DWORD [r10 + rcx * 8 + hot_fid]
+                    ; cmp r11d, crate::heap::FID_MIRROR_STR as i32
+                    ; je => is_str
+                    ; cmp DWORD [r10 + rcx * 8], 0
+                    ; jne => is_obj
+                    ; cmp QWORD [r10 + rcx * 8 + hot_vals], 0
+                    ; jne => is_obj
+                    ; cmp r11d, crate::heap::FID_MIRROR_CLASS as i32
+                    ; jae => helper_call
+                    ; jmp => is_fn
+                    ; => helper_call
+                    ; mov rdx, rax
+                    ; mov rcx, rdi
+                    ; mov r8d, code_neg
+                    ; mov rax, QWORD heap.typeof_is as i64
+                    ; call rax
+                    ; and eax, 1
+                    ; mov Rd(d), eax
+                    ; jmp => done
+                    ; => is_num
+                    ; mov Rd(d), r_num
+                    ; jmp => done
+                    ; => is_bool
+                    ; mov Rd(d), r_bool
+                    ; jmp => done
+                    ; => is_undef
+                    ; mov Rd(d), r_undef
+                    ; jmp => done
+                    ; => is_obj
+                    ; mov Rd(d), r_obj
+                    ; jmp => done
+                    ; => is_str
+                    ; mov Rd(d), r_str
+                    ; jmp => done
+                    ; => is_fn
+                    ; mov Rd(d), r_fn
+                    ; => done
+                );
+                self.done_gpr(d, st);
+            }
+            Op::TypeOfSame { a, b, neg } => {
+                let heap = f.heap.expect("Tier O bodies have their helpers");
+                let ra = self.gpr(a, RDX);
+                dynasm!(self.ops ; mov rax, Rq(ra));
+                let rb = self.gpr(b, R11);
+                dynasm!(self.ops
+                    ; mov r11, Rq(rb)
+                    ; mov rcx, rdi
+                    ; mov rdx, rax
+                    ; mov r8, r11
+                    ; mov r9d, i32::from(neg)
+                    ; mov rax, QWORD heap.typeof_same as i64
+                    ; call rax
+                );
+                let (d, st) = self.dst_gpr(v);
+                dynasm!(self.ops
+                    ; and eax, 1
+                    ; mov Rd(d), eax
+                );
+                self.done_gpr(d, st);
+            }
+            Op::LoadGlobalOrUndef(idx) => {
+                let stub = stub.expect("a guard has a frame state");
+                let (d, st) = self.dst_gpr(v);
+                let base = crate::vm::host_api::JIT_GLOBALS_RAW_OFFSET as i32;
+                let off = 8 * idx as i32;
+                dynasm!(self.ops
+                    ; cmp BYTE [rdi + crate::vm::host_api::JIT_ROUTE_DIRTY_OFFSET as i32], 0
+                    ; jne => stub
+                    ; mov rax, [rdi + base]
+                    ; mov Rq(d), [rax + off]
+                    ; mov rax, QWORD Value::UNINITIALIZED.bits() as i64
+                    ; mov rcx, QWORD Value::UNDEFINED.bits() as i64
+                    ; cmp Rq(d), rax
+                    ; cmove Rq(d), rcx
+                );
+                self.done_gpr(d, st);
+            }
+            Op::LoadCallee { ip } => {
+                let s = i.fs.expect("LoadCallee has a frame state");
+                let bail = self.add_plain_bail(s, ip);
+                dynasm!(self.ops
+                    ; mov rcx, rdi
+                    ; mov rax, QWORD crate::vm::jit_load_callee as *const () as i64
+                    ; call rax
+                    ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                );
+                let (d, st) = self.dst_gpr(v);
+                dynasm!(self.ops ; mov Rq(d), rax);
+                self.done_gpr(d, st);
+            }
+            Op::TailCallGuard { ip } => {
+                let s = i.fs.expect("TailCallGuard has a frame state");
+                let bail = self.add_plain_bail(s, ip);
+                let depth_off = crate::vm::host_api::JIT_CALL_DEPTH_OFFSET as i32;
+                dynasm!(self.ops
+                    ; mov eax, [rdi + depth_off]
+                    ; cmp eax, crate::vm::native_call_cap() as i32
+                    ; jae => bail
+                );
+            }
+            Op::CheckCoercible { src, ip } => {
+                let s = i.fs.expect("CheckCoercible has a frame state");
+                let bail = self.add_plain_bail(s, ip);
+                let rx = self.gpr(src, RDX);
+                dynasm!(self.ops
+                    ; mov rax, QWORD Value::NULL.bits() as i64
+                    ; cmp Rq(rx), rax
+                    ; je => bail
+                    ; mov rax, QWORD Value::UNDEFINED.bits() as i64
+                    ; cmp Rq(rx), rax
+                    ; je => bail
+                );
+            }
+            Op::BailOnly { ip } => {
+                let s = i.fs.expect("BailOnly has a frame state");
+                let epilogue = self.epilogue;
+                self.write_state(s);
+                dynasm!(self.ops
+                    ; mov DWORD [rsi], ip as i32
+                    ; xor eax, eax
+                    ; jmp => epilogue
+                );
+            }
+            Op::ConcatChain {
+                a,
+                b,
+                next_leaf,
+                hint,
+                ip,
+            } => {
+                let s = i.fs.expect("ConcatChain has a frame state");
+                self.write_state(s);
+                let ra = self.gpr(a, RDX);
+                dynasm!(self.ops ; mov rax, Rq(ra));
+                let rb = self.gpr(b, R11);
+                dynasm!(self.ops
+                    ; mov r11, Rq(rb)
+                    ; mov rcx, rdi
+                    ; mov rdx, rax
+                    ; mov r8, r11
+                    ; mov r9d, hint as i32
+                );
+                if let Some(next_b) = next_leaf {
+                    let helper_ready = self.ops.new_dynamic_label();
+                    dynasm!(self.ops
+                        ; mov rax, QWORD crate::vm::jit_concat_chain_fast as *const () as i64
+                        ; mov r10, [rbx + 8 * next_b as i32]
+                        ; shr r10, 48
+                        ; cmp r10d, 0x7FF9
+                        ; jne => helper_ready
+                        ; mov rax, QWORD crate::vm::jit_concat_chain_suffix_fast as *const () as i64
+                        ; => helper_ready
+                    );
+                } else {
+                    dynasm!(self.ops
+                        ; mov rax, QWORD crate::vm::jit_concat_chain_fast as *const () as i64
+                    );
+                }
+                dynasm!(self.ops ; call rax);
+                self.leave_on_sentinel(ip);
+                let (d, st) = self.dst_gpr(v);
+                dynasm!(self.ops ; mov Rq(d), rax);
+                self.done_gpr(d, st);
+            }
+            Op::CellGet { cell, ip } => {
+                let s = i.fs.expect("CellGet has a frame state");
+                let bail = self.add_plain_bail(s, ip);
+                let rc = self.gpr(cell, RDX);
+                let (d, st) = self.dst_gpr(v);
+                let mirror = crate::vm::host_api::JIT_CELL_MIRROR_RAW_OFFSET as i32;
+                dynasm!(self.ops
+                    ; mov eax, Rd(rc)
+                    ; mov rcx, [rdi + mirror]
+                    ; mov Rq(d), [rcx + rax * 8]
+                    ; mov rax, QWORD Value::UNINITIALIZED.bits() as i64
+                    ; cmp Rq(d), rax
+                    ; je => bail
+                );
+                self.done_gpr(d, st);
+            }
+            Op::CellSet { cell, src, checked, ip } => {
+                let rc = self.gpr(cell, RDX);
+                dynasm!(self.ops ; mov rax, Rq(rc));
+                let rs = self.gpr(src, R11);
+                if checked {
+                    let s = i.fs.expect("CellSetChecked has a frame state");
+                    let bail = self.add_plain_bail(s, ip);
+                    dynasm!(self.ops
+                        ; mov r11, Rq(rs)
+                        ; mov rcx, rdi
+                        ; mov rdx, rax
+                        ; mov r8, r11
+                        ; mov rax, QWORD crate::vm::jit_cell_set_tdz_checked as *const () as i64
+                        ; call rax
+                        ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                    );
+                } else {
+                    let mirror = crate::vm::host_api::JIT_CELL_MIRROR_RAW_OFFSET as i32;
+                    let done = self.ops.new_dynamic_label();
+                    dynasm!(self.ops
+                        ; mov r11, Rq(rs)
+                        ; mov edx, eax
+                        ; mov rcx, [rdi + mirror]
+                        ; mov [rcx + rdx * 8], r11
+                        ; mov rax, r11
+                        ; shr rax, 48
+                        ; cmp eax, 0x7FFD
+                        ; jne => done
+                        ; mov r8, r11
+                    );
+                    crate::codegen::emit_heap_store_barrier(&mut self.ops, f.gen_lane, done);
+                    dynasm!(self.ops ; => done);
+                }
+            }
+            Op::MakeFunc { ip } => {
+                let s = i.fs.expect("MakeFunc has a frame state");
+                self.write_state(s);
+                let fip = ((f.func_id as u64) << 32 | ip as u64) as i64;
+                dynasm!(self.ops
+                    ; mov rcx, rdi
+                    ; mov rdx, QWORD fip
+                    ; mov rax, QWORD crate::vm::jit_make_func as *const () as i64
+                    ; call rax
+                );
+                self.leave_on_sentinel(ip);
+                let (d, st) = self.dst_gpr(v);
+                dynasm!(self.ops ; mov Rq(d), rax);
+                self.done_gpr(d, st);
+            }
+            Op::NewObject { hint, ip } => {
+                let s = i.fs.expect("NewObject has a frame state");
+                self.write_state(s);
+                dynasm!(self.ops
+                    ; mov rcx, rdi
+                    ; mov edx, hint as i32
+                    ; mov rax, QWORD crate::vm::jit_new_object as *const () as i64
+                    ; call rax
+                );
+                self.leave_on_sentinel(ip);
+                let (d, st) = self.dst_gpr(v);
+                dynasm!(self.ops ; mov Rq(d), rax);
+                self.done_gpr(d, st);
+            }
+            Op::NewPlannedObject { plan, ip } => {
+                let s = i.fs.expect("NewPlannedObject has a frame state");
+                self.write_state(s);
+                let packed = ((f.func_id as u64) << 32 | plan as u64) as i64;
+                dynasm!(self.ops
+                    ; mov rcx, rdi
+                    ; mov rdx, QWORD packed
+                    ; mov rax, QWORD crate::vm::jit_new_planned_object as *const () as i64
+                    ; call rax
+                );
+                self.leave_on_sentinel(ip);
+                let (d, st) = self.dst_gpr(v);
+                dynasm!(self.ops ; mov Rq(d), rax);
+                self.done_gpr(d, st);
+            }
+            Op::AppendDataProp { obj, name, val, ip } => {
+                let s = i.fs.expect("AppendDataProp has a frame state");
+                self.write_state(s);
+                let ro = self.gpr(obj, RDX);
+                dynasm!(self.ops ; mov rax, Rq(ro));
+                let rv = self.gpr(val, R11);
+                let packed = ((f.func_id as u64) << 32 | name as u64) as i64;
+                dynasm!(self.ops
+                    ; mov r11, Rq(rv)
+                    ; mov rcx, rdi
+                    ; mov rdx, rax
+                    ; mov r8, QWORD packed
+                    ; mov r9, r11
+                    ; mov rax, QWORD crate::vm::jit_append_data_prop as *const () as i64
+                    ; call rax
+                );
+                self.leave_on_sentinel(ip);
+            }
+            Op::ObjectKeys { obj, callee, this_v, ip } => {
+                let s = i.fs.expect("ObjectKeys has a frame state");
+                self.write_state(s);
+                let ro = self.gpr(obj, RDX);
+                dynasm!(self.ops ; mov rax, Rq(ro));
+                let rc = self.gpr(callee, R10);
+                dynasm!(self.ops ; mov r10, Rq(rc));
+                let rt = self.gpr(this_v, R11);
+                dynasm!(self.ops
+                    ; mov r11, Rq(rt)
+                    ; mov rcx, rdi
+                    ; mov rdx, rax
+                    ; mov r8, r10
+                    ; mov r9, r11
+                    ; mov rax, QWORD crate::vm::jit_object_keys as *const () as i64
+                    ; call rax
+                );
+                self.leave_on_sentinel(ip);
+                let (d, st) = self.dst_gpr(v);
+                dynasm!(self.ops ; mov Rq(d), rax);
+                self.done_gpr(d, st);
+            }
+            Op::HasProp { key, obj, ip } => {
+                let s = i.fs.expect("HasProp has a frame state");
+                let bail = self.add_plain_bail(s, ip);
+                let heap = f.heap.expect("Tier O bodies have their helpers");
+                let rk = self.gpr(key, RDX);
+                dynasm!(self.ops ; mov rax, Rq(rk));
+                let ro = self.gpr(obj, R11);
+                dynasm!(self.ops
+                    ; mov r11, Rq(ro)
+                    ; mov rcx, rdi
+                    ; mov rdx, rax
+                    ; mov r8, r11
+                    ; mov rax, QWORD heap.has_property as i64
+                    ; call rax
+                    ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                );
+                let (d, st) = self.dst_gpr(v);
+                dynasm!(self.ops
+                    ; and eax, 1
+                    ; mov Rd(d), eax
+                );
+                self.done_gpr(d, st);
+            }
+            Op::LenOf { obj } => {
+                let heap = f.heap.expect("Tier O bodies have their helpers");
+                let ro = self.gpr(obj, RDX);
+                dynasm!(self.ops
+                    ; mov rdx, Rq(ro)
+                    ; mov rcx, rdi
+                    ; mov rax, QWORD heap.len_of as i64
+                    ; call rax
+                );
+                let (d, st) = self.dst_gpr(v);
+                dynasm!(self.ops ; mov Rq(d), rax);
+                self.done_gpr(d, st);
+            }
+            Op::ForInKeys { obj, ip } => {
+                let s = i.fs.expect("ForInKeys has a frame state");
+                let heap = f.heap.expect("Tier O bodies have their helpers");
+                self.write_state(s);
+                let ro = self.gpr(obj, RDX);
+                dynasm!(self.ops
+                    ; mov rdx, Rq(ro)
+                    ; mov rcx, rdi
+                    ; mov rax, QWORD heap.forin_keys as i64
+                    ; call rax
+                );
+                self.leave_on_sentinel(ip);
+                let (d, st) = self.dst_gpr(v);
+                dynasm!(self.ops ; mov Rq(d), rax);
+                self.done_gpr(d, st);
+            }
+            Op::ForInLive { obj, key } => {
+                let s = i.fs.expect("ForInLive has a frame state");
+                let heap = f.heap.expect("Tier O bodies have their helpers");
+                self.write_state(s);
+                let ro = self.gpr(obj, RDX);
+                dynasm!(self.ops ; mov rax, Rq(ro));
+                let rk = self.gpr(key, R11);
+                dynasm!(self.ops
+                    ; mov r11, Rq(rk)
+                    ; mov rcx, rdi
+                    ; mov rdx, rax
+                    ; mov r8, r11
+                    ; mov rax, QWORD heap.forin_live as i64
+                    ; call rax
+                );
+                let (d, st) = self.dst_gpr(v);
+                dynasm!(self.ops ; mov Rq(d), rax);
+                self.done_gpr(d, st);
+            }
+            Op::RegExpLitProbe { pattern, flags, ip } => {
+                let s = i.fs.expect("RegExpLitProbe has a frame state");
+                let bail = self.add_plain_bail(s, ip);
+                dynasm!(self.ops
+                    ; mov rcx, rdi
+                    ; mov edx, f.func_id as i32
+                    ; mov r8d, pattern as i32
+                    ; mov r9d, flags as i32
+                    ; mov rax, QWORD crate::vm::jit_regexp_lit_probe as *const () as i64
+                    ; call rax
+                    ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                );
+                let (d, st) = self.dst_gpr(v);
+                dynasm!(self.ops ; mov Rq(d), rax);
+                self.done_gpr(d, st);
+            }
+            Op::RegExpLitTest {
+                arg,
+                pattern,
+                flags,
+                ip,
+                packed,
+            } => {
+                let s = i.fs.expect("RegExpLitTest has a frame state");
+                self.write_state(s);
+                let slow = self.ops.new_dynamic_label();
+                let done = self.ops.new_dynamic_label();
+                let consts = (pattern as u64 | (flags as u64) << 32) as i64;
+                dynasm!(self.ops
+                    ; mov rcx, rdi
+                    ; mov edx, f.func_id as i32
+                    ; mov r8, QWORD consts
+                    ; mov r9, [rbx + 8 * arg as i32]
+                    ; mov rax, QWORD crate::vm::jit_regexp_lit_test as *const () as i64
+                    ; call rax
+                    ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => slow
+                );
+                self.leave_on_sentinel(ip);
+                dynasm!(self.ops ; jmp => done ; => slow);
+                self.call_written(crate::vm::jit_regexp_lit_test_ic as *const () as u64, ip, packed, 0);
+                let (d, st) = self.dst_gpr(v);
+                dynasm!(self.ops
+                    ; => done
+                    ; mov Rq(d), rax
+                );
+                self.done_gpr(d, st);
+            }
+            Op::RegExpMethod {
+                op,
+                callee,
+                this_v,
+                arg_base,
+                argc,
+                ip,
+                packed,
+            } => {
+                use crate::bytecode::RegExpMethod as R;
+                let s = i.fs.expect("RegExpMethod has a frame state");
+                let heap = f.heap.expect("Tier O bodies have their helpers");
+                self.write_state(s);
+                let done = self.ops.new_dynamic_label();
+                let direct_on = match op {
+                    R::Test | R::Exec => crate::vm::regexp_call_direct_enabled(),
+                    R::MatchAll if argc >= 1 => crate::vm::string_regexp_call_direct_enabled(),
+                    R::Replace if argc >= 2 => crate::vm::string_regexp_call_direct_enabled(),
+                    _ => false,
+                };
+                if direct_on {
+                    let slow = self.ops.new_dynamic_label();
+                    dynasm!(self.ops
+                        ; mov rcx, rdi
+                        ; mov rdx, [rbx + 8 * this_v as i32]
+                    );
+                    match op {
+                        R::Test | R::Exec => {
+                            if argc == 0 {
+                                dynasm!(self.ops ; mov r8, QWORD Value::UNDEFINED.bits() as i64);
+                            } else {
+                                dynasm!(self.ops ; mov r8, [rbx + 8 * arg_base as i32]);
+                            }
+                            dynasm!(self.ops
+                                ; mov r9d, i32::from(op == R::Test)
+                                ; mov rax, QWORD heap.regexp_call_direct as i64
+                            );
+                        }
+                        R::MatchAll | R::Replace => dynasm!(self.ops
+                            ; lea r8, [rbx + 8 * arg_base as i32]
+                            ; mov r9d, i32::from(op == R::Replace)
+                            ; mov rax, QWORD heap.string_regexp_call_direct as i64
+                        ),
+                    }
+                    dynasm!(self.ops
+                        ; mov r10, [rbx + 8 * callee as i32]
+                        ; mov [rsp + 32], r10
+                        ; call rax
+                        ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => slow
+                    );
+                    self.leave_on_sentinel(ip);
+                    dynasm!(self.ops ; jmp => done ; => slow);
+                }
+                self.call_written(crate::vm::jit_call_with_this_ic as *const () as u64, ip, packed, argc);
+                let (d, st) = self.dst_gpr(v);
+                dynasm!(self.ops
+                    ; => done
+                    ; mov Rq(d), rax
+                );
+                self.done_gpr(d, st);
+            }
+            Op::IterProbe => {
+                dynasm!(self.ops
+                    ; mov rcx, rdi
+                    ; mov rax, QWORD crate::vm::jit_iter_probe as *const () as i64
+                    ; call rax
+                );
+                let (d, st) = self.dst_gpr(v);
+                dynasm!(self.ops ; mov Rq(d), rax);
                 self.done_gpr(d, st);
             }
         }
@@ -2390,6 +3722,28 @@ impl Em<'_> {
                 let (o, p) = (self.slot(t), self.slot(u));
                 dynasm!(self.ops ; mov rcx, [rsp + o] ; mov [rsp + p], rcx);
             }
+            (Loc::Imm, _) | (_, Loc::Imm) => unreachable!("Loc::Imm is materialized directly in edge_moves"),
+        }
+    }
+
+    fn emit_imm_to(&mut self, v: V, d: Loc) {
+        match (self.f.insts[v as usize].op.clone(), d) {
+            (Op::ConstI32(c), Loc::Gpr(r)) => dynasm!(self.ops ; mov Rd(r), c),
+            (Op::ConstBool(b), Loc::Gpr(r)) => dynasm!(self.ops ; mov Rd(r), i32::from(b)),
+            (Op::ConstTagged(bits), Loc::Gpr(r)) => dynasm!(self.ops ; mov Rq(r), QWORD bits as i64),
+            (Op::ConstI32(c), Loc::Slot(t)) => {
+                let o = self.slot(t);
+                dynasm!(self.ops ; mov eax, c ; mov [rsp + o], rax);
+            }
+            (Op::ConstBool(b), Loc::Slot(t)) => {
+                let o = self.slot(t);
+                dynasm!(self.ops ; mov eax, i32::from(b) ; mov [rsp + o], rax);
+            }
+            (Op::ConstTagged(bits), Loc::Slot(t)) => {
+                let o = self.slot(t);
+                dynasm!(self.ops ; mov rax, QWORD bits as i64 ; mov [rsp + o], rax);
+            }
+            _ => unreachable!("unexpected immediate edge move to {d:?}"),
         }
     }
 
@@ -2400,10 +3754,14 @@ impl Em<'_> {
             return;
         };
         let mut pending: Vec<(Loc, Loc)> = Vec::new();
+        let mut imm_moves: Vec<(V, Loc)> = Vec::new();
         for &phi in &tb.insts {
             if let Op::Phi(ins) = &self.f.insts[phi as usize].op {
-                let (s, d) = (self.a.loc[ins[k] as usize], self.a.loc[phi as usize]);
-                if s != d {
+                let src_v = ins[k];
+                let (s, d) = (self.a.loc[src_v as usize], self.a.loc[phi as usize]);
+                if s == Loc::Imm {
+                    imm_moves.push((src_v, d));
+                } else if s != d {
                     pending.push((s, d));
                 }
             }
@@ -2428,11 +3786,14 @@ impl Em<'_> {
                 }
             }
         }
+        for (src_v, d) in imm_moves {
+            self.emit_imm_to(src_v, d);
+        }
     }
 }
 
-pub(crate) fn emit(f: &Func, a: &Alloc) -> Option<JitFn> {
-    let mut ops = Asm::new().ok()?;
+pub(crate) fn emit(f: &Func, a: &Alloc, prop_key_ids: &[u32]) -> Option<JitFn> {
+    let mut ops = crate::codegen::new_x64_asm();
     let block_labels: Vec<DynamicLabel> = f.blocks.iter().map(|_| ops.new_dynamic_label()).collect();
     let stubs: Vec<DynamicLabel> = f.states.iter().map(|_| ops.new_dynamic_label()).collect();
     let epilogue = ops.new_dynamic_label();
@@ -2484,9 +3845,7 @@ pub(crate) fn emit(f: &Func, a: &Alloc) -> Option<JitFn> {
     // only reader (no boolean made, then tested).
     let mut uses = vec![0u32; f.insts.len()];
     for inst in &f.insts {
-        for u in inst.op.operands() {
-            uses[u as usize] += 1;
-        }
+        inst.op.for_each_operand(|u| uses[u as usize] += 1);
         if let Op::Phi(ins) = &inst.op {
             for &u in ins {
                 uses[u as usize] += 1;
@@ -2511,13 +3870,23 @@ pub(crate) fn emit(f: &Func, a: &Alloc) -> Option<JitFn> {
         };
         (uses[cond as usize] == 1
             && b.insts.last() == Some(&cond)
-            && matches!(f.insts[cond as usize].op, Op::CmpF(..) | Op::CmpI(..)))
+            && (!stress || f.insts[cond as usize].fs.is_none())
+            && matches!(
+                f.insts[cond as usize].op,
+                Op::CmpF(..)
+                    | Op::CmpI(..)
+                    | Op::CmpB(..)
+                    | Op::StrictEqBits(..)
+                    | Op::StrictEqAtom { .. }
+                    | Op::IsNullish { .. }
+            ))
         .then_some(cond)
     };
     let mut em = Em {
         ops,
         f,
         a,
+        prop_key_ids,
         slot_base: OUT_AREA + xmm_area,
         stubs,
         stress,
@@ -2526,8 +3895,23 @@ pub(crate) fn emit(f: &Func, a: &Alloc) -> Option<JitFn> {
         ta_read,
         ta_write,
         c3,
+        eq_stub: None,
+        truthy_stub: None,
+        loose_eq_stub: None,
+        is_array_stub: None,
+        keyed_get_stub: None,
+        mega_prop_stubs: None,
+        mega_set_stubs: None,
+        #[cfg(not(feature = "safe-sandbox"))]
+        instanceof_pair_stub: None,
+        cross3_dyn_stub: None,
+        fn_call_dyn_stub: None,
+        fn_get_call_stub: None,
+        plain_bails: Vec::new(),
+        window_known: Vec::new(),
     };
     for (bi, b) in f.blocks.iter().enumerate() {
+        em.window_known.clear();
         dynasm!(em.ops ; => block_labels[bi]);
         let fuse = fused(b);
         for &v in &b.insts {
@@ -2563,6 +3947,75 @@ pub(crate) fn emit(f: &Func, a: &Alloc) -> Option<JitFn> {
                         Cmp::Eq => dynasm!(em.ops ; jne => lf),
                         Cmp::Ne => dynasm!(em.ops ; je => lf),
                     }
+                }
+                Op::CmpB(eq, x, y) => {
+                    let ra = em.gpr(x, RDX);
+                    let rb = em.gpr(y, R11);
+                    dynasm!(em.ops ; cmp Rd(ra), Rd(rb));
+                    if eq {
+                        dynasm!(em.ops ; jne => lf);
+                    } else {
+                        dynasm!(em.ops ; je => lf);
+                    }
+                }
+                Op::StrictEqBits(eq, a, bits) => {
+                    let ra = em.gpr(a, RDX);
+                    dynasm!(em.ops
+                        ; mov rcx, QWORD bits as i64
+                        ; cmp Rq(ra), rcx
+                    );
+                    if eq {
+                        dynasm!(em.ops ; jne => lf);
+                    } else {
+                        dynasm!(em.ops ; je => lf);
+                    }
+                }
+                Op::StrictEqAtom {
+                    eq,
+                    a,
+                    atom_bits,
+                    atom_ok,
+                } => {
+                    let ra = em.gpr(a, RDX);
+                    let rok = em.gpr(atom_ok, R11);
+                    let stub = *em.eq_stub.get_or_insert_with(|| em.ops.new_dynamic_label());
+                    let (eq_lbl, ne_lbl) = if eq { (lt, lf) } else { (lf, lt) };
+                    dynasm!(em.ops
+                        ; mov rcx, QWORD atom_bits as i64
+                        ; cmp Rq(ra), rcx
+                        ; je => eq_lbl
+                        ; test Rd(rok), Rd(rok)
+                        ; jnz => ne_lbl
+                        ; mov rax, Rq(ra)
+                        ; call => stub
+                        ; test eax, eax
+                        ; jnz => eq_lbl
+                        ; jmp => ne_lbl
+                    );
+                }
+                Op::IsNullish { is_ne, a, ip } => {
+                    let s = f.insts[c as usize].fs.expect("IsNullish has a frame state");
+                    let bail = em.add_plain_bail(s, ip);
+                    let ra = em.gpr(a, RDX);
+                    let (null_lbl, non_null_lbl) = if is_ne { (lf, lt) } else { (lt, lf) };
+                    dynasm!(em.ops
+                        ; cmp BYTE [rdi + crate::vm::host_api::JIT_HTMLDDA_SCALAR_ENABLED_OFFSET as i32], 0
+                        ; je => bail
+                        ; mov rax, Rq(ra)
+                        ; mov rcx, QWORD Value::UNDEFINED.bits() as i64
+                        ; cmp rax, rcx
+                        ; je => null_lbl
+                        ; mov rcx, QWORD Value::NULL.bits() as i64
+                        ; cmp rax, rcx
+                        ; je => null_lbl
+                        ; mov rcx, rax
+                        ; shr rcx, 48
+                        ; cmp ecx, 0x7FFD
+                        ; jne => non_null_lbl
+                        ; cmp eax, DWORD [rdi + crate::vm::host_api::JIT_HTMLDDA_IDX_OFFSET as i32]
+                        ; je => null_lbl
+                        ; jmp => non_null_lbl
+                    );
                 }
                 _ => unreachable!("only a compare fuses"),
             }
@@ -2612,7 +4065,7 @@ pub(crate) fn emit(f: &Func, a: &Alloc) -> Option<JitFn> {
     let helper = crate::vm::jit_opt_deopt as *const () as i64;
     for (k, s) in f.states.iter().enumerate() {
         dynasm!(em.ops ; => em.stubs[k]);
-        em.write_state(k as u32);
+        em.write_state_full(k as u32);
         dynasm!(em.ops
             ; mov DWORD [rsi], s.ip as i32
             ; mov rcx, rdi
@@ -2625,10 +4078,64 @@ pub(crate) fn emit(f: &Func, a: &Alloc) -> Option<JitFn> {
             ; jmp => epilogue
         );
     }
-    // ── typed-array element stubs ──
+    // ── non-deopt plain bail stubs ──
+    let plain_bails = std::mem::take(&mut em.plain_bails);
+    for (lbl, s, ip) in plain_bails {
+        dynasm!(em.ops ; => lbl);
+        em.write_state_full(s);
+        dynasm!(em.ops
+            ; mov DWORD [rsi], ip as i32
+            ; xor eax, eax
+            ; jmp => epilogue
+        );
+    }
+    // ── typed-array & per-function direct helper stubs ──
     if f.ta_records > 0 {
         super::super::proto_mem::emit_ta_read_stub(&mut em.ops, ta_read);
         super::super::proto_mem::emit_ta_write_stub(&mut em.ops, ta_write);
+    }
+    if let Some(heap) = f.heap.as_ref() {
+        if let Some(lbl) = em.eq_stub {
+            super::super::proto_mem::emit_strict_eq_stub(&mut em.ops, lbl, heap.strict_eq);
+        }
+        if let Some(lbl) = em.truthy_stub {
+            super::super::proto_mem::emit_truthy_stub(&mut em.ops, lbl, heap.truthy);
+        }
+        if let Some(lbl) = em.loose_eq_stub {
+            super::super::proto_mem::emit_loose_eq_stub(&mut em.ops, lbl);
+        }
+        if let Some(lbl) = em.is_array_stub {
+            super::super::proto_mem::emit_is_array_stub(&mut em.ops, lbl, heap.is_array);
+        }
+        if let Some(lbl) = em.keyed_get_stub {
+            super::super::proto_mem::emit_keyed_memo_get_stub(&mut em.ops, lbl, heap.get_index);
+        }
+        if let Some((full_lbl, dict_lbl)) = em.mega_prop_stubs {
+            super::super::proto_mem::emit_mega_get_prop_stub(&mut em.ops, full_lbl, dict_lbl, heap.get_prop_miss);
+        }
+        if let Some((full_lbl, dict_lbl)) = em.mega_set_stubs {
+            super::super::proto_mem::emit_mega_set_prop_stub(
+                &mut em.ops,
+                full_lbl,
+                dict_lbl,
+                f.gen_lane,
+                heap.set_prop_miss,
+            );
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
+        if let Some(lbl) = em.instanceof_pair_stub {
+            super::super::proto_mem::emit_instanceof_pair_stub(&mut em.ops, lbl);
+        }
+        if let Some(lbl) = em.fn_get_call_stub {
+            super::super::proto_mem::emit_fn_get_call_stub(&mut em.ops, lbl);
+        }
+        if let Some(lbl) = em.fn_call_dyn_stub {
+            let dyn_target = em.cross3_dyn_stub.expect("fn_call_dyn_stub requires cross3_dyn_stub");
+            super::super::proto_mem::emit_fn_call_dyn_stub(&mut em.ops, lbl, dyn_target);
+        }
+        if let Some(lbl) = em.cross3_dyn_stub {
+            super::super::proto_mem::emit_cross3_dyn_stub(&mut em.ops, lbl, f.reg_count.max(1), heap, None);
+        }
     }
     // ── epilogue ──
     dynasm!(em.ops ; => epilogue);
@@ -2646,7 +4153,7 @@ pub(crate) fn emit(f: &Func, a: &Alloc) -> Option<JitFn> {
         ; pop rbx
         ; ret
     );
-    let buf = em.ops.finalize().ok()?;
+    let buf = crate::codegen::finalize_code(em.ops)?;
     let entry = buf.ptr(dynasmrt::AssemblyOffset(0));
     // `ZIPP_OPT_DUMP=<dir>`: the body's bytes, for a disassembler.
     if let Some(dir) = crate::env_var_os("ZIPP_OPT_DUMP") {

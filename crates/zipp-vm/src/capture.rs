@@ -68,26 +68,121 @@ mod memo {
     use std::cell::RefCell;
 
     pub type Key = (usize, u32, u32, u8);
-    type Entry = Box<[(*const u8, usize)]>;
+    type Slot = (u32, u32);
+    struct Frame {
+        id: u64,
+        map: rustc_hash::FxHashMap<Key, Slot>,
+        arena: Vec<(*const u8, usize)>,
+        #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+        source: Option<std::sync::Arc<str>>,
+    }
 
     thread_local! {
-        static STACK: RefCell<Vec<(u64, rustc_hash::FxHashMap<Key, Entry>)>> =
-            const { RefCell::new(Vec::new()) };
+        static STACK: RefCell<Vec<Frame>> = const { RefCell::new(Vec::new()) };
         static NEXT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        /// Optional pointer to a `&Names<'_>` filter active during `captured_locals` /
+        /// `late_box_names`, so skipped bodies only check membership in `bound`
+        /// with zero per-function `FxHashSet` allocation or `memo::arena` writes.
+        #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+        static LAZY_FILTER: std::cell::Cell<*const ()> = const { std::cell::Cell::new(std::ptr::null()) };
+    }
+
+    /// Run `f` with `bound` installed as the active lazy-body identifier filter.
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    pub fn with_lazy_filter<R>(bound: &super::Names<'_>, f: impl FnOnce() -> R) -> R {
+        struct Reset(*const ());
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                LAZY_FILTER.with(|c| c.set(self.0));
+            }
+        }
+        let prev = LAZY_FILTER.with(|c| c.replace(bound as *const super::Names<'_> as *const ()));
+        let _guard = Reset(prev);
+        f()
+    }
+
+    /// If a `with_lazy_filter` is active, scan `span` and insert into `out` only
+    /// identifiers present in the filter and not in `exclude`. Returns `true` if
+    /// handled by an active filter (so the caller should skip `own` & `memo`).
+    ///
+    /// # Safety
+    /// Same lifetime contract as [`scan_source_idents`]: `out` does not outlive
+    /// the active `Session`.
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    pub unsafe fn scan_source_idents_filtered<'a>(
+        span: (u32, u32),
+        exclude: &[&str],
+        out: &mut super::Names<'a>,
+    ) -> bool {
+        let ptr = LAZY_FILTER.with(|c| c.get());
+        if ptr.is_null() {
+            return false;
+        }
+        // SAFETY: `ptr` points to a live `Names<'_>` owned by `with_lazy_filter` on this stack.
+        let filter: &super::Names<'_> = unsafe { &*(ptr as *const super::Names<'_>) };
+        if filter.is_empty() {
+            return true;
+        }
+        let scanned = unsafe {
+            scan_source_idents(span, |ident| {
+                if filter.contains(ident) && !exclude.contains(&ident) {
+                    out.insert(ident);
+                }
+                true
+            })
+        };
+        debug_assert!(scanned, "lazy_span requires an active capture::Session with source");
+        true
     }
 
     /// One compile's memo, popped on drop.
     pub struct Session(u64);
 
     impl Session {
+        #[allow(dead_code)]
         pub fn new() -> Session {
             let id = NEXT.with(|n| {
                 let id = n.get();
                 n.set(id + 1);
                 id
             });
-            STACK.with(|s| s.borrow_mut().push((id, Default::default())));
+            STACK.with(|s| {
+                s.borrow_mut().push(Frame {
+                    id,
+                    map: Default::default(),
+                    arena: Vec::new(),
+                    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                    source: None,
+                });
+            });
             Session(id)
+        }
+
+        /// One compile's memo, retaining a handle to the program source so
+        /// pre-parser-skipped function bodies can be scanned for free names.
+        pub fn new_with_source(source: std::sync::Arc<str>) -> Session {
+            #[cfg(any(feature = "meter-only", feature = "safe-sandbox"))]
+            {
+                let _ = source;
+                Self::new()
+            }
+            #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+            {
+                let id = NEXT.with(|n| {
+                    let id = n.get();
+                    n.set(id + 1);
+                    id
+                });
+                STACK.with(|s| {
+                    s.borrow_mut().push(Frame {
+                        id,
+                        map: Default::default(),
+                        arena: Vec::new(),
+                        source: Some(source),
+                    });
+                });
+                Session(id)
+            }
         }
 
         /// Make this session's memo the innermost again: a compiler kept
@@ -96,10 +191,10 @@ mod memo {
         pub fn activate(&self) {
             STACK.with(|s| {
                 let mut s = s.borrow_mut();
-                if s.last().is_some_and(|(id, _)| *id == self.0) {
+                if s.last().is_some_and(|f| f.id == self.0) {
                     return;
                 }
-                if let Some(i) = s.iter().position(|(id, _)| *id == self.0) {
+                if let Some(i) = s.iter().position(|f| f.id == self.0) {
                     let entry = s.remove(i);
                     s.push(entry);
                 }
@@ -109,7 +204,7 @@ mod memo {
 
     impl Drop for Session {
         fn drop(&mut self) {
-            STACK.with(|s| s.borrow_mut().retain(|(id, _)| *id != self.0));
+            STACK.with(|s| s.borrow_mut().retain(|f| f.id != self.0));
         }
     }
 
@@ -124,12 +219,43 @@ mod memo {
     pub unsafe fn get<'a>(key: Key, out: &mut super::Names<'a>) -> bool {
         STACK.with(|s| {
             let s = s.borrow();
-            let Some(e) = s.last().and_then(|(_, m)| m.get(&key)) else {
+            let Some(frame) = s.last() else {
                 return false;
             };
-            for &(p, n) in e.iter() {
+            let Some(&(start, len)) = frame.map.get(&key) else {
+                return false;
+            };
+            let slice = &frame.arena[start as usize..(start + len) as usize];
+            out.reserve(slice.len());
+            for &(p, n) in slice {
                 // SAFETY: the caller's contract; the bytes were a `&str`.
                 out.insert(unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(p, n)) });
+            }
+            true
+        })
+    }
+
+    /// Visit each memoised name for `key` without allocating a temporary set;
+    /// stops early if `f` returns `false`. Returns `true` on a cache hit.
+    ///
+    /// # Safety
+    /// Same as [`get`]: `key` names a live AST node of the innermost session.
+    #[cfg(not(feature = "safe-sandbox"))]
+    pub unsafe fn for_each(key: Key, mut f: impl FnMut(&str) -> bool) -> bool {
+        STACK.with(|s| {
+            let s = s.borrow();
+            let Some(frame) = s.last() else {
+                return false;
+            };
+            let Some(&(start, len)) = frame.map.get(&key) else {
+                return false;
+            };
+            let slice = &frame.arena[start as usize..(start + len) as usize];
+            for &(p, n) in slice {
+                // SAFETY: the caller's contract; the bytes were a `&str`.
+                if !f(unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(p, n)) }) {
+                    break;
+                }
             }
             true
         })
@@ -140,10 +266,236 @@ mod memo {
             return;
         }
         STACK.with(|s| {
-            if let Some((_, m)) = s.borrow_mut().last_mut() {
-                m.insert(key, names.iter().map(|n| (n.as_ptr(), n.len())).collect());
+            if let Some(frame) = s.borrow_mut().last_mut() {
+                if let (Ok(start), Ok(len)) = (u32::try_from(frame.arena.len()), u32::try_from(names.len())) {
+                    if start.checked_add(len).is_some() {
+                        frame.arena.reserve(names.len());
+                        for n in names {
+                            frame.arena.push((n.as_ptr(), n.len()));
+                        }
+                        frame.map.insert(key, (start, len));
+                    }
+                }
             }
         });
+    }
+
+    /// Scan identifiers in a pre-parser-skipped function body range `(start, end)`
+    /// of the active session's source. Returns `false` if no source is attached.
+    ///
+    /// # Safety
+    /// The yielded `&'a str` slices point into the innermost session's `Arc<str>`
+    /// source buffer, which stays alive for the lifetime of that `Session`.
+    /// Callers must not let those slices outlive the active `Session`.
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    pub unsafe fn scan_source_idents<'a>(
+        span: (u32, u32),
+        mut f: impl FnMut(&'a str) -> bool,
+    ) -> bool {
+        let raw = STACK.with(|s| {
+            let s = s.borrow();
+            let frame = s.last()?;
+            let src = frame.source.as_ref()?;
+            Some((src.as_ptr(), src.len()))
+        });
+        let Some((ptr, len)) = raw else {
+            return false;
+        };
+        let end = (span.1 as usize).min(len);
+        let start = (span.0 as usize).min(end);
+        // SAFETY: `ptr..ptr+len` is valid UTF-8 owned by the active Session's `Arc<str>`.
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+        scan_lazy_idents_in(bytes, start, end, |word| {
+            // SAFETY: `word` is an ASCII identifier slice inside `bytes`.
+            f(unsafe { std::str::from_utf8_unchecked(word) })
+        });
+        true
+    }
+
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    const ASCII_ID_CONT: [u8; 256] = {
+        let mut t = [0u8; 256];
+        let mut i = 0usize;
+        while i < 128 {
+            let b = i as u8;
+            if b.is_ascii_alphanumeric() || b == b'_' || b == b'$' {
+                t[i] = 1;
+            }
+            i += 1;
+        }
+        t
+    };
+
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    #[inline]
+    fn is_js_reserved_keyword(word: &[u8]) -> bool {
+        let n = word.len();
+        if !(2..=10).contains(&n) {
+            return false;
+        }
+        match word[0] {
+            b'b' => word == b"break",
+            b'c' => matches!(word, b"case" | b"catch" | b"class" | b"const" | b"continue"),
+            b'd' => matches!(word, b"debugger" | b"default" | b"delete" | b"do"),
+            b'e' => matches!(word, b"else" | b"enum" | b"export" | b"extends"),
+            b'f' => matches!(word, b"false" | b"finally" | b"for" | b"function"),
+            b'i' => matches!(word, b"if" | b"import" | b"in" | b"instanceof"),
+            b'n' => matches!(word, b"new" | b"null"),
+            b'r' => word == b"return",
+            b's' => matches!(word, b"super" | b"switch"),
+            b't' => matches!(word, b"this" | b"throw" | b"true" | b"try" | b"typeof"),
+            b'v' => matches!(word, b"var" | b"void"),
+            b'w' => matches!(word, b"while" | b"with"),
+            _ => false,
+        }
+    }
+
+    /// Fast ASCII identifier scanner over a pre-parser-skipped function body
+    /// (guaranteed ASCII, balanced braces, no regex literals). Skips strings,
+    /// comments, template raw chunks, numbers, reserved keywords, and `.prop`
+    /// property names while visiting all expression identifiers (including
+    /// inside `${...}` template substitutions).
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    fn scan_lazy_idents_in<'a>(
+        bytes: &'a [u8],
+        start: usize,
+        end: usize,
+        mut f: impl FnMut(&'a [u8]) -> bool,
+    ) {
+        fn scan_tpl(bytes: &[u8], end: usize, i: &mut usize, depth: &mut u32, tpl_stack: &mut Vec<u32>) {
+            while *i < end {
+                let ch = bytes[*i];
+                if ch == b'\\' {
+                    *i = (*i + 2).min(end);
+                } else if ch == b'`' {
+                    *i += 1;
+                    return;
+                } else if ch == b'$' && *i + 1 < end && bytes[*i + 1] == b'{' {
+                    tpl_stack.push(*depth);
+                    *depth += 1;
+                    *i += 2;
+                    return;
+                } else {
+                    *i += 1;
+                }
+            }
+        }
+
+        let mut i = start;
+        let mut depth: u32 = 0;
+        let mut tpl_stack: Vec<u32> = Vec::new();
+        let mut prev_dot = false;
+        while i < end {
+            let b = bytes[i];
+            if matches!(b, b' ' | b'\t' | b'\r' | b'\n' | 0x0B | 0x0C) {
+                i += 1;
+                continue;
+            }
+            match b {
+                b'\'' | b'"' => {
+                    let q = b;
+                    i += 1;
+                    while i < end {
+                        let ch = bytes[i];
+                        if ch == b'\\' {
+                            i = (i + 2).min(end);
+                        } else if ch == q {
+                            i += 1;
+                            break;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    prev_dot = false;
+                }
+                b'`' => {
+                    i += 1;
+                    scan_tpl(bytes, end, &mut i, &mut depth, &mut tpl_stack);
+                    prev_dot = false;
+                }
+                b'/' => {
+                    if i + 1 < end && bytes[i + 1] == b'/' {
+                        i += 2;
+                        while i < end && bytes[i] != b'\n' && bytes[i] != b'\r' {
+                            i += 1;
+                        }
+                    } else if i + 1 < end && bytes[i + 1] == b'*' {
+                        i += 2;
+                        while i + 1 < end && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                            i += 1;
+                        }
+                        i = (i + 2).min(end);
+                    } else {
+                        i += 1;
+                        prev_dot = false;
+                    }
+                }
+                b'{' => {
+                    depth += 1;
+                    i += 1;
+                    prev_dot = false;
+                }
+                b'}' => {
+                    depth = depth.saturating_sub(1);
+                    i += 1;
+                    if tpl_stack.last() == Some(&depth) {
+                        tpl_stack.pop();
+                        scan_tpl(bytes, end, &mut i, &mut depth, &mut tpl_stack);
+                    }
+                    prev_dot = false;
+                }
+                b'.' => {
+                    if i + 1 < end && bytes[i + 1] == b'.' {
+                        while i < end && bytes[i] == b'.' {
+                            i += 1;
+                        }
+                        prev_dot = false;
+                    } else if i + 1 < end && bytes[i + 1].is_ascii_digit() {
+                        i += 1;
+                        while i < end && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'.') {
+                            i += 1;
+                        }
+                        prev_dot = false;
+                    } else {
+                        i += 1;
+                        prev_dot = true;
+                    }
+                }
+                b'0'..=b'9' => {
+                    i += 1;
+                    while i < end {
+                        let c = bytes[i];
+                        if (c == b'e' || c == b'E') && i + 1 < end && (bytes[i + 1] == b'+' || bytes[i + 1] == b'-') {
+                            i += 2;
+                        } else if c.is_ascii_alphanumeric() || c == b'_' || c == b'.' {
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    prev_dot = false;
+                }
+                b'a'..=b'z' | b'A'..=b'Z' | b'_' | b'$' => {
+                    let s = i;
+                    i += 1;
+                    while i < end && ASCII_ID_CONT[bytes[i] as usize] != 0 {
+                        i += 1;
+                    }
+                    if prev_dot {
+                        prev_dot = false;
+                    } else {
+                        let word = &bytes[s..i];
+                        if !is_js_reserved_keyword(word) && !f(word) {
+                            return;
+                        }
+                    }
+                }
+                _ => {
+                    i += 1;
+                    prev_dot = false;
+                }
+            }
+        }
     }
 }
 
@@ -163,6 +515,19 @@ fn memo_get<'a, T>(node: &'a T, span: (u32, u32), kind: u8, out: &mut Names<'a>)
 #[cfg(feature = "safe-sandbox")]
 #[inline]
 fn memo_get<'a, T>(_node: &'a T, _span: (u32, u32), _kind: u8, _out: &mut Names<'a>) -> bool {
+    false
+}
+
+#[cfg(not(feature = "safe-sandbox"))]
+#[inline]
+fn memo_for_each<T>(node: &T, span: (u32, u32), kind: u8, f: impl FnMut(&str) -> bool) -> bool {
+    // SAFETY: same as `memo_get`.
+    unsafe { memo::for_each((node as *const T as usize, span.0, span.1, kind), f) }
+}
+
+#[cfg(feature = "safe-sandbox")]
+#[inline]
+fn memo_for_each<T>(_node: &T, _span: (u32, u32), _kind: u8, _f: impl FnMut(&str) -> bool) -> bool {
     false
 }
 
@@ -380,27 +745,98 @@ pub fn expr_refs_all(e: &Expr) -> HashSet<String> {
 
 /// Every name a STATEMENT LIST references, ignoring what it binds — the
 /// statement-level analogue of `expr_refs_all`. Superset of `free_vars`: a
-/// LOCALLY-bound name the body still mentions (`var eval = f; … eval(s)`)
-/// shows up here, which is what a "may this body direct-eval?" guard needs —
-/// 13.3.6.1 directness tests the callee VALUE, not the binding's location.
-pub fn stmts_refs_all(body: &[Stmt]) -> HashSet<String> {
-    let mut refs = Names::default();
-    for s in body {
-        stmt_refs(s, &mut refs, false);
-    }
-    owned(refs)
-}
-
-/// Whether [`stmts_refs_all`]'s set holds each of `names`, asked of the
+/// Whether [`stmts_refs_each`]'s walk holds each of `names`, asked of the
 /// walk's borrowed names: one walk for every question, and no owned copy.
 /// Compiling a function walked its body twice for two such questions and
 /// allocated a `String` per name it references each time.
 pub fn stmts_refs_each<const N: usize>(body: &[Stmt], names: [&str; N]) -> [bool; N] {
     let mut refs = Names::default();
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    {
+        // Pre-parser-skipped function bodies never contain direct `eval` or
+        // free `arguments` (the skip scanner bails out on both), so exclude
+        // them from the lazy filter; when all queried names are excluded,
+        // `filter` is empty and skipped bodies take 0 ns.
+        let mut filter = Names::default();
+        for &n in &names {
+            if n != DIRECT_EVAL_CALL && n != "arguments" && n != "eval" {
+                filter.insert(n);
+            }
+        }
+        memo::with_lazy_filter(&filter, || {
+            for s in body {
+                stmt_refs(s, &mut refs, false);
+            }
+        });
+    }
+    #[cfg(any(feature = "meter-only", feature = "safe-sandbox"))]
     for s in body {
         stmt_refs(s, &mut refs, false);
     }
     names.map(|n| refs.contains(n))
+}
+
+/// Top-level lexical bindings of an arrow block (`lex`) together with those
+/// requiring early TDZ cells (`early_cell`): classes, non-simple-single
+/// `let`/`const` declarations, and simple-single declarations referenced by an
+/// earlier statement. Uses borrowed names and a lazy-skip filter so skipped
+/// nested functions are neither re-scanned unfiltered nor allocated per ref.
+pub fn arrow_entry_lexicals(stmts: &[Stmt]) -> (HashSet<String>, HashSet<String>) {
+    let mut lex = HashSet::default();
+    let mut early_cell = HashSet::default();
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    let mut simple_lex = Names::default();
+    let mut last_simple: usize = 0;
+    for (i, s) in stmts.iter().enumerate() {
+        if let Stmt::VarDecl(d) = s {
+            if d.kind.is_lexical()
+                && d.decls.len() == 1
+                && matches!(&d.decls[0].id, Pattern::Ident(_))
+                && i > 0
+            {
+                #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                pattern_names(&d.decls[0].id, &mut simple_lex);
+                last_simple = i;
+            }
+        }
+    }
+    let mut prior_refs = Names::default();
+    let run = || {
+        for (i, s) in stmts.iter().enumerate() {
+            match s {
+                Stmt::VarDecl(d) if d.kind.is_lexical() => {
+                    let mut declared_here = Names::default();
+                    for decl in &d.decls {
+                        pattern_names(&decl.id, &mut declared_here);
+                    }
+                    let simple_single =
+                        d.decls.len() == 1 && matches!(&d.decls[0].id, Pattern::Ident(_));
+                    for name in declared_here {
+                        lex.insert(name.to_string());
+                        if !simple_single || prior_refs.contains(name) {
+                            early_cell.insert(name.to_string());
+                        }
+                    }
+                }
+                Stmt::ClassDecl(c) => {
+                    if let Some(id) = &c.name {
+                        let name = id.to_string();
+                        lex.insert(name.clone());
+                        early_cell.insert(name);
+                    }
+                }
+                _ => {}
+            }
+            if i < last_simple {
+                stmt_refs(s, &mut prior_refs, false);
+            }
+        }
+    };
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    memo::with_lazy_filter(&simple_lex, run);
+    #[cfg(any(feature = "meter-only", feature = "safe-sandbox"))]
+    (|f: &mut dyn FnMut()| f())(&mut { run });
+    (lex, early_cell)
 }
 
 /// The lexical names a statement list declares at its own level (`let`,
@@ -435,40 +871,66 @@ pub fn lexical_forward_refs(stmts: &[Stmt]) -> HashSet<String> {
             matches!(s, Stmt::VarDecl(d) if d.kind.is_lexical()) || matches!(s, Stmt::ClassDecl(_))
         })
         .map_or(0, |i| i + 1);
-    let mut seen = Names::default();
-    for s in &stmts[..last] {
-        match s {
-            Stmt::VarDecl(d) if d.kind.is_lexical() => {
-                for decl in &d.decls {
-                    let mut names = Names::default();
-                    pattern_names(&decl.id, &mut names);
-                    // The declarator's own initializer and pattern defaults
-                    // run before its names are bound, so they count too.
-                    let mut own = Names::default();
-                    if let Some(init) = &decl.init {
-                        expr_refs(init, &mut own);
-                    }
-                    pattern_init_refs(&decl.id, &mut own);
-                    found.extend(
-                        names
-                            .iter()
-                            .filter(|n| seen.contains(*n) || own.contains(*n))
-                            .map(|n| n.to_string()),
-                    );
-                    seen.extend(own);
-                }
-            }
-            Stmt::ClassDecl(c) => {
-                if let Some(n) = &c.name {
-                    if seen.contains(&**n) {
-                        found.insert(n.to_string());
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    let lex_filter = {
+        let mut lf = Names::default();
+        for s in &stmts[..last] {
+            match s {
+                Stmt::VarDecl(d) if d.kind.is_lexical() => {
+                    for decl in &d.decls {
+                        pattern_names(&decl.id, &mut lf);
                     }
                 }
-                stmt_refs(s, &mut seen, true);
+                Stmt::ClassDecl(c) => {
+                    if let Some(n) = &c.name {
+                        lf.insert(&**n);
+                    }
+                }
+                _ => {}
             }
-            _ => stmt_refs(s, &mut seen, true),
         }
-    }
+        lf
+    };
+    let walk = || {
+        let mut seen = Names::default();
+        for s in &stmts[..last] {
+            match s {
+                Stmt::VarDecl(d) if d.kind.is_lexical() => {
+                    for decl in &d.decls {
+                        let mut names = Names::default();
+                        pattern_names(&decl.id, &mut names);
+                        // The declarator's own initializer and pattern defaults
+                        // run before its names are bound, so they count too.
+                        let mut own = Names::default();
+                        if let Some(init) = &decl.init {
+                            expr_refs(init, &mut own);
+                        }
+                        pattern_init_refs(&decl.id, &mut own);
+                        found.extend(
+                            names
+                                .iter()
+                                .filter(|n| seen.contains(*n) || own.contains(*n))
+                                .map(|n| n.to_string()),
+                        );
+                        seen.extend(own);
+                    }
+                }
+                Stmt::ClassDecl(c) => {
+                    if let Some(n) = &c.name {
+                        if seen.contains(&**n) {
+                            found.insert(n.to_string());
+                        }
+                    }
+                    stmt_refs(s, &mut seen, true);
+                }
+                _ => stmt_refs(s, &mut seen, true),
+            }
+        }
+    };
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    memo::with_lazy_filter(&lex_filter, walk);
+    #[cfg(any(feature = "meter-only", feature = "safe-sandbox"))]
+    (|f: &mut dyn FnMut()| f())(&mut { walk });
     found
 }
 
@@ -607,12 +1069,25 @@ pub fn captured_locals(
 ) -> HashSet<String> {
     let mut bound: Names<'_> = params.iter().map(String::as_str).collect();
     collect_bound_in_body(body, &mut bound);
+    if bound.is_empty() {
+        return HashSet::default();
+    }
 
     // Union of free vars of each directly-nested function.
     let mut nested_free = Names::default();
-    params_nested_free(params_ast, &mut nested_free);
-    for s in body {
-        collect_nested_free(s, &mut nested_free);
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    memo::with_lazy_filter(&bound, || {
+        params_nested_free(params_ast, &mut nested_free);
+        for s in body {
+            collect_nested_free(s, &mut nested_free);
+        }
+    });
+    #[cfg(any(feature = "meter-only", feature = "safe-sandbox"))]
+    {
+        params_nested_free(params_ast, &mut nested_free);
+        for s in body {
+            collect_nested_free(s, &mut nested_free);
+        }
     }
     bound.intersection(&nested_free).map(|n| n.to_string()).collect()
 }
@@ -628,8 +1103,16 @@ pub fn captured_locals_arrow(
         ArrowBody::Expr(e) => {
             let bound: Names<'_> = params.iter().map(String::as_str).collect();
             let mut nested_free = Names::default();
-            params_nested_free(Some(params_ast), &mut nested_free);
-            collect_nested_free_expr(e, &mut nested_free);
+            #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+            memo::with_lazy_filter(&bound, || {
+                params_nested_free(Some(params_ast), &mut nested_free);
+                collect_nested_free_expr(e, &mut nested_free);
+            });
+            #[cfg(any(feature = "meter-only", feature = "safe-sandbox"))]
+            {
+                params_nested_free(Some(params_ast), &mut nested_free);
+                collect_nested_free_expr(e, &mut nested_free);
+            }
             bound.intersection(&nested_free).map(|n| n.to_string()).collect()
         }
     }
@@ -659,9 +1142,22 @@ pub fn late_box_names(
         return HashSet::default();
     }
     let mut kept = Names::default();
-    params_nested_free(params_ast, &mut kept);
-    for s in body {
-        collect_nested_free_in(s, &mut kept, true);
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    {
+        let cap_filter: Names<'_> = captured.iter().map(String::as_str).collect();
+        memo::with_lazy_filter(&cap_filter, || {
+            params_nested_free(params_ast, &mut kept);
+            for s in body {
+                collect_nested_free_in(s, &mut kept, true);
+            }
+        });
+    }
+    #[cfg(any(feature = "meter-only", feature = "safe-sandbox"))]
+    {
+        params_nested_free(params_ast, &mut kept);
+        for s in body {
+            collect_nested_free_in(s, &mut kept, true);
+        }
     }
     let mut lexical = Names::default();
     for s in body {
@@ -692,48 +1188,141 @@ pub fn copy_box_names(
     body: &[Stmt],
     captured: &HashSet<String>,
 ) -> HashSet<String> {
-    if !params_ast.is_some_and(|p| p.simple) || !params.iter().any(|p| captured.contains(p.as_str())) {
+    if !params_ast.is_some_and(|p| p.simple) || body.len() > 128 {
         return HashSet::default();
     }
-    let mut scan = WriteScan::default();
+    let mut targets: Vec<&str> = Vec::new();
+    for p in params {
+        if captured.contains(p.as_str()) && !targets.contains(&p.as_str()) {
+            targets.push(p.as_str());
+        }
+    }
+    if targets.is_empty() {
+        return HashSet::default();
+    }
+    let mut scan = WriteScan::new(&targets);
     for s in body {
         scan.stmt(s);
+        if scan.done() {
+            return HashSet::default();
+        }
     }
-    if scan.with_seen {
-        return HashSet::default();
-    }
-    params
-        .iter()
-        .filter(|p| {
-            captured.contains(p.as_str())
-                && !scan.written.contains(p.as_str())
-                && !scan.blocked.contains(p.as_str())
-        })
-        .cloned()
-        .collect()
+    scan.into_remaining()
 }
 
-/// [`copy_box_names`]' walk: every name written (an assignment, update or
-/// for-in/of target, at any depth) or declared (a `var`/`let`/`const`, a
-/// function, class or catch binding, a parameter of a nested function, an
-/// import) anywhere in a body, and the free names of the nested functions
-/// that are not function or arrow expressions. Exhaustive over the tree, as
-/// `expr_refs` is: a missed write would let a closure see a stale copy.
-#[derive(Default)]
-struct WriteScan<'a> {
-    written: Names<'a>,
-    blocked: Names<'a>,
+/// [`copy_box_names`]' walk: eliminates any candidate parameter in `targets`
+/// that is written (an assignment, update or for-in/of target, at any depth),
+/// declared (a `var`/`let`/`const`, a function, class or catch binding, a
+/// parameter of a nested function, an import) anywhere in a body, or captured
+/// by a nested function that is not a function/arrow expression, or invalidated
+/// by a `with` statement. Stops immediately once every candidate is ruled out.
+struct WriteScan<'t> {
+    targets: &'t [&'t str],
+    /// Bit `i` is 1 while `targets[i]` is still a viable copy-box candidate.
+    remaining: u64,
+    /// Conservative bitset of `name.len().min(63)` over all initial targets
+    /// for 2-cycle early rejection in `mark()`.
+    len_mask: u64,
+    /// Overflow set for functions with > 64 distinct captured parameters.
+    overflow: Names<'t>,
     with_seen: bool,
 }
 
-impl<'a> WriteScan<'a> {
-    fn stmts(&mut self, v: &'a [Stmt]) {
+impl<'t> WriteScan<'t> {
+    fn new(targets: &'t [&'t str]) -> Self {
+        let n_inline = targets.len().min(64);
+        let remaining = if n_inline == 64 {
+            u64::MAX
+        } else {
+            (1u64 << n_inline) - 1
+        };
+        let mut len_mask = 0u64;
+        for &name in targets {
+            len_mask |= 1u64 << name.len().min(63);
+        }
+        let mut overflow = Names::default();
+        if targets.len() > 64 {
+            for &name in &targets[64..] {
+                overflow.insert(name);
+            }
+        }
+        Self {
+            targets,
+            remaining,
+            len_mask,
+            overflow,
+            with_seen: false,
+        }
+    }
+
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    fn remaining_names(&self) -> Names<'t> {
+        let mut out = Names::default();
+        let mut m = self.remaining;
+        while m != 0 {
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            out.insert(self.targets[i]);
+        }
+        for &name in &self.overflow {
+            out.insert(name);
+        }
+        out
+    }
+
+    #[inline]
+    fn done(&self) -> bool {
+        self.with_seen || (self.remaining == 0 && self.overflow.is_empty())
+    }
+
+    #[inline]
+    fn mark(&mut self, name: &str) {
+        if (self.len_mask & (1u64 << name.len().min(63))) == 0 {
+            return;
+        }
+        let mut m = self.remaining;
+        while m != 0 {
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            if self.targets[i] == name {
+                self.remaining &= !(1u64 << i);
+            }
+        }
+        if !self.overflow.is_empty() {
+            self.overflow.remove(name);
+        }
+    }
+
+    fn into_remaining(self) -> HashSet<String> {
+        if self.with_seen {
+            return HashSet::default();
+        }
+        let mut out = HashSet::default();
+        let mut m = self.remaining;
+        while m != 0 {
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            out.insert(self.targets[i].to_string());
+        }
+        for name in self.overflow {
+            out.insert(name.to_string());
+        }
+        out
+    }
+
+    fn stmts(&mut self, v: &[Stmt]) {
         for s in v {
+            if self.done() {
+                return;
+            }
             self.stmt(s);
         }
     }
 
-    fn stmt(&mut self, s: &'a Stmt) {
+    fn stmt(&mut self, s: &Stmt) {
+        if self.done() {
+            return;
+        }
         match s {
             Stmt::Block(v) => self.stmts(v),
             Stmt::Empty | Stmt::Debugger | Stmt::Break(_) | Stmt::Continue(_) => {}
@@ -779,6 +1368,9 @@ impl<'a> WriteScan<'a> {
             Stmt::Switch { disc, cases } => {
                 self.expr(disc);
                 for c in cases {
+                    if self.done() {
+                        return;
+                    }
                     if let Some(t) = &c.test {
                         self.expr(t);
                     }
@@ -788,6 +1380,9 @@ impl<'a> WriteScan<'a> {
             Stmt::Try { block, handler, finalizer } => {
                 self.stmts(block);
                 if let Some(h) = handler {
+                    if self.done() {
+                        return;
+                    }
                     if let Some(p) = &h.param {
                         self.pattern(p);
                     }
@@ -798,10 +1393,8 @@ impl<'a> WriteScan<'a> {
                 }
             }
             Stmt::Labeled { body, .. } => self.stmt(body),
-            Stmt::With { object, body } => {
+            Stmt::With { .. } => {
                 self.with_seen = true;
-                self.expr(object);
-                self.stmt(body);
             }
             Stmt::VarDecl(d) => self.var_decl(d),
             Stmt::FnDecl(f) => self.blocked_function(f),
@@ -810,10 +1403,10 @@ impl<'a> WriteScan<'a> {
                 for sp in &i.specifiers {
                     match sp {
                         ImportSpecifier::Default(n) | ImportSpecifier::Namespace(n) => {
-                            self.written.insert(&**n);
+                            self.mark(n);
                         }
                         ImportSpecifier::Named { local, .. } => {
-                            self.written.insert(&**local);
+                            self.mark(local);
                         }
                     }
                 }
@@ -828,8 +1421,11 @@ impl<'a> WriteScan<'a> {
         }
     }
 
-    fn var_decl(&mut self, d: &'a crate::parse::ast::VarDecl) {
+    fn var_decl(&mut self, d: &crate::parse::ast::VarDecl) {
         for decl in &d.decls {
+            if self.done() {
+                return;
+            }
             self.pattern(&decl.id);
             if let Some(i) = &decl.init {
                 self.expr(i);
@@ -838,18 +1434,25 @@ impl<'a> WriteScan<'a> {
     }
 
     /// A binding pattern: every name it binds is a declaration.
-    fn pattern(&mut self, p: &'a Pattern) {
+    fn pattern(&mut self, p: &Pattern) {
+        if self.done() {
+            return;
+        }
         match p {
-            Pattern::Ident(n) => {
-                self.written.insert(&**n);
-            }
+            Pattern::Ident(n) => self.mark(n),
             Pattern::Array(els) => {
                 for el in els.iter().flatten() {
+                    if self.done() {
+                        return;
+                    }
                     self.pattern(&el.pat);
                 }
             }
             Pattern::Object { props, rest } => {
                 for pr in props {
+                    if self.done() {
+                        return;
+                    }
                     self.prop_key(&pr.key);
                     self.pattern(&pr.value);
                 }
@@ -865,15 +1468,19 @@ impl<'a> WriteScan<'a> {
         }
     }
 
-    fn target(&mut self, t: &'a Target) {
+    fn target(&mut self, t: &Target) {
+        if self.done() {
+            return;
+        }
         match t {
-            Target::Ident { name, .. } => {
-                self.written.insert(&**name);
-            }
+            Target::Ident { name, .. } => self.mark(name),
             Target::Member(m) => self.member(m),
             Target::Call(c) => self.call(c),
             Target::Array(els) => {
                 for el in els.iter().flatten() {
+                    if self.done() {
+                        return;
+                    }
                     self.target(&el.target);
                     if let Some(d) = &el.default {
                         self.expr(d);
@@ -882,6 +1489,9 @@ impl<'a> WriteScan<'a> {
             }
             Target::Object { props, rest } => {
                 for p in props {
+                    if self.done() {
+                        return;
+                    }
                     self.prop_key(&p.key);
                     self.target(&p.target);
                     if let Some(d) = &p.default {
@@ -895,27 +1505,30 @@ impl<'a> WriteScan<'a> {
         }
     }
 
-    fn prop_key(&mut self, k: &'a PropKey) {
+    fn prop_key(&mut self, k: &PropKey) {
         match k {
             PropKey::Computed(e) => self.expr(e),
             PropKey::Ident(_) | PropKey::Str(_) | PropKey::Num(_) | PropKey::Private(_) => {}
         }
     }
 
-    fn member(&mut self, m: &'a Member) {
+    fn member(&mut self, m: &Member) {
         self.expr(&m.object);
         if let MemberProp::Computed(k) = &m.prop {
             self.expr(k);
         }
     }
 
-    fn call(&mut self, c: &'a crate::parse::ast::CallExpr) {
+    fn call(&mut self, c: &crate::parse::ast::CallExpr) {
         self.expr(&c.callee);
         self.args(&c.args);
     }
 
-    fn args(&mut self, args: &'a [Arg]) {
+    fn args(&mut self, args: &[Arg]) {
         for a in args {
+            if self.done() {
+                return;
+            }
             match a {
                 Arg::Expr(e) | Arg::Spread(e) => self.expr(e),
             }
@@ -924,35 +1537,117 @@ impl<'a> WriteScan<'a> {
 
     /// A function or arrow EXPRESSION's insides (its own name and parameters
     /// count as declarations).
-    fn function(&mut self, f: &'a Function) {
+    fn function(&mut self, f: &Function) {
+        if self.done() {
+            return;
+        }
         if let Some(n) = &f.name {
-            self.written.insert(&**n);
+            self.mark(n);
+            if self.done() {
+                return;
+            }
         }
         for p in &f.params.items {
             self.pattern(p);
+            if self.done() {
+                return;
+            }
+        }
+        #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+        if let Some(span) = f.body.lazy_span() {
+            // SAFETY: slices are only compared against `self.targets` and never escape.
+            unsafe {
+                memo::scan_source_idents(span, |ident| {
+                    self.mark(ident);
+                    !self.done()
+                });
+            }
+            return;
         }
         self.stmts(&f.body.stmts);
     }
 
     /// A nested function some other path makes (a declaration, a method, an
     /// accessor): what it captures is blocked, and its insides are walked.
-    fn blocked_function(&mut self, f: &'a Function) {
-        fn_node_free(f, &mut self.blocked);
+    fn blocked_function(&mut self, f: &Function) {
+        if self.done() {
+            return;
+        }
+        // A pre-parser-skipped function body is scanned directly for every
+        // identifier in `self.function(f)` (which is a superset of its free
+        // vars, plus its name and params), avoiding an unfiltered `fn_node_free`
+        // HashSet build and double source scan.
+        #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+        if f.body.lazy_span().is_some() {
+            self.function(f);
+            return;
+        }
+        let hit = memo_for_each(f, (f.span.start, f.span.end), 0, |name| {
+            self.mark(name);
+            !self.done()
+        });
+        if !hit {
+            let mut tmp = Names::default();
+            #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+            {
+                let filter = self.remaining_names();
+                memo::with_lazy_filter(&filter, || fn_node_free(f, &mut tmp));
+            }
+            #[cfg(any(feature = "meter-only", feature = "safe-sandbox"))]
+            fn_node_free(f, &mut tmp);
+            for name in tmp {
+                self.mark(name);
+                if self.done() {
+                    return;
+                }
+            }
+        }
+        if self.done() {
+            return;
+        }
         self.function(f);
     }
 
-    fn blocked_class(&mut self, c: &'a Class) {
-        class_free(c, &mut self.blocked);
+    fn blocked_class(&mut self, c: &Class) {
+        if self.done() {
+            return;
+        }
+        let mut tmp = Names::default();
+        #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+        {
+            let filter = self.remaining_names();
+            memo::with_lazy_filter(&filter, || class_free(c, &mut tmp));
+        }
+        #[cfg(any(feature = "meter-only", feature = "safe-sandbox"))]
+        class_free(c, &mut tmp);
+        for name in tmp {
+            self.mark(name);
+            if self.done() {
+                return;
+            }
+        }
         if let Some(n) = &c.name {
-            self.written.insert(&**n);
+            self.mark(n);
+            if self.done() {
+                return;
+            }
         }
         for d in &c.decorators {
             self.expr(d);
+            if self.done() {
+                return;
+            }
         }
         if let Some(s) = &c.superclass {
             self.expr(s);
+            if self.done() {
+                return;
+            }
         }
         for m in &c.body {
+            if self.done() {
+                return;
+            }
             match m {
                 ClassMember::Method(m) => {
                     self.prop_key(&m.key);
@@ -979,7 +1674,10 @@ impl<'a> WriteScan<'a> {
         }
     }
 
-    fn expr(&mut self, e: &'a Expr) {
+    fn expr(&mut self, e: &Expr) {
+        if self.done() {
+            return;
+        }
         match e {
             Expr::Ident(_)
             | Expr::This
@@ -994,6 +1692,9 @@ impl<'a> WriteScan<'a> {
             | Expr::ImportMeta => {}
             Expr::Array(els, _) => {
                 for el in els.iter().flatten() {
+                    if self.done() {
+                        return;
+                    }
                     match el {
                         ArrayElem::Expr(e) | ArrayElem::Spread(e) => self.expr(e),
                     }
@@ -1001,6 +1702,9 @@ impl<'a> WriteScan<'a> {
             }
             Expr::Object(members, _) => {
                 for m in members {
+                    if self.done() {
+                        return;
+                    }
                     match m {
                         ObjectMember::Prop { key, value, init, .. } => {
                             self.prop_key(key);
@@ -1021,12 +1725,18 @@ impl<'a> WriteScan<'a> {
             }
             Expr::Template(t) => {
                 for e in &t.exprs {
+                    if self.done() {
+                        return;
+                    }
                     self.expr(e);
                 }
             }
             Expr::TaggedTemplate { tag, quasi } => {
                 self.expr(tag);
                 for e in &quasi.exprs {
+                    if self.done() {
+                        return;
+                    }
                     self.expr(e);
                 }
             }
@@ -1054,16 +1764,35 @@ impl<'a> WriteScan<'a> {
             Expr::Chain(inner) => self.expr(inner),
             Expr::Seq(v) => {
                 for e in v {
+                    if self.done() {
+                        return;
+                    }
                     self.expr(e);
                 }
             }
             Expr::Arrow(a) => {
                 for p in &a.params.items {
                     self.pattern(p);
+                    if self.done() {
+                        return;
+                    }
                 }
                 match &a.body {
                     ArrowBody::Expr(e) => self.expr(e),
-                    ArrowBody::Block(b) => self.stmts(&b.stmts),
+                    ArrowBody::Block(b) => {
+                        #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                        if let Some(span) = b.lazy_span() {
+                            // SAFETY: slices are only compared against `self.targets` and never escape.
+                            unsafe {
+                                memo::scan_source_idents(span, |ident| {
+                                    self.mark(ident);
+                                    !self.done()
+                                });
+                            }
+                            return;
+                        }
+                        self.stmts(&b.stmts);
+                    }
                 }
             }
             Expr::Function(f) => self.function(f),
@@ -1744,6 +2473,17 @@ fn params_nested_free<'a>(params_ast: Option<&'a Params>, out: &mut Names<'a>) {
 /// box its `arguments` object so the arrow can capture it lexically as an upvalue.
 pub fn nested_uses_arguments(body: &[Stmt]) -> bool {
     let mut nested_free = Names::default();
+    // Pre-parser-skipped bodies never reference free `arguments`.
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    {
+        let empty = Names::default();
+        memo::with_lazy_filter(&empty, || {
+            for s in body {
+                collect_nested_free(s, &mut nested_free);
+            }
+        });
+    }
+    #[cfg(any(feature = "meter-only", feature = "safe-sandbox"))]
     for s in body {
         collect_nested_free(s, &mut nested_free);
     }
@@ -1756,6 +2496,14 @@ pub fn nested_uses_arguments(body: &[Stmt]) -> bool {
 /// before `bind_params` — the body-only scan above never sees it.
 pub fn params_nested_use_arguments(params: &Params) -> bool {
     let mut nested_free = Names::default();
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    {
+        let empty = Names::default();
+        memo::with_lazy_filter(&empty, || {
+            params_nested_free(Some(params), &mut nested_free);
+        });
+    }
+    #[cfg(any(feature = "meter-only", feature = "safe-sandbox"))]
     params_nested_free(Some(params), &mut nested_free);
     nested_free.contains("arguments")
 }
@@ -2428,16 +3176,46 @@ fn fn_node_free<'a>(f: &'a Function, out: &mut Names<'a>) {
     // to `arguments` inside it is NOT free — it must not leak out as a capture of
     // the enclosing scope. (Arrows, handled by `arrow_free`, do not bind it.)
     param_names.push("arguments");
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    if let Some(body_span) = f.body.lazy_span() {
+        // SAFETY: `out` does not outlive the active `Session`.
+        if unsafe { memo::scan_source_idents_filtered(body_span, &param_names, out) } {
+            return;
+        }
+        let mut own = Names::default();
+        // SAFETY: `own` and `out` do not outlive the active `Session` whose `Arc<str>` owns the bytes.
+        let scanned = unsafe {
+            memo::scan_source_idents(body_span, |ident| {
+                if !param_names.contains(&ident) {
+                    own.insert(ident);
+                }
+                true
+            })
+        };
+        debug_assert!(scanned, "lazy_span requires an active capture::Session with source");
+        memo::put(key, &own);
+        if out.is_empty() {
+            *out = own;
+        } else {
+            out.extend(own);
+        }
+        return;
+    }
     let mut own = free_vars_in(&param_names, &f.body.stmts);
     params_free(&f.params, &param_names, &mut own);
     memo::put(key, &own);
-    out.extend(own);
+    if out.is_empty() {
+        *out = own;
+    } else {
+        out.extend(own);
+    }
 }
 
 /// The names function `f` takes from outside itself: what its body and its
 /// parameter defaults reference (nested functions' free names included) and
 /// it does not bind, sorted. What a deferred compile of `f` must find among
 /// its upvalues (`compile::lazy`).
+#[allow(dead_code)]
 pub(crate) fn function_free_names(f: &Function) -> Vec<String> {
     let mut out = Names::default();
     fn_node_free(f, &mut out);
@@ -2446,11 +3224,95 @@ pub(crate) fn function_free_names(f: &Function) -> Vec<String> {
     v
 }
 
+/// Like [`function_free_names`], but keeps only names matching `keep`: avoids
+/// allocating `FxHashSet` or `String`s for the ~98% of free identifiers that
+/// resolve to globals when the function is already memoized.
+pub(crate) fn function_free_matching(f: &Function, mut keep: impl FnMut(&str) -> bool) -> Vec<String> {
+    let mut v = Vec::new();
+    if memo_for_each(f, (f.span.start, f.span.end), 0, |n| {
+        if keep(n) {
+            v.push(n.to_string());
+        }
+        true
+    }) {
+        crate::cold_sort::sort(&mut v);
+        return v;
+    }
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    if let Some(body_span) = f.body.lazy_span() {
+        let mut pnames = param_names(&f.params);
+        pnames.push("arguments");
+        // SAFETY: slices are only filtered and copied into `String`s before returning.
+        unsafe {
+            memo::scan_source_idents(body_span, |n| {
+                if !pnames.contains(&n) && keep(n) {
+                    v.push(n.to_string());
+                }
+                true
+            });
+        }
+        crate::cold_sort::sort(&mut v);
+        v.dedup();
+        return v;
+    }
+    let mut out = Names::default();
+    fn_node_free(f, &mut out);
+    for n in out {
+        if keep(n) {
+            v.push(n.to_string());
+        }
+    }
+    crate::cold_sort::sort(&mut v);
+    v
+}
+
 /// [`function_free_names`] for an arrow.
+#[allow(dead_code)]
 pub(crate) fn arrow_free_names(a: &Arrow) -> Vec<String> {
     let mut out = Names::default();
     arrow_free(a, &mut out);
     let mut v: Vec<String> = out.into_iter().map(str::to_string).collect();
+    crate::cold_sort::sort(&mut v);
+    v
+}
+
+/// Like [`arrow_free_names`], keeping only names matching `keep`.
+pub(crate) fn arrow_free_matching(a: &Arrow, mut keep: impl FnMut(&str) -> bool) -> Vec<String> {
+    let mut v = Vec::new();
+    if memo_for_each(a, (a.span.start, a.span.end), 1, |n| {
+        if keep(n) {
+            v.push(n.to_string());
+        }
+        true
+    }) {
+        crate::cold_sort::sort(&mut v);
+        return v;
+    }
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    if let ArrowBody::Block(b) = &a.body {
+        if let Some(body_span) = b.lazy_span() {
+            let pnames = param_names(&a.params);
+            // SAFETY: slices are only filtered and copied into `String`s before returning.
+            unsafe {
+                memo::scan_source_idents(body_span, |n| {
+                    if !pnames.contains(&n) && keep(n) {
+                        v.push(n.to_string());
+                    }
+                    true
+                });
+            }
+            crate::cold_sort::sort(&mut v);
+            v.dedup();
+            return v;
+        }
+    }
+    let mut out = Names::default();
+    arrow_free(a, &mut out);
+    for n in out {
+        if keep(n) {
+            v.push(n.to_string());
+        }
+    }
     crate::cold_sort::sort(&mut v);
     v
 }
@@ -2461,10 +3323,41 @@ fn arrow_free<'a>(a: &'a Arrow, out: &mut Names<'a>) {
     }
     let key = (a as *const Arrow as usize, a.span.start, a.span.end, 1);
     let param_names = param_names(&a.params);
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    if let ArrowBody::Block(b) = &a.body {
+        if let Some(body_span) = b.lazy_span() {
+            // SAFETY: `out` does not outlive the active `Session`.
+            if unsafe { memo::scan_source_idents_filtered(body_span, &param_names, out) } {
+                return;
+            }
+            let mut own = Names::default();
+            // SAFETY: `own` and `out` do not outlive the active `Session`.
+            let scanned = unsafe {
+                memo::scan_source_idents(body_span, |ident| {
+                    if !param_names.contains(&ident) {
+                        own.insert(ident);
+                    }
+                    true
+                })
+            };
+            debug_assert!(scanned, "lazy_span requires an active capture::Session with source");
+            memo::put(key, &own);
+            if out.is_empty() {
+                *out = own;
+            } else {
+                out.extend(own);
+            }
+            return;
+        }
+    }
     let mut own = free_vars_arrow_in(&param_names, &a.body);
     params_free(&a.params, &param_names, &mut own);
     memo::put(key, &own);
-    out.extend(own);
+    if out.is_empty() {
+        *out = own;
+    } else {
+        out.extend(own);
+    }
 }
 
 /// Names a class body references from OUTSIDE a method's own scope: each

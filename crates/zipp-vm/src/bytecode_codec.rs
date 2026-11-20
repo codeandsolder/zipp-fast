@@ -14,7 +14,7 @@ use crate::bytecode::*;
 use crate::value::Value;
 
 /// Bumped when this file's layout changes.
-pub(crate) const FORMAT: u32 = 4;
+pub(crate) const FORMAT: u32 = 6;
 
 pub(crate) struct Writer {
     pub(crate) out: Vec<u8>,
@@ -703,9 +703,9 @@ fn decode_import(r: &mut Reader) -> R<ImportEntry> {
     })
 }
 
-/// A list of functions (a Python library module compiled for installation)
+/// A list of functions (a compiled Python library module or PHP OPcache unit)
 /// as bytes.
-#[cfg(feature = "python")]
+#[cfg(any(feature = "python", feature = "php"))]
 pub(crate) fn encode_functions(functions: &[FuncProto]) -> Vec<u8> {
     let mut w = Writer {
         out: Vec::with_capacity(1 << 16),
@@ -721,7 +721,7 @@ pub(crate) fn encode_functions(functions: &[FuncProto]) -> Vec<u8> {
 }
 
 /// The functions `bytes` encode (from [`encode_functions`] of this build).
-#[cfg(feature = "python")]
+#[cfg(any(feature = "python", feature = "php"))]
 pub(crate) fn decode_functions(bytes: &[u8]) -> R<Vec<FuncProto>> {
     let mut r = Reader { data: bytes, at: 0 };
     if r.u32()? != FORMAT || r.u32()? != INSTR_VARIANTS as u32 {
@@ -762,8 +762,12 @@ pub(crate) fn encode(program: &Program, source: Option<&str>) -> Option<Vec<u8>>
         module_decl_globals,
         python_natives,
         python_lazy,
+        php_natives,
+        php_ctx,
+        rust_natives,
+        rust_ctx,
     } = program;
-    if python_lazy.is_some() {
+    if python_lazy.is_some() || php_ctx.is_some() || rust_ctx.is_some() {
         return None;
     }
     let mut w = Writer {
@@ -810,6 +814,8 @@ pub(crate) fn encode(program: &Program, source: Option<&str>) -> Option<Vec<u8>>
     }
     w.u32s(module_decl_globals);
     w.bool(*python_natives);
+    w.bool(*php_natives);
+    w.bool(*rust_natives);
     Some(w.out)
 }
 
@@ -861,6 +867,8 @@ pub(crate) fn decode(bytes: &[u8], source: Option<&str>) -> R<Program> {
     }
     let module_decl_globals = r.u32s()?;
     let python_natives = r.bool()?;
+    let php_natives = r.bool()?;
+    let rust_natives = r.bool()?;
     if r.at != bytes.len() {
         return Err("trailing bytes after the program".into());
     }
@@ -882,5 +890,9 @@ pub(crate) fn decode(bytes: &[u8], source: Option<&str>) -> R<Program> {
         module_decl_globals,
         python_natives,
         python_lazy: None,
+        php_natives,
+        php_ctx: None,
+        rust_natives,
+        rust_ctx: None,
     })
 }

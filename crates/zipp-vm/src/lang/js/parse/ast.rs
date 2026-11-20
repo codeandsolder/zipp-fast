@@ -597,6 +597,34 @@ pub struct Function {
 pub struct FnBody {
     pub directives: Vec<Directive>,
     pub stmts: Vec<Stmt>,
+    /// When the pre-parser skipped this body without building an AST, holds
+    /// `(lbrace_byte_offset, rbrace_end_byte_offset)` in the original source.
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    pub lazy_span: Option<(u32, u32)>,
+}
+
+impl FnBody {
+    #[inline]
+    pub fn new(directives: Vec<Directive>, stmts: Vec<Stmt>) -> Self {
+        Self {
+            directives,
+            stmts,
+            #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+            lazy_span: None,
+        }
+    }
+
+    #[inline]
+    pub fn lazy_span(&self) -> Option<(u32, u32)> {
+        #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+        {
+            self.lazy_span
+        }
+        #[cfg(any(feature = "meter-only", feature = "safe-sandbox"))]
+        {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -2106,7 +2106,13 @@ pub(crate) fn parse_iso_duration(s: &str) -> Option<[i64; 10]> {
     let rest = rest.strip_prefix(['P', 'p'])?;
     let mut f = [0i64; 10];
     let (date_s, time_s) = match rest.find(['T', 't']) {
-        Some(i) => (&rest[..i], &rest[i + 1..]),
+        Some(i) => {
+            let t = &rest[i + 1..];
+            if t.is_empty() {
+                return None;
+            }
+            (&rest[..i], t)
+        }
         None => (rest, ""),
     };
     let mut saw = false;

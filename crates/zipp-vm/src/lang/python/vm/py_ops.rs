@@ -490,7 +490,7 @@ impl<'p> Vm<'p> {
     /// record and its heap version (so its keys are as they were) and the
     /// entry's slot; the value there is read afresh.
     #[inline(never)]
-    fn py_call_entry(&mut self, func_id: u32, ip: usize, f: Value, name: u32) -> Option<Value> {
+    pub(super) fn py_call_entry(&mut self, func_id: u32, ip: usize, f: Value, name: u32) -> Option<Value> {
         let key: &str = self.func(func_id as usize).string_constants[name as usize].as_str();
         let e = self.py_entry_of(func_id, ip, f, key)?;
         self.py_callable_fn(e).then_some(e)
@@ -505,7 +505,7 @@ impl<'p> Vm<'p> {
         }
         let fi = f.heap_index();
         let e = self.py_ic(func_id, ip);
-        if e.kind == ic::CALL_ENTRY && e.a == f.bits() && self.heap.version_of(fi) == e.hver {
+        if matches!(e.kind, ic::CALL_ENTRY | ic::CALL_PLAIN..=ic::CALL_REC) && e.a == f.bits() && self.heap.version_of(fi) == e.hver {
             if let HeapObj::Object(m) = self.heap.get(fi) {
                 let pos = e.pos as usize;
                 if pos < m.slot_len() && !m.is_accessor_at(pos) {
@@ -546,18 +546,64 @@ impl<'p> Vm<'p> {
         };
         let fv = self.get(base, f);
         let r = match self.py_call_target(func_id, ip, fv, argc) {
-            PyCallee::Lean(lean) => self.py_push_frame(&lean, fv, base, arg_base, argc, dst, ip + 1).map(|()| {
-                if argc < lean.params {
-                    self.py_fill_defaults(fv, lean.fid, argc as usize);
+            PyCallee::Lean(lean, kind) => {
+                // Single-byte dispatch by IC classification: CALL_PLAIN skips
+                // all fast-path checks and goes directly to frame push.
+                let fast_val = match kind {
+                    ic::CALL_PLAIN => None,
+                    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                    ic::CALL_REC if argc >= 1 && argc <= 4 && argc == lean.params => {
+                        let mut argv = [Value::UNDEFINED; 4];
+                        let start = base + arg_base as usize;
+                        let n = argc as usize;
+                        argv[..n].copy_from_slice(&self.regs[start..start + n]);
+                        self.py_rec_exec(lean.fid, fv, &argv[..n])
+                    }
+                    ic::CALL_LEAF if argc <= lean.params => {
+                        self.py_leaf_exec_window(lean.fid, fv, base, arg_base, argc)
+                    }
+                    ic::CALL_STORE if argc == lean.params => {
+                        self.py_leaf_exec_window(lean.fid, fv, base, arg_base, argc)
+                    }
+                    _ => None,
+                };
+                if let Some(v) = fast_val {
+                    self.set(base, dst, v);
+                    Ok(ip + 1)
+                } else {
+                    self.py_push_frame(&lean, fv, base, arg_base, argc, dst, ip + 1).map(|()| {
+                        if argc < lean.params {
+                            self.py_fill_defaults(fv, lean.fid, argc as usize);
+                        }
+                        usize::MAX
+                    })
                 }
-                usize::MAX
-            }),
-            PyCallee::Plain(fid, closure, entry) => self.setup_call(fid, closure, fv, base, arg_base, argc, dst, ip + 1, entry).map(|()| {
-                if (argc as usize) < self.func(fid as usize).param_count as usize {
-                    self.py_fill_defaults(fv, fid, argc as usize);
+            }
+            PyCallee::Plain(fid, closure, entry) => {
+                #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                let rec_val = if argc >= 1 && argc <= 4 && !self.py_rec_is_no(fid) {
+                    let mut argv = [Value::UNDEFINED; 4];
+                    let start = base + arg_base as usize;
+                    let n = argc as usize;
+                    argv[..n].copy_from_slice(&self.regs[start..start + n]);
+                    self.py_rec_exec(fid, fv, &argv[..n])
+                } else {
+                    None
+                };
+                #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+                let rec_val: Option<Value> = None;
+                if let Some(v) = rec_val {
+                    self.set(base, dst, v);
+                    Ok(ip + 1)
+                } else {
+                    self.setup_call(fid, closure, fv, base, arg_base, argc, dst, ip + 1, entry).map(|()| {
+                        if (argc as usize) < self.func(fid as usize).param_count as usize {
+                            self.py_fill_defaults(fv, fid, argc as usize);
+                        }
+                        usize::MAX
+                    })
                 }
-                usize::MAX
-            }),
+            }
             // An exception class's entry for the count (`R.EXCENTRY`):
             // `const e = makeExc(this, [args]); e.context = null; return e;`
             // run here, natively as `makeExc` itself runs (`py_make_exc`),
@@ -658,21 +704,32 @@ impl<'p> Vm<'p> {
         if let Ok(d) = u32::try_from(slot + 1) {
             self.py_ic_put(func_id, ip, PyIc { d, ..e });
         }
+        // Settle hot mirror for inline `math.sqrt` (`strop == 11`) so the JIT's
+        // inline `emit_py_sqrt_inline` hits on the very first compiled iteration.
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        {
+            let fi = f.heap_index();
+            if self.ic_obj_ok(fi) {
+                if let HeapObj::Object(m) = self.heap.get(fi) {
+                    if !m.is_ctor && m.shape() != crate::shape::DICT && slot < m.slot_len() && m.val_at(slot) == Value::int(11) {
+                        self.heap.refresh_mirror(fi);
+                    }
+                }
+            }
+        }
         slot
     }
 
     /// Whether the cache entry of the [`Instr::PyCall`] at `ip` names a
-    /// record whose entry for the count is a native right now (a builtin, a
-    /// str method: [`PyCallee::Other`], called where it is with no frame).
-    /// A site that has not run, one holding a plain Python callee (`c` set,
-    /// see [`Vm::py_call_target`]) and one whose record has changed answer
-    /// `false`. For the native tiers' call-bound gate, which reads it as a
-    /// hint (`codegen::set_py_native_calls`).
+    /// record whose entry for the count runs without pushing a frame: either a
+    /// native (`e.c == 0`: builtin / str method), or a plain Python callee
+    /// handled frame-lessly (`StoreBody`, `LeafBody`, or compiled `PyRec`).
+    /// For the native tiers' call-bound gate (`codegen::set_py_native_calls`).
     #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
     pub(crate) fn py_call_site_native(&self, func_id: u32, ip: usize) -> bool {
         let e = self.py_ic(func_id, ip);
         let f = Value::from_bits(e.a);
-        if e.kind != ic::CALL_ENTRY || e.c != 0 || !f.is_heap() {
+        if !matches!(e.kind, ic::CALL_ENTRY | ic::CALL_STORE | ic::CALL_LEAF | ic::CALL_REC) || !f.is_heap() {
             return false;
         }
         let fi = f.heap_index();
@@ -687,7 +744,10 @@ impl<'p> Vm<'p> {
             return false;
         }
         let entry = m.val_at(pos);
-        entry.is_heap() && matches!(self.heap.get(entry.heap_index()), HeapObj::Native(_))
+        if e.kind == ic::CALL_ENTRY {
+            return e.c == 0 && entry.is_heap() && matches!(self.heap.get(entry.heap_index()), HeapObj::Native(_));
+        }
+        entry.bits() == e.b
     }
 
     /// The parameters a [`Instr::PyCall`] left unbound in the frame just
@@ -741,13 +801,13 @@ impl<'p> Vm<'p> {
     fn py_call_target(&mut self, func_id: u32, ip: usize, f: Value, argc: u16) -> PyCallee {
         const ENTRIES: [&str; 13] = ["c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10", "c11", "c12"];
         let cached = self.py_ic(func_id, ip);
-        if cached.kind == ic::CALL_ENTRY && cached.c != 0 && cached.a == f.bits() {
+        if matches!(cached.kind, ic::CALL_PLAIN..=ic::CALL_REC) && cached.c != 0 && cached.a == f.bits() {
             if let Some(lean) = self.py_lean_hit(&cached, f) {
-                return PyCallee::Lean(lean);
+                return PyCallee::Lean(lean, cached.kind);
             }
             // The entry changed: forget the callee (the rest of the entry
             // still names the record's slot).
-            self.py_ic_put(func_id, ip, PyIc { b: 0, c: 0, d: 0, ..cached });
+            self.py_ic_put(func_id, ip, PyIc { kind: ic::CALL_ENTRY, b: 0, c: 0, d: 0, ..cached });
         }
         let Some(name) = ENTRIES.get(argc as usize) else {
             return PyCallee::Slow;
@@ -771,13 +831,31 @@ impl<'p> Vm<'p> {
         // What `setup_call` binds as it is given for this callee: strict,
         // so `this` as passed; no rest parameter; no `arguments`.
         if p.is_strict && !p.lexical_this && p.rest_reg.is_none() && p.arguments_reg.is_none() {
+            let c = fid as u64 | ((p.reg_count.max(1) as u64) << 32) | ((p.param_count as u64) << 48);
             let now = self.py_ic(func_id, ip);
-            if now.kind == ic::CALL_ENTRY && now.a == f.bits() {
-                let c = fid as u64 | ((p.reg_count.max(1) as u64) << 32) | ((p.param_count as u64) << 48);
-                self.py_ic_put(func_id, ip, PyIc { b: e.bits(), c, d: closure, ..now });
+            if matches!(now.kind, ic::CALL_ENTRY | ic::CALL_PLAIN..=ic::CALL_REC) && now.a == f.bits() {
+                let kind = self.py_classify_callee(fid);
+                self.py_ic_put(func_id, ip, PyIc { kind, b: e.bits(), c, d: closure, ..now });
             }
         }
         PyCallee::Plain(fid, closure, e)
+    }
+
+    /// Classify a plain Python callee once at IC population time so hot call
+    /// sites dispatch on a single `PyIc::kind` byte with zero redundant probes.
+    fn py_classify_callee(&mut self, fid: u32) -> u8 {
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        if self.py_store_body(fid).is_some() {
+            return ic::CALL_STORE;
+        }
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        if self.py_rec_prepare(fid) {
+            return ic::CALL_REC;
+        }
+        if self.py_leaf_info(fid).is_some_and(|info| info.native_eligible) {
+            return ic::CALL_LEAF;
+        }
+        ic::CALL_PLAIN
     }
 
     /// The slot of the builtin record `f`'s `strop` when the site's entry
@@ -792,7 +870,7 @@ impl<'p> Vm<'p> {
     /// (call_simple, call_defaults), for 4% on str_methods there.
     #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
     #[inline]
-    pub(super) fn py_strm_hit(&self, e: &PyIc, f: Value) -> Option<usize> {
+    pub(super) fn py_strm_hit(&self, e: &PyIc, f: Value) -> Option<(usize, i32)> {
         if e.kind != ic::CALL_ENTRY || e.c != 0 || e.d == 0 || e.a != f.bits() || !f.is_heap() {
             return None;
         }
@@ -808,7 +886,17 @@ impl<'p> Vm<'p> {
             return None;
         }
         let entry = m.val_at(pos);
-        (entry.is_heap() && self.py_strm_entry(entry)).then_some((e.d - 1) as usize)
+        if !entry.is_heap() || !self.py_strm_entry(entry) {
+            return None;
+        }
+        let at = (e.d - 1) as usize;
+        if at < m.slot_len() && !m.is_accessor_at(at) && super::py_rt::key_eq(m.key_at(at), "strop") {
+            let op = m.val_at(at);
+            if op.is_int() {
+                return Some((at, op.as_int()));
+            }
+        }
+        None
     }
 
     /// Whether `e` is the runtime's positional entry of exception classes
@@ -1378,6 +1466,56 @@ impl<'p> Vm<'p> {
         self.py_table_get(map, k)
     }
 
+    /// Whether `t` is in class `c`'s `mro`, served from `PyRt::isinstance_cache`
+    /// keyed by `(c, c_hver, c_ver, t, t_hver)`.
+    #[inline]
+    fn py_mro_contains_cached(&self, c: Value, t: Value, ty: super::py_rt::TySlots) -> Option<bool> {
+        if c.bits() == t.bits() {
+            return Some(true);
+        }
+        if !c.is_heap() || !t.is_heap() {
+            return None;
+        }
+        let (ci, ti) = (c.heap_index(), t.heap_index());
+        let (c_hver, t_hver) = (self.heap.version_of(ci), self.heap.version_of(ti));
+        let c_ver = match self.heap.get(ci) {
+            HeapObj::Object(m) if !m.is_ctor && ty.ver < m.slot_len() => Some(m.val_at(ty.ver).bits()),
+            _ => None,
+        };
+        let slot = ((ci.wrapping_mul(31) ^ ti) as usize) & (super::py_rt::ISINST_CACHE_LEN - 1);
+        if let (Some(cv), Some(p)) = (c_ver, self.py_rt.as_deref()) {
+            let ce = p.isinstance_cache[slot].get();
+            if ce.result != 0
+                && ce.c == c.bits()
+                && ce.c_hver == c_hver
+                && ce.c_ver == cv
+                && ce.t == t.bits()
+                && ce.t_hver == t_hver
+            {
+                return Some(ce.result == 2);
+            }
+        }
+        let mro = self.py_ty_field(ci, ty.mro, "mro")?;
+        if !mro.is_heap() {
+            return None;
+        }
+        let HeapObj::Array(items) = self.heap.get(mro.heap_index()) else {
+            return None;
+        };
+        let found = items.iter().any(|x| x.bits() == t.bits());
+        if let (Some(cv), Some(p)) = (c_ver, self.py_rt.as_deref()) {
+            p.isinstance_cache[slot].set(super::py_rt::IsInstEntry {
+                c: c.bits(),
+                c_hver,
+                c_ver: cv,
+                t: t.bits(),
+                t_hver,
+                result: if found { 2 } else { 1 },
+            });
+        }
+        Some(found)
+    }
+
     /// For [`Instr::PyRaise`] / [`Instr::PyCaught`]: whether `e` is an
     /// exception record (own data `cls` a plain object whose own data `mro`
     /// Array holds `rt.EBASE`; for a raise, no own `isType` of `true`), and
@@ -1413,14 +1551,7 @@ impl<'p> Vm<'p> {
         if !self.py_plain_rec(cls) {
             return None;
         }
-        let mro = self.py_ty_field(cls.heap_index(), ty.mro, "mro")?;
-        if !mro.is_heap() {
-            return None;
-        }
-        let HeapObj::Array(items) = self.heap.get(mro.heap_index()) else {
-            return None;
-        };
-        items.iter().any(|x| x.bits() == ebase.bits()).then_some((ctx_slot, tb_slot))
+        self.py_mro_contains_cached(cls, ebase, ty)?.then_some((ctx_slot, tb_slot))
     }
 
     /// Whether the exception record at `idx` has a catch pending (its
@@ -1510,10 +1641,13 @@ impl<'p> Vm<'p> {
         if !items.is_heap() {
             return None;
         }
-        match self.heap.get(items.heap_index()) {
+        let items_idx = items.heap_index();
+        match self.heap.get(items_idx) {
             HeapObj::Array(a) if a.len() <= (1 << 24) => {}
             _ => return None,
         }
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        self.py_repair_seq_arr_mirror(items_idx);
         let p = self.py_rt_for(rt)?;
         let cls = if tuple { p.t_tuple } else { p.t_list };
         let (tmpl, shape) = (p.seq_tmpl, p.seq_shape);
@@ -1630,6 +1764,12 @@ impl<'p> Vm<'p> {
             if self.py_ty_field(ti, ty.is_type, "isType")? != Value::TRUE {
                 return None;
             }
+            // Custom metaclasses (e.g. ABCMeta) may override `__instancecheck__`.
+            let t_cls = self.py_hint_field(super::py_rt::hint::HIT_CLS, ti, "cls")?;
+            let type_type = self.py_hint_field(super::py_rt::hint::HIT_CLS, istypes[0].heap_index(), "cls")?;
+            if t_cls != type_type {
+                return None;
+            }
             let hver = self.heap.version_of(ti);
             self.py_ic_put(func_id, ip, PyIc { kind: ic::IS_TYPE, pos: 0, hver, a: t.bits(), b: 0, c: 0, d: 0 });
         }
@@ -1663,17 +1803,7 @@ impl<'p> Vm<'p> {
         if c.bits() == t.bits() {
             return Some(true);
         }
-        if !c.is_heap() {
-            return None;
-        }
-        let mro = self.py_ty_field(c.heap_index(), ty.mro, "mro")?;
-        if !mro.is_heap() {
-            return None;
-        }
-        let HeapObj::Array(items) = self.heap.get(mro.heap_index()) else {
-            return None;
-        };
-        if !items.iter().any(|x| x.bits() == t.bits()) {
+        if !self.py_mro_contains_cached(c, t, ty)? {
             return Some(false);
         }
         // `bytes` excludes bytearray, which the runtime models as a subclass.
@@ -2293,12 +2423,61 @@ impl<'p> Vm<'p> {
         }
     }
 
-    /// For [`Instr::PyGetItem`] / [`Instr::PySetItem`]: `o.items` and the
-    /// index when `o` is a record of the sequence template's shape whose
-    /// `cls` is `seq` and `k` an immediate int within its items: what
-    /// `py_item_kind` and `py_seq_slot` find for such a pair, read in one
-    /// pass (they read the record twice, the items once each). `None` for
-    /// anything else, which those then decide.
+    /// Repair `arr_mirror[items]` for a plain dense Array backing a Python
+    /// list or tuple so compiled inline paths hit on subsequent iterations.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub(super) fn py_repair_seq_arr_mirror(&mut self, items: u32) {
+        if !self.heap.arr_mirror_live(items)
+            && !self.arr_props.contains_key(&items)
+            && !self.arguments_objs.contains_key(&items)
+            && !self.array_js_len.contains_key(&items)
+        {
+            self.heap.repair_arr_mirror(items);
+        }
+    }
+
+    /// For [`Instr::PyGetItem`]: `o.items` and the resolved index when `o` is
+    /// a list or tuple record of `seq_shape` and `k` is an in-bounds immediate
+    /// int (positive or negative).
+    #[inline(always)]
+    fn py_seq_get_fast(&self, o: Value, k: Value, seq: Value) -> Option<(u32, usize)> {
+        let n = k.small_bigint_val()?;
+        if !o.is_heap() {
+            return None;
+        }
+        let p = self.py_rt.as_deref()?;
+        let shape = p.seq_shape;
+        let HeapObj::Object(m) = self.heap.get(o.heap_index()) else {
+            return None;
+        };
+        if m.is_ctor || shape == crate::shape::DICT || m.shape() != shape {
+            return None;
+        }
+        let cls = m.val_at(0).bits();
+        if cls != seq.bits() && cls != p.t_tuple.bits() {
+            return None;
+        }
+        let items = m.val_at(1);
+        if !items.is_heap() {
+            return None;
+        }
+        let HeapObj::Array(vals) = self.heap.get(items.heap_index()) else {
+            return None;
+        };
+        let len = vals.len();
+        let i = if n >= 0 {
+            usize::try_from(n).ok().filter(|&i| i < len)?
+        } else {
+            let adj = (len as i64).checked_add(n)?;
+            usize::try_from(adj).ok().filter(|&i| i < len)?
+        };
+        Some((items.heap_index(), i))
+    }
+
+    /// For [`Instr::PySetItem`]: `o.items` and the index when `o` is a record
+    /// of the sequence template's shape whose `cls` is `seq` (mutable list
+    /// only, never tuple) and `k` an immediate int within its items.
     #[inline(always)]
     fn py_seq_index_fast(&self, o: Value, k: Value, seq: Value) -> Option<(u32, usize)> {
         let n = k.small_bigint_val()?;
@@ -2319,7 +2498,13 @@ impl<'p> Vm<'p> {
         let HeapObj::Array(vals) = self.heap.get(items.heap_index()) else {
             return None;
         };
-        let i = usize::try_from(n).ok().filter(|&i| i < vals.len())?;
+        let len = vals.len();
+        let i = if n >= 0 {
+            usize::try_from(n).ok().filter(|&i| i < len)?
+        } else {
+            let adj = (len as i64).checked_add(n)?;
+            usize::try_from(adj).ok().filter(|&i| i < len)?
+        };
         Some((items.heap_index(), i))
     }
 
@@ -2360,9 +2545,11 @@ impl<'p> Vm<'p> {
     /// [`Instr::PyGetItem`]: `Some(Some(value))`, `Some(None)` for a key
     /// the dict's table finds missing, `None` for the slow edge.
     pub(super) fn py_get_item(&mut self, o: Value, k: Value, seq: Value, dict: Value) -> Result<Option<Option<Value>>, Thrown> {
-        // The commonest case first, in one pass: a `seq` record of the
-        // sequence template's shape and a fast-tier int within its items.
-        if let Some((items, i)) = self.py_seq_index_fast(o, k, seq) {
+        // The commonest case first, in one pass: a list or tuple record of
+        // the sequence template's shape and a fast-tier int within its items.
+        if let Some((items, i)) = self.py_seq_get_fast(o, k, seq) {
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            self.py_repair_seq_arr_mirror(items);
             let HeapObj::Array(vals) = self.heap.get(items) else {
                 return Ok(None);
             };
@@ -2411,15 +2598,21 @@ impl<'p> Vm<'p> {
             };
             // An element present in a plain Array (no side table: nothing
             // frozen, overridden or mapped to an `arguments` object): stored
-            // in place, which is all `set_index` does for one after its barrier.
+            // in place without clearing `arr_mirror`.
             let plain = !self.arr_props.contains_key(&items)
                 && !self.arguments_objs.contains_key(&items)
                 && matches!(self.heap.get(items), HeapObj::Array(vals) if vals.get(i).is_some_and(|x| !x.is_hole()));
             if plain {
-                self.store_barrier_v(crate::heap::gcoracle::SET_INDEX, Value::heap(items), v);
-                if let HeapObj::Array(vals) = self.heap.get_mut(items) {
-                    vals[i] = v;
+                if v.is_heap() {
+                    self.store_barrier_v(crate::heap::gcoracle::SET_INDEX, Value::heap(items), v);
                 }
+                if !self.heap.array_overwrite_present(items, i, v) {
+                    if let HeapObj::Array(vals) = self.heap.get_mut(items) {
+                        vals[i] = v;
+                    }
+                }
+                #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                self.py_repair_seq_arr_mirror(items);
                 return Ok(true);
             }
             self.set_index(Value::heap(items), Value::int(i as i32), v, true)?;
@@ -2433,11 +2626,13 @@ impl<'p> Vm<'p> {
             },
         };
         // A key needing guest code, or a full table: the runtime's path.
-        let Some(Ok(n)) = self.py_table_set(map, k, v) else {
+        let Some(Ok((n, inserted))) = self.py_table_set_ex(map, k, v) else {
             return Ok(false);
         };
-        if let HeapObj::Object(m) = self.heap.get_mut(idx) {
-            m.set_val_at(size_slot, Value::num(n as f64));
+        if inserted {
+            if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+                m.set_val_at(size_slot, Value::num(n as f64));
+            }
         }
         Ok(true)
     }
@@ -2464,6 +2659,15 @@ impl<'p> Vm<'p> {
     /// its slow path.
     #[inline(always)] // one copy in the step, one in its JIT helper (`lang/python/jit/py_jit.rs`)
     pub(crate) fn py_arith(&mut self, op: PyArithOp, va: Value, vb: Value) -> Result<Option<Value>, Thrown> {
+        // `str + str`: native concatenation for well-formed primitive strs.
+        if op == PyArithOp::Add
+            && va.is_heap()
+            && vb.is_heap()
+            && self.heap.is_str_like(va.heap_index())
+            && self.heap.is_str_like(vb.heap_index())
+        {
+            return Ok(self.py_str_concat(va, vb));
+        }
         // `str % values`: the runtime's `R.mod` asks `__zipp_py_pct` first
         // (`py_pct_format`, which answers only what the runtime's
         // `percentFormat` answers, and declines anything else); asked here,
@@ -2662,7 +2866,7 @@ impl<'p> Vm<'p> {
 /// which is checked); `None` for true division, a zero divisor and an
 /// overflowing product, which take `py_arith`'s general path.
 #[inline(always)]
-fn py_small_arith(op: PyArithOp, x: i64, y: i64) -> Option<i64> {
+pub(super) fn py_small_arith(op: PyArithOp, x: i64, y: i64) -> Option<i64> {
     Some(match op {
         PyArithOp::Add => x + y,
         PyArithOp::Sub => x - y,
@@ -2771,8 +2975,8 @@ pub(super) enum PyDictGot {
 
 /// [`Vm::py_call_target`]'s answer.
 enum PyCallee {
-    /// A plain Python code object the site's entry records.
-    Lean(PyLean),
+    /// A plain Python code object the site's entry records, plus its classified `ic::CALL_*` kind.
+    Lean(PyLean, u8),
     /// A plain function: its id, closure and value.
     Plain(u32, u32, Value),
     /// An exception class's positional entry (`R.EXCENTRY`), as `Plain`.

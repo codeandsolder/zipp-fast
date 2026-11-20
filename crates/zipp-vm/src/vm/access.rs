@@ -1915,7 +1915,9 @@ impl<'p> Vm<'p> {
                 }
                 self.fn_proto_override.insert(idx, val);
                 if val.is_heap() {
-                    self.prototypes.insert(idx, val.heap_index());
+                    let p = val.heap_index();
+                    self.prototypes.insert(idx, p);
+                    self.prototypes_fresh.push(p);
                 }
                 // A compiled `new` of this function guards its version
                 // (`NewLanePlan`), with its prototype baked.
@@ -1951,6 +1953,12 @@ impl<'p> Vm<'p> {
                     return self.reject_write(key, strict);
                 }
                 self.fn_props_gen = self.fn_props_gen.wrapping_add(1);
+                match key {
+                    "call" => self.fn_props_has_call = 1,
+                    "apply" => self.fn_props_has_apply = 1,
+                    "bind" => self.fn_props_has_bind = 1,
+                    _ => {}
+                }
                 self.fn_props
                     .entry(idx)
                     .or_insert_with(ObjMap::new_side_table)
@@ -2229,7 +2237,7 @@ impl<'p> Vm<'p> {
             }
             // Static-member assignment on a class value (`C.x = …`).
             HeapObj::Class(c) => {
-                c.statics.set(key, val);
+                added = c.statics.set(key, val);
             }
             _ => {}
         }
@@ -2251,6 +2259,9 @@ impl<'p> Vm<'p> {
         }
         if added {
             self.heap.bump_version(idx); // invalidate any JIT inline cache (vals realloc)
+            if self.ic_obj_ok(idx) {
+                self.heap.refresh_mirror(idx);
+            }
         }
         Ok(true)
     }
