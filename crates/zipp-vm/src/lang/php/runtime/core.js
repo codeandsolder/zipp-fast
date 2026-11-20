@@ -89,7 +89,9 @@ var __zipp_php = (function () {
     let suppressDepth = 0;
     let errorReportingLevel = 32767n; // E_ALL
     let errorHandler = null;
+    const errorHandlerStack = [];
     let exceptionHandler = null;
+    const exceptionHandlerStack = [];
     const shutdownFns = [];
     rt.suppressDepth = function () { return suppressDepth; };
     rt.errorReporting = function (v) {
@@ -97,8 +99,26 @@ var __zipp_php = (function () {
         if (v !== undefined) errorReportingLevel = toInt(v);
         return prev;
     };
-    rt.setErrorHandler = function (cb) { const prev = errorHandler; errorHandler = cb; return prev; };
-    rt.setExceptionHandler = function (cb) { const prev = exceptionHandler; exceptionHandler = cb; return prev; };
+    rt.setErrorHandler = function (cb) {
+        const prev = errorHandler;
+        errorHandlerStack.push(prev);
+        errorHandler = cb;
+        return prev;
+    };
+    rt.restoreErrorHandler = function () {
+        errorHandler = errorHandlerStack.length > 0 ? errorHandlerStack.pop() : null;
+        return true;
+    };
+    rt.setExceptionHandler = function (cb) {
+        const prev = exceptionHandler;
+        exceptionHandlerStack.push(prev);
+        exceptionHandler = cb;
+        return prev;
+    };
+    rt.restoreExceptionHandler = function () {
+        exceptionHandler = exceptionHandlerStack.length > 0 ? exceptionHandlerStack.pop() : null;
+        return true;
+    };
     rt.getExceptionHandler = function () { return exceptionHandler; };
     rt.registerShutdown = function (cb, args) { shutdownFns.push({ cb: cb, args: args }); };
     rt.runShutdown = function () {

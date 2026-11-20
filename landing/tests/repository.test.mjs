@@ -102,8 +102,8 @@ test('client rejects malformed data and unsafe links while retaining legitimate 
 test('current README reports the unmodified result, with no corrected profile', () => {
   const facts = readReadmeFacts(readFileSync(new URL('../../README.md', import.meta.url), 'utf8'))
   assert.equal(facts.test262_pct, 99.999)
-  assert.equal(facts.test262_pass, 96227)
-  assert.equal(facts.test262_total, 96228)
+  assert.equal(facts.test262_pass, 96563)
+  assert.equal(facts.test262_total, 96564)
   assert.equal(facts.test262_corrected_pass, undefined)
   assert.equal(facts.test262_corrected_total, undefined)
   const summary = test262Summary(parseRepoStats({ ...snapshot, readme: facts }))

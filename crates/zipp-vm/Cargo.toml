@@ -67,7 +67,7 @@ wasmi_core = { version = "2", optional = true, default-features = false }
 # needs 1.95 and 49 needs 1.96); 36.0.20 has every fix published up to
 # 2026-10-29. `wasmparser` moves with it: 36 builds with 0.236, and another
 # version here would link a second copy.
-wasmtime = { version = "36.0.20", optional = true, default-features = false, features = ["std", "runtime", "cranelift", "gc", "gc-drc", "parallel-compilation"] }
+wasmtime = { version = "36.0.21", optional = true, default-features = false, features = ["std", "runtime", "cranelift", "gc", "gc-drc", "parallel-compilation"] }
 wasmparser = { version = "0.236", optional = true, default-features = false, features = ["std"] }
 dynasm = { workspace = true, optional = true }
 dynasmrt = { workspace = true, optional = true }

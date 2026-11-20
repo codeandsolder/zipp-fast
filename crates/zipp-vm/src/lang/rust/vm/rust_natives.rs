@@ -1691,12 +1691,12 @@ fn parse_sqlite_params(raw: &str) -> Vec<rusqlite::types::Value> {
                 if !is_float {
                     if let Ok(iv) = tok.parse::<i64>() {
                         out.push(SqlVal::Integer(iv));
-                    } else if let Ok(fv) = tok.parse::<f64>() {
+                    } else if let Some(fv) = crate::num_parse::parse_f64(tok) {
                         out.push(SqlVal::Real(fv));
                     } else {
                         out.push(SqlVal::Null);
                     }
-                } else if let Ok(fv) = tok.parse::<f64>() {
+                } else if let Some(fv) = crate::num_parse::parse_f64(tok) {
                     out.push(SqlVal::Real(fv));
                 } else {
                     out.push(SqlVal::Null);
