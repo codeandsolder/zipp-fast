@@ -3592,6 +3592,8 @@ pub(crate) fn compile_proto_mem(
     // `LoadClassValue` constants by class id (`Vm::class_value_fixed`), valid
     // while `Vm::mi_class_epoch` is the second value.
     class_consts: (&FxHashMap<u32, u64>, u32),
+    // Canonical VM-wide property key IDs indexed by `name_idx`.
+    prop_key_ids: &[u32],
 ) -> Option<JitFn> {
     if !mem_can_compile(proto, const_strs) {
         return None;
@@ -3927,9 +3929,11 @@ pub(crate) fn compile_proto_mem(
     let mut loose_eq_stub: Option<dynasmrt::DynamicLabel> = None;
     let mut cross3_dyn_stub: Option<dynasmrt::DynamicLabel> = None;
     let mut fn_call_dyn_stub: Option<dynasmrt::DynamicLabel> = None;
+    let mut fn_get_call_stub: Option<dynasmrt::DynamicLabel> = None;
     let mut is_array_stub: Option<dynasmrt::DynamicLabel> = None;
     let mut keyed_get_stub: Option<dynasmrt::DynamicLabel> = None;
     let mut mega_prop_stubs: Option<(dynasmrt::DynamicLabel, dynasmrt::DynamicLabel)> = None;
+    let mut mega_set_stubs: Option<(dynasmrt::DynamicLabel, dynasmrt::DynamicLabel)> = None;
     #[cfg(not(feature = "safe-sandbox"))]
     let mut instanceof_pair_stub: Option<dynasmrt::DynamicLabel> = None;
     let mut deferred_prop_cold: Vec<DeferredPropCold> = Vec::new();
@@ -7256,6 +7260,25 @@ pub(crate) fn compile_proto_mem(
                 if is_length && crate::codegen::arr_len_mirror_enabled() {
                     emit_arr_mirror_len(&mut ops, obj, dst, cont);
                 }
+                if !is_length
+                    && meter.is_none()
+                    && proto
+                        .string_constants
+                        .get(name as usize)
+                        .is_some_and(|s| s == "call")
+                {
+                    let stub = *fn_get_call_stub.get_or_insert_with(|| ops.new_dynamic_label());
+                    dynasm!(ops
+                        ; mov rax, [rbx + dreg(obj)]
+                        ; call => stub
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je > fn_call_get_miss
+                        ; mov [rbx + dreg(dst)], rax
+                        ; jmp => cont
+                        ; fn_call_get_miss:
+                    );
+                }
                 emit_ic_probe(
                     &mut ops,
                     IcProbe::Get { dst },
@@ -7272,7 +7295,8 @@ pub(crate) fn compile_proto_mem(
                     ; jmp => miss_lbl
                     ; => cont
                 );
-                let mega_target = use_mega_prop.then(|| {
+                let key_id = prop_key_ids.get(name as usize).copied().unwrap_or(0);
+                let mega_target = (use_mega_prop && key_id != 0).then(|| {
                     let (full_lbl, dict_lbl) = *mega_prop_stubs
                         .get_or_insert_with(|| (ops.new_dynamic_label(), ops.new_dynamic_label()));
                     if site_emit.direct_miss {
@@ -7289,6 +7313,7 @@ pub(crate) fn compile_proto_mem(
                     acc_lane_join,
                     quick_len: is_length,
                     mega_target,
+                    key_id,
                     dst,
                     obj,
                     name,
@@ -7387,12 +7412,24 @@ pub(crate) fn compile_proto_mem(
                     ; jmp => miss_lbl
                     ; => cont
                 );
+                let key_id = prop_key_ids.get(name as usize).copied().unwrap_or(0);
+                let mega_target = (use_mega_prop && key_id != 0).then(|| {
+                    let (full_lbl, dict_lbl) = *mega_set_stubs
+                        .get_or_insert_with(|| (ops.new_dynamic_label(), ops.new_dynamic_label()));
+                    if site_emit.direct_miss {
+                        full_lbl
+                    } else {
+                        dict_lbl
+                    }
+                });
                 deferred_prop_cold.push(DeferredPropCold::Set {
                     miss_lbl,
                     cont,
                     bail,
                     acc,
                     acc_lane_join,
+                    mega_target,
+                    key_id,
                     obj,
                     val,
                     name,
@@ -7600,13 +7637,9 @@ pub(crate) fn compile_proto_mem(
                     }
                     lane = true;
                 } else if matches!(key, "get" | "has") {
-                    // Map.get / Map.has / Set.has — the region arm verbatim:
-                    // `has` retries as Set (op 2) before deopting; a wrong
-                    // receiver kind deopts, so a same-named user method is
-                    // unaffected (the interpreter runs it at this ip).
-                    let opsel: i32 = if key == "get" { 0 } else { 1 };
-                    let set_try = ops.new_dynamic_label();
-                    let coll_done = ops.new_dynamic_label();
+                    // Map.get / WeakMap.get (op 0) or unified Map/WeakMap/Set/WeakSet.has (op 3):
+                    // a wrong receiver kind deopts so any user method runs unchanged.
+                    let opsel: i32 = if key == "get" { 0 } else { 3 };
                     dynasm!(ops
                         ; mov rcx, rdi                        // vm
                         ; mov rdx, [rbx + dreg(obj)]          // receiver bits
@@ -7616,26 +7649,7 @@ pub(crate) fn compile_proto_mem(
                         ; call rax
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64
                         ; cmp rax, r10
-                        ; jne => coll_done
-                    );
-                    if opsel == 1 {
-                        dynasm!(ops
-                            ; => set_try
-                            ; mov rcx, rdi
-                            ; mov rdx, [rbx + dreg(obj)]
-                            ; mov r8, [rbx + dreg(arg_base)]
-                            ; mov r9d, 2
-                            ; mov rax, QWORD heap.coll_lookup as i64
-                            ; call rax
-                            ; mov r10, QWORD SELF_CALL_DEOPT as i64
-                            ; cmp rax, r10
-                            ; je => general
-                        );
-                    } else {
-                        dynasm!(ops ; => set_try ; jmp => general);
-                    }
-                    dynasm!(ops
-                        ; => coll_done
+                        ; je => general
                         ; mov [rbx + dreg(dst)], rax
                     );
                     lane = true;
@@ -9595,9 +9609,21 @@ pub(crate) fn compile_proto_mem(
     if let Some((full_lbl, dict_lbl)) = mega_prop_stubs {
         emit_mega_get_prop_stub(&mut ops, full_lbl, dict_lbl, heap.get_prop_miss);
     }
+    if let Some((full_lbl, dict_lbl)) = mega_set_stubs {
+        emit_mega_set_prop_stub(
+            &mut ops,
+            full_lbl,
+            dict_lbl,
+            heap.inline_store_lane_ok,
+            heap.set_prop_miss,
+        );
+    }
     #[cfg(not(feature = "safe-sandbox"))]
     if let Some(lbl) = instanceof_pair_stub {
         emit_instanceof_pair_stub(&mut ops, lbl);
+    }
+    if let Some(lbl) = fn_get_call_stub {
+        emit_fn_get_call_stub(&mut ops, lbl);
     }
     if let Some(lbl) = fn_call_dyn_stub {
         let dyn_target = cross3_dyn_stub.expect("fn_call_dyn_stub requires cross3_dyn_stub");
@@ -10047,6 +10073,7 @@ enum DeferredPropCold {
         acc_lane_join: Option<dynasmrt::DynamicLabel>,
         quick_len: bool,
         mega_target: Option<dynasmrt::DynamicLabel>,
+        key_id: u32,
         dst: u16,
         obj: u16,
         name: u32,
@@ -10060,6 +10087,8 @@ enum DeferredPropCold {
         bail: dynasmrt::DynamicLabel,
         acc: Option<dynasmrt::DynamicLabel>,
         acc_lane_join: Option<dynasmrt::DynamicLabel>,
+        mega_target: Option<dynasmrt::DynamicLabel>,
+        key_id: u32,
         obj: u16,
         val: u16,
         name: u32,
@@ -10535,12 +10564,17 @@ pub(crate) fn emit_keyed_memo_get_stub(
     get_index_helper: usize,
 ) {
     use crate::vm::host_api::{
-        JIT_DEFERRED_NS_NONEMPTY_OFFSET, JIT_GLOBAL_THIS_IDX_OFFSET, JIT_HOT_FID_OFF,
-        JIT_HOT_MIRROR_RAW_OFFSET, JIT_HOT_VALS_OFF, JIT_KEYED_MEMO_RAW_OFFSET,
-        JIT_MOD_NS_NONEMPTY_OFFSET, JIT_OBJ_PROTO_IDX_OFFSET, JIT_PROTO_LEN_OFFSET,
-        JIT_PROTO_RAW_OFFSET, JIT_REALM_GLOBALS_NONEMPTY_OFFSET, JIT_VERSIONS_RAW_OFFSET,
+        JIT_ARR_MIRROR_LEN_OFFSET, JIT_ARR_MIRROR_RAW_OFFSET, JIT_ARR_PROTO_IDX_OFFSET,
+        JIT_ARR_PROTO_ITER_SLOT_PTR_OFFSET, JIT_ARR_PROTO_ITER_VER_OFFSET,
+        JIT_DEFAULT_ARRAY_ITER_BITS_OFFSET, JIT_DEFERRED_NS_NONEMPTY_OFFSET,
+        JIT_GLOBAL_THIS_IDX_OFFSET, JIT_HOT_FID_OFF, JIT_HOT_MIRROR_RAW_OFFSET, JIT_HOT_VALS_OFF,
+        JIT_KEYED_MEMO_RAW_OFFSET, JIT_MOD_NS_NONEMPTY_OFFSET, JIT_OBJ_PROTO_IDX_OFFSET,
+        JIT_PROTO_LEN_OFFSET, JIT_PROTO_RAW_OFFSET, JIT_REALM_GLOBALS_NONEMPTY_OFFSET,
+        JIT_SYM_ITERATOR_BITS_OFFSET, JIT_VERSIONS_RAW_OFFSET,
     };
     use crate::vm::{KSM_ABSENT_MASK, KSM_ABSENT_NULL_PROTO, KSM_IMMUTABLE_KEY, KSM_PURE_SHAPE};
+    let arr_sym_iter = ops.new_dynamic_label();
+    let arr_iter_proto_ok = ops.new_dynamic_label();
     let dict_path = ops.new_dynamic_label();
     let shaped_absent = ops.new_dynamic_label();
     let dict_absent = ops.new_dynamic_label();
@@ -10559,6 +10593,8 @@ pub(crate) fn emit_keyed_memo_get_stub(
         ; shr rax, 48
         ; cmp eax, TAG_HEAP_HI as i32
         ; jne => slow
+        ; cmp r8, [rdi + JIT_SYM_ITERATOR_BITS_OFFSET as i32]
+        ; je => arr_sym_iter
         ; mov r9, [rdi + JIT_KEYED_MEMO_RAW_OFFSET as i32]
         ; test r9, r9
         ; jz => slow
@@ -10706,6 +10742,37 @@ pub(crate) fn emit_keyed_memo_get_stub(
         ; jnz => absent_null_proto
         ; jmp => absent_default_proto
 
+        // Dense `arr[Symbol.iterator]` -> pristine `%Array.prototype%.values`.
+        ; => arr_sym_iter
+        ; cmp BYTE [rdi + JIT_REALM_GLOBALS_NONEMPTY_OFFSET as i32], 0
+        ; jne => slow
+        ; mov r9, [rdi + JIT_ARR_PROTO_ITER_SLOT_PTR_OFFSET as i32]
+        ; test r9, r9
+        ; jz => slow
+        ; mov eax, edx
+        ; cmp eax, DWORD [rdi + JIT_ARR_MIRROR_LEN_OFFSET as i32]
+        ; jae => slow
+        ; mov r10, [rdi + JIT_ARR_MIRROR_RAW_OFFSET as i32]
+        ; shl rax, 4
+        ; cmp QWORD [r10 + rax], 0
+        ; je => slow
+        ; mov eax, edx
+        ; cmp rax, [rdi + JIT_PROTO_LEN_OFFSET as i32]
+        ; jae => arr_iter_proto_ok
+        ; mov r10, [rdi + JIT_PROTO_RAW_OFFSET as i32]
+        ; cmp QWORD [r10 + rax * 8], 0
+        ; jne => slow
+        ; => arr_iter_proto_ok
+        ; mov eax, DWORD [rdi + JIT_ARR_PROTO_IDX_OFFSET as i32]
+        ; mov r10, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
+        ; mov eax, DWORD [r10 + rax * 4]
+        ; cmp eax, DWORD [rdi + JIT_ARR_PROTO_ITER_VER_OFFSET as i32]
+        ; jne => slow
+        ; mov rax, [rdi + JIT_DEFAULT_ARRAY_ITER_BITS_OFFSET as i32]
+        ; cmp rax, [r9]
+        ; jne => slow
+        ; ret
+
         ; => slow
         ; mov rcx, rdi
         ; mov rax, QWORD get_index_helper as i64
@@ -10714,13 +10781,15 @@ pub(crate) fn emit_keyed_memo_get_stub(
 }
 
 /// Shared per-function megamorphic `GetProp` miss stub with two entry points:
-/// - `full_lbl` (`direct_miss == true` sites): probes `shape_prop_memo` (own
-///   data, proved absent, or ES5 prototype chain via `es5_proto_memo`) and
-///   `dict_prop_memo` for DICT objects, then tail-jumps to `jit_get_prop_miss`.
+/// - `full_lbl` (`direct_miss == true` sites): probes canonical `(shape, key_id)`
+///   `shape_prop_memo` (16384 × 16B: own data, proved absent, or ES5 prototype
+///   chain via 4096 × 32B `es5_proto_memo`) and 4096 × 32B `dict_prop_memo` for
+///   DICT objects, then tail-jumps to `jit_get_prop_miss`.
 /// - `dict_lbl` (`direct_miss == false` sites): probes `dict_prop_memo` only
 ///   for settled DICT objects (leaving shaped misses untouched for
 ///   `direct_miss_gate`), then tail-jumps to `jit_get_prop_miss`.
-/// Input: `rdx = obj_bits`, `r8d = site_idx`, `r9 = (func_id<<32)|name_idx`, `rdi = vm`.
+/// Input: `rdx = obj_bits`, `r8d = site_idx`, `r9 = (func_id<<32)|name_idx`,
+/// `ecx = key_id`, `rdi = vm`.
 pub(crate) fn emit_mega_get_prop_stub(
     ops: &mut crate::codegen::X64Asm,
     full_lbl: dynasmrt::DynamicLabel,
@@ -10728,7 +10797,8 @@ pub(crate) fn emit_mega_get_prop_stub(
     get_prop_miss_helper: usize,
 ) {
     use crate::vm::host_api::{
-        JIT_CHAIN_EPOCH_OFFSET, JIT_DEFERRED_NS_NONEMPTY_OFFSET, JIT_DICT_PROP_MEMO_RAW_OFFSET,
+        JIT_CHAIN_EPOCH_OFFSET, JIT_CLASS_PROP_MEMO_RAW_OFFSET, JIT_CLASS_PROTO_EPOCH_OFFSET,
+        JIT_DEFERRED_NS_NONEMPTY_OFFSET, JIT_DICT_PROP_MEMO_RAW_OFFSET,
         JIT_ES5_PROTO_MEMO_RAW_OFFSET, JIT_GLOBAL_THIS_IDX_OFFSET, JIT_HOT_FID_OFF,
         JIT_HOT_MIRROR_RAW_OFFSET, JIT_HOT_VALS_OFF, JIT_OBJ_PROTO_IDX_OFFSET,
         JIT_OBJ_PROTO_SETUP_VER_OFFSET, JIT_PROTO_LEN_OFFSET, JIT_PROTO_RAW_OFFSET,
@@ -10736,7 +10806,10 @@ pub(crate) fn emit_mega_get_prop_stub(
         JIT_VERSIONS_RAW_OFFSET,
     };
     let dict_body = ops.new_dynamic_label();
+    let dict_special = ops.new_dynamic_label();
     let shape_special = ops.new_dynamic_label();
+    let class_prop = ops.new_dynamic_label();
+    let class_hit = ops.new_dynamic_label();
     let es5_proto = ops.new_dynamic_label();
     let ret_undef = ops.new_dynamic_label();
     let slow = ops.new_dynamic_label();
@@ -10757,39 +10830,37 @@ pub(crate) fn emit_mega_get_prop_stub(
         ; mov eax, DWORD [r10]
         ; test eax, eax
         ; jz => dict_body
-        // Megamorphic shaped read: probe `shape_prop_memo` (8192 × 16B).
+        // Megamorphic shaped read: probe `shape_prop_memo` (16384 × 16B) by `(shape, key_id)`.
+        ; imul eax, eax, 0x9E37_79B1u32 as i32
+        ; imul r11d, ecx, 0xC2B2_AE35u32 as i32
+        ; xor eax, r11d
+        ; imul eax, eax, 0x27D4_EB2Fu32 as i32
+        ; shr eax, 18
+        ; shl rax, 4
         ; mov r11, [rdi + JIT_SHAPE_PROP_MEMO_RAW_OFFSET as i32]
         ; test r11, r11
         ; jz => slow
-        ; imul eax, eax, 0x9E37_79B1u32 as i32
-        ; mov ecx, r9d
-        ; imul ecx, ecx, 0xC2B2_AE35u32 as i32
-        ; xor eax, ecx
-        ; mov rcx, r9
-        ; shr rcx, 32
-        ; imul ecx, ecx, 0x85EB_CA77u32 as i32
-        ; xor eax, ecx
-        ; imul eax, eax, 0x27D4_EB2Fu32 as i32
-        ; shr eax, 19
-        ; shl rax, 4
         ; add r11, rax
         ; mov eax, DWORD [r10]
         ; cmp DWORD [r11], eax
         ; jne => slow
-        ; cmp QWORD [r11 + 8], r9
+        ; cmp DWORD [r11 + 4], ecx
         ; jne => slow
-        ; mov ecx, DWORD [r11 + 4]
-        ; test ecx, ecx
+        ; mov eax, DWORD [r11 + 8]
+        ; test eax, eax
         ; js => shape_special
         ; mov r11, [r10 + JIT_HOT_VALS_OFF as i32]
-        ; mov rax, [r11 + rcx * 8]
+        ; mov rax, [r11 + rax * 8]
         ; ret
 
         ; => shape_special
-        ; cmp DWORD [r10 + JIT_HOT_FID_OFF as i32], crate::heap::FID_MIRROR_NONE as i32
-        ; jne => slow
-        ; cmp ecx, crate::vm::SHAPE_PROP_ES5_PROTO as i32
+        ; mov r10d, DWORD [r10 + JIT_HOT_FID_OFF as i32]
+        ; cmp r10d, crate::heap::FID_MIRROR_NONE as i32
+        ; jne => class_prop
+        ; cmp eax, crate::vm::SHAPE_PROP_ES5_PROTO as i32
         ; je => es5_proto
+        ; cmp eax, crate::vm::SHAPE_PROP_ABSENT as i32
+        ; jne => slow
         // Proved absent on default or null prototype plain object.
         ; mov eax, DWORD [rdi + JIT_OBJ_PROTO_IDX_OFFSET as i32]
         ; mov r11, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
@@ -10810,14 +10881,45 @@ pub(crate) fn emit_mega_get_prop_stub(
         ; mov rax, QWORD Value::UNDEFINED.bits() as i64
         ; ret
 
+        // Class instance with proved-absent own key (`SHAPE_PROP_*` sentinel):
+        // probe canonical `(class_id, key_id)` `class_prop_memo` (4096 × 32B).
+        ; => class_prop
+        ; and r10d, 0x7FFF_FFFF
+        ; imul eax, r10d, 0x9E37_79B1u32 as i32
+        ; imul r11d, ecx, 0xC2B2_AE35u32 as i32
+        ; xor eax, r11d
+        ; imul eax, eax, 0x27D4_EB2Fu32 as i32
+        ; shr eax, 20
+        ; shl rax, 5
+        ; mov r11, [rdi + JIT_CLASS_PROP_MEMO_RAW_OFFSET as i32]
+        ; test r11, r11
+        ; jz => slow
+        ; add r11, rax
+        ; cmp DWORD [r11], r10d
+        ; jne => slow
+        ; cmp DWORD [r11 + 4], ecx
+        ; jne => slow
+        ; mov eax, DWORD [rdi + JIT_CLASS_PROTO_EPOCH_OFFSET as i32]
+        ; cmp DWORD [r11 + 16], eax
+        ; jne => slow
+        ; mov rax, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
+        ; mov eax, DWORD [rax + r10 * 4]
+        ; cmp DWORD [r11 + 8], eax
+        ; jne => slow
+        ; cmp DWORD [r11 + 20], 0
+        ; je => class_hit
+        ; mov eax, DWORD [rdi + JIT_CHAIN_EPOCH_OFFSET as i32]
+        ; cmp DWORD [r11 + 12], eax
+        ; jne => slow
+        ; => class_hit
+        ; mov rax, [r11 + 24]
+        ; ret
+
         ; => es5_proto
         ; cmp edx, DWORD [rdi + JIT_GLOBAL_THIS_IDX_OFFSET as i32]
         ; je => slow
         ; cmp BYTE [rdi + JIT_REALM_GLOBALS_NONEMPTY_OFFSET as i32], 0
         ; jne => slow
-        ; mov r11, [rdi + JIT_ES5_PROTO_MEMO_RAW_OFFSET as i32]
-        ; test r11, r11
-        ; jz => slow
         ; mov eax, edx
         ; cmp rax, [rdi + JIT_PROTO_LEN_OFFSET as i32]
         ; jae => slow
@@ -10828,27 +10930,24 @@ pub(crate) fn emit_mega_get_prop_stub(
         ; cmp eax, TAG_HEAP_HI as i32
         ; jne => slow
         ; mov r10d, r10d
-        ; mov eax, r10d
-        ; imul eax, eax, 0x9E37_79B1u32 as i32
-        ; mov ecx, r9d
-        ; imul ecx, ecx, 0xC2B2_AE35u32 as i32
-        ; xor eax, ecx
-        ; mov rcx, r9
-        ; shr rcx, 32
-        ; imul ecx, ecx, 0x85EB_CA77u32 as i32
-        ; xor eax, ecx
+        ; imul eax, r10d, 0x9E37_79B1u32 as i32
+        ; imul r11d, ecx, 0xC2B2_AE35u32 as i32
+        ; xor eax, r11d
         ; imul eax, eax, 0x27D4_EB2Fu32 as i32
-        ; shr eax, 21
+        ; shr eax, 20
         ; shl rax, 5
+        ; mov r11, [rdi + JIT_ES5_PROTO_MEMO_RAW_OFFSET as i32]
+        ; test r11, r11
+        ; jz => slow
         ; add r11, rax
         ; cmp DWORD [r11], r10d
         ; jne => slow
-        ; cmp QWORD [r11 + 8], r9
+        ; cmp DWORD [r11 + 4], ecx
         ; jne => slow
         ; mov eax, DWORD [rdi + JIT_CHAIN_EPOCH_OFFSET as i32]
-        ; cmp DWORD [r11 + 4], eax
+        ; cmp DWORD [r11 + 8], eax
         ; jne => slow
-        ; mov ecx, DWORD [r11 + 24]
+        ; mov ecx, DWORD [r11 + 12]
         ; cmp ecx, -1
         ; je => ret_undef
         ; mov r10, [r11 + 16]
@@ -10871,44 +10970,72 @@ pub(crate) fn emit_mega_get_prop_stub(
         ; lea r10, [r10 + rax * 8]
         ; test DWORD [r10 + JIT_HOT_FID_OFF as i32], 0x8000_0000u32 as i32
         ; jz => slow
-        ; cmp DWORD [r10], 0
+        ; mov eax, DWORD [r10]
+        ; test eax, eax
+        ; jz => dict_body
+        // Shaped object on a `direct == false` site: identity ways never cache
+        // class methods or class absent reads, so probe `shape_prop_memo` ->
+        // `class_prop_memo` for class instances (`fid != FID_MIRROR_NONE`) when
+        // the own key is proved absent (`slot < 0`). Own data props fall to
+        // `=> slow` so identity ways and `direct_miss_gate` still warm up.
+        ; cmp DWORD [r10 + JIT_HOT_FID_OFF as i32], crate::heap::FID_MIRROR_NONE as i32
+        ; je => slow
+        ; imul eax, eax, 0x9E37_79B1u32 as i32
+        ; imul r11d, ecx, 0xC2B2_AE35u32 as i32
+        ; xor eax, r11d
+        ; imul eax, eax, 0x27D4_EB2Fu32 as i32
+        ; shr eax, 18
+        ; shl rax, 4
+        ; mov r11, [rdi + JIT_SHAPE_PROP_MEMO_RAW_OFFSET as i32]
+        ; test r11, r11
+        ; jz => slow
+        ; add r11, rax
+        ; mov eax, DWORD [r10]
+        ; cmp DWORD [r11], eax
         ; jne => slow
+        ; cmp DWORD [r11 + 4], ecx
+        ; jne => slow
+        ; mov eax, DWORD [r11 + 8]
+        ; test eax, eax
+        ; js => shape_special
+        ; jmp => slow
 
         ; => dict_body
-        ; cmp QWORD [r10 + JIT_HOT_VALS_OFF as i32], 0
-        ; je => slow
+        ; imul eax, edx, 0x9E37_79B1u32 as i32
+        ; imul r11d, ecx, 0xC2B2_AE35u32 as i32
+        ; xor eax, r11d
+        ; imul eax, eax, 0x27D4_EB2Fu32 as i32
+        ; shr eax, 20
+        ; shl rax, 5
         ; mov r11, [rdi + JIT_DICT_PROP_MEMO_RAW_OFFSET as i32]
         ; test r11, r11
         ; jz => slow
-        ; mov eax, edx
-        ; imul eax, eax, 0x9E37_79B1u32 as i32
-        ; mov ecx, r9d
-        ; imul ecx, ecx, 0xC2B2_AE35u32 as i32
-        ; xor eax, ecx
-        ; mov rcx, r9
-        ; shr rcx, 32
-        ; imul ecx, ecx, 0x85EB_CA77u32 as i32
-        ; xor eax, ecx
-        ; imul eax, eax, 0x27D4_EB2Fu32 as i32
-        ; shr eax, 21
-        ; shl rax, 5
         ; add r11, rax
         ; cmp DWORD [r11], edx
         ; jne => slow
-        ; cmp QWORD [r11 + 8], r9
+        ; cmp DWORD [r11 + 4], ecx
         ; jne => slow
         ; mov r10, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
         ; mov eax, edx
         ; mov eax, DWORD [r10 + rax * 4]
-        ; cmp DWORD [r11 + 4], eax
+        ; cmp DWORD [r11 + 8], eax
         ; jne => slow
+        ; mov eax, DWORD [r11 + 12]
+        ; test eax, eax
+        ; js => dict_special
         ; mov r10, [r11 + 16]
-        ; mov ecx, DWORD [r11 + 24]
-        ; mov rax, [r10 + rcx * 8]
+        ; mov rax, [r10 + rax * 8]
         ; mov r11, QWORD Value::UNINITIALIZED.bits() as i64
         ; cmp rax, r11
         ; je => slow
         ; ret
+
+        ; => dict_special
+        ; mov r11d, edx
+        ; mov r10, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
+        ; lea r10, [r10 + r11 * 8]
+        ; lea r10, [r10 + r11 * 8]
+        ; jmp => shape_special
 
         ; => slow
         ; mov rcx, rdi
@@ -10917,12 +11044,217 @@ pub(crate) fn emit_mega_get_prop_stub(
     );
 }
 
+/// Shared per-function megamorphic `SetProp` miss stub with two entry points:
+/// - `full_lbl` (`direct_miss == true` sites): probes canonical `(shape, key_id)`
+///   `shape_prop_memo` (writable own data) and `(idx, key_id)` `dict_prop_memo`
+///   (writable own data), commits the store + nursery barrier inline, returning
+///   `rax = 0`; otherwise tail-jumps to `jit_set_prop_miss`.
+/// - `dict_lbl` (`direct_miss == false` sites): probes `dict_prop_memo` only
+///   for settled DICT objects, then tail-jumps to `jit_set_prop_miss`.
+/// Input: `rdx = obj_bits`, `r8 = val_bits`, `r9 = (func_id<<32)|name_idx`,
+/// `ecx = key_id`, `[rsp + 40] = ic_site` (5th Win64 arg placed by caller at
+/// `[rsp + 32]` before `call => stub`), `rdi = vm`.
+pub(crate) fn emit_mega_set_prop_stub(
+    ops: &mut crate::codegen::X64Asm,
+    full_lbl: dynasmrt::DynamicLabel,
+    dict_lbl: dynasmrt::DynamicLabel,
+    gen_lane: bool,
+    set_prop_miss_helper: usize,
+) {
+    use crate::vm::host_api::{
+        JIT_DEFERRED_NS_NONEMPTY_OFFSET, JIT_DICT_PROP_MEMO_RAW_OFFSET, JIT_GEN_RAW_OFFSET,
+        JIT_HOT_FID_OFF, JIT_HOT_MIRROR_RAW_OFFSET, JIT_HOT_VALS_OFF,
+        JIT_SHAPE_PROP_MEMO_RAW_OFFSET, JIT_VERSIONS_RAW_OFFSET,
+    };
+    let dict_body = ops.new_dynamic_label();
+    let barrier = ops.new_dynamic_label();
+    let ret_ok = ops.new_dynamic_label();
+    let slow = ops.new_dynamic_label();
+    dynasm!(ops
+        ; => full_lbl
+        ; mov rax, rdx
+        ; shr rax, 48
+        ; cmp eax, TAG_HEAP_HI as i32
+        ; jne => slow
+        ; cmp BYTE [rdi + JIT_DEFERRED_NS_NONEMPTY_OFFSET as i32], 0
+        ; jne => slow
+        ; mov eax, edx
+        ; mov r10, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
+        ; lea r10, [r10 + rax * 8]
+        ; lea r10, [r10 + rax * 8]
+        ; test DWORD [r10 + JIT_HOT_FID_OFF as i32], 0x8000_0000u32 as i32
+        ; jz => slow
+        ; mov eax, DWORD [r10]
+        ; test eax, eax
+        ; jz => dict_body
+        ; imul eax, eax, 0x9E37_79B1u32 as i32
+        ; imul r11d, ecx, 0xC2B2_AE35u32 as i32
+        ; xor eax, r11d
+        ; imul eax, eax, 0x27D4_EB2Fu32 as i32
+        ; shr eax, 18
+        ; shl rax, 4
+        ; mov r11, [rdi + JIT_SHAPE_PROP_MEMO_RAW_OFFSET as i32]
+        ; test r11, r11
+        ; jz => slow
+        ; add r11, rax
+        ; mov eax, DWORD [r10]
+        ; cmp DWORD [r11], eax
+        ; jne => slow
+        ; cmp DWORD [r11 + 4], ecx
+        ; jne => slow
+        ; cmp DWORD [r11 + 12], 1
+        ; jne => slow
+        ; mov eax, DWORD [r11 + 8]
+        ; mov r10, [r10 + JIT_HOT_VALS_OFF as i32]
+        ; mov [r10 + rax * 8], r8
+        ; jmp => barrier
+
+        ; => dict_lbl
+        ; mov rax, rdx
+        ; shr rax, 48
+        ; cmp eax, TAG_HEAP_HI as i32
+        ; jne => slow
+        ; cmp BYTE [rdi + JIT_DEFERRED_NS_NONEMPTY_OFFSET as i32], 0
+        ; jne => slow
+        ; mov eax, edx
+        ; mov r10, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
+        ; lea r10, [r10 + rax * 8]
+        ; lea r10, [r10 + rax * 8]
+        ; test DWORD [r10 + JIT_HOT_FID_OFF as i32], 0x8000_0000u32 as i32
+        ; jz => slow
+        ; cmp DWORD [r10], 0
+        ; jne => slow
+
+        ; => dict_body
+        ; imul eax, edx, 0x9E37_79B1u32 as i32
+        ; imul r11d, ecx, 0xC2B2_AE35u32 as i32
+        ; xor eax, r11d
+        ; imul eax, eax, 0x27D4_EB2Fu32 as i32
+        ; shr eax, 20
+        ; shl rax, 5
+        ; mov r11, [rdi + JIT_DICT_PROP_MEMO_RAW_OFFSET as i32]
+        ; test r11, r11
+        ; jz => slow
+        ; add r11, rax
+        ; cmp DWORD [r11], edx
+        ; jne => slow
+        ; cmp DWORD [r11 + 4], ecx
+        ; jne => slow
+        ; cmp QWORD [r11 + 24], 1
+        ; jne => slow
+        ; mov r10, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
+        ; mov eax, edx
+        ; mov eax, DWORD [r10 + rax * 4]
+        ; cmp DWORD [r11 + 8], eax
+        ; jne => slow
+        ; mov r10, [r11 + 16]
+        ; mov ecx, DWORD [r11 + 12]
+        ; mov [r10 + rcx * 8], r8
+
+        ; => barrier
+        ; mov rax, r8
+        ; shr rax, 48
+        ; cmp eax, TAG_HEAP_HI as i32
+        ; jne => ret_ok
+        ; mov edx, edx
+    );
+    if gen_lane {
+        dynasm!(ops
+            ; mov r11, [rdi + JIT_GEN_RAW_OFFSET as i32]
+            ; test BYTE [r11 + rdx], crate::heap::JIT_GEN_STATE_MASK as i8
+            ; jz => ret_ok
+        );
+        if crate::codegen::barrier_filter_enabled() {
+            dynasm!(ops
+                ; mov r10d, r8d
+                ; test BYTE [r11 + r10], crate::heap::JIT_GEN_STATE_MASK as i8
+                ; jnz => ret_ok
+            );
+        }
+    }
+    dynasm!(ops
+        ; sub rsp, 40
+        ; mov rcx, rdi
+        ; mov rax, QWORD crate::vm::jit_shape_set_barrier as *const () as i64
+        ; call rax
+        ; add rsp, 40
+        ; => ret_ok
+        ; xor eax, eax
+        ; ret
+
+        ; => slow
+        ; mov rcx, rdi
+        ; mov rax, QWORD set_prop_miss_helper as i64
+        ; jmp rax
+    );
+}
+
+/// Shared per-function `GetProp("call")` fast stub for `Func`/`Closure`
+/// receivers: proves `fn` is a JS function with no own `"call"` property and
+/// default `%Function.prototype%` holding pristine `FN_CALL`, returning
+/// `fn_call_native_bits` in `rax` (or `SELF_CALL_DEOPT` on miss).
+/// Clobbers only `rax, r9, r10, r11`.
+pub(crate) fn emit_fn_get_call_stub(
+    ops: &mut crate::codegen::X64Asm,
+    stub: dynasmrt::DynamicLabel,
+) {
+    use crate::vm::host_api::{
+        JIT_FN_CALL_NATIVE_BITS_OFFSET, JIT_FN_PROPS_HAS_CALL_OFFSET,
+        JIT_FN_PROTO_CALL_SLOT_OFFSET, JIT_FN_PROTO_IDX_OFFSET, JIT_FN_PROTO_SHAPE_OFFSET,
+        JIT_HOT_FID_OFF, JIT_HOT_MIRROR_RAW_OFFSET, JIT_HOT_VALS_OFF,
+        JIT_OBJ_REALM_NONEMPTY_OFFSET, JIT_PROTO_LEN_OFFSET, JIT_PROTO_RAW_OFFSET,
+        JIT_REALM_GLOBALS_NONEMPTY_OFFSET,
+    };
+    let proto_ok = ops.new_dynamic_label();
+    let decline = ops.new_dynamic_label();
+    dynasm!(ops
+        ; => stub
+        ; cmp BYTE [rdi + JIT_FN_PROPS_HAS_CALL_OFFSET as i32], 0
+        ; jne => decline
+        ; cmp BYTE [rdi + JIT_OBJ_REALM_NONEMPTY_OFFSET as i32], 0
+        ; jne => decline
+        ; cmp BYTE [rdi + JIT_REALM_GLOBALS_NONEMPTY_OFFSET as i32], 0
+        ; jne => decline
+        ; mov r10, rax
+        ; shr r10, 48
+        ; cmp r10d, TAG_HEAP_HI as i32
+        ; jne => decline
+        ; mov r10d, eax
+        ; mov r9, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
+        ; lea r11, [r9 + r10 * 8]
+        ; cmp DWORD [r11 + r10 * 8 + JIT_HOT_FID_OFF as i32], crate::heap::FID_MIRROR_STR as i32
+        ; jae => decline
+        ; cmp r10, [rdi + JIT_PROTO_LEN_OFFSET as i32]
+        ; jae => proto_ok
+        ; mov r11, [rdi + JIT_PROTO_RAW_OFFSET as i32]
+        ; cmp QWORD [r11 + r10 * 8], 0
+        ; jne => decline
+        ; => proto_ok
+        ; mov r10d, DWORD [rdi + JIT_FN_PROTO_IDX_OFFSET as i32]
+        ; lea r9, [r9 + r10 * 8]
+        ; mov r11d, DWORD [r9 + r10 * 8]
+        ; test r11d, r11d
+        ; jz => decline
+        ; cmp r11d, DWORD [rdi + JIT_FN_PROTO_SHAPE_OFFSET as i32]
+        ; jne => decline
+        ; mov r9, [r9 + r10 * 8 + JIT_HOT_VALS_OFF as i32]
+        ; mov r10d, DWORD [rdi + JIT_FN_PROTO_CALL_SLOT_OFFSET as i32]
+        ; mov rax, [r9 + r10 * 8]
+        ; cmp rax, [rdi + JIT_FN_CALL_NATIVE_BITS_OFFSET as i32]
+        ; jne => decline
+        ; ret
+        ; => decline
+        ; mov rax, QWORD SELF_CALL_DEOPT as i64
+        ; ret
+    );
+}
+
 /// Shared per-function `fn.call(thisArg, ...)` pristine-guard prefix stub.
 /// Proves `%Function.prototype%.call` is pristine, `fn` has no own `"call"`
 /// property in `fn_props`, and `fn` has no `proto_of` override, then
 /// tail-jumps directly into `cross3_dyn_stub` to execute the callee natively.
 /// Preserves `rax`, `rdx`, `r8`, `ecx`.
-fn emit_fn_call_dyn_stub(
+pub(crate) fn emit_fn_call_dyn_stub(
     ops: &mut crate::codegen::X64Asm,
     stub: dynasmrt::DynamicLabel,
     dyn_target: dynasmrt::DynamicLabel,
@@ -10982,7 +11314,7 @@ fn emit_fn_call_dyn_stub(
 /// Returns in `rax`: return Value bits, `SELF_CALL_DEOPT` (pure-prefix
 /// decline, nothing mutated), or `CALL_THREW` (callee threw; caller bails).
 /// Refetches `r13`/`r14` when `refetch.is_some()` on every non-decline return.
-fn emit_cross3_dyn_stub(
+pub(crate) fn emit_cross3_dyn_stub(
     ops: &mut crate::codegen::X64Asm,
     stub: dynasmrt::DynamicLabel,
     caller_regs: u16,
@@ -10992,14 +11324,16 @@ fn emit_cross3_dyn_stub(
     use crate::codegen::{CROSS_DYN_ARROW, CROSS_DYN_OK, CROSS_DYN_STRICT, CROSS_DYN_WIDE_ZERO};
     use crate::vm::host_api::{
         JIT_ACTIVATION_OFFSET, JIT_CALL_DEPTH_OFFSET, JIT_CROSS_TABLE_LEN_OFFSET,
-        JIT_CROSS_TABLE_RAW_OFFSET, JIT_EVAL_SCOPE_NONEMPTY_OFFSET, JIT_GC_REQUESTED_OFFSET,
-        JIT_GC_STRESS_OFFSET, JIT_GLOBAL_ROUTE_EPOCH_OFFSET, JIT_GLOBAL_THIS_BITS_OFFSET,
-        JIT_HOT_FID_OFF, JIT_HOT_MIRROR_RAW_OFFSET, JIT_HOT_VALS_OFF,
+        JIT_CROSS_TABLE_RAW_OFFSET, JIT_EVAL_SCOPE_NONEMPTY_OFFSET, JIT_FN_CALL_NATIVE_BITS_OFFSET,
+        JIT_GC_REQUESTED_OFFSET, JIT_GC_STRESS_OFFSET, JIT_GLOBAL_ROUTE_EPOCH_OFFSET,
+        JIT_GLOBAL_THIS_BITS_OFFSET, JIT_HOT_FID_OFF, JIT_HOT_MIRROR_RAW_OFFSET, JIT_HOT_VALS_OFF,
         JIT_OBJ_REALM_NONEMPTY_OFFSET, JIT_REALM_GLOBALS_NONEMPTY_OFFSET, JIT_REGS_HW_OFFSET,
         JIT_REGS_LEN_OFFSET, JIT_REGS_PTR_OFFSET, JIT_ROOT_DEPTH_OFFSET, JIT_ROOT_SLOTS_OFFSET,
         JIT_THIS_MIRROR_RAW_OFFSET, JIT_UPVALS_MIRROR_RAW_OFFSET,
     };
     let fast_decline = ops.new_dynamic_label();
+    let not_direct_fn = ops.new_dynamic_label();
+    let fn_call_no_args = ops.new_dynamic_label();
     let decline_pop = ops.new_dynamic_label();
     let this_arrow = ops.new_dynamic_label();
     let this_plain = ops.new_dynamic_label();
@@ -11054,7 +11388,7 @@ fn emit_cross3_dyn_stub(
         ; lea r11, [r11 + r10 * 8]
         ; mov r9d, DWORD [r11 + r10 * 8 + JIT_HOT_FID_OFF as i32]
         ; cmp r9d, DWORD [rdi + JIT_CROSS_TABLE_LEN_OFFSET as i32]
-        ; jae => fast_decline
+        ; jae => not_direct_fn
         ; mov r11, [rdi + JIT_CROSS_TABLE_RAW_OFFSET as i32]
         ; shl r9, 5
         ; add r11, r9
@@ -11359,6 +11693,28 @@ fn emit_cross3_dyn_stub(
 
         ; => decline_pop
         ; add rsp, STUB_FRAME
+        ; => not_direct_fn
+        // Split `fn.call(thisArg, ...args)` (`CallWithThis` where `callee` is
+        // the pristine `%Function.prototype%.call` native): unwrap `this` as
+        // the target function and re-enter the native trampoline with zero
+        // Rust FFI transitions.
+        ; test ecx, 0x100
+        ; jz => fast_decline
+        ; cmp rax, [rdi + JIT_FN_CALL_NATIVE_BITS_OFFSET as i32]
+        ; jne => fast_decline
+        ; mov rax, rdx
+        ; mov r10d, ecx
+        ; and r10d, 0xFF
+        ; test r10d, r10d
+        ; jz => fn_call_no_args
+        ; mov rdx, [r8]
+        ; add r8, 8
+        ; dec ecx
+        ; jmp => stub
+        ; => fn_call_no_args
+        ; xor ecx, ecx
+        ; jmp => stub
+
         ; => fast_decline
         ; mov rax, QWORD SELF_CALL_DEOPT as i64
         ; ret
@@ -11381,6 +11737,7 @@ fn emit_deferred_prop_cold(
             acc_lane_join,
             quick_len,
             mega_target,
+            key_id,
             dst,
             obj,
             name,
@@ -11411,6 +11768,7 @@ fn emit_deferred_prop_cold(
                     ; mov rdx, rax
                     ; mov r8d, ic_site as i32
                     ; mov r9, QWORD packed as i64
+                    ; mov ecx, key_id as i32
                     ; call => stub
                 );
             } else {
@@ -11481,6 +11839,8 @@ fn emit_deferred_prop_cold(
             bail,
             acc,
             acc_lane_join,
+            mega_target,
+            key_id,
             obj,
             val,
             name,
@@ -11488,15 +11848,28 @@ fn emit_deferred_prop_cold(
             packed,
             packed_fip,
         } => {
+            dynasm!(ops ; => miss_lbl);
+            if let Some(stub) = mega_target {
+                dynasm!(ops
+                    ; mov rdx, rax
+                    ; mov r8, [rbx + dreg(val)]
+                    ; mov r9, QWORD packed as i64
+                    ; mov QWORD [rsp + 32], ic_site as i32
+                    ; mov ecx, key_id as i32
+                    ; call => stub
+                );
+            } else {
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, rax
+                    ; mov r8, [rbx + dreg(val)]
+                    ; mov r9, QWORD packed as i64
+                    ; mov QWORD [rsp + 32], ic_site as i32
+                    ; mov rax, QWORD heap.set_prop_miss as i64
+                    ; call rax
+                );
+            }
             dynasm!(ops
-                ; => miss_lbl
-                ; mov rcx, rdi
-                ; mov rdx, rax
-                ; mov r8, [rbx + dreg(val)]
-                ; mov r9, QWORD packed as i64
-                ; mov QWORD [rsp + 32], ic_site as i32
-                ; mov rax, QWORD heap.set_prop_miss as i64
-                ; call rax
                 ; mov r10, QWORD SELF_CALL_DEOPT as i64
                 ; cmp rax, r10
                 ; je => bail

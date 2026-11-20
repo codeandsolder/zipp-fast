@@ -761,6 +761,14 @@ impl<'p> Vm<'p> {
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             shape_prop_memo_raw: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            class_prop_memo: Vec::new(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            class_prop_memo_raw: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            prop_key_map: rustc_hash::FxHashMap::default(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            prop_key_cache: Vec::new(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             keyed_slot_memo_raw: 0,
             deferred_ns_nonempty: 0,
             mod_ns_nonempty: 0,
@@ -776,6 +784,12 @@ impl<'p> Vm<'p> {
             array_is_array_bits: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             obj_proto_setup_ver: u32::MAX,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            sym_iterator_bits: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            arr_proto_iter_slot_ptr: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            arr_proto_iter_ver: u32::MAX,
             fn_proto_readonly: rustc_hash::FxHashSet::default(),
             objproto_method_memo: [(crate::shape::DICT, 0, 0); 3],
             is_htmldda: Default::default(),

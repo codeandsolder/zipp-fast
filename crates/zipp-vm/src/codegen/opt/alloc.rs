@@ -20,6 +20,9 @@ pub(crate) enum Loc {
     Xmm(u8),
     /// A stack slot, by index.
     Slot(u32),
+    /// A rematerialized compile-time constant (`ConstI32`/`ConstBool`/`ConstTagged`):
+    /// consumes zero registers and zero stack slots.
+    Imm,
 }
 
 /// The registers the allocator hands out. The emitter keeps rax, rcx, rdx,
@@ -63,25 +66,15 @@ pub(crate) fn allocate(f: &Func) -> Alloc {
     let words = nv.div_ceil(64).max(1);
     let mut live_in = vec![vec![0u64; words]; nb];
     let mut live_out = vec![vec![0u64; words]; nb];
+    let mut live = vec![0u64; words];
     let set = |s: &mut [u64], v: V| s[v as usize / 64] |= 1 << (v % 64);
     let clr = |s: &mut [u64], v: V| s[v as usize / 64] &= !(1 << (v % 64));
-    let get = |s: &[u64], v: usize| s[v / 64] >> (v % 64) & 1 != 0;
-    // The values each block reads (operands, frame states, terminator) in
-    // order, for the backward walk.
-    let reads = |v: V| -> Vec<V> {
-        let i = &f.insts[v as usize];
-        let mut r = i.op.operands();
-        if let Some(s) = i.fs {
-            r.extend(f.states[s as usize].regs.iter().map(|&(_, x)| x));
-        }
-        r
-    };
     let mut changed = true;
     while changed {
         changed = false;
         for bi in (0..nb).rev() {
             let b = &f.blocks[bi];
-            let mut live = vec![0u64; words];
+            live.fill(0);
             for s in b.term.succs() {
                 let sb = &f.blocks[s as usize];
                 for (w, x) in live.iter_mut().zip(&live_in[s as usize]) {
@@ -96,7 +89,7 @@ pub(crate) fn allocate(f: &Func) -> Alloc {
                 }
             }
             if live != live_out[bi] {
-                live_out[bi] = live.clone();
+                live_out[bi].copy_from_slice(&live);
                 changed = true;
             }
             match b.term {
@@ -106,14 +99,18 @@ pub(crate) fn allocate(f: &Func) -> Alloc {
             }
             for &v in b.insts.iter().rev() {
                 clr(&mut live, v);
-                if !matches!(f.insts[v as usize].op, Op::Phi(_)) {
-                    for u in reads(v) {
-                        set(&mut live, u);
+                let i = &f.insts[v as usize];
+                if !matches!(i.op, Op::Phi(_)) {
+                    i.op.for_each_operand(|u| set(&mut live, u));
+                    if let Some(s) = i.fs {
+                        for &(_, u) in &f.states[s as usize].regs {
+                            set(&mut live, u);
+                        }
                     }
                 }
             }
             if live != live_in[bi] {
-                live_in[bi] = live;
+                live_in[bi].copy_from_slice(&live);
                 changed = true;
             }
         }
@@ -122,30 +119,37 @@ pub(crate) fn allocate(f: &Func) -> Alloc {
     // it is live into or out of.
     let mut start = pos.clone();
     let mut end = pos.clone();
+    #[inline(always)]
     fn extend(v: usize, at: u32, start: &mut [u32], end: &mut [u32]) {
         start[v] = start[v].min(at);
         end[v] = end[v].max(at);
     }
-    for (bi, b) in f.blocks.iter().enumerate() {
-        let (bs, be) = block_pos[bi];
-        for v in 0..nv {
-            if get(&live_in[bi], v) {
-                extend(v, bs, &mut start, &mut end);
-            }
-            if get(&live_out[bi], v) {
-                extend(v, be, &mut start, &mut end);
+    #[inline]
+    fn extend_bitset(bits: &[u64], at: u32, start: &mut [u32], end: &mut [u32]) {
+        for (wi, &w) in bits.iter().enumerate() {
+            let mut m = w;
+            let base = wi * 64;
+            while m != 0 {
+                let v = base + m.trailing_zeros() as usize;
+                extend(v, at, start, end);
+                m &= m - 1;
             }
         }
+    }
+    for (bi, b) in f.blocks.iter().enumerate() {
+        let (bs, be) = block_pos[bi];
+        extend_bitset(&live_in[bi], bs, &mut start, &mut end);
+        extend_bitset(&live_out[bi], be, &mut start, &mut end);
         for &v in &b.insts {
             let i = &f.insts[v as usize];
             if !matches!(i.op, Op::Phi(_)) {
-                for u in reads(v) {
-                    extend(u as usize, pos[v as usize], &mut start, &mut end);
-                }
-                // A state written after a native call is read after it.
-                if let (true, Some(s)) = (i.op.state_after_call(), i.fs) {
+                let pv = pos[v as usize];
+                i.op.for_each_operand(|u| extend(u as usize, pv, &mut start, &mut end));
+                if let Some(s) = i.fs {
+                    // A state written after a native call is read after it.
+                    let at = if i.op.state_after_call() { pv + 1 } else { pv };
                     for &(_, u) in &f.states[s as usize].regs {
-                        extend(u as usize, pos[v as usize] + 1, &mut start, &mut end);
+                        extend(u as usize, at, &mut start, &mut end);
                     }
                 }
             }
@@ -159,14 +163,30 @@ pub(crate) fn allocate(f: &Func) -> Alloc {
     // ── linear scan ── a value live across a call-out (a call position
     // strictly inside its interval) takes a callee-saved register, which
     // the native callee preserves, or a slot.
-    let calls: Vec<u32> = (0..nv)
+    let mut calls: Vec<u32> = (0..nv)
         .filter(|&v| f.insts[v].op.calls())
         .map(|v| pos[v])
         .collect();
-    let crosses = |v: usize| calls.iter().any(|&c| start[v] < c && c < end[v]);
-    let mut order: Vec<usize> = (0..nv).filter(|&v| f.insts[v].rep != Rep::Void).collect();
+    calls.sort_unstable();
+    let crosses = |v: usize| {
+        let s = start[v];
+        let e = end[v];
+        if s + 1 >= e {
+            return false;
+        }
+        let k = calls.partition_point(|&c| c <= s);
+        k < calls.len() && calls[k] < e
+    };
+    let mut order: Vec<usize> = (0..nv)
+        .filter(|&v| f.insts[v].rep != Rep::Void && !f.insts[v].op.is_imm())
+        .collect();
     order.sort_by_key(|&v| (start[v], v));
     let mut loc = vec![Loc::Slot(u32::MAX); nv];
+    for v in 0..nv {
+        if f.insts[v].op.is_imm() {
+            loc[v] = Loc::Imm;
+        }
+    }
     let mut slots = 0u32;
     let saved = |class: usize, r: u8| if class == 1 { r >= 6 } else { r != 8 && r != 9 };
     // Per class: the active intervals (value) and the free registers,
@@ -220,7 +240,7 @@ pub(crate) fn allocate(f: &Func) -> Alloc {
             .enumerate()
             .filter(|&(_, &a)| match loc[a] {
                 Loc::Gpr(r) | Loc::Xmm(r) => !cross || saved(class, r),
-                Loc::Slot(_) => false,
+                Loc::Slot(_) | Loc::Imm => false,
             })
             .max_by_key(|&(_, &a)| end[a])
             .map(|(ki, &a)| (ki, a));

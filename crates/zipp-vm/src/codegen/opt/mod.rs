@@ -33,12 +33,20 @@ use rustc_hash::FxHashMap;
 
 use super::{ClassReadPlan, CrossCallPlan, FuncProto, JitFn, MathIntrinsicGuard, PropShapePlan};
 
+/// One inlinable callee's bytecode and cached feedback (`OptCallees::bodies`).
+pub(crate) struct OptCallee<'a> {
+    pub(crate) proto: &'a FuncProto,
+    pub(crate) prop_shape: PropShapePlan,
+    pub(crate) const_strs: FxHashMap<u32, u64>,
+    pub(crate) poly: FxHashMap<usize, Vec<(u32, u32)>>,
+}
+
 /// What the VM supplies for Tier O's inlining, from the caches.
 #[derive(Default)]
 pub(crate) struct OptCallees<'a> {
     /// The bodies Tier O may inline, by function id, each with its own
-    /// property plan.
-    pub(crate) bodies: FxHashMap<u32, (&'a FuncProto, PropShapePlan)>,
+    /// property plan, rooted string constants, and polymorphic read ways.
+    pub(crate) bodies: FxHashMap<u32, OptCallee<'a>>,
     /// The `GetProp` sites whose cache found a class getter
     /// (`Vm::ic_class_getter_read`), by position.
     pub(crate) getters: ClassReadPlan,
@@ -144,7 +152,20 @@ pub(crate) fn tier_up_enabled() -> bool {
 }
 
 /// Entries of a function's Tier C body before it asks for Tier O.
-pub(crate) const TIER_UP_ENTRIES: u32 = 1000;
+pub(crate) const TIER_UP_ENTRIES: u32 = 256;
+
+/// Runtime override for `TIER_UP_ENTRIES` (`ZIPP_OPT_TIER_UP=N`).
+pub(crate) fn tier_up_entries() -> u32 {
+    use std::sync::OnceLock;
+    static N: OnceLock<u32> = OnceLock::new();
+    *N.get_or_init(|| {
+        crate::env_var("ZIPP_OPT_TIER_UP")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(TIER_UP_ENTRIES)
+    })
+}
 
 /// Whether Tier O would admit `proto` (`build::admits`): only then does its
 /// Tier C body count toward Tier O.
@@ -226,6 +247,8 @@ pub(crate) struct Env<'a> {
     pub(crate) generic: Option<&'a rustc_hash::FxHashSet<u32>>,
     /// The helpers Tier C's emitted cross-call lanes call.
     pub(crate) heap: super::HeapHelpers,
+    /// Canonical VM-wide property key IDs indexed by `name_idx`.
+    pub(crate) prop_key_ids: &'a [u32],
 }
 
 /// What a function's Tier O bodies learned by deopting.
@@ -284,6 +307,7 @@ pub(crate) fn compile(
         const_strs: env.const_strs,
         math: env.math,
         generic: env.generic,
+        heap: &env.heap,
     };
     let mut func = build::build(proto, func_id, &inputs)?;
     func.gen_lane = env.gen_lane;
@@ -291,9 +315,10 @@ pub(crate) fn compile(
     func.heap = Some(env.heap);
     func.cross = cross_plan
         .iter()
-        .filter(|(_, s)| !s.cross3.is_empty() || s.cross3m.is_some())
+        .filter(|(_, s)| !s.cross3.is_empty() || s.cross3m.is_some() || s.proto_read.is_some() || s.class_method)
         .map(|(&ip, &s)| (ip as u32, s))
         .collect();
+    func.class_read = class_read.iter().map(|(&ip, &l)| (ip as u32, l)).collect();
     func.captured = proto
         .code
         .iter()
@@ -310,18 +335,18 @@ pub(crate) fn compile(
         let direct_on = super::direct_ic_miss_enabled();
         for (ip, i) in proto.code.iter().enumerate() {
             match i {
-                crate::bytecode::Instr::GetProp { .. } => {
+                crate::bytecode::Instr::GetProp { .. }
+                | crate::bytecode::Instr::SetProp { .. } => {
                     let direct = direct_on && !ic_identity_keyed(&proto.code, ip);
                     func.ic_sites.insert(ip as u32, (k, direct));
                     k += 1;
                 }
-                crate::bytecode::Instr::SetProp { .. } => k += 1,
                 _ => {}
             }
         }
     }
     let alloc = alloc::allocate(&func);
-    let f = emit::emit(&func, &alloc)?;
+    let f = emit::emit(&func, &alloc, env.prop_key_ids)?;
     // The reads built knowing nothing of their receivers: the ones a replan
     // may build better (`Jit::opt_slow_read_due`).
     let plain: rustc_hash::FxHashSet<u32> = func

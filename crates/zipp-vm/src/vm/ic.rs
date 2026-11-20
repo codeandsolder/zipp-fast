@@ -1591,7 +1591,8 @@ pub(crate) fn own_pos_in(cache: &[std::cell::Cell<OwnSlot>], m: &ObjMap, key: &s
 #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OwnSlotProbe {
-    Data(u32),
+    /// Own data property `(slot, writable)`.
+    Data(u32, bool),
     Miss,
     Unknown,
 }
@@ -1604,7 +1605,7 @@ impl<'p> Vm<'p> {
     }
 
     /// Single-lookup read-only probe of `(sh, key)` in `own_slot_cache`:
-    /// distinguishes own DATA property (`Data(slot)`), proved own absence
+    /// distinguishes own DATA property (`Data(slot, writable)`), proved own absence
     /// (`Miss`), and cache miss / accessor (`Unknown`).
     #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
     #[inline(always)]
@@ -1619,7 +1620,7 @@ impl<'p> Vm<'p> {
             if e.slot == u32::MAX {
                 OwnSlotProbe::Miss
             } else if e.slot & OwnSlot::ACCESSOR == 0 {
-                OwnSlotProbe::Data(e.slot & !OwnSlot::FLAGS)
+                OwnSlotProbe::Data(e.slot & !OwnSlot::FLAGS, e.slot & OwnSlot::READONLY == 0)
             } else {
                 OwnSlotProbe::Unknown
             }

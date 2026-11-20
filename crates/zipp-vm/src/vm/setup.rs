@@ -2890,6 +2890,26 @@ impl<'p> Vm<'p> {
             if self.obj_proto != 0 {
                 self.obj_proto_setup_ver = self.heap.version_of(self.obj_proto);
             }
+            if self.symbol_ctor != 0 {
+                if let HeapObj::Object(m) = self.heap.get(self.symbol_ctor) {
+                    if let Some(v) = m.get("iterator") {
+                        self.sym_iterator_bits = v.bits();
+                    }
+                }
+            }
+            if self.arr_proto != 0 && self.default_array_iter.is_heap() {
+                if let HeapObj::Object(m) = self.heap.get(self.arr_proto) {
+                    if let Some(slot) = m.pos("@@iterator") {
+                        if !m.attr_at(slot).accessor
+                            && m.val_at(slot).bits() == self.default_array_iter.bits()
+                        {
+                            self.arr_proto_iter_slot_ptr =
+                                m.vals_ptr_raw().wrapping_add(slot) as u64;
+                            self.arr_proto_iter_ver = self.heap.version_of(self.arr_proto);
+                        }
+                    }
+                }
+            }
         }
         // `$262.agent`: the full multi-agent surface (vm/agents.rs). getReport
         // must exist (returning null on empty) even before any worker agent

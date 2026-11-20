@@ -430,6 +430,7 @@ impl<'p> Vm<'p> {
                     }
                 }
             }
+            let prop_key_ids = self.build_prop_key_ids(fid);
             self.jit.compile(
                 fid,
                 proto_ref,
@@ -447,6 +448,7 @@ impl<'p> Vm<'p> {
                 &prop_shape,
                 &class_read,
                 &crate::codegen::OptCallees::default(),
+                &prop_key_ids,
             );
         }
         // The direct global routes the body was compiled with, as

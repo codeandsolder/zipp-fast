@@ -33,7 +33,7 @@ use std::hash::{BuildHasher, Hash, Hasher};
 /// Collection size at which an indexed operation switches from the linear
 /// scan to building (and from then on maintaining) the hash index. Small
 /// collections never touch the index machinery.
-pub(crate) const INDEX_THRESHOLD: usize = 16;
+pub(crate) const INDEX_THRESHOLD: usize = 9;
 
 /// The SameValueZero key representation: a u64 that SameValueZero-equal keys
 /// map to (a table hit is always CONFIRMED against the stored key with

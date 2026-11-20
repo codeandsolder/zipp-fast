@@ -3113,12 +3113,8 @@ pub(crate) fn compile_region_mem(
                 // other object takes the general route.
                 if argc == 1 && matches!(key, "get" | "has") {
                     let general = ops.new_dynamic_label();
-                    // 0 = Map.get, 1 = Map.has, 2 = Set.has. Map and Set are
-                    // distinguished at runtime, so `has` tries Map first and the
-                    // helper falls through to Set on a kind mismatch.
-                    let opsel: i32 = if key == "get" { 0 } else { 1 };
-                    let set_try = ops.new_dynamic_label();
-                    let coll_done = ops.new_dynamic_label();
+                    // 0 = Map/WeakMap.get, 3 = unified Map/WeakMap/Set/WeakSet.has.
+                    let opsel: i32 = if key == "get" { 0 } else { 3 };
                     dynasm!(ops
                         ; mov rcx, rdi                          // vm
                         ; mov rdx, [rbx + dreg(obj)]            // receiver bits
@@ -3128,28 +3124,10 @@ pub(crate) fn compile_region_mem(
                         ; call rax
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64
                         ; cmp rax, r10
-                        ; jne => coll_done
+                        ; je => general
                     );
-                    if opsel == 1 {
-                        // `has` on a Set: retry with op = 2 before deopting.
-                        dynasm!(ops
-                            ; => set_try
-                            ; mov rcx, rdi
-                            ; mov rdx, [rbx + dreg(obj)]
-                            ; mov r8, [rbx + dreg(arg_base)]
-                            ; mov r9d, 2
-                            ; mov rax, QWORD heap.coll_lookup as i64
-                            ; call rax
-                            ; mov r10, QWORD SELF_CALL_DEOPT as i64
-                            ; cmp rax, r10
-                            ; je => general
-                        );
-                    } else {
-                        dynasm!(ops ; => set_try ; jmp => general);
-                    }
                     let done = ops.new_dynamic_label();
                     dynasm!(ops
-                        ; => coll_done
                         ; mov [rbx + dreg(dst)], rax
                         ; jmp => done
                         ; => general

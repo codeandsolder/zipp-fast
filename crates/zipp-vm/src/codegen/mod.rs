@@ -5229,6 +5229,8 @@ impl Jit {
         class_read: &ClassReadPlan,
         // Tier O's inlinable callees (empty unless Tier O is on).
         opt_callees: &OptCallees,
+        // Canonical VM-wide property key IDs indexed by `name_idx`.
+        prop_key_ids: &[u32],
     ) {
         if self.compiled.contains_key(&func_id) || self.blacklist.contains(&func_id) {
             return;
@@ -5311,6 +5313,7 @@ impl Jit {
                 ic_base,
                 generic: self.opt_feedback.get(&func_id).map(|fb| &fb.generic),
                 heap: heap_helpers.to_heap_helpers(func_id, ic_base.unwrap_or(0)),
+                prop_key_ids,
             };
             if let Some((f, plain)) = opt::compile(proto, func_id, prop_shape, cross_plan, class_read, opt_callees, &env) {
                 self.opt_plain_reads.insert(func_id, plain);
@@ -5380,7 +5383,7 @@ impl Jit {
                 && !self.opt_ready.contains(&func_id)
                 && opt::admits(proto, const_strs, heap_helpers.math_imul_guard.as_ref())
             {
-                let c = self.opt_counters.entry(func_id).or_insert_with(|| Box::new(opt::TIER_UP_ENTRIES));
+                let c = self.opt_counters.entry(func_id).or_insert_with(|| Box::new(opt::tier_up_entries()));
                 helpers.opt_tier_up = &mut **c as *mut u32 as u64;
             }
             let arith_fb_base = self.arith_table(func_id, proto.code.len());
@@ -5404,6 +5407,7 @@ impl Jit {
                 prop_shape,
                 class_read,
                 (&opt_callees.class_values, opt_callees.class_epoch),
+                prop_key_ids,
             ) {
                 if crate::jitlog_enabled() {
                     eprintln!(
@@ -7095,7 +7099,7 @@ mod int_splice;
 mod kernels;
 pub(crate) mod meter;
 mod opt;
-pub(crate) use opt::{plan_callee_ids as opt_plan_callee_ids, OptCallees};
+pub(crate) use opt::{plan_callee_ids as opt_plan_callee_ids, OptCallee, OptCallees};
 mod plan;
 mod plan_region;
 mod proto_mem;

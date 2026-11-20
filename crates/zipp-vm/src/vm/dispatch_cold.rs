@@ -4510,7 +4510,34 @@ impl<'p> Vm<'p> {
                     for fid in crate::codegen::opt_plan_callee_ids(&cross_plan, &class_read, &opt_callees.getters) {
                         if (fid as usize) < self.main_func_count {
                             let callee: &'p crate::bytecode::FuncProto = self.func(fid as usize);
-                            opt_callees.bodies.insert(fid, (callee, self.build_prop_shape_plan(fid)));
+                            if callee.code.len() <= 64
+                                && !callee.is_generator
+                                && !callee.is_async
+                                && callee.rest_reg.is_none()
+                                && callee.arguments_reg.is_none()
+                                && callee.eval_sites.is_empty()
+                            {
+                                let c_prop = self.build_prop_shape_plan(fid);
+                                let c_strs = self.jit_build_const_strs(fid);
+                                let mut c_poly = rustc_hash::FxHashMap::default();
+                                for (cip, cinstr) in callee.code.iter().enumerate() {
+                                    if matches!(cinstr, Instr::GetProp { .. }) {
+                                        let ways = self.ic_own_data_ways(fid, cip);
+                                        if ways.len() >= 2 {
+                                            c_poly.insert(cip, ways);
+                                        }
+                                    }
+                                }
+                                opt_callees.bodies.insert(
+                                    fid,
+                                    crate::codegen::OptCallee {
+                                        proto: callee,
+                                        prop_shape: c_prop,
+                                        const_strs: c_strs,
+                                        poly: c_poly,
+                                    },
+                                );
+                            }
                         }
                     }
                 } else if crate::codegen::tierc_class_const_enabled() {
@@ -4538,6 +4565,7 @@ impl<'p> Vm<'p> {
                         }
                     }
                 }
+                let prop_key_ids = self.build_prop_key_ids(func_id);
                 self.jit.compile(
                     func_id,
                     proto_ref,
@@ -4555,6 +4583,7 @@ impl<'p> Vm<'p> {
                     &prop_shape,
                     &class_read,
                     &opt_callees,
+                    &prop_key_ids,
                 );
             }
         }

@@ -406,6 +406,18 @@ pub(crate) const JIT_OBJ_PROTO_IDX_OFFSET: usize =
 pub(crate) const JIT_OBJ_PROTO_SETUP_VER_OFFSET: usize =
     core::mem::offset_of!(Vm<'static>, obj_proto_setup_ver);
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_SYM_ITERATOR_BITS_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, sym_iterator_bits);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_ARR_PROTO_ITER_SLOT_PTR_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, arr_proto_iter_slot_ptr);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_ARR_PROTO_ITER_VER_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, arr_proto_iter_ver);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_DEFAULT_ARRAY_ITER_BITS_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, default_array_iter);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_HAS_TYPED_ARRAY_OFFSET: usize =
     core::mem::offset_of!(Vm<'static>, heap) + core::mem::offset_of!(crate::heap::Heap, has_typed_array);
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -426,6 +438,9 @@ pub(crate) const JIT_DICT_PROP_MEMO_RAW_OFFSET: usize =
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_ES5_PROTO_MEMO_RAW_OFFSET: usize =
     core::mem::offset_of!(Vm<'static>, es5_proto_memo_raw);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_CLASS_PROP_MEMO_RAW_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, class_prop_memo_raw);
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_DEFERRED_NS_NONEMPTY_OFFSET: usize =
     core::mem::offset_of!(Vm<'static>, deferred_ns_nonempty);
@@ -455,7 +470,7 @@ const _: () = {
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 const _: () = {
     use crate::vm::indexing_date::KeyedSlotMemo as K;
-    use crate::vm::{DictPropMemo as D, Es5ProtoMemo as E, ShapePropMemo as S};
+    use crate::vm::{ClassPropMemo as C, DictPropMemo as D, Es5ProtoMemo as E, ShapePropMemo as S};
     assert!(core::mem::size_of::<K>() == 32);
     assert!(core::mem::offset_of!(K, owner) == 0);
     assert!(core::mem::offset_of!(K, key) == 4);
@@ -466,20 +481,30 @@ const _: () = {
     assert!(core::mem::offset_of!(K, flags) == 21);
     assert!(core::mem::size_of::<S>() == 16);
     assert!(core::mem::offset_of!(S, shape) == 0);
-    assert!(core::mem::offset_of!(S, slot) == 4);
-    assert!(core::mem::offset_of!(S, packed) == 8);
+    assert!(core::mem::offset_of!(S, key_id) == 4);
+    assert!(core::mem::offset_of!(S, slot) == 8);
+    assert!(core::mem::offset_of!(S, writable) == 12);
     assert!(core::mem::size_of::<D>() == 32);
     assert!(core::mem::offset_of!(D, idx) == 0);
-    assert!(core::mem::offset_of!(D, ver) == 4);
-    assert!(core::mem::offset_of!(D, packed) == 8);
+    assert!(core::mem::offset_of!(D, key_id) == 4);
+    assert!(core::mem::offset_of!(D, ver) == 8);
+    assert!(core::mem::offset_of!(D, slot) == 12);
     assert!(core::mem::offset_of!(D, vals_ptr) == 16);
-    assert!(core::mem::offset_of!(D, slot) == 24);
+    assert!(core::mem::offset_of!(D, writable) == 24);
     assert!(core::mem::size_of::<E>() == 32);
     assert!(core::mem::offset_of!(E, first_proto) == 0);
-    assert!(core::mem::offset_of!(E, chain_epoch) == 4);
-    assert!(core::mem::offset_of!(E, packed) == 8);
+    assert!(core::mem::offset_of!(E, key_id) == 4);
+    assert!(core::mem::offset_of!(E, chain_epoch) == 8);
+    assert!(core::mem::offset_of!(E, slot) == 12);
     assert!(core::mem::offset_of!(E, vals_ptr) == 16);
-    assert!(core::mem::offset_of!(E, slot) == 24);
+    assert!(core::mem::size_of::<C>() == 32);
+    assert!(core::mem::offset_of!(C, class_id) == 0);
+    assert!(core::mem::offset_of!(C, key_id) == 4);
+    assert!(core::mem::offset_of!(C, class_ver) == 8);
+    assert!(core::mem::offset_of!(C, chain_epoch) == 12);
+    assert!(core::mem::offset_of!(C, class_epoch) == 16);
+    assert!(core::mem::offset_of!(C, check_chain) == 20);
+    assert!(core::mem::offset_of!(C, value_bits) == 24);
 };
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 const _: () = {

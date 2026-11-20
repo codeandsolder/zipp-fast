@@ -88,72 +88,73 @@ impl InstanceofPairMemo {
     };
 }
 
-/// Slots of `Vm::es5_proto_memo`, direct-mapped by `(first_proto, packed)`.
+/// Slots of `Vm::es5_proto_memo`, direct-mapped by `(first_proto, key_id)`.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) const ES5_PROTO_MEMO_SLOTS: usize = 2048;
+pub(crate) const ES5_PROTO_MEMO_SLOTS: usize = 4096;
 
 /// Cached ES5 prototype-chain lookup result (`vals_ptr` + `slot`, or
-/// `slot == u32::MAX` for proved absence) keyed by `(first_proto, packed)`
-/// (`packed = (func << 32) | name`) and guarded in O(1) by `Heap::chain_epoch`.
+/// `slot == u32::MAX` for proved absence) keyed by `(first_proto, key_id)`
+/// (canonical VM-wide property name ID) and guarded in O(1) by `Heap::chain_epoch`.
 /// `#[repr(C)]`, 32 bytes (power of two) for direct x86-64 JIT probing.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct Es5ProtoMemo {
     pub(crate) first_proto: u32,
+    pub(crate) key_id: u32,
     pub(crate) chain_epoch: u32,
-    pub(crate) packed: u64,
-    pub(crate) vals_ptr: u64,
     pub(crate) slot: u32,
-    pub(crate) _pad: u32,
+    pub(crate) vals_ptr: u64,
+    pub(crate) _pad: u64,
 }
 
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 impl Es5ProtoMemo {
     pub(crate) const EMPTY: Es5ProtoMemo = Es5ProtoMemo {
         first_proto: u32::MAX,
+        key_id: 0,
         chain_epoch: 0,
-        packed: u64::MAX,
-        vals_ptr: 0,
         slot: u32::MAX,
+        vals_ptr: 0,
         _pad: 0,
     };
 }
 
-/// Slots of `Vm::dict_prop_memo`, direct-mapped by `(idx, packed)`.
+/// Slots of `Vm::dict_prop_memo`, direct-mapped by `(idx, key_id)`.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) const DICT_PROP_MEMO_SLOTS: usize = 2048;
+pub(crate) const DICT_PROP_MEMO_SLOTS: usize = 4096;
 
 /// Cached own DATA property slot for dictionary-mode (`shape::DICT`) objects
 /// (`NodePath`, `Scope`, `Parser`, `Printer`, `File`, `opts`), guarded by
-/// `Heap::version_of(idx)`. `#[repr(C)]`, 32 bytes for direct x86-64 probing.
+/// `Heap::version_of(idx)`. `writable == 1` iff own writable data slot.
+/// `#[repr(C)]`, 32 bytes for direct x86-64 probing.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct DictPropMemo {
     pub(crate) idx: u32,
+    pub(crate) key_id: u32,
     pub(crate) ver: u32,
-    pub(crate) packed: u64,
-    pub(crate) vals_ptr: u64,
     pub(crate) slot: u32,
-    pub(crate) _pad: u32,
+    pub(crate) vals_ptr: u64,
+    pub(crate) writable: u64,
 }
 
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 impl DictPropMemo {
     pub(crate) const EMPTY: DictPropMemo = DictPropMemo {
         idx: u32::MAX,
+        key_id: 0,
         ver: 0,
-        packed: u64::MAX,
-        vals_ptr: 0,
         slot: u32::MAX,
-        _pad: 0,
+        vals_ptr: 0,
+        writable: 0,
     };
 }
 
-/// Slots of `Vm::shape_prop_memo`, direct-mapped by `(shape, packed)`.
+/// Slots of `Vm::shape_prop_memo`, direct-mapped by `(shape, key_id)`.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) const SHAPE_PROP_MEMO_SLOTS: usize = 8192;
+pub(crate) const SHAPE_PROP_MEMO_SLOTS: usize = 16384;
 
 /// Sentinel `ShapePropMemo::slot` for a proved-absent key on a default/null
 /// prototype plain object (`FID_MIRROR_NONE`).
@@ -165,24 +166,65 @@ pub(crate) const SHAPE_PROP_ABSENT: u32 = 0x8000_0000;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const SHAPE_PROP_ES5_PROTO: u32 = 0x8000_0001;
 
-/// Direct-mapped megamorphic `(shape, (func << 32) | name) -> slot` cache probed
-/// inline from x86-64 `mega_get_prop_stub` before falling back to `jit_get_prop_miss`.
-/// `#[repr(C)]`, 16 bytes (power of two).
+/// Sentinel `ShapePropMemo::slot` when `shape` lacks the key on a class instance
+/// and `class_prop_memo` should be probed next by `(class_id, key_id)`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const SHAPE_PROP_CLASS_MISS: u32 = 0x8000_0002;
+
+/// Slots of `Vm::class_prop_memo`, direct-mapped by `(class_id, key_id)`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const CLASS_PROP_MEMO_SLOTS: usize = 4096;
+
+/// Cached class-chain method or proved-absent lookup result (`value_bits`)
+/// keyed by `(class_id, key_id)`, guarded by `version_of(class_id)`,
+/// `Vm::class_proto_epoch`, and (when `check_chain != 0`) `Heap::chain_epoch`.
+/// `#[repr(C)]`, 32 bytes for direct x86-64 JIT probing.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct ClassPropMemo {
+    pub(crate) class_id: u32,
+    pub(crate) key_id: u32,
+    pub(crate) class_ver: u32,
+    pub(crate) chain_epoch: u32,
+    pub(crate) class_epoch: u32,
+    pub(crate) check_chain: u32,
+    pub(crate) value_bits: u64,
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+impl ClassPropMemo {
+    pub(crate) const EMPTY: ClassPropMemo = ClassPropMemo {
+        class_id: u32::MAX,
+        key_id: 0,
+        class_ver: 0,
+        chain_epoch: 0,
+        class_epoch: 0,
+        check_chain: 0,
+        value_bits: 0,
+    };
+}
+
+/// Direct-mapped megamorphic `(shape, key_id) -> (slot, writable)` cache probed
+/// inline from x86-64 `mega_get_prop_stub` / `mega_set_prop_stub`. Shared across
+/// all functions in the VM via canonical property key IDs. `#[repr(C)]`, 16 bytes.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct ShapePropMemo {
     pub(crate) shape: u32,
+    pub(crate) key_id: u32,
     pub(crate) slot: u32,
-    pub(crate) packed: u64,
+    pub(crate) writable: u32,
 }
 
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 impl ShapePropMemo {
     pub(crate) const EMPTY: ShapePropMemo = ShapePropMemo {
         shape: 0,
+        key_id: 0,
         slot: u32::MAX,
-        packed: u64::MAX,
+        writable: 0,
     };
 }
 
@@ -3715,6 +3757,20 @@ pub struct Vm<'p> {
     pub(crate) shape_prop_memo: Vec<ShapePropMemo>,
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) shape_prop_memo_raw: u64,
+    /// Direct-mapped `(class_id, key_id) -> value_bits` memo for class methods
+    /// and proved-absent properties across all receiver shapes of a class,
+    /// probed inline from `mega_get_prop_stub`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) class_prop_memo: Vec<ClassPropMemo>,
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) class_prop_memo_raw: u64,
+    /// Canonical VM-wide property-name -> `u32` ID (`1..`) so megamorphic
+    /// `(shape, key_id)` / `(first_proto, key_id)` / `(idx, key_id)` memos are
+    /// shared across every function in the program without per-function thrashing.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) prop_key_map: rustc_hash::FxHashMap<Box<str>, u32>,
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) prop_key_cache: Vec<Vec<u32>>,
     /// Cached raw base of `Vm::keyed_slot_memo` (0 while empty; fixed 16384-slot
     /// buffer once allocated) for direct x86-64 `keyed_memo_get_stub` probing.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -3740,6 +3796,15 @@ pub struct Vm<'p> {
     /// guarding `SHAPE_PAIR_ABSENT_SLOT` inline shape-way hits in `emit_ic_probe`.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) obj_proto_setup_ver: u32,
+    /// Snapshot of `Symbol.iterator` Value bits and pristine
+    /// `%Array.prototype%[Symbol.iterator]` slot pointer & version for inline
+    /// `arr[Symbol.iterator]` resolution in `emit_keyed_memo_get_stub`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) sym_iterator_bits: u64,
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) arr_proto_iter_slot_ptr: u64,
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) arr_proto_iter_ver: u32,
     /// Ordinary functions whose `prototype` was made non-writable
     /// (`Object.defineProperty(f, "prototype", {writable: false})`,
     /// `Object.freeze(f)`). Each also has a `fn_proto_override` entry (its
@@ -4479,6 +4544,92 @@ impl<'p> Vm<'p> {
             self.console_order.push(ConsoleStream::Stdout);
             self.output.push(line);
         }
+    }
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+impl<'p> Vm<'p> {
+    /// Canonical VM-wide property key ID (`1..`) for `(func_id, name_idx)` so
+    /// megamorphic `(shape, key_id)` / `(first_proto, key_id)` / `(idx, key_id)`
+    /// memos are shared across every function in the VM.
+    #[inline(always)]
+    pub(crate) fn prop_key_id(&mut self, func_id: u32, name_idx: u32) -> u32 {
+        let f = func_id as usize;
+        let n = name_idx as usize;
+        if let Some(id) = self
+            .prop_key_cache
+            .get(f)
+            .and_then(|v| v.get(n))
+            .copied()
+            .filter(|&id| id != 0)
+        {
+            return id;
+        }
+        self.prop_key_id_slow(func_id, name_idx)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn prop_key_id_slow(&mut self, func_id: u32, name_idx: u32) -> u32 {
+        let f = func_id as usize;
+        let n = name_idx as usize;
+        let existing = {
+            let key: &str = self.func(f).string_constants[n].as_str();
+            self.prop_key_map.get(key).copied()
+        };
+        let id = if let Some(id) = existing {
+            id
+        } else {
+            let owned: Box<str> = Box::from(self.func(f).string_constants[n].as_str());
+            let next = (self.prop_key_map.len() as u32).saturating_add(1);
+            self.prop_key_map.insert(owned, next);
+            next
+        };
+        if self.prop_key_cache.len() <= f {
+            self.prop_key_cache.resize_with(f + 1, Vec::new);
+        }
+        let slot = &mut self.prop_key_cache[f];
+        if slot.len() <= n {
+            slot.resize(n + 1, 0);
+        }
+        slot[n] = id;
+        id
+    }
+
+    /// Precompute canonical VM-wide property key IDs for every `GetProp` /
+    /// `SetProp` string constant in `func_id`, returning a dense slice indexed
+    /// by `name_idx` (`0` for unused non-property constants).
+    pub(crate) fn build_prop_key_ids(&mut self, func_id: u32) -> Vec<u32> {
+        let f = func_id as usize;
+        let code_len = self.func(f).code.len();
+        let mut max_name: usize = 0;
+        let mut has_prop = false;
+        for ip in 0..code_len {
+            let name = match self.func(f).code[ip] {
+                crate::bytecode::Instr::GetProp { name, .. }
+                | crate::bytecode::Instr::SetProp { name, .. } => name as usize,
+                _ => continue,
+            };
+            has_prop = true;
+            if name >= max_name {
+                max_name = name + 1;
+            }
+        }
+        if !has_prop {
+            return Vec::new();
+        }
+        let mut out = vec![0u32; max_name];
+        for ip in 0..code_len {
+            let name = match self.func(f).code[ip] {
+                crate::bytecode::Instr::GetProp { name, .. }
+                | crate::bytecode::Instr::SetProp { name, .. } => name,
+                _ => continue,
+            };
+            if out[name as usize] == 0 {
+                out[name as usize] = self.prop_key_id(func_id, name);
+            }
+        }
+        out
     }
 }
 
