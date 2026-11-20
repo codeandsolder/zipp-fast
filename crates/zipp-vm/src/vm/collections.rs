@@ -83,7 +83,7 @@ pub(crate) fn svz_repr(heap: &Heap, v: Value) -> u64 {
         }
         match heap.get(i) {
             HeapObj::Str(s) => {
-                return fnv1a(s.as_bytes());
+                return s.seeded_hash();
             }
             HeapObj::Cons { .. } => {
                 return fnv1a(&heap.str_wtf8_cow(i).unwrap());

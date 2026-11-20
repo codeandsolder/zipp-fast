@@ -745,19 +745,7 @@ pub fn expr_refs_all(e: &Expr) -> HashSet<String> {
 
 /// Every name a STATEMENT LIST references, ignoring what it binds — the
 /// statement-level analogue of `expr_refs_all`. Superset of `free_vars`: a
-/// LOCALLY-bound name the body still mentions (`var eval = f; … eval(s)`)
-/// shows up here, which is what a "may this body direct-eval?" guard needs —
-/// 13.3.6.1 directness tests the callee VALUE, not the binding's location.
-#[cfg(test)]
-pub fn stmts_refs_all(body: &[Stmt]) -> HashSet<String> {
-    let mut refs = Names::default();
-    for s in body {
-        stmt_refs(s, &mut refs, false);
-    }
-    owned(refs)
-}
-
-/// Whether [`stmts_refs_all`]'s set holds each of `names`, asked of the
+/// Whether [`stmts_refs_each`]'s walk holds each of `names`, asked of the
 /// walk's borrowed names: one walk for every question, and no owned copy.
 /// Compiling a function walked its body twice for two such questions and
 /// allocated a `String` per name it references each time.
@@ -1232,6 +1220,9 @@ struct WriteScan<'t> {
     targets: &'t [&'t str],
     /// Bit `i` is 1 while `targets[i]` is still a viable copy-box candidate.
     remaining: u64,
+    /// Conservative bitset of `name.len().min(63)` over all initial targets
+    /// for 2-cycle early rejection in `mark()`.
+    len_mask: u64,
     /// Overflow set for functions with > 64 distinct captured parameters.
     overflow: Names<'t>,
     with_seen: bool,
@@ -1245,6 +1236,10 @@ impl<'t> WriteScan<'t> {
         } else {
             (1u64 << n_inline) - 1
         };
+        let mut len_mask = 0u64;
+        for &name in targets {
+            len_mask |= 1u64 << name.len().min(63);
+        }
         let mut overflow = Names::default();
         if targets.len() > 64 {
             for &name in &targets[64..] {
@@ -1254,9 +1249,25 @@ impl<'t> WriteScan<'t> {
         Self {
             targets,
             remaining,
+            len_mask,
             overflow,
             with_seen: false,
         }
+    }
+
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    fn remaining_names(&self) -> Names<'t> {
+        let mut out = Names::default();
+        let mut m = self.remaining;
+        while m != 0 {
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            out.insert(self.targets[i]);
+        }
+        for &name in &self.overflow {
+            out.insert(name);
+        }
+        out
     }
 
     #[inline]
@@ -1266,6 +1277,9 @@ impl<'t> WriteScan<'t> {
 
     #[inline]
     fn mark(&mut self, name: &str) {
+        if (self.len_mask & (1u64 << name.len().min(63))) == 0 {
+            return;
+        }
         let mut m = self.remaining;
         while m != 0 {
             let i = m.trailing_zeros() as usize;
@@ -1559,12 +1573,27 @@ impl<'t> WriteScan<'t> {
         if self.done() {
             return;
         }
+        // A pre-parser-skipped function body is scanned directly for every
+        // identifier in `self.function(f)` (which is a superset of its free
+        // vars, plus its name and params), avoiding an unfiltered `fn_node_free`
+        // HashSet build and double source scan.
+        #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+        if f.body.lazy_span().is_some() {
+            self.function(f);
+            return;
+        }
         let hit = memo_for_each(f, (f.span.start, f.span.end), 0, |name| {
             self.mark(name);
             !self.done()
         });
         if !hit {
             let mut tmp = Names::default();
+            #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+            {
+                let filter = self.remaining_names();
+                memo::with_lazy_filter(&filter, || fn_node_free(f, &mut tmp));
+            }
+            #[cfg(any(feature = "meter-only", feature = "safe-sandbox"))]
             fn_node_free(f, &mut tmp);
             for name in tmp {
                 self.mark(name);
@@ -1584,6 +1613,12 @@ impl<'t> WriteScan<'t> {
             return;
         }
         let mut tmp = Names::default();
+        #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+        {
+            let filter = self.remaining_names();
+            memo::with_lazy_filter(&filter, || class_free(c, &mut tmp));
+        }
+        #[cfg(any(feature = "meter-only", feature = "safe-sandbox"))]
         class_free(c, &mut tmp);
         for name in tmp {
             self.mark(name);

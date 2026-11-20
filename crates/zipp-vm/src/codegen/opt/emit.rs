@@ -214,11 +214,11 @@ impl Em<'_> {
         let f = self.f;
         let heap = f.heap.as_ref()?;
         let site = f.cross.get(&ip).copied();
-        let arms = site.is_some_and(|s| !s.cross3.is_empty());
+        let dyn_ok = self.can_cross3_dyn() && argc <= 255;
+        let arms = site.is_some_and(|s| !s.cross3.is_empty() && (!dyn_ok || s.cross3.len() <= 1));
         let own = site
             .and_then(|s| s.cross3m)
             .filter(|_| super::super::tierc_cross3m_enabled());
-        let dyn_ok = self.can_cross3_dyn() && argc <= 255;
         let class_guard = f.class_read.get(&ip).copied();
         let proto_guard = site.and_then(|s| s.proto_read);
         let class_method = site.is_some_and(|s| s.class_method);
@@ -261,23 +261,25 @@ impl Em<'_> {
                 arg_base,
                 dst,
             } => {
-                if let Some(site) = site {
-                    for arm in site.cross3.iter() {
-                        emit_cross3_call(
-                            &mut self.ops,
-                            arm,
-                            Cross3Callee::Reg(callee),
-                            this,
-                            arg_base,
-                            dst,
-                            regs,
-                            c3,
-                            heap,
-                            bail,
-                            cross_done,
-                            false,
-                            None,
-                        );
+                if arms {
+                    if let Some(site) = site {
+                        for arm in site.cross3.iter() {
+                            emit_cross3_call(
+                                &mut self.ops,
+                                arm,
+                                Cross3Callee::Reg(callee),
+                                this,
+                                arg_base,
+                                dst,
+                                regs,
+                                c3,
+                                heap,
+                                bail,
+                                cross_done,
+                                false,
+                                None,
+                            );
+                        }
                     }
                 }
                 if dyn_ok {
@@ -620,9 +622,13 @@ impl Em<'_> {
                     MethodIntr::Push => heap.array_push,
                     _ => heap.char_code_at,
                 };
+                if matches!(m, MethodIntr::Push) {
+                    super::super::proto_mem::emit_guard_hot_mirror_clear(&mut self.ops, o, decline);
+                } else {
+                    super::super::proto_mem::emit_guard_hot_mirror_clear_or_str(&mut self.ops, o, decline);
+                }
                 dynasm!(self.ops
                     ; mov rcx, rdi
-                    ; mov rdx, [rbx + o]
                     ; mov r8, [rbx + a0]
                     ; mov rax, QWORD helper as i64
                     ; call rax
@@ -630,9 +636,9 @@ impl Em<'_> {
                 answer(self);
             }
             MethodIntr::Substring(mode) => {
+                super::super::proto_mem::emit_guard_hot_mirror_clear_or_str(&mut self.ops, o, decline);
                 dynasm!(self.ops
                     ; mov rcx, rdi
-                    ; mov rdx, [rbx + o]
                     ; lea r8, [rbx + a0]
                     ; mov r9d, mode
                     ; mov rax, QWORD heap.str_substring as i64
@@ -643,9 +649,9 @@ impl Em<'_> {
             MethodIntr::Get | MethodIntr::Has => {
                 // 0 = Map/WeakMap.get, 3 = unified Map/WeakMap/Set/WeakSet.has.
                 let op: i32 = if matches!(m, MethodIntr::Get) { 0 } else { 3 };
+                super::super::proto_mem::emit_guard_hot_mirror_clear(&mut self.ops, o, decline);
                 dynasm!(self.ops
                     ; mov rcx, rdi
-                    ; mov rdx, [rbx + o]
                     ; mov r8, [rbx + a0]
                     ; mov r9d, op
                     ; mov rax, QWORD heap.coll_lookup as i64
@@ -655,6 +661,7 @@ impl Em<'_> {
             }
             MethodIntr::Mutate(op, argc) => {
                 // `delete` asks as a Set (op 4) when not a Map's.
+                super::super::proto_mem::emit_guard_hot_mirror_clear(&mut self.ops, o, decline);
                 let ops: &[i32] = if op == 3 { &[3, 4] } else { &[op] };
                 for &op in ops {
                     let next = self.ops.new_dynamic_label();
@@ -681,21 +688,26 @@ impl Em<'_> {
             }
             MethodIntr::Upper | MethodIntr::Pop => {
                 let helper = match m {
-                    MethodIntr::Upper => heap.str_upper_case as i64,
-                    _ => crate::vm::jit_array_pop as *const () as i64,
+                    MethodIntr::Upper => {
+                        super::super::proto_mem::emit_guard_hot_mirror_clear_or_str(&mut self.ops, o, decline);
+                        heap.str_upper_case as i64
+                    }
+                    _ => {
+                        super::super::proto_mem::emit_guard_hot_mirror_clear(&mut self.ops, o, decline);
+                        crate::vm::jit_array_pop as *const () as i64
+                    }
                 };
                 dynasm!(self.ops
                     ; mov rcx, rdi
-                    ; mov rdx, [rbx + o]
                     ; mov rax, QWORD helper
                     ; call rax
                 );
                 answer(self);
             }
             MethodIntr::StrArrBuiltin(packed) => {
+                super::super::proto_mem::emit_guard_hot_mirror_clear_or_str(&mut self.ops, o, decline);
                 dynasm!(self.ops
                     ; mov rcx, rdi
-                    ; mov rdx, [rbx + o]
                     ; lea r8, [rbx + a0]
                     ; mov r9d, packed as i32
                     ; mov rax, QWORD crate::vm::jit_str_method as *const () as i64
@@ -704,9 +716,9 @@ impl Em<'_> {
                 answer(self);
             }
             MethodIntr::ArrMutate(op, argc) => {
+                super::super::proto_mem::emit_guard_hot_mirror_clear(&mut self.ops, o, decline);
                 dynasm!(self.ops
                     ; mov rcx, rdi
-                    ; mov rdx, [rbx + o]
                     ; lea r8, [rbx + a0]
                     ; mov r9d, (op as i32) | ((argc as i32) << 8)
                     ; mov rax, QWORD crate::vm::jit_array_mutate as *const () as i64
@@ -4118,7 +4130,7 @@ pub(crate) fn emit(f: &Func, a: &Alloc, prop_key_ids: &[u32]) -> Option<JitFn> {
             super::super::proto_mem::emit_fn_call_dyn_stub(&mut em.ops, lbl, dyn_target);
         }
         if let Some(lbl) = em.cross3_dyn_stub {
-            super::super::proto_mem::emit_cross3_dyn_stub(&mut em.ops, lbl, f.reg_count, heap, None);
+            super::super::proto_mem::emit_cross3_dyn_stub(&mut em.ops, lbl, f.reg_count.max(1), heap, None);
         }
     }
     // ── epilogue ──

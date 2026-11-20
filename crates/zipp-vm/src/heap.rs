@@ -298,12 +298,16 @@ pub(crate) fn seeded_bytes_hash(bytes: &[u8]) -> u64 {
 /// splitmix64-style avalanche; the HIGH half is the stored tag and also picks
 /// the bucket (`tag & mask`), so growth rehashes straight from stored tags —
 /// no key re-reads (same scheme as vm/collections.rs' CollIndex).
-#[inline]
-fn prop_tag(key: &str) -> u32 {
-    let mut h = seeded_bytes_hash(key.as_bytes());
+#[inline(always)]
+pub(crate) fn prop_tag_from_hash(mut h: u64) -> u32 {
     h = (h ^ (h >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     h = (h ^ (h >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     ((h ^ (h >> 31)) >> 32) as u32
+}
+
+#[inline]
+fn prop_tag(key: &str) -> u32 {
+    prop_tag_from_hash(seeded_bytes_hash(key.as_bytes()))
 }
 
 /// Decrement every occupied entry of `slots` above `slot`: the renumbering a
@@ -5261,11 +5265,34 @@ impl JsStr {
         self.memo_state = STR_MEMO_FROZEN | if suffix_head { STR_MEMO_SUFFIX_HEAD } else { 0 };
     }
 
+    /// Cached seeded content hash (`seeded_bytes_hash(self.as_bytes())`).
+    /// For ASCII strings, `self.cursor` is never used by UTF-16 seeking, so it
+    /// caches the 64-bit hash in place at zero struct-size cost.
+    #[inline]
+    pub(crate) fn seeded_hash(&self) -> u64 {
+        if self.ascii {
+            let cached = self.cursor.get();
+            if cached != 0 {
+                return cached;
+            }
+            let h = seeded_bytes_hash(self.as_bytes());
+            if h != 0 {
+                self.cursor.set(h);
+            }
+            h
+        } else {
+            seeded_bytes_hash(self.as_bytes())
+        }
+    }
+
     /// Append one ASCII byte (the `s += digit` fast path), updating metadata.
     #[inline]
     pub fn push_ascii(&mut self, b: u8) {
         debug_assert!(b < 128);
         debug_assert!(!self.frozen(), "mutated a frozen concat-memo string");
+        if self.ascii {
+            self.cursor.set(0);
+        }
         self.bytes.push_ascii(b);
         self.units += 1;
     }
@@ -5342,6 +5369,7 @@ impl JsStr {
         // initialized in-bounds through this exact allocation.
         unsafe { self.bytes.wtf8_mut().set_len(new_len) };
         self.units += (new_len - old_len) as u32;
+        self.cursor.set(0);
         true
     }
 
@@ -5353,6 +5381,9 @@ impl JsStr {
     #[allow(dead_code)]
     pub fn push_str(&mut self, add: &str) {
         debug_assert!(!self.frozen(), "mutated a frozen concat-memo string");
+        if self.ascii {
+            self.cursor.set(0);
+        }
         self.units += str_units(add) as u32;
         self.ascii &= add.is_ascii();
         self.bytes.push_text(add);
@@ -5363,6 +5394,9 @@ impl JsStr {
     pub fn push_js(&mut self, add: &JsStr) {
         if self.wellformed && add.wellformed {
             debug_assert!(!self.frozen(), "mutated a frozen concat-memo string");
+            if self.ascii {
+                self.cursor.set(0);
+            }
             self.units += add.units;
             self.ascii &= add.ascii;
             self.bytes.push_all(&add.bytes);
@@ -5376,6 +5410,9 @@ impl JsStr {
     /// canonicalizing the seam. Unit length stays additive across the merge.
     pub fn push_wtf8(&mut self, add: &[u8]) {
         debug_assert!(!self.frozen(), "mutated a frozen concat-memo string");
+        if self.ascii {
+            self.cursor.set(0);
+        }
         if add.is_ascii() {
             // ASCII joins no seam and changes neither flag, whatever it is
             // appended to. (Onto a string with a lone surrogate this used to

@@ -2740,33 +2740,39 @@ pub(crate) extern "win64" fn jit_get_index(
             return crate::codegen::SELF_CALL_DEOPT;
         }
         // ("@@…" is escaped as a key — `key_of` — so it takes the slow path.)
-        if let Some(std::borrow::Cow::Borrowed(b)) = vm
-            .heap
-            .str_wtf8_cow(kidx)
-            .filter(|b| !b.starts_with(b"@@"))
-        {
-            if let Ok(k) = std::str::from_utf8(b) {
-                if plain_receiver {
-                    if let HeapObj::Object(m) = vm.heap.get(oidx) {
-                        if let Some(i) = crate::vm::ic::own_pos_in(&vm.own_slot_cache, m, k) {
-                            if !m.attr_at(i).accessor {
-                                let v = m.val_at(i);
-                                if !v.is_uninitialized() {
-                                    // SAFETY: the helper's own pointer, as for
-                                    // the flatten above; the shared view is
-                                    // not used again on this path.
-                                    unsafe { (*vm_raw).keyed_memo_put(oidx, kidx, i) };
-                                    return v.bits();
+        if let HeapObj::Str(js) = vm.heap.get(kidx) {
+            let b = js.as_bytes();
+            if !b.starts_with(b"@@") {
+                if let Ok(k) = std::str::from_utf8(b) {
+                    if plain_receiver {
+                        if let HeapObj::Object(m) = vm.heap.get(oidx) {
+                            let pos = if m.shape() != crate::shape::DICT {
+                                crate::vm::ic::own_pos_in(&vm.own_slot_cache, m, k)
+                            } else if m.is_indexed() {
+                                m.pos_tagged(k, crate::heap::prop_tag_from_hash(js.seeded_hash()))
+                            } else {
+                                m.pos(k)
+                            };
+                            if let Some(i) = pos {
+                                if !m.attr_at(i).accessor {
+                                    let v = m.val_at(i);
+                                    if !v.is_uninitialized() {
+                                        // SAFETY: the helper's own pointer, as for
+                                        // the flatten above; the shared view is
+                                        // not used again on this path.
+                                        unsafe { (*vm_raw).keyed_memo_put(oidx, kidx, i) };
+                                        return v.bits();
+                                    }
                                 }
+                            } else if let Some(v) = jit_string_key_miss(vm, oidx, m, k) {
+                                if v.is_undefined() {
+                                    // SAFETY: the helper's own pointer, as for
+                                    // `keyed_memo_put` above; shared `vm` is not
+                                    // used again on this path.
+                                    unsafe { (*vm_raw).keyed_memo_put_absent(oidx, kidx) };
+                                }
+                                return v.bits();
                             }
-                        } else if let Some(v) = jit_string_key_miss(vm, oidx, m, k) {
-                            if v.is_undefined() {
-                                // SAFETY: the helper's own pointer, as for
-                                // `keyed_memo_put` above; shared `vm` is not
-                                // used again on this path.
-                                unsafe { (*vm_raw).keyed_memo_put_absent(oidx, kidx) };
-                            }
-                            return v.bits();
                         }
                     }
                 }

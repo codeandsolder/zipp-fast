@@ -1198,8 +1198,10 @@ impl<'p> Vm<'p> {
         let mirror_hit = self.ic_call_method_mirror(func_id, ip, recv);
         #[cfg(feature = "safe-sandbox")]
         let mirror_hit: Option<(u32, u32, Value)> = None;
-        let callee = if let Some((_fid, _closure, callee)) = mirror_hit {
-            crate::vm::helpers_misc::warm_mega_method_memo(self, recv, func_id, name, key);
+        let callee = if let Some((fid, _closure, callee)) = mirror_hit {
+            if self.jit.cross_dyn_ok(fid) {
+                crate::vm::helpers_misc::warm_mega_method_memo(self, recv, func_id, name, key);
+            }
             callee
         } else if crate::vm::helpers_misc::is_private_key(key) {
             // `recv.#m(...)`: the private method, brand-checked, as the

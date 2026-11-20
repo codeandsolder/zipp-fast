@@ -7559,6 +7559,7 @@ pub(crate) fn compile_proto_mem(
                         ),
                     };
                     let mutate_done = ops.new_dynamic_label();
+                    emit_guard_hot_mirror_clear(&mut ops, dreg(obj), general);
                     load_args(&mut ops);
                     dynasm!(ops
                         ; mov QWORD [rsp + 32], op
@@ -7599,6 +7600,7 @@ pub(crate) fn compile_proto_mem(
                     let retry_packed = crate::vm::builtin_lane_packed(key, argc).filter(|_| meter.is_none());
                     let retry = ops.new_dynamic_label();
                     let decline = if retry_packed.is_some() { retry } else { general };
+                    emit_guard_hot_mirror_clear_or_str(&mut ops, dreg(obj), general);
                     dynasm!(ops
                         ; mov rcx, rdi                        // vm
                         ; mov rdx, [rbx + dreg(obj)]          // receiver bits
@@ -7638,11 +7640,11 @@ pub(crate) fn compile_proto_mem(
                     lane = true;
                 } else if matches!(key, "get" | "has") {
                     // Map.get / WeakMap.get (op 0) or unified Map/WeakMap/Set/WeakSet.has (op 3):
-                    // a wrong receiver kind deopts so any user method runs unchanged.
+                    // inline HotMirror::CLEAR guard skips Win64 FFI on JS Objects/class instances.
                     let opsel: i32 = if key == "get" { 0 } else { 3 };
+                    emit_guard_hot_mirror_clear(&mut ops, dreg(obj), general);
                     dynasm!(ops
                         ; mov rcx, rdi                        // vm
-                        ; mov rdx, [rbx + dreg(obj)]          // receiver bits
                         ; mov r8, [rbx + dreg(arg_base)]      // key bits
                         ; mov r9d, opsel
                         ; mov rax, QWORD heap.coll_lookup as i64
@@ -7671,9 +7673,13 @@ pub(crate) fn compile_proto_mem(
                         .filter(|p| (p >> 16) & 0xff != 0xff && meter.is_none());
                     let retry = ops.new_dynamic_label();
                     let decline = if arr_retry.is_some() { retry } else { general };
+                    if key == "push" {
+                        emit_guard_hot_mirror_clear(&mut ops, dreg(obj), general);
+                    } else {
+                        emit_guard_hot_mirror_clear_or_str(&mut ops, dreg(obj), general);
+                    }
                     dynasm!(ops
                         ; mov rcx, rdi                        // vm
-                        ; mov rdx, [rbx + dreg(obj)]          // receiver bits
                         ; mov r8, [rbx + dreg(arg_base)]      // arg0 bits
                         ; mov rax, QWORD helper as i64
                         ; call rax
@@ -7709,9 +7715,9 @@ pub(crate) fn compile_proto_mem(
                     // sets, called directly past the builtin call chain
                     // (metered bodies keep the helper route for
                     // interpreter-parity charging).
+                    emit_guard_hot_mirror_clear_or_str(&mut ops, dreg(obj), general);
                     dynasm!(ops
                         ; mov rcx, rdi                        // vm
-                        ; mov rdx, [rbx + dreg(obj)]          // receiver bits
                         ; lea r8, [rbx + dreg(arg_base)]      // &args[0..argc]
                         ; mov r9d, packed as i32
                         ; mov rax, QWORD crate::vm::jit_str_method as *const () as i64
@@ -7961,7 +7967,13 @@ pub(crate) fn compile_proto_mem(
                     if has_method_lane {
                         let lookup_miss = ops.new_dynamic_label();
                         let have_callee = ops.new_dynamic_label();
-                        let static_arms = class_lane.is_some_and(|s| !s.cross3.is_empty());
+                        // Keep monomorphic 1-arm static cross3 inline; polymorphic
+                        // 2+ arm sites route straight through per-function `cross3_dyn`
+                        // to avoid ~800-1400B of inline arm bloat per site in L1i.
+                        let static_arms = class_lane.is_some_and(|s| {
+                            !s.cross3.is_empty()
+                                && (!(can_cross3_dyn && argc <= 255) || s.cross3.len() <= 1)
+                        });
                         let dyn_only = !static_arms;
                         let have_mega = mega_method_key_id != 0;
                         // The method the class-method or prototype-method lane's
@@ -8030,23 +8042,25 @@ pub(crate) fn compile_proto_mem(
                         } else {
                             dynasm!(ops ; => have_callee);
                         }
-                        if let Some(site) = class_lane {
-                            for c3plan in site.cross3.iter() {
-                                emit_cross3_call(
-                                    &mut ops,
-                                    c3plan,
-                                    Cross3Callee::Stash,
-                                    Some(obj),
-                                    arg_base,
-                                    dst,
-                                    proto.reg_count.max(1),
-                                    c3_off,
-                                    &heap,
-                                    bail,
-                                    class_done,
-                                    refetch.is_some(),
-                                    None,
-                                );
+                        if !dyn_only {
+                            if let Some(site) = class_lane {
+                                for c3plan in site.cross3.iter() {
+                                    emit_cross3_call(
+                                        &mut ops,
+                                        c3plan,
+                                        Cross3Callee::Stash,
+                                        Some(obj),
+                                        arg_base,
+                                        dst,
+                                        proto.reg_count.max(1),
+                                        c3_off,
+                                        &heap,
+                                        bail,
+                                        class_done,
+                                        refetch.is_some(),
+                                        None,
+                                    );
+                                }
                             }
                         }
                         if can_cross3_dyn && argc <= 255 {
@@ -8170,7 +8184,7 @@ pub(crate) fn compile_proto_mem(
                     // pure prefix). Whole-fn callers run under a frame-free
                     // activation when cross-called themselves; the enter
                     // helper's root-stack duplication handles exactly that.
-                    if do_cross3 {
+                    if do_cross3 && (!dyn_call || site.cross3.len() <= 1) {
                         for c3plan in site.cross3.iter() {
                             emit_cross3_call(
                                 &mut ops,
@@ -8982,7 +8996,7 @@ pub(crate) fn compile_proto_mem(
                     && lane_done.is_none()
                     && leaf_plan.get(&ip).is_none();
                 let cross_done = ops.new_dynamic_label();
-                if let Some(site) = cwt_cross {
+                if let Some(site) = cwt_cross.filter(|s| !dyn_cwt || s.cross3.len() <= 1) {
                     for c3plan in site.cross3.iter() {
                         emit_cross3_call(
                             &mut ops,
@@ -10139,6 +10153,76 @@ enum DeferredPropCold {
         packed: u64,
         packed_fip: u64,
     },
+}
+
+/// Inline 6-op guard that accepts only heap values with `HotMirror::CLEAR`
+/// (`shape == DICT`, `fid == FID_MIRROR_NONE`, `vals == 0` — i.e., `Map`,
+/// `Set`, `WeakMap`, `WeakSet`, `Array`), rejecting plain/shaped/class/dict JS
+/// objects, strings, functions, and primitives before a Win64 FFI call.
+/// Leaves `rdx = [rbx + obj_off]` on fallthrough.
+pub(crate) fn emit_guard_hot_mirror_clear(
+    ops: &mut crate::codegen::X64Asm,
+    obj_off: i32,
+    decline: dynasmrt::DynamicLabel,
+) {
+    use crate::vm::host_api::{JIT_HOT_FID_OFF, JIT_HOT_MIRROR_RAW_OFFSET, JIT_HOT_VALS_OFF};
+    const _: () = assert!(JIT_HOT_FID_OFF == 4 && JIT_HOT_VALS_OFF == 8);
+    let clear_lo_hi: u64 =
+        ((crate::heap::FID_MIRROR_NONE as u64) << 32) | (crate::shape::DICT as u64);
+    dynasm!(ops
+        ; mov rdx, [rbx + obj_off]
+        ; mov rax, rdx
+        ; shr rax, 48
+        ; cmp eax, TAG_HEAP_HI as i32
+        ; jne => decline
+        ; mov eax, edx
+        ; mov r10, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
+        ; lea r10, [r10 + rax * 8]
+        ; mov r11, QWORD clear_lo_hi as i64
+        ; cmp QWORD [r10 + rax * 8], r11
+        ; jne => decline
+        ; cmp QWORD [r10 + rax * 8 + JIT_HOT_VALS_OFF as i32], 0
+        ; jne => decline
+    );
+}
+
+/// Inline guard accepting `HotMirror::STR` or `HotMirror::CLEAR` (strings and
+/// arrays), rejecting shaped/class/non-empty-dict JS objects, functions, and
+/// primitives before a String/Array builtin Win64 FFI call.
+/// Leaves `rdx = [rbx + obj_off]` on fallthrough.
+pub(crate) fn emit_guard_hot_mirror_clear_or_str(
+    ops: &mut crate::codegen::X64Asm,
+    obj_off: i32,
+    decline: dynasmrt::DynamicLabel,
+) {
+    use crate::vm::host_api::{JIT_HOT_FID_OFF, JIT_HOT_MIRROR_RAW_OFFSET, JIT_HOT_VALS_OFF};
+    const _: () = assert!(JIT_HOT_FID_OFF == 4 && JIT_HOT_VALS_OFF == 8);
+    let clear_lo_hi: u64 =
+        ((crate::heap::FID_MIRROR_NONE as u64) << 32) | (crate::shape::DICT as u64);
+    let str_lo_hi: u64 =
+        ((crate::heap::FID_MIRROR_STR as u64) << 32) | (crate::shape::DICT as u64);
+    let ok = ops.new_dynamic_label();
+    dynasm!(ops
+        ; mov rdx, [rbx + obj_off]
+        ; mov rax, rdx
+        ; shr rax, 48
+        ; cmp eax, TAG_HEAP_HI as i32
+        ; jne => decline
+        ; mov eax, edx
+        ; mov r10, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
+        ; lea r10, [r10 + rax * 8]
+        ; mov rax, [r10 + rax * 8]
+        ; mov r11, QWORD str_lo_hi as i64
+        ; cmp rax, r11
+        ; je => ok
+        ; mov r11, QWORD clear_lo_hi as i64
+        ; cmp rax, r11
+        ; jne => decline
+        ; mov eax, edx
+        ; cmp QWORD [r10 + rax * 8 + JIT_HOT_VALS_OFF as i32], 0
+        ; jne => decline
+        ; => ok
+    );
 }
 
 /// Shared per-function inline `Vm::instanceof_pair_memo` probe for `Instr::InstanceOfDyn`.
@@ -11642,7 +11726,7 @@ pub(crate) fn emit_cross3_dyn_stub(
         ; and r9, -4
         ; mov r11, [rsp + 96]
 
-        // 4. Populate callee registers: `this`, `min(argc, param_count)` args,
+        // 4. Populate callee registers: `this`, unrolled 0..=3 args (loop for 4+),
         //    and `(uninit_mask | param_all_mask) & !written_mask` undefined fill.
         ; => entered_fast
         ; mov rdx, [rsp + 80]
@@ -11652,32 +11736,42 @@ pub(crate) fn emit_cross3_dyn_stub(
         ; cmp ecx, edx
         ; cmova ecx, edx
         ; mov r8, [rsp + 88]
-        ; xor r10d, r10d
+        ; test ecx, ecx
+        ; jz => copy_done
+        ; mov rdx, [r8]
+        ; mov [r9 + 8], rdx
+        ; cmp ecx, 1
+        ; je => copy_done
+        ; mov rdx, [r8 + 8]
+        ; mov [r9 + 16], rdx
+        ; cmp ecx, 2
+        ; je => copy_done
+        ; mov rdx, [r8 + 16]
+        ; mov [r9 + 24], rdx
+        ; cmp ecx, 3
+        ; je => copy_done
+        ; mov r10d, 3
         ; => copy_loop
-        ; cmp r10d, ecx
-        ; jae => copy_done
         ; mov rdx, [r8 + r10 * 8]
         ; mov [r9 + r10 * 8 + 8], rdx
         ; inc r10d
-        ; jmp => copy_loop
+        ; cmp r10d, ecx
+        ; jb => copy_loop
         ; => copy_done
 
         ; test al, 1
         ; jnz => zero_done
         ; test DWORD [r11 + 12], CROSS_DYN_WIDE_ZERO as i32
         ; jnz => wide_zero
-        // `ecx` = copy_n (<= param_count <= 62), so copy_n + 1 <= 63.
-        ; inc ecx
-        ; mov r8d, 1
+        // `ecx` = copy_n (<= param_count <= 62): `(-2i64) << copy_n` clears
+        // bits `0..=copy_n` (this + written args) and sets `(copy_n+1)..=63`.
+        ; mov r8, -2
         ; shl r8, cl
-        ; dec r8
         ; movzx ecx, WORD [r11 + 26]
-        ; inc ecx
-        ; mov r10d, 1
+        ; mov r10, -2
         ; shl r10, cl
-        ; dec r10
+        ; not r10
         ; or r10, [r11 + 16]
-        ; not r8
         ; and r10, r8
         ; jz => zero_done
         ; mov rdx, QWORD Value::UNDEFINED.bits() as i64
@@ -11770,6 +11864,8 @@ pub(crate) fn emit_cross3_dyn_stub(
 
         ; => decline_pop
         ; add rsp, STUB_FRAME
+        ; jmp => fast_decline
+
         ; => not_direct_fn
         // Split `fn.call(thisArg, ...args)` (`CallWithThis` where `callee` is
         // the pristine `%Function.prototype%.call` native): unwrap `this` as

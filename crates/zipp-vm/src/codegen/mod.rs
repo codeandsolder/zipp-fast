@@ -4214,6 +4214,13 @@ pub struct Jit {
 }
 
 impl Jit {
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub(crate) fn cross_dyn_ok(&self, fid: u32) -> bool {
+        self.cross_table
+            .get(fid as usize)
+            .is_some_and(|r| r.entry != 0 && (r.dyn_flags & CROSS_DYN_OK) != 0)
+    }
     pub fn new() -> Jit {
         let mut jit = Jit::default();
         // Values below 1 are meaningless (a counter starts at 1, so `== 0` would
@@ -6894,6 +6901,7 @@ impl Jit {
         }
         self.ic_site_meta.get(site as usize).is_some_and(|m| {
             !m.direct_miss_emitted
+                && m.region_entry != OPT_IC_ENTRY
                 && self
                     .direct_miss_recompiles
                     .get(&(m.func_id, m.region_entry))
