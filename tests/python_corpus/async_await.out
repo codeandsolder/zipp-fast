@@ -1,0 +1,19 @@
+basic 42 70 ok T
+introspect True False
+anext 0 1 done
+async_for [0, 1, 3, 4, 'else'] [0, 1]
+agen_sq [0, 1, 4, 9, 16]
+agen_echo ready got:a got:b [('a', 'b')]
+comps [1, 2, 3, 4] [0, 2, 4, 6] {0: 1, 1: 2, 2: 3} [3, 9]
+async_with ['enter:a', 'enter:b', 'body:A:B', 'exit:b:None', 'exit:a:None', 'enter:s', 'exit:s:ValueError', 'enter:p', 'exit:p:KeyError', 'caught:KeyError']
+gather [2, 3, 4] 11 ValueError bad
+cancel worker True ['cancelled', 'awaited_cancel']
+timeouts 6 True True
+wait_all [2, 3] 0
+event True ['waiting', 'woke']
+lock ['in:A', 'out:A', 'in:B', 'out:B']
+sem True False
+queues [0, 1, 2, 3] b a (1, 'one') (2, 'two')
+barrier [0, 1, 2]
+tg_ok 11 21
+tg_err [('K', ["'k'"]), ('V', ['v'])]

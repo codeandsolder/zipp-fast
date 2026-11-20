@@ -1,0 +1,19 @@
+simple TypeAliasType Simple () int | str
+recursive Tree (T,) typing.Union[T, list[Tree[T]]] Tree[int]
+bounded T <class 'int'> () False typing.NoDefault
+constrained T None (<class 'int'>, <class 'str'>) False
+defaults ('TypeVar', 'T', True, <class 'int'>) ('TypeVarTuple', 'Ts', True, tuple[str, ...]) ('ParamSpec', 'P', True, [<class 'int'>, <class 'str'>])
+fn_call 10 99
+fn_tp ['T'] True
+variadic_call (1, 'a', True)
+variadic_tp ['TypeVar', 'TypeVarTuple', 'ParamSpec']
+variadic_ann {'x': T, 'args': typing.Unpack[Ts], 'return': tuple[T, typing.Unpack[Ts]]}
+box_meta (T,) (typing.Generic[T],) ['Box', 'Generic', 'object']
+box_alias __main__.Box[int] True (<class 'int'>,) 7
+child_meta (U,) (__main__.Box[U], typing.Generic[U]) ['LabeledBox', 'Box', 'Generic', 'object']
+child_inst ('ans', 42) True True
+generic_super derived:base:5 T
+scoping outer (3, 'T') outer
+builtin_ga dict[str, list[int]] True (<class 'str'>, list[int]) {'a': 1}
+ga_union list[int] | None UnionType
+plain_tp () ()

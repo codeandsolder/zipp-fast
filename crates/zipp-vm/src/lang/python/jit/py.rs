@@ -48,6 +48,10 @@ use super::*;
 mod attr_inline;
 pub(crate) use attr_inline::*;
 
+#[path = "py_rec.rs"]
+mod py_rec;
+pub(crate) use py_rec::*;
+
 /// `Vm::jit_py_op` outcomes.
 pub(crate) const PY_NEXT: u64 = 0;
 /// A `PyJumpCompare` took its branch.
@@ -841,14 +845,16 @@ pub(crate) fn emit_py_op(
                 }
             }
         }
-        // A subscript: the step's own answer through `Vm::jit_py_get_item`
-        // over the operands (the instruction not looked up again), its fifth
-        // argument in the 5th-argument slot. (A `ZIPP_PY_PROF` run takes the
-        // ordinary step, which counts.)
+        // A subscript: inline fast path for exact `list`/`tuple` + small int,
+        // else `Vm::jit_py_get_item` (never allocates, so no `refetch`).
         Instr::PyGetItem { dst, o, k, seq, dict, .. } if labels.target.is_some() && !crate::vm::prof_py::on() => {
             let Some(absent) = labels.target else {
                 unreachable!("PyGetItem carries an absent label");
             };
+            let miss = ops.new_dynamic_label();
+            if emit_py_get_item_inline(ops, dst, o, k, seq, miss, done) {
+                dynasm!(ops ; => miss);
+            }
             dynasm!(ops
                 ; mov rcx, rdi
                 ; mov rdx, [rbx + dreg(o)]
@@ -858,11 +864,6 @@ pub(crate) fn emit_py_op(
                 ; mov [rsp + 32], rax
                 ; mov rax, QWORD crate::vm::Vm::jit_py_get_item as *const () as usize as i64
                 ; call rax
-                ; mov [rsp + 32], rax
-            );
-            refetch(ops);
-            dynasm!(ops
-                ; mov rax, [rsp + 32]
                 ; mov r10, QWORD PY_SLOW_BITS as i64
                 ; cmp rax, r10
                 ; je => labels.slow
@@ -875,11 +876,13 @@ pub(crate) fn emit_py_op(
                 ; mov [rbx + dreg(dst)], rax
             );
         }
-        // A subscript store: likewise through `Vm::jit_py_set_item`, which
-        // reads the operands from the window (`rbx`) by the registers packed
-        // here; 0 is done, anything but the slow edge's answer bails (a throw
-        // pending, or nothing done).
+        // A subscript store: inline fast path for exact `list` overwrite,
+        // else `Vm::jit_py_set_item`.
         Instr::PySetItem { o, k, v, seq, dict, .. } if !crate::vm::prof_py::on() => {
+            let miss = ops.new_dynamic_label();
+            if emit_py_set_item_inline(ops, o, k, v, seq, miss, done) {
+                dynasm!(ops ; => miss);
+            }
             let packed = o as u64 | (k as u64) << 16 | (v as u64) << 32 | (seq as u64) << 48;
             dynasm!(ops
                 ; mov rcx, rdi
@@ -936,6 +939,10 @@ pub(crate) fn emit_py_op(
         // instead of through `Vm::jit_py_op`, which finds and decodes the
         // instruction again first. (A `ZIPP_PY_PROF` run takes the ordinary
         // step, which counts.)
+        Instr::PyCallEntry { dst, f, name, .. } if !crate::vm::prof_py::on() => {
+            let h = crate::vm::Vm::jit_py_call_entry as *const () as usize;
+            emit_py_value_call_noalloc(ops, h, [V::Reg(f), V::Imm(site(func_id, ip)), V::Imm(name as u64), V::None], dst, labels);
+        }
         Instr::PyGlobal { dst, globals, rt, key, .. } if !crate::vm::prof_py::on() => {
             let h = crate::vm::Vm::jit_py_global as *const () as usize;
             emit_py_value_call(ops, h, [V::Reg(globals), V::Reg(rt), V::Imm(site(func_id, ip)), V::Imm(key as u64)], dst, labels, refetch);
@@ -962,11 +969,11 @@ pub(crate) fn emit_py_op(
         }
         Instr::PyClassOf { dst, obj, .. } if !crate::vm::prof_py::on() => {
             let h = crate::vm::Vm::jit_py_class_of as *const () as usize;
-            emit_py_value_call(ops, h, [V::Reg(obj), V::None, V::None, V::None], dst, labels, refetch);
+            emit_py_value_call_noalloc(ops, h, [V::Reg(obj), V::None, V::None, V::None], dst, labels);
         }
         Instr::PyCaught { dst, e, line, rt, .. } if !crate::vm::prof_py::on() => {
             let h = crate::vm::Vm::jit_py_caught as *const () as usize;
-            emit_py_value_call(ops, h, [V::Reg(e), V::Reg(line), V::Reg(rt), V::None], dst, labels, refetch);
+            emit_py_value_call_noalloc(ops, h, [V::Reg(e), V::Reg(line), V::Reg(rt), V::None], dst, labels);
         }
         // An instance dict's entry (`PyDictGet`): as a value helper, with
         // `PY_ABSENT_BITS` the fall-through that leaves `dst` untouched.
@@ -996,8 +1003,7 @@ pub(crate) fn emit_py_op(
                 ; mov [rbx + dreg(dst)], rax
             );
         }
-        // A dict's `.get` (`PyDictLookup`): as `PyGetItem`'s helper, its
-        // `absent` edge the second.
+        // A dict's `.get` (`PyDictLookup`): never allocates.
         Instr::PyDictLookup { dst, d, k, rt, .. } if labels.target.is_some() && !crate::vm::prof_py::on() => {
             let Some(absent) = labels.target else {
                 unreachable!("PyDictLookup carries an absent label");
@@ -1009,11 +1015,6 @@ pub(crate) fn emit_py_op(
                 ; mov r9, [rbx + dreg(rt)]
                 ; mov rax, QWORD crate::vm::Vm::jit_py_dict_lookup as *const () as usize as i64
                 ; call rax
-                ; mov [rsp + 32], rax
-            );
-            refetch(ops);
-            dynasm!(ops
-                ; mov rax, [rsp + 32]
                 ; mov r10, QWORD PY_SLOW_BITS as i64
                 ; cmp rax, r10
                 ; je => labels.slow
@@ -1023,18 +1024,13 @@ pub(crate) fn emit_py_op(
                 ; mov [rbx + dreg(dst)], rax
             );
         }
-        // An exception stack's pop (`PyExcPop`): 0 is done.
+        // An exception stack's pop (`PyExcPop`): never allocates.
         Instr::PyExcPop { rt, .. } if !crate::vm::prof_py::on() => {
             dynasm!(ops
                 ; mov rcx, rdi
                 ; mov rdx, [rbx + dreg(rt)]
                 ; mov rax, QWORD crate::vm::Vm::jit_py_exc_pop as *const () as usize as i64
                 ; call rax
-                ; mov [rsp + 32], rax
-            );
-            refetch(ops);
-            dynasm!(ops
-                ; mov rax, [rsp + 32]
                 ; test rax, rax
                 ; jz => done
                 ; mov r10, QWORD PY_SLOW_BITS as i64
@@ -1045,19 +1041,27 @@ pub(crate) fn emit_py_op(
         }
         Instr::PyIsInstance { dst, v, t, rt, .. } if !crate::vm::prof_py::on() => {
             let h = crate::vm::Vm::jit_py_isinstance as *const () as usize;
-            emit_py_value_call(ops, h, [V::Reg(v), V::Reg(t), V::Reg(rt), V::Imm(site(func_id, ip))], dst, labels, refetch);
+            emit_py_value_call_noalloc(ops, h, [V::Reg(v), V::Reg(t), V::Reg(rt), V::Imm(site(func_id, ip))], dst, labels);
         }
         Instr::PyLen { dst, v, rt, .. } if !crate::vm::prof_py::on() => {
+            let miss = ops.new_dynamic_label();
+            if emit_py_len_inline(ops, dst, v, miss, done) {
+                dynasm!(ops ; => miss);
+            }
             let h = crate::vm::Vm::jit_py_len as *const () as usize;
-            emit_py_value_call(ops, h, [V::Reg(v), V::Reg(rt), V::None, V::None], dst, labels, refetch);
+            emit_py_value_call_noalloc(ops, h, [V::Reg(v), V::Reg(rt), V::None, V::None], dst, labels);
         }
         Instr::PySeq { dst, items, rt, tuple, .. } if !crate::vm::prof_py::on() => {
             let h = crate::vm::Vm::jit_py_seq as *const () as usize;
             emit_py_value_call(ops, h, [V::Reg(items), V::Reg(rt), V::Imm(tuple as u64), V::None], dst, labels, refetch);
         }
         Instr::PyUnpack { dst, v, rt, n, .. } if !crate::vm::prof_py::on() => {
+            let miss = ops.new_dynamic_label();
+            if emit_py_unpack_inline(ops, dst, v, n, miss, done) {
+                dynasm!(ops ; => miss);
+            }
             let h = crate::vm::Vm::jit_py_unpack as *const () as usize;
-            emit_py_value_call(ops, h, [V::Reg(v), V::Reg(rt), V::Imm(n as u64), V::None], dst, labels, refetch);
+            emit_py_value_call_noalloc(ops, h, [V::Reg(v), V::Reg(rt), V::Imm(n as u64), V::None], dst, labels);
         }
         Instr::PyMakeExc { dst, cls, args, rt, .. } if !crate::vm::prof_py::on() => {
             let h = crate::vm::Vm::jit_py_make_exc as *const () as usize;
@@ -1070,10 +1074,14 @@ pub(crate) fn emit_py_op(
             let h = crate::vm::Vm::jit_py_gen_next as *const () as usize;
             emit_py_value_call(ops, h, [V::Reg(next), V::Reg(this), V::Imm(ip as u64), V::None], dst, labels, refetch);
         }
-        // A call: through `Vm::jit_py_call` with the operands packed, which
-        // calls a str method's native where it is and hands any other
-        // callee to `Vm::jit_py_op`; the same outcomes as the step's.
+        // A call: inline `math.sqrt` when planned, else `Vm::jit_py_call`.
         Instr::PyCall { dst, f, arg_base, argc, .. } if !crate::vm::prof_py::on() => {
+            if argc == 1 {
+                let miss = ops.new_dynamic_label();
+                if emit_py_sqrt_inline(ops, ip, dst, f, arg_base, miss, done) {
+                    dynasm!(ops ; => miss);
+                }
+            }
             let regs = f as u64 | (arg_base as u64) << 16 | (argc as u64) << 32 | (dst as u64) << 48;
             emit_py_step_with(ops, crate::vm::Vm::jit_py_call as *const () as usize, func_id, ip, Some(regs), labels, refetch);
         }
@@ -1151,6 +1159,49 @@ fn emit_py_value_call(
         ; call rax
     );
     emit_value_outcome(ops, dst, labels, refetch);
+}
+
+/// [`emit_py_value_call`] for a helper guaranteed never to allocate on the VM
+/// heap (no `[rsp + 32]` spill and no `refetch`).
+fn emit_py_value_call_noalloc(
+    ops: &mut crate::codegen::X64Asm,
+    helper: usize,
+    args: [V; 4],
+    dst: u16,
+    labels: &PyLabels,
+) {
+    match args[3] {
+        V::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)] ; mov [rsp + 32], rax),
+        V::Imm(v) => dynasm!(ops ; mov rax, QWORD v as i64 ; mov [rsp + 32], rax),
+        V::None => {}
+    }
+    match args[0] {
+        V::Reg(r) => dynasm!(ops ; mov rdx, [rbx + dreg(r)]),
+        V::Imm(v) => dynasm!(ops ; mov rdx, QWORD v as i64),
+        V::None => {}
+    }
+    match args[1] {
+        V::Reg(r) => dynasm!(ops ; mov r8, [rbx + dreg(r)]),
+        V::Imm(v) => dynasm!(ops ; mov r8, QWORD v as i64),
+        V::None => {}
+    }
+    match args[2] {
+        V::Reg(r) => dynasm!(ops ; mov r9, [rbx + dreg(r)]),
+        V::Imm(v) => dynasm!(ops ; mov r9, QWORD v as i64),
+        V::None => {}
+    }
+    dynasm!(ops
+        ; mov rcx, rdi
+        ; mov rax, QWORD helper as i64
+        ; call rax
+        ; mov r10, QWORD PY_SLOW_BITS as i64
+        ; cmp rax, r10
+        ; je => labels.slow
+        ; mov r10, QWORD CALL_THREW as i64
+        ; cmp rax, r10
+        ; je => labels.bail
+        ; mov [rbx + dreg(dst)], rax
+    );
 }
 
 /// After a `jit_py_arith`/`jit_py_add_imm` call: `PY_SLOW_BITS` takes the
@@ -1343,6 +1394,7 @@ impl Jit {
                     },
                 );
                 self.note_reg_region_installed(func_id, true);
+                self.mark_has_region(func_id);
             }
             None => {
                 if log {

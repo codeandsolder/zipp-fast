@@ -137,17 +137,29 @@ impl<'p> Vm<'p> {
             let base = (addr - start) / 8;
             let len = v.regs.len();
             if base + (f.max(dst) as usize) < len && base + arg_base as usize + argc as usize <= len {
-                v.maybe_gc();
                 let ip = packed as u32 as usize;
                 let fv = v.get(base, f);
                 let e = v.py_ic((packed >> 32) as u32, ip);
-                if let Some(at) = v.py_strm_hit(&e, fv) {
+                if let Some((at, op)) = v.py_strm_hit(&e, fv) {
+                    if !matches!(op, 6 | 10 | 11 | 14..=19) {
+                        v.maybe_gc();
+                    }
+                    if op == 11 {
+                        let fi = fv.heap_index();
+                        if v.ic_obj_ok(fi) {
+                            if let HeapObj::Object(m) = v.heap.get(fi) {
+                                if !m.is_ctor && m.shape() != crate::shape::DICT {
+                                    v.heap.refresh_mirror(fi);
+                                }
+                            }
+                        }
+                    }
                     if v.at_call_cap() {
                         v.osr_deopt_exempt = true;
                         return PY_BAIL;
                     }
                     v.jit_call_depth += 1;
-                    let r = v.with_argv(base, arg_base, argc, |vm, argv| vm.py_str_method_at(fv, argv, at));
+                    let r = v.with_argv(base, arg_base, argc, |vm, argv| vm.py_str_method_op(fv, argv, at, op));
                     v.jit_call_depth -= 1;
                     return match r {
                         Ok(x) => {
@@ -162,13 +174,28 @@ impl<'p> Vm<'p> {
                         }
                     };
                 }
-                // A plain callee whose body only stores its parameters into
-                // attributes of the first: the call made without its frame
-                // (`Vm::py_store_call`) when every store's site holds. No
-                // guest code runs.
-                if v.py_store_call_site(&e, fv, base, arg_base, argc) {
-                    v.set(base, dst, Value::NULL);
-                    return PY_NEXT;
+                // Single-byte dispatch by IC classification: `CALL_PLAIN` skips
+                // straight to `jit_py_op` with zero extra checks.
+                match e.kind {
+                    super::py_rt::ic::CALL_STORE => {
+                        if v.py_store_call_site(&e, fv, base, arg_base, argc) {
+                            v.set(base, dst, Value::NULL);
+                            return PY_NEXT;
+                        }
+                    }
+                    super::py_rt::ic::CALL_REC => {
+                        if let Some(x) = v.py_rec_call_site(&e, fv, base, arg_base, argc) {
+                            v.set(base, dst, x);
+                            return PY_NEXT;
+                        }
+                    }
+                    super::py_rt::ic::CALL_LEAF => {
+                        if let Some(x) = v.py_leaf_call_site(&e, fv, base, arg_base, argc) {
+                            v.set(base, dst, x);
+                            return PY_NEXT;
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -199,7 +226,6 @@ impl<'p> Vm<'p> {
         if base + (e.max(rt) as usize) >= v.regs.len() {
             return PY_BAIL;
         }
-        v.maybe_gc();
         let ip = packed as u32 as usize;
         // `u32::MAX - 1` stands for the slow edge (never an ip a catch
         // target can be: the catch, when there is one, is a real ip).
@@ -409,11 +435,10 @@ impl<'p> Vm<'p> {
     /// the step's own answer without finding the instruction again: the
     /// item's bits, `PY_SLOW_BITS` for the `slow` edge, `PY_ABSENT_BITS`
     /// for the `absent` edge (a key the dict lacks), `CALL_THREW` when it
-    /// threw. A GC safe point, as `jit_py_op` is.
+    /// threw. Never allocates on the VM heap.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) extern "win64" fn jit_py_get_item(vm: *mut core::ffi::c_void, o: u64, k: u64, seq: u64, dict: u64) -> u64 {
         let vm = unsafe { &mut *(vm as *mut Vm) };
-        vm.maybe_gc();
         match vm.py_get_item(Value::from_bits(o), Value::from_bits(k), Value::from_bits(seq), Value::from_bits(dict)) {
             Ok(Some(Some(v))) => v.bits(),
             Ok(Some(None)) => crate::codegen::PY_ABSENT_BITS,
@@ -422,24 +447,18 @@ impl<'p> Vm<'p> {
         }
     }
 
-    // The fused instructions that only answer a value or take their slow
-    // edge (they run no guest code, raise nothing and change nothing when
-    // they decline), from compiled code: each helper below is the step's own
-    // function for one of them over the operands' bits, with the site
-    // (`packed = (func_id << 32) | ip`, for its cache entry) where that
-    // function takes one, and answers the value's bits or `PY_SLOW_BITS`
-    // for the `slow` edge. `jit_py_op` reaches the same function after
-    // finding the code object and the instruction again, decoding its
-    // edges, checking the window and routing it through `py_exec` and the
-    // step's match. Each is a GC safe point, as `jit_py_op` is (the
-    // operands are also in the frame's registers).
-
-    /// `PyGlobal` from compiled code: `py_global` (see above).
+    /// `PyGlobal` from compiled code: `py_global_hit` first (no allocation),
+    /// else `py_global`.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) extern "win64" fn jit_py_global(vm: *mut core::ffi::c_void, g: u64, rt: u64, packed: u64, key: u64) -> u64 {
         let vm = unsafe { &mut *(vm as *mut Vm) };
+        let (func_id, ip) = ((packed >> 32) as u32, packed as u32 as usize);
+        let (gv, rv) = (Value::from_bits(g), Value::from_bits(rt));
+        if let Some(v) = vm.py_global_hit(func_id, ip, gv, rv) {
+            return v.bits();
+        }
         vm.maybe_gc();
-        match vm.py_global((packed >> 32) as u32, packed as u32 as usize, Value::from_bits(g), Value::from_bits(rt), key as u32) {
+        match vm.py_global(func_id, ip, gv, rv, key as u32) {
             Some(v) => v.bits(),
             None => crate::codegen::PY_SLOW_BITS,
         }
@@ -449,7 +468,6 @@ impl<'p> Vm<'p> {
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) extern "win64" fn jit_py_mod_get(vm: *mut core::ffi::c_void, o: u64, rt: u64, packed: u64, key: u64) -> u64 {
         let vm = unsafe { &mut *(vm as *mut Vm) };
-        vm.maybe_gc();
         match vm.py_mod_get((packed >> 32) as u32, packed as u32 as usize, Value::from_bits(o), Value::from_bits(rt), key as u32) {
             Some(v) => v.bits(),
             None => crate::codegen::PY_SLOW_BITS,
@@ -467,18 +485,32 @@ impl<'p> Vm<'p> {
             vm.py_settle_class_of(Value::from_bits(o));
         }
         let keys = keys & !crate::codegen::PY_METHOD_SETTLE;
+        let (func_id, ip) = ((packed >> 32) as u32, packed as u32 as usize);
+        let (ov, rv) = (Value::from_bits(o), Value::from_bits(rt));
+        if let Some(f) = vm.py_method_hit(func_id, ip, ov, rv) {
+            return f.bits();
+        }
         vm.maybe_gc();
-        match vm.py_method((packed >> 32) as u32, packed as u32 as usize, Value::from_bits(o), Value::from_bits(rt), keys as u32, (keys >> 32) as u32) {
+        match vm.py_method(func_id, ip, ov, rv, keys as u32, (keys >> 32) as u32) {
             Some(f) => f.bits(),
             None => crate::codegen::PY_SLOW_BITS,
         }
     }
 
-    /// `PyClassOf` from compiled code: `py_class_of` (see above).
+    /// `PyCallEntry` from compiled code: `py_call_entry` (never allocates).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) extern "win64" fn jit_py_call_entry(vm: *mut core::ffi::c_void, f: u64, packed: u64, name: u64) -> u64 {
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        match vm.py_call_entry((packed >> 32) as u32, packed as u32 as usize, Value::from_bits(f), name as u32) {
+            Some(e) => e.bits(),
+            None => crate::codegen::PY_SLOW_BITS,
+        }
+    }
+
+    /// `PyClassOf` from compiled code: `py_class_of` (never allocates).
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) extern "win64" fn jit_py_class_of(vm: *mut core::ffi::c_void, o: u64) -> u64 {
         let vm = unsafe { &mut *(vm as *mut Vm) };
-        vm.maybe_gc();
         match vm.py_class_of(Value::from_bits(o)) {
             Some(c) => c.bits(),
             None => crate::codegen::PY_SLOW_BITS,
@@ -506,13 +538,10 @@ impl<'p> Vm<'p> {
         }
     }
 
-    /// `PyDictLookup` from compiled code: `py_dict_lookup` (see above), as
-    /// `PyGetItem`'s helper answers: the value's bits, `PY_ABSENT_BITS` for
-    /// the `absent` edge, `PY_SLOW_BITS` for the `slow` edge.
+    /// `PyDictLookup` from compiled code: `py_dict_lookup` (never allocates).
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) extern "win64" fn jit_py_dict_lookup(vm: *mut core::ffi::c_void, d: u64, k: u64, rt: u64) -> u64 {
         let vm = unsafe { &mut *(vm as *mut Vm) };
-        vm.maybe_gc();
         match vm.py_dict_lookup(Value::from_bits(d), Value::from_bits(k), Value::from_bits(rt)) {
             Some(Some(v)) => v.bits(),
             Some(None) => crate::codegen::PY_ABSENT_BITS,
@@ -520,12 +549,10 @@ impl<'p> Vm<'p> {
         }
     }
 
-    /// `PyCaught` from compiled code: `py_caught` (see above), answering the
-    /// exception's bits (the step's `dst`).
+    /// `PyCaught` from compiled code: `py_caught` (never allocates).
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) extern "win64" fn jit_py_caught(vm: *mut core::ffi::c_void, e: u64, line: u64, rt: u64) -> u64 {
         let vm = unsafe { &mut *(vm as *mut Vm) };
-        vm.maybe_gc();
         if vm.py_caught(Value::from_bits(e), Value::from_bits(line), Value::from_bits(rt)) {
             e
         } else {
@@ -533,38 +560,39 @@ impl<'p> Vm<'p> {
         }
     }
 
-    /// `PyExcPop` from compiled code: `py_exc_pop` (see above). 0 done,
-    /// `PY_SLOW_BITS` for the `slow` edge.
+    /// `PyExcPop` from compiled code: `py_exc_pop` (never allocates).
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) extern "win64" fn jit_py_exc_pop(vm: *mut core::ffi::c_void, rt: u64) -> u64 {
         let vm = unsafe { &mut *(vm as *mut Vm) };
-        vm.maybe_gc();
         match vm.py_exc_pop(Value::from_bits(rt)) {
             Some(()) => 0,
             None => crate::codegen::PY_SLOW_BITS,
         }
     }
 
-    /// `PyIsInstance` from compiled code: `py_isinstance` (see above), its
-    /// answer as the bool the step stores.
+    /// `PyIsInstance` from compiled code: `py_isinstance` (never allocates).
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) extern "win64" fn jit_py_isinstance(vm: *mut core::ffi::c_void, v: u64, t: u64, rt: u64, packed: u64) -> u64 {
         let vm = unsafe { &mut *(vm as *mut Vm) };
-        vm.maybe_gc();
         match vm.py_isinstance((packed >> 32) as u32, packed as u32 as usize, Value::from_bits(v), Value::from_bits(t), Value::from_bits(rt)) {
             Some(r) => Value::bool(r).bits(),
             None => crate::codegen::PY_SLOW_BITS,
         }
     }
 
-    /// `PyLen` from compiled code: `py_len` (see above), its answer as the
-    /// int the step stores.
+    /// `PyLen` from compiled code: `py_len` (never allocates; repairs
+    /// `arr_mirror` for plain sequences so subsequent iterations hit inline).
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) extern "win64" fn jit_py_len(vm: *mut core::ffi::c_void, v: u64, rt: u64) -> u64 {
         let vm = unsafe { &mut *(vm as *mut Vm) };
-        vm.maybe_gc();
-        match vm.py_len(Value::from_bits(v), Value::from_bits(rt)) {
-            Some(n) => vm.make_bigint(n as i128).bits(),
+        let vv = Value::from_bits(v);
+        if let Some((_, items)) = vm.py_seq_parts(vv) {
+            if items.is_heap() {
+                vm.py_repair_seq_arr_mirror(items.heap_index());
+            }
+        }
+        match vm.py_len(vv, Value::from_bits(rt)).and_then(|n| Value::small_bigint(n as i128)) {
+            Some(b) => b.bits(),
             None => crate::codegen::PY_SLOW_BITS,
         }
     }
@@ -580,13 +608,18 @@ impl<'p> Vm<'p> {
         }
     }
 
-    /// `PyUnpack` from compiled code: `py_unpack` (see above).
+    /// `PyUnpack` from compiled code: `py_unpack` (never allocates; repairs
+    /// `arr_mirror` so subsequent iterations hit inline).
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) extern "win64" fn jit_py_unpack(vm: *mut core::ffi::c_void, v: u64, rt: u64, n: u64) -> u64 {
         let vm = unsafe { &mut *(vm as *mut Vm) };
-        vm.maybe_gc();
         match vm.py_unpack(Value::from_bits(v), Value::from_bits(rt), n as u32) {
-            Some(items) => items.bits(),
+            Some(items) => {
+                if items.is_heap() {
+                    vm.py_repair_seq_arr_mirror(items.heap_index());
+                }
+                items.bits()
+            }
             None => crate::codegen::PY_SLOW_BITS,
         }
     }
@@ -617,14 +650,19 @@ impl<'p> Vm<'p> {
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) extern "win64" fn jit_py_gen_next(vm: *mut core::ffi::c_void, next: u64, this: u64, ip: u64) -> u64 {
         let vm = unsafe { &mut *(vm as *mut Vm) };
+        let nv = Value::from_bits(next);
+        if !nv.is_heap() || !matches!(vm.heap.get(nv.heap_index()), HeapObj::Native(id) if *id == crate::vm::native::PY_GEN) {
+            return crate::codegen::PY_SLOW_BITS;
+        }
+        // Pure non-allocating in-register fast step: no GC safe point or
+        // nested interpreter frame needed.
+        if let Some(Ok(v)) = vm.py_gen_next_fast(Value::from_bits(this)) {
+            return v.bits();
+        }
         vm.maybe_gc();
         if vm.at_call_cap() {
             vm.osr_deopt_exempt = true;
             return crate::codegen::CALL_THREW;
-        }
-        let nv = Value::from_bits(next);
-        if !nv.is_heap() || !matches!(vm.heap.get(nv.heap_index()), HeapObj::Native(id) if *id == crate::vm::native::PY_GEN) {
-            return crate::codegen::PY_SLOW_BITS;
         }
         vm.jit_call_depth += 1;
         let r = vm.py_gen_next(Value::from_bits(this));
@@ -736,9 +774,16 @@ impl<'p> Vm<'p> {
             return crate::codegen::SELF_CALL_DEOPT;
         }
         let aidx = arr.heap_index();
-        vm.heap.write_barrier(aidx);
+        let was_live = vm.heap.arr_mirror_live(aidx);
+        let val = Value::from_bits(val_bits);
+        if val.is_heap() {
+            vm.heap.write_barrier_val(aidx, val);
+        }
         if let HeapObj::Array(items) = vm.heap.get_mut(aidx) {
-            items.push(Value::from_bits(val_bits));
+            items.push(val);
+        }
+        if was_live {
+            vm.heap.repair_arr_mirror(aidx);
         }
         0
     }

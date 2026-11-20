@@ -118,5 +118,8 @@ zipfile                                          zipfile.py                     
 pathlib                                          pathlib.py                                    base
 argparse                                         argparse.py                                   base
 inspect                                          inspect.py                                    base
+asyncio                                          asyncio.py                                    base
+numbers                                          numbers.py                                    base
+fractions                                        fractions.py                                  base
 pytest                                           pytest.py                                     base
 traceback                                        traceback.py                                  base

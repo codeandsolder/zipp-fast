@@ -141,12 +141,324 @@ impl<'p> Vm<'p> {
         Some(rt)
     }
 
+    /// Ultra-fast pure in-register mini-stepper for an already-started,
+    /// suspended plain generator (`GenState::Suspended(resume_ip)` at a plain
+    /// `Instr::Yield`, empty handlers, no eval scope, no `arguments`).
+    ///
+    /// Executes up to 16 pure, non-allocating bytecode ops directly against
+    /// `GeneratorData::regs` using a stack journal, committing atomically only
+    /// upon reaching the next `Instr::Yield` or `Instr::Return`. Never pushes
+    /// a `Frame`, never copies `regs`, never allocates on the VM heap, and
+    /// never invokes guest code — so `jit_py_gen_next` can call it before
+    /// `maybe_gc()` and before bumping `jit_call_depth`. Returns `None` with
+    /// zero mutations for anything else.
+    pub(crate) fn py_gen_next_fast(&mut self, this: Value) -> Option<Result<Value, Thrown>> {
+        use super::py_ops::py_small_arith;
+        use crate::bytecode::{Instr, PyArithOp};
+        use crate::heap::GenState;
+
+        if super::prof_py::on() || !self.native_kernel_admits(32, 0) || !this.is_heap() {
+            return None;
+        }
+        let g = this.heap_index();
+        let shape = self.py_rt.as_deref()?.gen_shape.get();
+        let (js, grt) = match self.heap.get(g) {
+            HeapObj::Object(m) if !m.is_ctor && shape != crate::shape::DICT && m.shape() == shape => {
+                let done = m.val_at(F_DONE.0);
+                let started = m.val_at(F_STARTED.0);
+                let running = m.val_at(F_RUNNING.0);
+                let excs = m.val_at(F_EXCS.0);
+                let js = m.val_at(F_JS.0);
+                if done != Value::FALSE
+                    || started != Value::TRUE
+                    || running != Value::FALSE
+                    || excs != Value::NULL
+                    || !js.is_heap()
+                {
+                    return None;
+                }
+                (js, m.val_at(F_GRT.0))
+            }
+            _ => return None,
+        };
+        let js_idx = js.heap_index();
+        if !self.closure_eval_scope.is_empty() && self.closure_eval_scope.contains_key(&js_idx) {
+            return None;
+        }
+        const MAX_FAST_REGS: usize = 64;
+        let mut regs = [Value::UNDEFINED; MAX_FAST_REGS];
+        let (fid, resume_ip, regs_len) = match self.heap.get(js_idx) {
+            HeapObj::Generator(gen) => {
+                let GenState::Suspended(ip) = gen.state else {
+                    return None;
+                };
+                let n = gen.regs.len();
+                if !gen.handlers.is_empty() || n > MAX_FAST_REGS {
+                    return None;
+                }
+                regs[..n].copy_from_slice(&gen.regs);
+                (gen.func, ip, n)
+            }
+            _ => return None,
+        };
+        let yield_dst = {
+            let proto = self.func(fid as usize);
+            if proto.arguments_reg.is_some() {
+                return None;
+            }
+            match proto.code.get(resume_ip) {
+                Some(&Instr::Yield { dst, .. }) if (dst as usize) < regs_len => dst,
+                _ => return None,
+            }
+        };
+
+        regs[yield_dst as usize] = Value::UNDEFINED;
+        let mut dirty: u64 = 1u64 << yield_dst;
+
+        let mut ip = resume_ip + 1;
+        let mut steps = 0i64;
+        while steps < 16 {
+            let instr = *self.func(fid as usize).code.get(ip)?;
+            steps += 1;
+            match instr {
+                Instr::Move { dst, src } => {
+                    regs[dst as usize] = regs[src as usize];
+                    dirty |= 1u64 << dst;
+                    ip += 1;
+                }
+                Instr::LoadNull { dst } => {
+                    regs[dst as usize] = Value::NULL;
+                    dirty |= 1u64 << dst;
+                    ip += 1;
+                }
+                Instr::LoadUndefined { dst } => {
+                    regs[dst as usize] = Value::UNDEFINED;
+                    dirty |= 1u64 << dst;
+                    ip += 1;
+                }
+                Instr::LoadBool { dst, val } => {
+                    regs[dst as usize] = Value::bool(val);
+                    dirty |= 1u64 << dst;
+                    ip += 1;
+                }
+                Instr::LoadInt { dst, val } => {
+                    regs[dst as usize] = Value::int(val);
+                    dirty |= 1u64 << dst;
+                    ip += 1;
+                }
+                Instr::LoadBigInt { dst, value } => {
+                    regs[dst as usize] = Value::small_bigint(value.get())?;
+                    dirty |= 1u64 << dst;
+                    ip += 1;
+                }
+                Instr::TypeOfIs { dst, a, code, neg } => {
+                    let v = regs[a as usize];
+                    let eq = crate::bytecode::TYPEOF_NAMES
+                        .get(code as usize)
+                        .is_some_and(|&want| want == self.type_of(v));
+                    regs[dst as usize] = Value::bool(eq != neg);
+                    dirty |= 1u64 << dst;
+                    ip += 1;
+                }
+                Instr::Not { dst, a } => {
+                    let v = regs[a as usize];
+                    let out = if v == Value::TRUE {
+                        Value::FALSE
+                    } else if v == Value::FALSE {
+                        Value::TRUE
+                    } else {
+                        return None;
+                    };
+                    regs[dst as usize] = out;
+                    dirty |= 1u64 << dst;
+                    ip += 1;
+                }
+                Instr::AddInt { dst, a, imm, upd } => {
+                    let va = regs[a as usize];
+                    let res = if va.is_int() {
+                        match va.as_int().checked_add(imm) {
+                            Some(v) => Value::int(v),
+                            None => Value::num(va.as_int() as f64 + imm as f64),
+                        }
+                    } else if va.is_double() {
+                        Value::num(va.as_f64() + imm as f64)
+                    } else if upd {
+                        let x = va.small_bigint_val()?;
+                        Value::small_bigint((x as i128) + (imm as i128))?
+                    } else {
+                        return None;
+                    };
+                    regs[dst as usize] = res;
+                    dirty |= 1u64 << dst;
+                    ip += 1;
+                }
+                Instr::PyAddImm { dst, a, imm, .. } => {
+                    let va = regs[a as usize];
+                    let res = if let Some(x) = va.small_bigint_val() {
+                        Value::small_bigint((x as i128) + (imm as i128))?
+                    } else if va.is_number() {
+                        Value::num(va.as_f64() + imm as f64)
+                    } else {
+                        return None;
+                    };
+                    regs[dst as usize] = res;
+                    dirty |= 1u64 << dst;
+                    ip += 1;
+                }
+                Instr::PyArith { op, dst, a, b, .. } => {
+                    let (va, vb) = (regs[a as usize], regs[b as usize]);
+                    let res = if let (Some(x), Some(y)) = (va.small_bigint_val(), vb.small_bigint_val()) {
+                        let r = py_small_arith(op, x, y)?;
+                        Value::small_bigint(r as i128)?
+                    } else if va.is_number() && vb.is_number() {
+                        match op {
+                            PyArithOp::Add => Value::num(va.as_f64() + vb.as_f64()),
+                            PyArithOp::Sub => Value::num(va.as_f64() - vb.as_f64()),
+                            PyArithOp::Mul => Value::num(va.as_f64() * vb.as_f64()),
+                            PyArithOp::TrueDiv => {
+                                let y = vb.as_f64();
+                                if y == 0.0 {
+                                    return None;
+                                }
+                                Value::num(va.as_f64() / y)
+                            }
+                            _ => return None,
+                        }
+                    } else {
+                        return None;
+                    };
+                    regs[dst as usize] = res;
+                    dirty |= 1u64 << dst;
+                    ip += 1;
+                }
+                Instr::PyCompare { op, dst, a, b, .. } => {
+                    let r = self.py_compare(op, regs[a as usize], regs[b as usize]).ok()??;
+                    regs[dst as usize] = Value::bool(r);
+                    dirty |= 1u64 << dst;
+                    ip += 1;
+                }
+                Instr::PyJumpCompare { op, a, b, when, target, .. } => {
+                    let r = self.py_compare(op, regs[a as usize], regs[b as usize]).ok()??;
+                    if r == when {
+                        ip = target as usize;
+                    } else {
+                        ip += 1;
+                    }
+                }
+                Instr::Jump { target } => {
+                    ip = target as usize;
+                }
+                Instr::JumpIfFalse { cond, target } => {
+                    let v = regs[cond as usize];
+                    if v == Value::FALSE {
+                        ip = target as usize;
+                    } else if v == Value::TRUE {
+                        ip += 1;
+                    } else {
+                        return None;
+                    }
+                }
+                Instr::JumpIfTrue { cond, target } => {
+                    let v = regs[cond as usize];
+                    if v == Value::TRUE {
+                        ip = target as usize;
+                    } else if v == Value::FALSE {
+                        ip += 1;
+                    } else {
+                        return None;
+                    }
+                }
+                Instr::JumpIfNotLt { a, b, target } => {
+                    let (va, vb) = (regs[a as usize], regs[b as usize]);
+                    let lt = if let (Some(x), Some(y)) = (va.small_bigint_val(), vb.small_bigint_val()) {
+                        x < y
+                    } else if va.is_number() && vb.is_number() {
+                        va.as_f64() < vb.as_f64()
+                    } else {
+                        return None;
+                    };
+                    if !lt {
+                        ip = target as usize;
+                    } else {
+                        ip += 1;
+                    }
+                }
+                Instr::JumpIfNotLe { a, b, target } => {
+                    let (va, vb) = (regs[a as usize], regs[b as usize]);
+                    let le = if let (Some(x), Some(y)) = (va.small_bigint_val(), vb.small_bigint_val()) {
+                        x <= y
+                    } else if va.is_number() && vb.is_number() {
+                        va.as_f64() <= vb.as_f64()
+                    } else {
+                        return None;
+                    };
+                    if !le {
+                        ip = target as usize;
+                    } else {
+                        ip += 1;
+                    }
+                }
+                Instr::Yield { val, .. } => {
+                    let yielded = regs[val as usize];
+                    let mut wb = dirty;
+                    while wb != 0 {
+                        let r = wb.trailing_zeros() as usize;
+                        wb &= wb - 1;
+                        let v = regs[r];
+                        if v.is_heap() {
+                            self.heap.write_barrier_val(js_idx, v);
+                        }
+                    }
+                    if let HeapObj::Generator(gen) = self.heap.get_mut(js_idx) {
+                        let mut d = dirty;
+                        while d != 0 {
+                            let r = d.trailing_zeros() as usize;
+                            d &= d - 1;
+                            gen.regs[r] = regs[r];
+                        }
+                        gen.state = GenState::Suspended(ip);
+                    }
+                    if self.instr_rec.is_some() {
+                        self.charge_steps(steps);
+                    }
+                    return Some(Ok(yielded));
+                }
+                Instr::Return { src } => {
+                    let ret = regs[src as usize];
+                    let rt = self.py_gen_runtime_cached(grt)?;
+                    if let HeapObj::Generator(gen) = self.heap.get_mut(js_idx) {
+                        gen.state = GenState::Completed;
+                        gen.regs.clear();
+                        gen.handlers.clear();
+                    }
+                    let r = if ret.is_undefined() { Value::NULL } else { ret };
+                    if r.is_heap() {
+                        self.heap.write_barrier_val(g, r);
+                    }
+                    if let HeapObj::Object(m) = self.heap.get_mut(g) {
+                        m.set_val_at(F_DONE.0, Value::TRUE);
+                        m.set_val_at(F_RETURNED.0, r);
+                    }
+                    if self.instr_rec.is_some() {
+                        self.charge_steps(steps);
+                    }
+                    return Some(Ok(rt.stop));
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
     /// [`Vm::py_gen_next`] for the state that matters for speed: a record of
     /// the shape already seen with every field at its usual slot (so read
     /// together), not done, not running, holding no exceptions, around an
     /// engine generator. `None` for anything else, with nothing done.
     #[inline]
     fn py_gen_next_plain(&mut self, this: Value) -> Option<Result<Value, Thrown>> {
+        if let Some(r) = self.py_gen_next_fast(this) {
+            return Some(r);
+        }
         if !this.is_heap() {
             return None;
         }

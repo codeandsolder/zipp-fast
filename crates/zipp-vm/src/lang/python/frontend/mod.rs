@@ -99,12 +99,13 @@ pub(super) const BUILTIN_MODULES: &[&str] = &[
     "heapq",
     "bisect",
     "statistics",
-    "fractions",
     "struct",
     "contextlib",
     "hashlib",
     "platform",
     "importlib",
+    "weakref",
+    "types",
     "_zipp_gpu",
     "_zipp_tensor",
     "_zipp_crc",
@@ -349,11 +350,16 @@ fn imported_modules(suite: &[ast::Stmt], here: &str, out: &mut BTreeSet<String>)
                 imported_modules(&s.body, here, out);
                 imported_modules(&s.orelse, here, out);
             }
+            ast::Stmt::AsyncFor(s) => {
+                imported_modules(&s.body, here, out);
+                imported_modules(&s.orelse, here, out);
+            }
             ast::Stmt::While(s) => {
                 imported_modules(&s.body, here, out);
                 imported_modules(&s.orelse, here, out);
             }
             ast::Stmt::With(s) => imported_modules(&s.body, here, out),
+            ast::Stmt::AsyncWith(s) => imported_modules(&s.body, here, out),
             ast::Stmt::Try(s) => {
                 imported_modules(&s.body, here, out);
                 for handler in &s.handlers {
@@ -363,7 +369,17 @@ fn imported_modules(suite: &[ast::Stmt], here: &str, out: &mut BTreeSet<String>)
                 imported_modules(&s.orelse, here, out);
                 imported_modules(&s.finalbody, here, out);
             }
+            ast::Stmt::TryStar(s) => {
+                imported_modules(&s.body, here, out);
+                for handler in &s.handlers {
+                    let ast::ExceptHandler::ExceptHandler(h) = handler;
+                    imported_modules(&h.body, here, out);
+                }
+                imported_modules(&s.orelse, here, out);
+                imported_modules(&s.finalbody, here, out);
+            }
             ast::Stmt::FunctionDef(s) => imported_modules(&s.body, here, out),
+            ast::Stmt::AsyncFunctionDef(s) => imported_modules(&s.body, here, out),
             ast::Stmt::ClassDef(s) => imported_modules(&s.body, here, out),
             ast::Stmt::Match(s) => {
                 for case in &s.cases {

@@ -25,32 +25,30 @@ integration date every corpus program matched.
 | --- | --- |
 | Numbers | arbitrary-precision `int`, `float` (Python `repr`/formatting rules, half-to-even rounding), `bool`, `complex` (imaginary literals; the constructor with CPython's string parsing, keywords and the `__complex__`/`__float__`/`__index__` protocols; subclassing; CPython 3.13's arithmetic, `**` algorithm, equality with int/float, hash, `repr` and `format` specs); `+ - * / // % ** << >> & \| ^ ~`, chained comparisons, `divmod`, `round`, `pow` with modulus |
 | Strings | full `str` method set, `%` formatting, `str.format`, f-strings with conversions and nested format specs, `bytes` (utf-8/ascii/latin-1 encode/decode), code-point indexing, `\N{...}` escapes for the common character names (see below) |
-| Containers | `list`, `tuple`, `dict` (insertion-ordered, `__missing__`), `set`, `frozenset`, `range`, slices with steps and slice assignment/deletion, comprehensions (list/set/dict/generator), starred unpacking, `del` |
-| Functions | defaults, keyword and keyword-only arguments, positional-only, `*args`/`**kwargs`, `*`/`**` at call sites, closures with `nonlocal`/`global`, lambdas, decorators, `__name__`/`__doc__`/`__defaults__`, generators (`yield`, `yield from`, `send`, `throw`, `close`, return value via `StopIteration.value`) |
-| Classes | single and multiple inheritance (C3 MRO), `super()` (zero- and two-argument), `__init__`/`__new__`, instance and class attributes, `property` with setters/deleters, `classmethod`, `staticmethod`, descriptors, `__getattr__`/`__setattr__`/`__delattr__`, `__init_subclass__`, `__class_getitem__`, `__slots__` (accepted), subclassing `list`/`dict`/`tuple`/`set`/exceptions, every operator, comparison, container, iteration, call, context-manager and conversion dunder |
-| Exceptions | the builtin hierarchy, `try`/`except`/`else`/`finally`, `raise ... from`, `__cause__`/`__context__`, bare `raise`, `with` (and multi-item `with`), `assert`, `SystemExit` |
-| Statements | `if`/`elif`/`else`, `while`/`for` with `else`, `break`/`continue` through `try`/`finally`, `pass`, annotations (`__annotations__`), walrus `:=`, `global`/`nonlocal`, `import`/`from ... import` (including inside functions) |
+| Containers | `list`, `tuple`, `dict` (insertion-ordered, `__missing__`), `set`, `frozenset`, `range`, slices with steps and slice assignment/deletion, comprehensions (list/set/dict/generator, including async comprehensions), starred unpacking, `del` |
+| Functions | defaults, keyword and keyword-only arguments, positional-only, `*args`/`**kwargs`, `*`/`**` at call sites, closures with `nonlocal`/`global`, lambdas, decorators, `__name__`/`__doc__`/`__defaults__`/`__type_params__`, generators (`yield`, `yield from`, `send`, `throw`, `close`, return value via `StopIteration.value`), coroutines & async generators (`async def`, `await`, `asend`, `athrow`, `aclose`), PEP 695/696 type parameters (`def f[T, *Ts, **P]`) |
+| Classes | single and multiple inheritance (C3 MRO), `super()` (zero- and two-argument), `__init__`/`__new__`, instance and class attributes, `property` with setters/deleters, `classmethod`, `staticmethod`, descriptors, `__getattribute__`/`__getattr__`/`__setattr__`/`__delattr__`, `__init_subclass__`, `__class_getitem__`, PEP 560 `__mro_entries__`/`__orig_bases__`, PEP 695/696 generic classes (`class C[T = int]:`, `__type_params__`), `__slots__` (accepted), subclassing `list`/`dict`/`tuple`/`set`/exceptions, every operator, comparison, container, iteration, call, context-manager, async-iteration/context and conversion dunder |
+| Exceptions | the builtin hierarchy, `try`/`except`/`except*`/`else`/`finally`, `BaseExceptionGroup`/`ExceptionGroup` (`.subgroup()`, `.split()`, `.derive()`), PEP 678 `BaseException.add_note()`/`__notes__`, `raise ... from`, `__cause__`/`__context__`, bare `raise`, `with` and `async with` (including multi-item), `assert`, `SystemExit` |
+| Statements | `if`/`elif`/`else`, `while`/`for`/`async for` with `else`, `break`/`continue` through `try`/`finally`, `pass`, annotations (`__annotations__`), PEP 695/696 `type` aliases (`type Alias[T = int] = ...`), walrus `:=`, `global`/`nonlocal`, `import`/`from ... import` (including inside functions) |
 | Modules | one module per `.py` file, packages by folder (`pkg/__init__.py` or a namespace folder; `import a.b.c`, `from pkg import submodule`), `__name__ == "__main__"`, cycles resolved like CPython, `import x as y`, `from x import *`, `__all__`; only the modules reachable from the entry through imports are compiled. A module that does not exist raises `ModuleNotFoundError` when the import runs, so `try: import numpy` / `except ImportError:` guards work |
-| Builtins | `print` (sep/end/file), `len`, `range`, `enumerate`, `zip` (strict), `map`, `filter`, `reversed`, `sorted`/`list.sort` (stable, key, reverse), `min`/`max` (key, default), `sum`, `any`/`all`, `abs`, `round`, `divmod`, `pow`, `isinstance`/`issubclass`, `hasattr`/`getattr`/`setattr`/`delattr`, `id`, `hash`, `callable`, `chr`/`ord`, `bin`/`oct`/`hex`, `format`, `repr`/`ascii`, `iter`/`next`, `type`, `object`, `dir`, `vars`, `globals`, `exit` |
-| Built-in modules | `math`, `cmath` (every function, with CPython's special-value tables, branch cuts and errors; `isclose`; the constants), `random` (CPython's Mersenne Twister with CPython's seeding, so seeded streams match; `Random`/`SystemRandom` instances, `getstate`/`setstate`), `time`, `sys`, `os`/`os.path` (a virtual empty filesystem), `io` (`StringIO`), `json`, `string`, `textwrap`, `copy` (including dict/list/set subclasses and the `__copy__`/`__deepcopy__`/`__reduce_ex__`/`__getstate__` hooks), `operator`, `itertools`, `functools` (`reduce`, `partial`, `lru_cache`/`cache`, `wraps`, `total_ordering`, `cmp_to_key`), `collections` (`Counter`, `defaultdict`, `deque`, `namedtuple`, `OrderedDict`, `ChainMap`), `heapq`, `bisect`, `statistics`, `re` (JavaScript-backed: groups, named groups and backreferences, inline and scoped flags, Unicode classes, `pos`/`endpos`, `sub` with templates or callables, `split`), `dataclasses` (`dataclass`, `field`, `asdict`, `astuple`, `replace`, `fields`; `order`, `frozen`), `enum` (`Enum`, `IntEnum`, `Flag`, `IntFlag`, `auto`), `typing` (generic aliases, `NamedTuple`, `TypedDict`), `abc` (`ABC` with abstract-method enforcement), `contextlib` (`contextmanager`, `suppress`, `closing`, `nullcontext`, `ExitStack`), `struct` (`pack`/`unpack`/`calcsize`/`iter_unpack`/`Struct` for the standard codes and byte orders), `hashlib` (`md5`, `sha1`, `sha256`, `sha512`), `platform`, `importlib` (`import_module` over the project), `io` (`StringIO`, `BytesIO`), `__future__` (`annotations`: PEP 563 string annotations, plus `X | None` union types) |
+| Builtins | `print` (sep/end/file), `len`, `range`, `enumerate`, `zip` (strict), `map`, `filter`, `reversed`, `sorted`/`list.sort` (stable, key, reverse), `min`/`max` (key, default), `sum`, `any`/`all`, `abs`, `round`, `divmod`, `pow`, `isinstance`/`issubclass`, `hasattr`/`getattr`/`setattr`/`delattr`, `id`, `hash`, `callable`, `chr`/`ord`, `bin`/`oct`/`hex`, `format`, `repr`/`ascii`, `iter`/`next`, `aiter`/`anext`, `type`, `object`, `dir`, `vars`, `globals`, `exit` |
+| Built-in modules | `math`, `cmath` (every function, with CPython's special-value tables, branch cuts and errors; `isclose`; the constants), `random` (CPython's Mersenne Twister with CPython's seeding, so seeded streams match; `Random`/`SystemRandom` instances, `getstate`/`setstate`), `time`, `sys`, `os`/`os.path` (a virtual empty filesystem), `io` (`StringIO`, `BytesIO`), `json`, `string`, `textwrap`, `copy` (including dict/list/set subclasses and the `__copy__`/`__deepcopy__`/`__reduce_ex__`/`__getstate__` hooks), `operator`, `itertools` (including Python 3.13 `batched(..., strict=)`), `functools` (`reduce`, `partial`, `lru_cache`/`cache`, `wraps`, `total_ordering`, `cmp_to_key`, `singledispatch`, `cached_property`), `collections` (`Counter`, `defaultdict`, `deque`, `namedtuple`, `OrderedDict`, `ChainMap`), `heapq`, `bisect`, `statistics`, `re` (JavaScript-backed: groups, named groups and backreferences, inline and scoped flags, Unicode classes, `pos`/`endpos`, `sub` with templates or callables, `split`), `dataclasses` (`dataclass`, `field`, `asdict`, `astuple`, `replace`, `fields`; `order`, `frozen`), `enum` (`Enum`, `IntEnum`, `StrEnum`, `Flag`, `IntFlag`, `auto`, plus `int`/`str`/`float` data-type mixins), `typing` (`TypeVar`, `ParamSpec`, `TypeVarTuple`, `TypeAliasType`, `Generic`, `NoDefault`, `Unpack`, generic aliases, `NamedTuple`, `TypedDict`), `types` (`SimpleNamespace`, `MappingProxyType`, `GenericAlias`, `UnionType`, `new_class`, `prepare_class`, core type aliases), `abc` (`ABC`, `ABCMeta` with `.register()`, `__subclasscheck__`/`__instancecheck__`, `__subclasshook__`, and abstract-method enforcement), `weakref` (`ref`, `proxy`, `WeakKeyDictionary`, `WeakValueDictionary`, `WeakSet`, `finalize`), `contextlib` (`contextmanager`, `suppress`, `closing`, `nullcontext`, `ExitStack`), `struct` (`pack`/`unpack`/`calcsize`/`iter_unpack`/`Struct` for the standard codes and byte orders), `hashlib` (`md5`, `sha1`, `sha256`, `sha512`), `platform`, `importlib` (`import_module` over the project), `__future__` (`annotations`: PEP 563 string annotations, plus `X | None` union types) |
 | Files | a virtual filesystem holding the project folder's files (the CLI and the playground load them; 8 MiB per file, and 64 MiB in total from the CLI or 16 MiB through the WebAssembly module the playground uses): `open()` in text and binary modes with `read`/`readline`/`readlines`/`write`/`seek`/`tell`/`truncate`, iteration and context managers; `os.listdir`/`makedirs`/`remove`/`rename`/`rmdir`/`getcwd`, `os.path`, `pathlib.Path` (`read_text`, `write_bytes`, `glob`, `rglob`, `mkdir`, ...); `sys.argv` from the host. Written files are reported back to the host (`__zipp_py_vfs_changed`), which the CLI copies to disk and the playground shows in its tree |
-| Bundled Python-source modules | `zipp_gpu` (`crates/zipp-vm/src/lang/python/lib/shared/zipp_gpu.py`): float32 compute graphs (`Graph`, `Tensor`, `submit`, `program`, `to_json`, `execute_locally`) and prepared sessions (`Graph.prepare` -> `Session` with `run`, `run_steps`, `download`, `dispose`: the step validated once, weights and optimizer state carried on the device, several steps per request); `pickle` (reads protocols 0-5, writes protocol 2, with `persistent_load`/`find_class`), `zipfile` (stored entries, zip64 reads, modes `a` and `x`), `pathlib`, `argparse`, `inspect` (signatures, including bound methods and `functools.partial`; `*args`/`**kwargs` and the positional-only `/` are missing, since the runtime's code records omit them), `pytest` (`raises`, `approx`, `mark.parametrize`/`skip`/`skipif`, `fixture`, `tmp_path`, `main`; a `test_*.py` entry runs its tests automatically and a failure exits non-zero); and a `torch` subset (below). Each is registered by name and compiled the first time it is imported (once per process; `crates/zipp-vm/src/lang/python/lib/modules.txt` lists them), so a program pays nothing for the modules it never imports and `importlib.import_module` reaches any of them. `zipp_gpu.py` also runs under CPython, which is how the corpus checks it |
+| Bundled Python-source modules | `asyncio` (cooperative `EventLoop`, `Future`, `Task`, `TaskGroup`, `run`, `sleep`, `gather`, `create_task`, `ensure_future`, `wait_for`, `wait`, `as_completed`, `shield`, `timeout`/`timeout_at`, `Event`, `Lock`, `Semaphore`, `BoundedSemaphore`, `Condition`, `Barrier`, `Queue`/`LifoQueue`/`PriorityQueue`), `numbers` (PEP 3141 `Number`/`Complex`/`Real`/`Rational`/`Integral` tower), `fractions` (`Fraction` with exact arithmetic and CPython rational hashing), `zipp_gpu` (`crates/zipp-vm/src/lang/python/lib/shared/zipp_gpu.py`): float32 compute graphs (`Graph`, `Tensor`, `submit`, `program`, `to_json`, `execute_locally`) and prepared sessions (`Graph.prepare` -> `Session` with `run`, `run_steps`, `download`, `dispose`: the step validated once, weights and optimizer state carried on the device, several steps per request); `pickle` (reads protocols 0-5, writes protocol 2, with `persistent_load`/`find_class`), `zipfile` (stored entries, zip64 reads, modes `a` and `x`), `pathlib`, `argparse`, `inspect` (signatures, including bound methods and `functools.partial`; `*args`/`**kwargs` and the positional-only `/` are missing, since the runtime's code records omit them), `pytest` (`raises`, `approx`, `mark.parametrize`/`skip`/`skipif`, `fixture`, `tmp_path`, `main`; a `test_*.py` entry runs its tests automatically and a failure exits non-zero); and a `torch` subset (below). Each is registered by name and compiled the first time it is imported (once per process; `crates/zipp-vm/src/lang/python/lib/modules.txt` lists them), so a program pays nothing for the modules it never imports and `importlib.import_module` reaches any of them. `zipp_gpu.py` also runs under CPython, which is how the corpus checks it |
 | `torch` subset | `crates/zipp-vm/src/lang/python/lib/torch*.py` over the runtime's `_zipp_tensor` kernels (contiguous tensors on typed-array storages): dtypes, creation (`tensor`, `zeros`, `ones`, `full`, `arange`, `eye`, `randn`, `rand`, `randint`, `multinomial`, `randperm`), indexing and slicing (basic, advanced, boolean), shape ops (`view`, `reshape`, `permute`, `transpose`, `cat`, `stack`, `roll`, `unsqueeze`, `expand`, ...), elementwise and reduction ops with broadcasting (including `sin`, `cos` and `rsqrt`, and `repeat_interleave`, which together with `outer`/`cat`/`narrow` are what a rotary, grouped-query, RMSNorm decoder needs), `matmul`/`@`/`einsum`, `softmax`/`log_softmax`, comparisons, in-place ops, reverse-mode autograd (`backward`, `autograd.grad`, `no_grad`, `requires_grad`), `nn` (`Module`, `Parameter`, `Sequential`, `ModuleList`, `Linear`, `Embedding`, `Conv1d` with stride 1, `GRUCell`, `LSTMCell`, `LayerNorm`, `Dropout`, activations, the common losses), `nn.functional`, `nn.init`, `nn.utils.clip_grad_norm_`, `optim` (`SGD`, `Adam`, `AdamW`, `RMSprop`, `lr_scheduler.StepLR`), `manual_seed`/`Generator` (seeded and deterministic; sample streams are not guaranteed to match PyTorch's), `save`/`load` of state dicts and tensors in PyTorch's zip checkpoint format (checkpoints written by PyTorch load, and the ones written here load in PyTorch). Everything runs on CPU kernels inside the engine: eager execution is CPU-only; experimental `torch.compile` records supported GPU inference and dense training steps (relu/gelu/sigmoid/tanh, softmax, MSE or fused cross-entropy, SGD with momentum, Adam, AdamW) with asynchronous completion, and `compiled.prepare(x, target)` records a step once as a device-resident session (`step`/`steps` feed only the batch, weights and optimizer state carry on the device, `sync` writes them back into the model and `optimizer.state`, `dispose` frees them; at most 15 parameter tensors with Adam under the protocol's 64 outputs) (see [Torch compatibility](TORCH_COMPATIBILITY.md)) |
 | Host requests | a program can hand its embedder plain-data work (`kind`, `payload`, a callback); the wasm engine exposes them through `takeHostRequests()` and answers through `pythonCall("__zipp_py_deliver", [id, reply])`. `zipp_gpu.Graph.submit` raises `gpu.execute`; `Graph.prepare` and its `Session` raise `gpu.session.create` / `run` / `download` / `dispose`, and the runtime's `_zipp_gpu.request` admits exactly those kinds. Compiled without a host (`zipp py`), `submit` and sessions evaluate with the library's own float32 reference implementation (under Zipp on the tensor kernels, carried tensors staying as storage between steps), so CPython and Zipp agree (`tests/python_corpus/ml_gpu_session.py`, `ml_gpu_prepared.py`) |
-| Object model | metaclasses (`metaclass=`, inherited metaclasses, metaclass `__call__`/`__new__`, `type(name, bases, ns)`), `__init_subclass__` with class keywords, `__set_name__`, `__class_getitem__`, `__slots__` (attribute restriction), user descriptors (`__get__`/`__set__`), a live `obj.__dict__` that is a real `dict` (assignable; non-string keys are refused), function `__annotations__` |
+| Object model | metaclasses (`metaclass=`, inherited metaclasses, metaclass `__call__`/`__new__`/`__getattribute__`/`__instancecheck__`/`__subclasscheck__`, `type(name, bases, ns)`), `__getattribute__` overrides, `abc.ABCMeta` virtual subclasses, `__init_subclass__` with class keywords, `__set_name__`, `__class_getitem__`, `__mro_entries__`, `__slots__` (attribute restriction), user descriptors (`__get__`/`__set__`/`__delete__`), a live `obj.__dict__` that is a real `dict` (assignable; non-string keys are refused), function & class `__annotations__` and `__type_params__` |
 | `match` | every pattern kind: literals and value patterns, singletons, captures and wildcards, `as`, `\|` alternatives, sequence patterns with a star, mapping patterns with `**rest`, class patterns with positional (`__match_args__`, self-matching builtins, named tuples, dataclasses) and keyword sub-patterns, guards |
 | Tracebacks | an uncaught exception prints the full call chain, outermost frame first, with file, line and function names (long recursions are collapsed like CPython's `[Previous line repeated N more times]`), plus the chained cause or context |
 | Host `ui` module | buffered drawing commands (`canvas`, `clear`, `rect`, `circle`, `line`, `text`, `font`, `button`) and an input snapshot (`mouse`, `clicked`, `key`, `width`, `height`) for a host that renders them; see the wasm README and `crates/zipp-wasm/playground/` |
 
 ## What does not run yet
 
-- `async`/`await`, type-parameter syntax, `except*`.
 - `complex`: `cmath` and `**` with a non-integral or large exponent take their
   transcendental functions from the engine's libm, so a result can differ from
   CPython's in the last bit. `abs()` of a complex, and the hypot that `**` and
   `cmath` use, is correctly rounded; CPython on Windows uses the C runtime's
-  `hypot`, which is not, so there about 1 value in 12 differs by an ulp. There
-  is no `numbers` module to register with.
+  `hypot`, which is not, so there about 1 value in 12 differs by an ulp.
 - `\N{...}` knows a bundled table of names rather than all of Unicode
   (Latin-1, Greek letters, punctuation, currency, arrows, mathematical
   operators, box drawing, symbols, dingbats, common emoji, the control and
@@ -68,7 +66,9 @@ integration date every corpus program matched.
   [Torch compatibility](TORCH_COMPATIBILITY.md)) and full PyTorch compiler
   support are missing, and float64 accumulations differ from PyTorch's
   float32 kernels in the last bits.
-- `__getattribute__` overrides, weak references, `__del__`.
+- `__del__` finalizers and GC-triggered `weakref` expiry (`weakref` references,
+  proxies, weak collections and explicit `finalize` calls work, but references
+  stay alive rather than being cleared by the engine's garbage collector).
 - `int` values are limited by the engine's BigInt size cap (2^30 bits; 2^20
   in the hardened profile). Any operation whose result would exceed it,
   including `**` and `<<` (checked before computing), raises
@@ -76,9 +76,6 @@ integration date every corpus program matched.
 - `time.sleep` blocks in a standalone run but is a no-op under an embedding
   host (the wasm engine), so the host's worker is never held; `perf_counter`,
   `monotonic` and `process_time` read the engine's monotonic clock.
-- `enum`: `IntEnum`/`IntFlag` members are not `int` instances, and data-type
-  mixins such as `class S(str, Enum)` do not build their members through
-  the mixin type (a user `__init__` does receive each member's value).
 - `re` runs on the engine's JavaScript regex with Python's syntax, flags and
   `\w`/`\d`/`\s` sets translated; `\W`/`\S` inside a character class are
   approximations, and `Pattern.match(s, pos)` that fails still scans to the
@@ -97,34 +94,33 @@ integration date every corpus program matched.
 - Performance: Python compiles to the engine's register bytecode plus 27
   fused Python-only instructions (arithmetic and compare-and-branch, class
   guards, instance-dict, global, method and class-attribute reads through
-  per-VM, per-site caches keyed by class version, attribute and
-  method lookup, subscripts, `len`, `isinstance`, unpacking, sequence
-  displays, raise and handler entry, the generator loop step) and native
-  helpers for json, the common `str` methods, `str %`, `hash`, `heapq`,
-  `bisect`, generator steps and iterator steps; every one defers to the
-  JavaScript runtime whenever it cannot answer exactly. On the command line
-  (`zipp py`/`zipp run`, no instruction budget) hot Python loops (1024
-  iterations) also compile to native code: float and small-int arithmetic,
-  comparisons and `range` counters run inline, and every other fused
-  instruction calls the interpreter's own step, so results are identical.
-  Attribute reads and writes on an instance whose attributes are in
-  layout-mode storage also run inline, guarded by the class's version and the
-  storage's layout; any change runs the ordinary step (a
-  153-program corpus is byte-identical JIT on/off). Loops over generators also compile (each
-  generator step runs on a nested interpreter loop, as a call from compiled
-  code does), and `try`/`except`/`finally` inside a hot loop compiles with its
-  normal completion inline. Loops that spend most of their time in calls, and
-  whole functions (`ZIPP_PY_TIERC=1` compiles them, measured slower on
-  call-heavy code), stay interpreted; the tier is x86-64 only; embedders with
-  an instruction budget, sandbox and WebAssembly keep the JIT off. Measured
-  against CPython 3.13 over the 36 programs of `tools/python_bench.py`
-  (geomean of work time): about 3x slower interpreted and 1.75x with the
-  JIT, from `range_loop`, `int_arith`, `float_arith`, `tuple_swap` and
-  `global_read` (faster than CPython with the JIT) to instance creation and
-  list comprehensions (about 5-7x). Ints within ±2^46 are unboxed
-  immediates in the value word (larger ones are heap BigInts), and dicts, sets and instance attributes live in native tables
-  (`lang/python/vm/py_table.rs`, with hidden-class layouts in `lang/python/vm/py_table_layout.rs`). `ZIPP_PY_PROF=1` prints fused-op hit and slow-path counts, runtime
-  helper call counts and the allocation mix at exit.
+  per-VM, per-site caches keyed by class version, specialized call sites,
+  attribute and method lookup, subscripts, `len`, `isinstance`, unpacking,
+  sequence displays, raise and handler entry, the generator loop step) and
+  native helpers for json, the common `str` methods, `str %`, `hash` (with
+  a string-hash cache and zero-alloc tuple hashing), `heapq`, `bisect`,
+  stack-buffered generator steps, frame-less leaf-function execution and
+  iterator steps; every one defers to the JavaScript runtime whenever it
+  cannot answer exactly. On the command line (`zipp py`/`zipp run`, no
+  instruction budget) hot Python loops (1024 iterations) and pure small-int
+  self-recursive functions compile to native x86-64 code: float and small-int
+  arithmetic, comparisons, `range` counters, layout-mode attribute reads and
+  writes, trivial `@property` accessors, `list`/`tuple` indexing and append,
+  unpacking, `len`, `math.sqrt` (`sqrtsd`) and native `str` methods run
+  inline, guarded by class versions and layouts; any guard miss runs the
+  ordinary step (a 203-program corpus is byte-identical JIT on/off). Loops
+  over generators and `try`/`except`/`finally` inside hot loops also compile
+  with their normal completion inline. Embedders with an instruction budget,
+  sandbox and WebAssembly keep the JIT off. Measured against CPython 3.13
+  over the 36 programs of `tools/python_bench.py` (5-rep geomean of work
+  time with JIT): **0.75x** overall (**0.74x** across the 30 microbenchmarks
+  and **0.85x** across the 6 CPython-comparable macrobenchmarks — faster than
+  CPython 3.13 on both suites). Ints within ±2^46 are unboxed immediates in
+  the value word (larger ones are heap BigInts), and dicts, sets and instance
+  attributes live in native tables (`lang/python/vm/py_table.rs`, with
+  hidden-class layouts in `lang/python/vm/py_table_layout.rs`).
+  `ZIPP_PY_PROF=1` prints fused-op hit and slow-path counts, runtime helper
+  call counts and the allocation mix at exit.
 - Errors: uncaught exceptions print CPython's traceback (file paths relative
   to the project, no caret lines) and exit with status 1; `e.__traceback__`,
   `sys.exc_info()[2]` and the `traceback` module give CPython's frames and

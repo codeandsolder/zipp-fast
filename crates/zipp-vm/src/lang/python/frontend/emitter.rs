@@ -20,7 +20,7 @@
 //! `Instr::Py*` instructions, or short instruction sequences over the
 //! runtime's per-class cache tables `ga/sa/gm/gb/gp/sp/gx`, see core.js)
 //! and lay its runtime-helper fallback out of line ([`Emitter::defer_cold`]).
-use super::symtable::{Scope, ScopeKind, SymKind, SymTable};
+use super::symtable::{Scope, ScopeKey, ScopeKind, SymKind, SymTable};
 use super::{Project, BUILTIN_MODULES};
 use crate::bytecode::{FuncProto, Instr, Program, Reg, NO_NAME};
 use ast::Ranged;
@@ -110,6 +110,7 @@ pub(super) struct LoopCtx {
     pub breaks: Vec<usize>,
     pub continues: Vec<usize>,
     pub handler_depth: usize,
+    pub except_star_depth: usize,
 }
 
 /// What a module contributes to diagnostics and line stamps.
@@ -170,6 +171,11 @@ pub(super) struct Emitter<'a> {
     /// Blocks save and restore it, so a binding made inside a branch, loop
     /// body or handler is definite only until that block ends.
     pub definite: BTreeSet<String>,
+    /// Function locals whose every assignment in the body is an int literal
+    /// or safe int-only augmented assignment (`+=`/`-=`/`*=`/`&=`/`|=`/`^=`).
+    /// Combined with `is_definite(name)`, guarantees runtime value is a Python
+    /// `int` without dynamic checks.
+    pub int_locals: BTreeSet<String>,
     /// Non-zero while compiling an operand that may not be evaluated (the
     /// right side of `and`/`or`, a conditional expression's arms): a walrus
     /// there must not count as a definite binding.
@@ -177,6 +183,7 @@ pub(super) struct Emitter<'a> {
     /// `from __future__ import annotations`: annotations stay strings.
     pub future_annotations: bool,
     pub control_depth: usize,
+    pub except_star_depth: usize,
     pub loops: Vec<LoopCtx>,
     pub handler_depth: usize,
     /// The handlers open at this point of the code, innermost last, one per
@@ -261,7 +268,7 @@ impl<'a> Emitter<'a> {
         proto.simple_params = true;
         proto.param_count = 1;
         proto.length = 1;
-        proto.is_generator = table.scopes[scope].is_generator;
+        proto.is_generator = table.scopes[scope].is_generator || table.scopes[scope].is_async;
         Emitter {
             proto,
             unit,
@@ -282,9 +289,11 @@ impl<'a> Emitter<'a> {
             locals: BTreeMap::new(),
             cells: BTreeMap::new(),
             definite: BTreeSet::new(),
+            int_locals: BTreeSet::new(),
             speculative: 0,
             future_annotations: false,
             control_depth: 0,
+            except_star_depth: 0,
             loops: Vec::new(),
             handler_depth: 0,
             handlers: Vec::new(),
@@ -1115,6 +1124,10 @@ impl<'a> Emitter<'a> {
             let text = self.unit.source.get(start..end).unwrap_or("").to_owned();
             return self.string(&text);
         }
+        if let ast::Expr::Starred(s) = expr {
+            let inner = self.expr(&s.value, depth + 1)?;
+            return self.helper("unpack_type", &[inner]);
+        }
         self.expr(expr, depth)
     }
 
@@ -1771,7 +1784,7 @@ impl<'a> Emitter<'a> {
     }
     /// Whether a read of `name` here can skip the unbound check: bound on
     /// every path to this point and never the target of a `del`.
-    fn is_definite(&self, name: &str) -> bool {
+    pub(super) fn is_definite(&self, name: &str) -> bool {
         self.definite.contains(name) && !self.scope().deleted.contains(name)
     }
     /// Whether a walrus anywhere in the code this one runs in can rebind
@@ -1937,7 +1950,20 @@ impl<'a> Emitter<'a> {
         body: impl FnOnce(&mut Emitter<'a>) -> R<()>,
     ) -> R<(u32, &'a Scope)> {
         let range = node.range();
-        let key = (u32::from(range.start()), u32::from(range.end()));
+        let key = ScopeKey::Node(u32::from(range.start()), u32::from(range.end()));
+        self.compile_child_key(key, node, name, qualname, signature, body)
+    }
+
+    /// Compile the scope identified by `key` into a new proto; returns its id.
+    pub fn compile_child_key(
+        &mut self,
+        key: ScopeKey,
+        node: &impl Ranged,
+        name: &str,
+        qualname: String,
+        signature: Option<&ast::Arguments>,
+        body: impl FnOnce(&mut Emitter<'a>) -> R<()>,
+    ) -> R<(u32, &'a Scope)> {
         let scope_id = *self
             .table
             .by_offset
@@ -2042,7 +2068,13 @@ impl<'a> Emitter<'a> {
         let varargs_r = self.boolean(varargs)?;
         let varkw_r = self.boolean(varkw)?;
         let cells = self.cells_for(child)?;
-        let isgen = self.boolean(child.is_generator)?;
+        let fn_mode = match (child.is_async, child.is_generator) {
+            (false, false) => 0,
+            (false, true) => 1,
+            (true, false) => 2,
+            (true, true) => 3,
+        };
+        let isgen = self.small_int(fn_mode)?;
         let module = self.string(self.module_name())?;
         let globals = self.globals()?;
         self.helper(

@@ -1,0 +1,28 @@
+notes ['first note', 'second note']
+bad_note_type TypeError
+narrow ExceptionGroup all exc 2 ExceptionGroup('all exc', [ValueError('a'), TypeError('b')])
+base BaseExceptionGroup mixed 2 BaseExceptionGroup('mixed', [ValueError('a'), KeyboardInterrupt('k')])
+nest_base_in_eg TypeError
+empty_eg ValueError
+non_str_msg TypeError
+split_m ExceptionGroup('outer', [ValueError('v1'), ExceptionGroup('inner', [ValueError('v2')])]) ['outer-note']
+split_u ExceptionGroup('outer', [ExceptionGroup('inner', [KeyError('k1')]), TypeError('t1')]) ['outer-note']
+subgroup_key ExceptionGroup('outer', [ExceptionGroup('inner', [KeyError('k1')])])
+subgroup_none None
+subgroup_pred ExceptionGroup('outer', [ExceptionGroup('inner', [ValueError('v2')])])
+subgroup_tuple ExceptionGroup('outer', [ExceptionGroup('inner', [KeyError('k1')]), TypeError('t1')])
+custom_derive MyEG 42 MyEG('tagged', [ValueError('a')])
+multi_match [('val', ['v']), ('tk', ['t', "'k'"]), 'finally']
+normal_else ['try', 'else', 'finally']
+partial_caught ExceptionGroup('outer', [ExceptionGroup('inner', [TypeError(2)])])
+partial_rem ExceptionGroup('outer', [ValueError(1), ExceptionGroup('inner', [KeyError(3)])])
+solo_caught ExceptionGroup ExceptionGroup('', (ValueError('solo'),))
+reraise_all ExceptionGroup('g', [ValueError(1), TypeError(2)])
+reraise_partial ExceptionGroup('g', [ValueError(1)])
+handler_one_new RuntimeError RuntimeError('h1') ExceptionGroup
+handler_new_plus_rem ExceptionGroup ["RuntimeError('h1')", "ExceptionGroup('g', [TypeError(2)])"]
+handler_two_new ExceptionGroup ["RuntimeError('h1')", "RuntimeError('h2')"]
+forbid_eg TypeError
+bound_inside 1
+unbound_after True
+nested_loop_ok [0, 2, 3]
