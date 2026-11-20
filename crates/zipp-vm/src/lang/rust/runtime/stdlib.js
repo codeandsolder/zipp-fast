@@ -170,11 +170,13 @@
     function fromJsonRaw(raw, targetDesc) {
         const td = parseTypeDesc(targetDesc);
         const targetType = td.base;
-        if (targetType && rt.structs[targetType] && raw && typeof raw === "object" && !Array.isArray(raw)) {
-            const st = rt.structs[targetType];
+        const shortTarget = targetType && targetType.indexOf("::") >= 0 ? targetType.slice(targetType.lastIndexOf("::") + 2) : targetType;
+        const stLookup = targetType ? (rt.structs[targetType] || rt.structs[shortTarget]) : null;
+        if (stLookup && raw && typeof raw === "object" && !Array.isArray(raw)) {
+            const st = stLookup;
             const cMeta = st.serde || null;
             const fMetas = (cMeta && cMeta.fields) ? cMeta.fields : null;
-            const obj = { __rs: 1, __type: targetType, __tuple: false };
+            const obj = { __rs: 1, __type: st.shortName || shortTarget, __tuple: false };
             for (let i = 0; i < st.fields.length; i++) {
                 const fname = st.fields[i][0];
                 const ftype = st.fields[i][1];
@@ -188,14 +190,18 @@
                     obj[fname] = fromJsonRaw(raw[fname], ftype);
                 } else if (fm && fm.alias && Object.prototype.hasOwnProperty.call(raw, fm.alias)) {
                     obj[fname] = fromJsonRaw(raw[fm.alias], ftype);
+                } else if (fm && typeof fm.default_fn === "function") {
+                    obj[fname] = fm.default_fn();
                 } else {
                     obj[fname] = rt.defaultOf(parseTypeDesc(ftype).base);
                 }
             }
             return obj;
         }
-        if (targetType && rt.enums[targetType]) {
-            const en = rt.enums[targetType];
+        const enLookup = targetType ? (rt.enums[targetType] || rt.enums[shortTarget]) : null;
+        if (enLookup) {
+            const en = enLookup;
+            const enName = en.shortName || shortTarget;
             const cMeta = en.serde || null;
             const matchVariant = function (k) {
                 const vs = Object.keys(en.variants || {});
@@ -209,24 +215,24 @@
             };
             if (typeof raw === "string") {
                 const vn = matchVariant(raw);
-                if (vn === null) throw new Error("unknown variant `" + raw + "` for `" + targetType + "`");
+                if (vn === null) throw new Error("unknown variant `" + raw + "` for `" + enName + "`");
                 const disc = en.variants && Object.prototype.hasOwnProperty.call(en.variants, vn) ? en.variants[vn] : null;
-                return R.mkEnumUnit(targetType, vn, disc);
+                return R.mkEnumUnit(enName, vn, disc);
             }
             if (raw && typeof raw === "object" && !Array.isArray(raw)) {
                 const ks = Object.keys(raw);
                 if (ks.length === 1) {
                     const vn = matchVariant(ks[0]);
-                    if (vn === null) throw new Error("unknown variant `" + ks[0] + "` for `" + targetType + "`");
+                    if (vn === null) throw new Error("unknown variant `" + ks[0] + "` for `" + enName + "`");
                     const val = raw[ks[0]];
-                    if (Array.isArray(val)) return R.mkEnumTuple(targetType, vn, val.map(function (x) { return fromJsonRaw(x, ""); }));
+                    if (Array.isArray(val)) return R.mkEnumTuple(enName, vn, val.map(function (x) { return fromJsonRaw(x, ""); }));
                     if (val && typeof val === "object") {
                         const d = {};
                         const iks = Object.keys(val);
                         for (let i = 0; i < iks.length; i++) d[iks[i]] = fromJsonRaw(val[iks[i]], "");
-                        return R.mkEnumStruct(targetType, vn, d);
+                        return R.mkEnumStruct(enName, vn, d);
                     }
-                    return R.mkEnumTuple(targetType, vn, [fromJsonRaw(val, "")]);
+                    return R.mkEnumTuple(enName, vn, [fromJsonRaw(val, "")]);
                 }
             }
         }
@@ -252,6 +258,9 @@
         if (Array.isArray(raw)) return { __rs: 7, items: raw.map(function (x) { return fromJsonRaw(x, ""); }) };
         return raw;
     }
+
+    rt.parseTypeDesc = parseTypeDesc;
+    rt.fromJsonRaw = fromJsonRaw;
 
     // ---- Path helpers ----
     function mkPath(p) {
@@ -297,6 +306,21 @@
         if (typeof __zipp_rs_proc !== "function") return null;
         return __zipp_rs_proc(op, a === undefined ? "" : a, b === undefined ? "" : b, c === undefined ? "" : c);
     }
+
+    rt.fsCall = fsCall;
+    rt.envCall = envCall;
+    rt.timeCall = timeCall;
+    rt.netCall = netCall;
+    rt.cryptoCall = cryptoCall;
+    rt.procCall = procCall;
+    rt.mkPath = mkPath;
+    rt.statusReason = statusReason;
+    rt.compileRoutePattern = compileRoutePattern;
+    rt.matchRoute = matchRoute;
+    rt.joinRoutePrefix = joinRoutePrefix;
+    rt.mimeForPath = mimeForPath;
+    rt.parseQueryString = parseQueryString;
+    rt.parseCookies = parseCookies;
 
     // ---- TCP incoming iterator ----
     function tcpIncomingIter(listener) {
@@ -352,6 +376,9 @@
             queryMap: parseQueryString(queryStr),
             headers: headers,
             params: params,
+            pathParamList: [],
+            extensions: Object.create(null),
+            peerAddr: null,
             body: typeof bodyStr === "string" ? bodyStr : strVal(bodyStr || ""),
             state: undefined
         };
@@ -407,46 +434,84 @@
         const segs = clean === "/" ? [] : clean.slice(1).split("/");
         const rsegs = route.pat.segs;
         const params = {};
+        const paramList = [];
         let i = 0;
         for (; i < rsegs.length; i++) {
             const rs = rsegs[i];
             if (rs.startsWith("*")) {
-                params[rs.slice(1) || "wildcard"] = segs.slice(i).join("/");
-                return params;
+                const v = segs.slice(i).join("/");
+                params[rs.slice(1) || "wildcard"] = v;
+                paramList.push(v);
+                return { map: params, list: paramList };
             }
             if (i >= segs.length) return null;
             if (rs.startsWith(":")) {
-                params[rs.slice(1)] = decodeURIComponent(segs[i]);
+                const v = decodeURIComponent(segs[i]);
+                params[rs.slice(1)] = v;
+                paramList.push(v);
             } else if (rs.startsWith("{") && rs.endsWith("}")) {
-                params[rs.slice(1, -1)] = decodeURIComponent(segs[i]);
+                const v = decodeURIComponent(segs[i]);
+                params[rs.slice(1, -1)] = v;
+                paramList.push(v);
             } else if (rs !== segs[i]) {
                 return null;
             }
         }
-        return i === segs.length ? params : null;
+        return i === segs.length ? { map: params, list: paramList } : null;
     }
 
     function coerceHandlerResult(res) {
         res = R.blockOn(res);
+        return coerceHandlerValue(res);
+    }
+    function coerceHandlerValue(res) {
         res = deref(res);
         if (res && res.__rs === 15 && res.kind === "response") return res;
         if (res && res.__rs === 2 && res.__enum === "Result") {
-            if (res.__var === "Ok") return coerceHandlerResult(res.__data[0]);
+            if (res.__var === "Ok") return coerceHandlerValue(res.__data[0]);
             const errVal = deref(res.__data[0]);
             if (errVal && (errVal.__rs === 1 || errVal.__rs === 2)) {
                 const tag = errVal.__rs === 1 ? errVal.__type : errVal.__enum;
                 const intoResp = rt.lookupUserMethod(tag, "into_response");
-                if (intoResp) return coerceHandlerResult(intoResp(errVal));
+                if (intoResp) return coerceHandlerValue(intoResp(errVal));
             }
             return mkResponse(500, rt.fmtDisplay(errVal), "text/plain; charset=utf-8");
+        }
+        if (res && res.__rs === 1 && res.__type === "Json" && res.__tuple) {
+            return mkResponse(200, JSON.stringify(toJsonRaw(res[0])), "application/json; charset=utf-8");
         }
         if (res && (res.__rs === 1 || res.__rs === 2)) {
             const tag = res.__rs === 1 ? res.__type : res.__enum;
             const intoResp = rt.lookupUserMethod(tag, "into_response");
-            if (intoResp) return coerceHandlerResult(intoResp(res));
+            if (intoResp) return coerceHandlerValue(intoResp(res));
         }
-        if (res && res.__rs === 3 && res.__items.length === 2 && typeof deref(res.__items[0]) === "number") {
-            return mkResponse(Number(deref(res.__items[0])), strVal(res.__items[1]), "text/plain; charset=utf-8");
+        if (res && res.__rs === 3 && res.__items.length >= 2 && typeof deref(res.__items[0]) === "number") {
+            const code = Number(deref(res.__items[0])) | 0;
+            if (res.__items.length === 2) {
+                const bodyResp = coerceHandlerValue(res.__items[1]);
+                bodyResp.status = code;
+                return bodyResp;
+            }
+            if (res.__items.length === 3) {
+                const hdrs = deref(res.__items[1]);
+                const bodyResp = coerceHandlerValue(res.__items[2]);
+                bodyResp.status = code;
+                if (hdrs && hdrs.__rs === 7) {
+                    for (let i = 0; i < hdrs.items.length; i++) {
+                        const pair = deref(hdrs.items[i]);
+                        if (pair && pair.__rs === 3) {
+                            rt.mapSetRaw(bodyResp.headers, R.mkString(strVal(pair.__items[0])), R.mkString(strVal(pair.__items[1])));
+                        }
+                    }
+                } else if (hdrs && hdrs.__rs === 15 && hdrs.kind === "header_map") {
+                    const es = rt.mapEntries(hdrs.map);
+                    for (let i = 0; i < es.length; i++) rt.mapSetRaw(bodyResp.headers, es[i][0], es[i][1]);
+                }
+                return bodyResp;
+            }
+        }
+        if (typeof res === "number") {
+            return mkResponse(res | 0, "", "text/plain; charset=utf-8");
         }
         if (typeof res === "string" || (res && res.__rs === 4)) {
             return mkResponse(200, strVal(res), "text/plain; charset=utf-8");
@@ -459,6 +524,8 @@
         }
         return mkResponse(200, JSON.stringify(toJsonRaw(res)), "application/json; charset=utf-8");
     }
+    rt.intoResponse = coerceHandlerValue;
+    rt.coerceHandlerValue = coerceHandlerValue;
 
     function mimeForPath(p) {
         const lower = p.toLowerCase();
@@ -497,6 +564,9 @@
     }
 
     function routerDispatch(router, req) {
+        return R.blockOn(routerDispatchAsync(router, req));
+    }
+    async function routerDispatchAsync(router, req) {
         req.state = router.state;
         const routes = router.routes;
         let pathMatched = false;
@@ -504,28 +574,35 @@
         let matchedParams = null;
         for (let i = 0; i < routes.length; i++) {
             const route = routes[i];
-            const params = matchRoute(route, req.path);
-            if (params !== null) {
+            const m = matchRoute(route, req.path);
+            if (m !== null) {
                 pathMatched = true;
                 if (route.method === "ANY" || route.method === req.method) {
                     matchedRoute = route;
-                    matchedParams = params;
+                    matchedParams = m;
                     break;
                 }
             }
         }
         if (matchedParams) {
-            const ks = Object.keys(matchedParams);
+            const ks = Object.keys(matchedParams.map);
             for (let i = 0; i < ks.length; i++) {
-                rt.mapSetRaw(req.params, R.mkString(ks[i]), R.mkString(matchedParams[ks[i]]));
+                rt.mapSetRaw(req.params, R.mkString(ks[i]), R.mkString(matchedParams.map[ks[i]]));
             }
+            req.pathParamList = matchedParams.list;
         }
-        let exec = function (r) {
+        let exec = async function (r) {
             if (matchedRoute) {
                 const st = matchedRoute.hasOwnState ? matchedRoute.state : router.state;
                 const useState = matchedRoute.hasOwnState || router.hasState;
                 r.state = st;
-                return coerceHandlerResult(useState ? matchedRoute.handler(r, st) : matchedRoute.handler(r));
+                const handler = matchedRoute.handler;
+                if (handler && handler.__rs_params && rt.invokeAxumHandler) {
+                    const out = await rt.invokeAxumHandler(handler, r, st, null);
+                    return coerceHandlerValue(out);
+                }
+                const out = await (useState ? handler(r, st) : handler(r));
+                return coerceHandlerValue(out);
             }
             // Check static file mounts (`serve_dir`)
             if (router.staticDirs && (r.method === "GET" || r.method === "HEAD")) {
@@ -546,20 +623,85 @@
                 }
             }
             if (router.fallback) {
-                return coerceHandlerResult(router.hasState ? router.fallback(r, router.state) : router.fallback(r));
+                const out = await (router.hasState ? router.fallback(r, router.state) : router.fallback(r));
+                return coerceHandlerValue(out);
             }
             if (pathMatched) return mkResponse(405, "Method Not Allowed", "text/plain; charset=utf-8");
             return mkResponse(404, "Not Found", "text/plain; charset=utf-8");
         };
-        // Wrap middlewares (outermost first; supports sync and async middleware!)
-        for (let i = router.middlewares.length - 1; i >= 0; i--) {
-            const mw = router.middlewares[i];
-            const next = exec;
-            exec = function (r) { return coerceHandlerResult(mw(r, next)); };
+        // Wrap route-specific layers (innermost first; `route.layers` stores outermost at index 0)
+        const wrapLayer = function (layer, innerExec) {
+            const mw = deref(layer);
+            if (!mw) return innerExec;
+            if (typeof mw === "function") {
+                return async function (r) {
+                    const out = await mw(r, function (r2) { return R.blockOn(innerExec(r2)); });
+                    return coerceHandlerValue(out);
+                };
+            }
+            if (mw.__rs === 15 && mw.kind === "axum_mw") {
+                return async function (r) {
+                    const nextObj = { __rs: 15, kind: "axum_next", runFn: innerExec };
+                    const st = mw.hasState ? mw.state : router.state;
+                    if (mw.fn && mw.fn.__rs_params && rt.invokeAxumHandler) {
+                        const out = await rt.invokeAxumHandler(mw.fn, r, st, nextObj);
+                        return coerceHandlerValue(out);
+                    }
+                    const out = await mw.fn(R.mkTupleStruct("State", [st]), r, nextObj);
+                    return coerceHandlerValue(out);
+                };
+            }
+            if (mw.__rs === 15 && mw.kind === "cors_layer") {
+                return async function (r) {
+                    const originHdr = rt.mapGetRaw(r.headers, R.mkString("origin"));
+                    const originStr = originHdr ? strVal(originHdr) : null;
+                    let allowed = false;
+                    if (originStr) {
+                        if (mw.allowAny) allowed = true;
+                        else if (mw.predicate) {
+                            allowed = !!deref(mw.predicate({ __rs: 15, kind: "header_value", v: originStr }, r));
+                        } else if (mw.origins && mw.origins.indexOf(originStr) >= 0) {
+                            allowed = true;
+                        }
+                    }
+                    if (r.method === "OPTIONS" && originStr) {
+                        const pre = mkResponse(204, "", null);
+                        if (allowed) {
+                            rt.mapSetRaw(pre.headers, R.mkString("access-control-allow-origin"), R.mkString(originStr));
+                            if (mw.methods && mw.methods.length) {
+                                rt.mapSetRaw(pre.headers, R.mkString("access-control-allow-methods"), R.mkString(mw.methods.join(", ")));
+                            }
+                            if (mw.headers && mw.headers.length) {
+                                rt.mapSetRaw(pre.headers, R.mkString("access-control-allow-headers"), R.mkString(mw.headers.join(", ")));
+                            }
+                            rt.mapSetRaw(pre.headers, R.mkString("vary"), R.mkString("origin"));
+                        }
+                        return pre;
+                    }
+                    const resp = await innerExec(r);
+                    if (allowed && originStr) {
+                        rt.mapSetRaw(resp.headers, R.mkString("access-control-allow-origin"), R.mkString(originStr));
+                        rt.mapSetRaw(resp.headers, R.mkString("vary"), R.mkString("origin"));
+                    }
+                    return resp;
+                };
+            }
+            // TraceLayer, CompressionLayer, or unknown pass-through layer
+            return innerExec;
+        };
+        if (matchedRoute && matchedRoute.layers && matchedRoute.layers.length > 0) {
+            for (let i = matchedRoute.layers.length - 1; i >= 0; i--) {
+                exec = wrapLayer(matchedRoute.layers[i], exec);
+            }
         }
-        return exec(req);
+        // Wrap router-wide layers/middlewares (outermost first)
+        for (let i = router.middlewares.length - 1; i >= 0; i--) {
+            exec = wrapLayer(router.middlewares[i], exec);
+        }
+        return await exec(req);
     }
     rt.routerDispatch = routerDispatch;
+    rt.routerDispatchAsync = routerDispatchAsync;
 
     function responseToJson(resp) {
         const hdrs = [];
@@ -685,7 +827,10 @@
                     return refOf();
                 }
                 if (name === "or_default") {
-                    if (!m.map.has(mk)) m.map.set(mk, [k, 0]);
+                    if (!m.map.has(mk)) {
+                        const defVal = m.valType ? rt.defaultOf(m.valType) : 0;
+                        m.map.set(mk, [k, defVal === undefined ? 0 : defVal]);
+                    }
                     return refOf();
                 }
                 if (name === "and_modify") {
@@ -728,6 +873,15 @@
                         const stem = d > 0 ? b.slice(0, d) : b;
                         return mkPath(basePrefix + stem + (ext ? "." + ext : ""));
                     }
+                    case "set_file_name": {
+                        const fnm = strVal(args[0]);
+                        const b = pathBase(p);
+                        const basePrefix = p.slice(0, p.length - b.length);
+                        obj.p = basePrefix + fnm;
+                        return undefined;
+                    }
+                    case "as_os_str": return R.mkString(p);
+                    case "as_path": return obj;
                     case "exists": return fsCall("exists", p) === true;
                     case "is_file": return fsCall("is_file", p) === true;
                     case "is_dir": return fsCall("is_dir", p) === true;
@@ -836,7 +990,7 @@
                 if (name === "as_secs") return Number(ns / 1000000000n);
                 if (name === "as_millis") return Number(ns / 1000000n);
                 if (name === "as_micros") return Number(ns / 1000n);
-                if (name === "as_nanos") return Number(ns);
+                if (name === "as_nanos") return ns > 9007199254740991n ? ns : Number(ns);
                 if (name === "as_secs_f64" || name === "as_secs_f32") return Number(ns) / 1e9;
                 if (name === "subsec_nanos") return Number(ns % 1000000000n);
                 if (name === "subsec_millis") return Number((ns % 1000000000n) / 1000000n);
@@ -974,13 +1128,14 @@
                 break;
             }
             case "router": {
-                const addRoute = function (method, pat, handler, ownState, hasOwnState) {
+                const addRoute = function (method, pat, handler, ownState, hasOwnState, layers) {
                     obj.routes.push({
                         method: method,
                         pat: compileRoutePattern(strVal(pat)),
                         handler: handler,
                         state: ownState,
-                        hasOwnState: !!hasOwnState
+                        hasOwnState: !!hasOwnState,
+                        layers: layers ? layers.slice() : []
                     });
                     rt.setRouter(obj);
                     return obj;
@@ -1012,7 +1167,8 @@
                             const fullPat = joinRoutePrefix(prefix, r.pat.raw);
                             const hasSt = r.hasOwnState || sub.hasState;
                             const st = r.hasOwnState ? r.state : sub.state;
-                            addRoute(r.method, fullPat, r.handler, st, hasSt);
+                            const layers = sub.middlewares.concat(r.layers || []);
+                            addRoute(r.method, fullPat, r.handler, st, hasSt, layers);
                         }
                     }
                     return obj;
@@ -1024,9 +1180,22 @@
                             const r = sub.routes[i];
                             const hasSt = r.hasOwnState || sub.hasState;
                             const st = r.hasOwnState ? r.state : sub.state;
-                            addRoute(r.method, r.pat.raw, r.handler, st, hasSt);
+                            const layers = sub.middlewares.concat(r.layers || []);
+                            addRoute(r.method, r.pat.raw, r.handler, st, hasSt, layers);
                         }
                     }
+                    return obj;
+                }
+                if (name === "route_layer") {
+                    // Axum `.route_layer(L)`: wraps only routes currently in this router, outermost first!
+                    const layer = args[0];
+                    for (let i = 0; i < obj.routes.length; i++) {
+                        if (!obj.routes[i].layers) obj.routes[i].layers = [];
+                        obj.routes[i].layers.unshift(layer);
+                    }
+                    return obj;
+                }
+                if (name === "into_make_service" || name === "into_make_service_with_connect_info") {
                     return obj;
                 }
                 if (name === "serve_dir") {
@@ -1053,7 +1222,11 @@
                     rt.setRouter(obj);
                     return obj;
                 }
-                if (name === "layer" || name === "middleware") {
+                if (name === "layer") {
+                    obj.middlewares.unshift(args[0]);
+                    return obj;
+                }
+                if (name === "middleware") {
                     obj.middlewares.push(args[0]);
                     return obj;
                 }
@@ -1082,8 +1255,8 @@
                 break;
             }
             case "request": {
-                if (name === "method") return obj.method;
-                if (name === "uri") return obj.uri;
+                if (name === "method") return R.mkEnumUnit("Method", obj.method, null);
+                if (name === "uri") return { __rs: 15, kind: "uri", raw: obj.uri, path: obj.path, query: obj.queryStr };
                 if (name === "path") return obj.path;
                 if (name === "body") return obj.body;
                 if (name === "bytes") return { __rs: 7, items: rt.strToUtf8Bytes(obj.body) };
@@ -1092,7 +1265,16 @@
                 if (name === "param") return rt.mapGetOpt(obj.params, R.mkString(strVal(args[0])));
                 if (name === "params") return obj.params;
                 if (name === "header") return rt.mapGetOpt(obj.headers, R.mkString(strVal(args[0]).toLowerCase()));
-                if (name === "headers") return obj.headers;
+                if (name === "headers") return { __rs: 15, kind: "header_map", map: obj.headers };
+                if (name === "extensions" || name === "extensions_mut") {
+                    if (!obj.extensions) obj.extensions = Object.create(null);
+                    return { __rs: 15, kind: "extensions", store: obj.extensions };
+                }
+                if (name === "into_parts") {
+                    const parts = { __rs: 15, kind: "req_parts", req: obj };
+                    const body = { __rs: 15, kind: "body", data: obj.body };
+                    return R.mkTuple([parts, body]);
+                }
                 if (name === "bearer_token") {
                     const auth = rt.mapGetRaw(obj.headers, R.mkString("authorization"));
                     if (!auth) return None;
@@ -1124,7 +1306,13 @@
                 if (name === "status") return obj.status;
                 if (name === "body") return obj.body;
                 if (name === "header") return rt.mapGetOpt(obj.headers, R.mkString(strVal(args[0])));
-                if (name === "headers") return obj.headers;
+                if (name === "headers" || name === "headers_mut") return { __rs: 15, kind: "header_map", map: obj.headers };
+                if (name === "into_parts") {
+                    const parts = { __rs: 15, kind: "resp_parts", resp: obj };
+                    const body = { __rs: 15, kind: "body", data: obj.body };
+                    return R.mkTuple([parts, body]);
+                }
+                if (name === "into_response") return obj;
                 if (name === "with_status") { obj.status = Number(deref(args[0])) | 0; return obj; }
                 if (name === "with_header") {
                     rt.mapSetRaw(obj.headers, R.mkString(strVal(args[0])), R.mkString(strVal(args[1])));
@@ -1289,6 +1477,10 @@
                 if (name === "kind") return R.mkEnumUnit("ErrorKind", obj.errKind);
                 break;
         }
+        if (rt.callEcoMethod) {
+            const ecoRes = rt.callEcoMethod(obj, name, args, typeArgs);
+            if (ecoRes !== rt.ECO_MISS) return ecoRes;
+        }
         R.panic("unknown stdlib method `" + name + "` on `" + obj.kind + "`");
     }
     rt.callStdMethod = callStdMethod;
@@ -1315,7 +1507,13 @@
         const userFn = rt.lookupUserMethod(parent, last) || rt.lookupUserMethod(prefix, last);
         if (userFn) return userFn.apply(null, args);
 
-        // 2. Built-in prelude / std / ecosystem types & functions
+        // 2. Ecosystem crates (sqlx, axum, tower_http, tokio, tracing, argon2, jsonwebtoken, time, uuid, sha2, hmac, base64, hex, rand, reqwest, fs2, std::net, windows_sys)
+        if (rt.callEcoAssoc) {
+            const ecoRes = rt.callEcoAssoc(pathParts, args, typeArgs);
+            if (ecoRes !== rt.ECO_MISS) return ecoRes;
+        }
+
+        // 3. Built-in prelude / std / ecosystem types & functions
         switch (parent) {
             case "String":
                 if (last === "new" || last === "with_capacity" || last === "default") return R.mkString("");
@@ -1535,11 +1733,24 @@
                     return typeof txt === "string" ? Ok(R.mkString(txt)) : Err(mkIoErr("NotFound", "cannot read " + strVal(args[0])));
                 }
                 if (last === "read") {
+                    const hex = fsCall("read_bytes_hex", strVal(args[0]));
+                    if (typeof hex === "string") {
+                        const out = [];
+                        for (let i = 0; i + 1 < hex.length; i += 2) out.push(parseInt(hex.slice(i, i + 2), 16));
+                        return Ok({ __rs: 7, items: out });
+                    }
                     const txt = fsCall("read", strVal(args[0]));
                     return typeof txt === "string" ? Ok({ __rs: 7, items: rt.strToUtf8Bytes(txt) }) : Err(mkIoErr("NotFound", "cannot read " + strVal(args[0])));
                 }
                 if (last === "write") {
                     const d = deref(args[1]);
+                    if (d && d.__rs === 7) {
+                        let hx = "";
+                        for (let i = 0; i < d.items.length; i++) hx += (Number(d.items[i]) & 0xFF).toString(16).padStart(2, "0");
+                        const okHex = fsCall("write_bytes_hex", strVal(args[0]), hx);
+                        if (okHex === true) return Ok(undefined);
+                        if (okHex === false) return Err(mkIoErr("PermissionDenied", "failed to write " + strVal(args[0])));
+                    }
                     const s = (d && d.__rs === 7) ? rt.utf8BytesToStr(d.items) : strVal(d);
                     return fsCall("write", strVal(args[0]), s) ? Ok(undefined) : Err(mkIoErr("PermissionDenied", "failed to write " + strVal(args[0])));
                 }
@@ -1908,7 +2119,7 @@
             // `std::sync::atomic::Ordering::SeqCst` etc.
             return R.mkEnumUnit("Ordering", last, 0);
         }
-        if (parent === "SystemTime" && last === "UNIX_EPOCH") return { __rs: 15, kind: "system_time", ns: 0n };
+        if (last === "UNIX_EPOCH") return { __rs: 15, kind: "system_time", ns: 0n };
         if (parent === "Duration" && last === "ZERO") return { __rs: 15, kind: "duration", ns: 0n };
         if (parent === "ErrorKind") return R.mkEnumUnit("ErrorKind", last, 0);
         if (parent === "Shutdown") return R.mkEnumUnit("Shutdown", last, 0);
@@ -1917,9 +2128,11 @@
                 OK: 200, CREATED: 201, ACCEPTED: 202, NO_CONTENT: 204,
                 MOVED_PERMANENTLY: 301, FOUND: 302, NOT_MODIFIED: 304,
                 BAD_REQUEST: 400, UNAUTHORIZED: 401, FORBIDDEN: 403, NOT_FOUND: 404,
-                METHOD_NOT_ALLOWED: 405, CONFLICT: 409, UNPROCESSABLE_ENTITY: 422,
-                TOO_MANY_REQUESTS: 429, INTERNAL_SERVER_ERROR: 500, BAD_GATEWAY: 502,
-                SERVICE_UNAVAILABLE: 503
+                METHOD_NOT_ALLOWED: 405, CONFLICT: 409, GONE: 410,
+                PAYLOAD_TOO_LARGE: 413, UNSUPPORTED_MEDIA_TYPE: 415,
+                UNPROCESSABLE_ENTITY: 422, TOO_MANY_REQUESTS: 429,
+                INTERNAL_SERVER_ERROR: 500, NOT_IMPLEMENTED: 501,
+                BAD_GATEWAY: 502, SERVICE_UNAVAILABLE: 503, GATEWAY_TIMEOUT: 504
             };
             if (Object.prototype.hasOwnProperty.call(codes, last)) return codes[last];
         }
@@ -1949,6 +2162,30 @@
             if (last === "EPSILON") return Number.EPSILON;
             if (last === "MAX") return Number.MAX_VALUE;
             if (last === "MIN") return -Number.MAX_VALUE;
+        }
+        if (parent === "str") {
+            if (last === "to_owned" || last === "to_string") return function (x) { return R.mkString(strVal(x)); };
+            if (last === "trim") return function (x) { return strVal(x).trim(); };
+            if (last === "to_lowercase") return function (x) { return R.mkString(strVal(x).toLowerCase()); };
+            if (last === "to_uppercase") return function (x) { return R.mkString(strVal(x).toUpperCase()); };
+            if (last === "len") return function (x) { return rt.utf8ByteLen(strVal(x)); };
+            if (last === "is_empty") return function (x) { return strVal(x).length === 0; };
+            if (last === "as_bytes") return function (x) { return { __rs: 7, items: rt.strToUtf8Bytes(strVal(x)) }; };
+        }
+        if ((parent === "ToOwned" && last === "to_owned") || (parent === "ToString" && last === "to_string")) {
+            return function (x) { return R.callMethod(x, last, []); };
+        }
+        if (parent === "String" && last === "from") return function (x) { return R.mkString(strVal(x)); };
+        if (parent === "Clone" && last === "clone") return function (x) { return rt.cloneVal(x); };
+        if (parent === "Option" && last === "Some") return Some;
+        if (parent === "Result" && last === "Ok") return Ok;
+        if (parent === "Result" && last === "Err") return Err;
+        if ((parent === "i64" || parent === "i32" || parent === "u64" || parent === "u32" || parent === "usize" || parent === "f64") && last === "from") {
+            return function (x) { return Number(deref(x)); };
+        }
+        if (rt.resolveEcoConst) {
+            const ecoC = rt.resolveEcoConst(pathParts);
+            if (ecoC !== rt.ECO_MISS) return ecoC;
         }
         if (rt.enums[parent]) {
             const info = rt.enums[parent];

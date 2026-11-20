@@ -2,7 +2,7 @@
 
 use super::emitter::{LocalVar, LoopCtx, RsEmitter, R};
 use super::scope::{
-    analyze_closure, analyze_fn, literal_num_kind, type_base_name, type_desc, NumKind, VariantKind,
+    analyze_closure, analyze_fn, literal_num_kind, type_base_name, NumKind, VariantKind,
 };
 use crate::bytecode::{BitwiseOp, Instr, Reg};
 use zipp_rsparse::ast::*;
@@ -10,13 +10,40 @@ use zipp_rsparse::token::IntSuffix;
 
 impl<'a> RsEmitter<'a> {
     pub(super) fn emit_block(&mut self, block: &Block) -> R<Reg> {
+        self.emit_block_with_hint(block, None)
+    }
+
+    pub(super) fn emit_block_with_hint(&mut self, block: &Block, hint: Option<&str>) -> R<Reg> {
         self.push_scope();
         let saved_uses = self.local_uses.clone();
-        for stmt in &block.stmts {
+        let last_enabled_idx = block
+            .stmts
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, s)| super::scope::item_cfg_enabled(&s.attrs, self.file.is_test_mode))
+            .map(|(i, _)| i);
+        let mut tail_reg: Option<Reg> = None;
+        for (i, stmt) in block.stmts.iter().enumerate() {
+            if !super::scope::item_cfg_enabled(&stmt.attrs, self.file.is_test_mode) {
+                continue;
+            }
+            if block.tail.is_none() && Some(i) == last_enabled_idx {
+                if let StmtKind::Expr {
+                    expr,
+                    has_semi: false,
+                } = &stmt.kind
+                {
+                    tail_reg = Some(self.emit_expr_with_hint(expr, hint)?);
+                    continue;
+                }
+            }
             self.emit_stmt(stmt)?;
         }
         let result = if let Some(ref tail) = block.tail {
-            self.emit_expr(tail)?
+            self.emit_expr_with_hint(tail, hint)?
+        } else if let Some(r) = tail_reg {
+            r
         } else {
             self.undefined()?
         };
@@ -26,11 +53,16 @@ impl<'a> RsEmitter<'a> {
     }
 
     pub(super) fn emit_stmt(&mut self, stmt: &Stmt) -> R<()> {
+        if !super::scope::item_cfg_enabled(&stmt.attrs, self.file.is_test_mode) {
+            return Ok(());
+        }
         let mark = self.mark();
         match &stmt.kind {
             StmtKind::Empty => {}
             StmtKind::Item(item) => {
                 self.emit_items(std::slice::from_ref(item.as_ref()))?;
+                // Do NOT release registers allocated for local `fn` / `const` bindings!
+                return Ok(());
             }
             StmtKind::Let {
                 pat,
@@ -44,7 +76,9 @@ impl<'a> RsEmitter<'a> {
                     .filter(|k| k.is_numeric())
                     .or_else(|| init.as_ref().map(|e| self.infer_num_kind(e)))
                     .unwrap_or(NumKind::Unknown);
-                let hint = ty.as_ref().map(type_base_name);
+                let hint = ty
+                    .as_ref()
+                    .map(|t| self.syms.type_desc_resolved(&self.mod_prefix, t));
                 let val = if let Some(ref expr) = init {
                     self.emit_expr_with_hint(expr, hint.as_deref())?
                 } else {
@@ -187,34 +221,137 @@ impl<'a> RsEmitter<'a> {
         }
     }
 
-    /// Emit an expression with an optional statically-known target type hint
-    /// (from `let x: Target = ...;` or struct literal field types), so `.into()`,
-    /// `.unwrap_or_default()`, and `Default::default()` receive their concrete target type!
+    /// Emit an expression with an optional statically-known target type descriptor
+    /// (from `let x: Target = ...;`, struct literal fields, or function return type),
+    /// propagating type targets into `.into()`, `.unwrap_or_default()`, `Default::default()`,
+    /// `.parse()`, `.collect()`, `serde_json::from_str()`, `sqlx::query_as().fetch_*()`,
+    /// and through `?`, `.await`, `.unwrap*()`, `match`, and `if` expressions!
     pub(super) fn emit_expr_with_hint(&mut self, expr: &Expr, hint: Option<&str>) -> R<Reg> {
         if let Some(target) = hint {
             if !target.is_empty() {
+                let base_target = target.split('<').next().unwrap_or(target).trim();
                 match &expr.kind {
+                    ExprKind::Try(inner) => {
+                        let v = self.emit_expr_with_hint(inner, Some(target))?;
+                        let ok = self.helper("tryOk", &[v])?;
+                        let j_ok = self.jump_if_true(ok)?;
+                        let err_val = if let Some(ref et) = self.ret_err_type.clone() {
+                            let et_r = self.string(et)?;
+                            self.helper("tryErr", &[v, et_r])?
+                        } else {
+                            self.helper("tryErr", &[v])?
+                        };
+                        self.emit(Instr::Return { src: err_val })?;
+                        self.patch(j_ok, self.here())?;
+                        return self.helper("tryUnwrap", &[v]);
+                    }
+                    ExprKind::Await(inner) => {
+                        let fut = self.emit_expr_with_hint(inner, Some(target))?;
+                        if self.proto.is_async {
+                            let dst = self.alloc()?;
+                            self.emit(Instr::Await { dst, val: fut })?;
+                            return Ok(dst);
+                        }
+                        return Ok(fut);
+                    }
+                    ExprKind::Block(b) | ExprKind::UnsafeBlock(b) => {
+                        return self.emit_block_with_hint(b, Some(target));
+                    }
+                    ExprKind::Match { scrutinee, arms } => {
+                        // If a match unwraps `Ok(v)` / `Some(v)`, forward hint to the scrutinee too
+                        // (e.g. `let rows: Vec<(i64, String)> = match sqlx::query_as(...).fetch_all(...).await { Ok(r) => r, ... }`)
+                        let unwraps_res = arms.iter().any(|a| {
+                            matches!(&a.pat.kind, PatKind::TupleStruct { path, .. }
+                                if matches!(path.last_ident(), "Ok" | "Some"))
+                        });
+                        let val = if unwraps_res {
+                            self.emit_expr_with_hint(scrutinee, Some(target))?
+                        } else {
+                            self.emit_expr(scrutinee)?
+                        };
+                        let dst = self.undefined()?;
+                        let mut end_jumps = Vec::with_capacity(arms.len());
+                        for arm in arms {
+                            self.push_scope();
+                            let mut fails = Vec::new();
+                            self.emit_pat_match(&arm.pat, val, &mut fails)?;
+                            if let Some(ref guard) = arm.guard {
+                                let g = self.emit_expr(guard)?;
+                                fails.push(self.jump_if_false(g)?);
+                            }
+                            let body_val = self.emit_expr_with_hint(&arm.body, Some(target))?;
+                            self.emit(Instr::Move { dst, src: body_val })?;
+                            self.pop_scope();
+                            end_jumps.push(self.jump()?);
+                            let next_pc = self.here();
+                            for fj in fails {
+                                self.patch(fj, next_pc)?;
+                            }
+                        }
+                        let end_pc = self.here();
+                        for ej in end_jumps {
+                            self.patch(ej, end_pc)?;
+                        }
+                        return Ok(dst);
+                    }
                     ExprKind::MethodCall {
                         receiver,
                         method,
                         type_args,
                         args,
-                    } if type_args.is_empty() && args.is_empty() => {
-                        if method == "into" {
+                    } => {
+                        if type_args.is_empty() && args.is_empty() && method == "into" {
                             let recv = self.emit_expr(receiver)?;
-                            let dst_t = self.string(target)?;
+                            let dst_t = self.string(base_target)?;
                             return self.helper("convertInto", &[recv, dst_t]);
                         }
-                        if method == "unwrap_or_default" {
+                        if matches!(
+                            method.as_str(),
+                            "unwrap"
+                                | "expect"
+                                | "unwrap_or"
+                                | "unwrap_or_else"
+                                | "unwrap_or_default"
+                                | "ok"
+                        ) {
+                            let recv = self.emit_expr_with_hint(receiver, Some(target))?;
+                            let mname = self.string(method)?;
+                            let mut a_regs = Vec::with_capacity(args.len());
+                            for a in args {
+                                a_regs.push(self.emit_expr(a)?);
+                            }
+                            let a_arr = self.js_array(&a_regs)?;
+                            if method == "unwrap_or_default" {
+                                let t_reg = self.string(base_target)?;
+                                let t_arr = self.js_array(&[t_reg])?;
+                                return self.helper("callMethod", &[recv, mname, a_arr, t_arr]);
+                            }
+                            return self.helper("callMethod", &[recv, mname, a_arr]);
+                        }
+                        if type_args.is_empty()
+                            && matches!(
+                                method.as_str(),
+                                "parse"
+                                    | "collect"
+                                    | "fetch_one"
+                                    | "fetch_optional"
+                                    | "fetch_all"
+                                    | "json"
+                            )
+                        {
                             let recv = self.emit_expr(receiver)?;
-                            let mname = self.string("unwrap_or_default")?;
-                            let empty_args = self.js_array(&[])?;
+                            let mname = self.string(method)?;
+                            let mut a_regs = Vec::with_capacity(args.len());
+                            for a in args {
+                                a_regs.push(self.emit_expr(a)?);
+                            }
+                            let a_arr = self.js_array(&a_regs)?;
                             let t_reg = self.string(target)?;
                             let t_arr = self.js_array(&[t_reg])?;
-                            return self.helper("callMethod", &[recv, mname, empty_args, t_arr]);
+                            return self.helper("callMethod", &[recv, mname, a_arr, t_arr]);
                         }
                     }
-                    ExprKind::Call { callee, args } if args.is_empty() => {
+                    ExprKind::Call { callee, args } => {
                         if let ExprKind::Path(p) = &callee.kind {
                             let last = p.segments.last().map(|s| s.ident.as_str());
                             let parent = p
@@ -223,14 +360,51 @@ impl<'a> RsEmitter<'a> {
                                 .checked_sub(2)
                                 .and_then(|i| p.segments.get(i))
                                 .map(|s| s.ident.as_str());
-                            if last == Some("default") && parent == Some("Default") {
+                            if args.is_empty()
+                                && last == Some("default")
+                                && parent == Some("Default")
+                            {
                                 let p1 = self.string("Default")?;
                                 let p2 = self.string("default")?;
                                 let p_arr = self.js_array(&[p1, p2])?;
                                 let empty_args = self.js_array(&[])?;
-                                let t_reg = self.string(target)?;
+                                let t_reg = self.string(base_target)?;
                                 let t_arr = self.js_array(&[t_reg])?;
                                 return self.helper("callAssoc", &[p_arr, empty_args, t_arr]);
+                            }
+                            let has_explicit_ta = p
+                                .segments
+                                .last()
+                                .is_some_and(|s| !s.type_args.is_empty());
+                            if !has_explicit_ta
+                                && matches!(
+                                    last,
+                                    Some(
+                                        "from_str"
+                                            | "from_value"
+                                            | "from_slice"
+                                            | "decode"
+                                            | "query_as"
+                                            | "query_scalar"
+                                    )
+                                )
+                            {
+                                let raw: Vec<String> =
+                                    p.segments.iter().map(|s| s.ident.clone()).collect();
+                                let resolved = self.resolve_segments(&raw);
+                                let mut p_regs = Vec::with_capacity(resolved.len());
+                                for seg in &resolved {
+                                    p_regs.push(self.string(seg)?);
+                                }
+                                let p_arr = self.js_array(&p_regs)?;
+                                let mut a_regs = Vec::with_capacity(args.len());
+                                for a in args {
+                                    a_regs.push(self.emit_expr(a)?);
+                                }
+                                let a_arr = self.js_array(&a_regs)?;
+                                let t_reg = self.string(target)?;
+                                let t_arr = self.js_array(&[t_reg])?;
+                                return self.helper("callAssoc", &[p_arr, a_arr, t_arr]);
                             }
                         }
                     }
@@ -310,7 +484,7 @@ impl<'a> RsEmitter<'a> {
                 }
                 // Check if this is an enum struct variant `Enum::Variant { ... }`
                 if let Some((ename, vname, VariantKind::Struct)) =
-                    self.syms.lookup_enum_variant(&self.mod_prefix, &raw)
+                    self.syms.lookup_enum_variant(&self.mod_prefix, &resolved)
                 {
                     let en = self.string(&ename)?;
                     let vn = self.string(&vname)?;
@@ -849,8 +1023,15 @@ impl<'a> RsEmitter<'a> {
             let raw: Vec<String> = path.segments.iter().map(|s| s.ident.clone()).collect();
             let type_args: Vec<String> = path
                 .segments
-                .last()
-                .map(|s| s.type_args.iter().map(type_desc).collect())
+                .iter()
+                .rev()
+                .find(|s| !s.type_args.is_empty())
+                .map(|s| {
+                    s.type_args
+                        .iter()
+                        .map(|t| self.syms.type_desc_resolved(&self.mod_prefix, t))
+                        .collect()
+                })
                 .unwrap_or_default();
 
             // 1. Local variable holding a closure/fn pointer (auto-derefs Box<dyn Fn> / Arc<dyn Fn>!)
@@ -908,7 +1089,7 @@ impl<'a> RsEmitter<'a> {
 
             // 4. Enum tuple variant constructor `MyEnum::Variant(a, b)`
             if let Some((ename, vname, VariantKind::Tuple)) =
-                self.syms.lookup_enum_variant(&self.mod_prefix, &raw)
+                self.syms.lookup_enum_variant(&self.mod_prefix, &resolved)
             {
                 let en = self.string(&ename)?;
                 let vn = self.string(&vname)?;
@@ -1010,7 +1191,7 @@ impl<'a> RsEmitter<'a> {
         } else {
             let mut t_regs = Vec::with_capacity(type_args.len());
             for t in type_args {
-                t_regs.push(self.string(&type_desc(t))?);
+                t_regs.push(self.string(&self.syms.type_desc_resolved(&self.mod_prefix, t))?);
             }
             let t_arr = self.js_array(&t_regs)?;
             self.helper("callMethod", &[recv, mname, a_arr, t_arr])

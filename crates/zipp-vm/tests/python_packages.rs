@@ -116,3 +116,91 @@ fn the_built_in_torch_package_refuses_another() {
     let out = run("import _zipp_crc, _zipp_tensor\nprint(_zipp_crc.crc32(b'hello'), _zipp_tensor.crc32(b'hello'))\n").unwrap();
     assert_eq!(out, ["907060870 907060870"]);
 }
+
+#[test]
+fn named_package_bridge_and_shared_step_budget() {
+    use std::sync::Arc;
+
+    let abi = python_packages::engine_abi();
+    let runtime = r#"(function (R) {
+        const rt = R.__rt;
+        rt.defineModule("_kvplug", (g) => {
+            g.set("call", rt.builtin("call", 2, (a) => __zipp_py_pkg_call("kvplug", String(a[0]), String(a[1])), 2));
+        });
+        rt.defineModule("_sqlplug", (g) => {
+            g.set("query", rt.builtin("query", 1, (a) => __zipp_py_pkg_call("sql", "query", String(a[0])), 1));
+        });
+    })(__zipp_py);"#;
+    let pkg = archive(
+        "kvplug",
+        abi,
+        &[("kvplug.js", runtime)],
+        &[
+            ("kvplug", "kvplug.py", "import _kvplug\ndef get(k):\n    return _kvplug.call('get', k)\n"),
+            ("sqlplug", "sqlplug.py", "import _sqlplug\ndef query(s):\n    return _sqlplug.query(s)\n"),
+        ],
+    );
+    python_packages::install(&pkg).expect("install kvplug package");
+
+    // 1. Direct named package bridge registered with `set_package_bridge`, charging ZIPP's unified budget.
+    python_packages::set_package_bridge(
+        "kvplug",
+        Arc::new(|ctx, op, args| {
+            assert_eq!(op, "get");
+            assert!(ctx.steps_remaining() > 0);
+            ctx.charge_steps(25_000)?;
+            Ok(format!("val:{}", args.first().map(String::as_str).unwrap_or("")))
+        }),
+    );
+
+    let files = vec![(
+        "main".to_string(),
+        "import kvplug, sqlplug\nprint(kvplug.get('k1'), sqlplug.query('SELECT 1'))\n".to_string(),
+    )];
+    let (out, steps_used) = big_stack(move || {
+        let mut compiled = compile_python_project("main", &files).expect("compile");
+        let st = compiled.state_mut();
+        st.set_limits(200_000_000, None);
+        // 2. Fallback path: `sqlplug` has no dedicated package bridge, so
+        //    `__zipp_py_pkg_call("sql", "query", ...)` routes through the VM's
+        //    sandboxed `app.sql.query` host hook and shares the same budget!
+        st.set_host_call_ctx(Box::new(|ctx, kind, args| {
+            assert_eq!(kind, "app.sql.query");
+            ctx.charge_steps(15_000)?;
+            Ok(format!("sql-ok:{}", args[0]))
+        }));
+        st.run_init().expect("run");
+        (st.take_output(), st.resource_usage().steps_used)
+    });
+    assert_eq!(out, ["val:k1 sql-ok:SELECT 1"]);
+    assert!(steps_used >= 40_000, "steps_used={steps_used}");
+
+    // 3. Exhausting ZIPP's unified step budget inside a package bridge halts Python
+    //    uncatchably (even inside `try: ... except Exception:`).
+    python_packages::set_package_bridge(
+        "kvplug",
+        Arc::new(|ctx, _op, _args| {
+            ctx.charge_steps(500_000)?;
+            Ok("unreachable".into())
+        }),
+    );
+    let files2 = vec![(
+        "main".to_string(),
+        "import kvplug\ntry:\n    kvplug.get('boom')\nexcept Exception:\n    print('CAUGHT')\n".to_string(),
+    )];
+    let (err, limit_err, out2) = big_stack(move || {
+        let mut compiled = compile_python_project("main", &files2).expect("compile");
+        let st = compiled.state_mut();
+        st.set_limits(300_000, None);
+        let err = st.run_init().expect_err("must halt on budget exhaustion");
+        (err, st.resource_limit_error().map(str::to_owned), st.take_output())
+    });
+    assert!(err.contains("instruction budget"), "err={err}");
+    assert!(
+        limit_err.as_deref().is_some_and(|m| m.contains("instruction budget")),
+        "limit_err={limit_err:?}"
+    );
+    assert!(out2.is_empty(), "Python must not catch past budget exhaustion: {out2:?}");
+
+    python_packages::remove_package_bridge("kvplug");
+}

@@ -269,6 +269,7 @@ pub struct Block {
 
 #[derive(Debug, Clone)]
 pub struct Stmt {
+    pub attrs: Vec<Attribute>,
     pub kind: StmtKind,
     pub span: Span,
 }

@@ -25,6 +25,11 @@ pub(crate) struct RustVmState {
     pub listeners: HashMap<u32, TcpListener>,
     #[cfg(not(any(feature = "safe-sandbox", target_arch = "wasm32")))]
     pub streams: HashMap<u32, TcpStream>,
+    #[cfg(all(
+        feature = "rust-sqlite",
+        not(any(feature = "safe-sandbox", target_arch = "wasm32"))
+    ))]
+    pub sqlite_conns: HashMap<u32, rusqlite::Connection>,
     pub rng_state: u64,
 }
 
@@ -47,6 +52,11 @@ impl Default for RustVmState {
             listeners: HashMap::new(),
             #[cfg(not(any(feature = "safe-sandbox", target_arch = "wasm32")))]
             streams: HashMap::new(),
+            #[cfg(all(
+                feature = "rust-sqlite",
+                not(any(feature = "safe-sandbox", target_arch = "wasm32"))
+            ))]
+            sqlite_conns: HashMap::new(),
             rng_state: seed ^ 0xA076_1D64_78BD_642F,
         }
     }
@@ -74,6 +84,7 @@ impl<'p> Vm<'p> {
             native::RS_NET => self.rs_net_native(arg(0), arg(1), arg(2), arg(3)),
             native::RS_CRYPTO => self.rs_crypto_native(arg(0), arg(1), arg(2)),
             native::RS_PROC => self.rs_proc_native(arg(0), arg(1)),
+            native::RS_SQLITE => self.rs_sqlite_native(arg(0), arg(1), arg(2), arg(3)),
             _ => Err(Thrown::from_static("InternalError: unknown Rust native")),
         }
     }
@@ -217,7 +228,15 @@ impl<'p> Vm<'p> {
                     Ok(s) => Ok(self.alloc_str(s)),
                     Err(_) => Ok(Value::NULL),
                 },
+                "read_bytes_hex" => match std::fs::read(&p) {
+                    Ok(bytes) => Ok(self.alloc_str(hex_encode(&bytes))),
+                    Err(_) => Ok(Value::NULL),
+                },
                 "write" => Ok(Value::bool(std::fs::write(&p, b.as_bytes()).is_ok())),
+                "write_bytes_hex" => {
+                    let bytes = hex_decode(&b);
+                    Ok(Value::bool(std::fs::write(&p, &bytes).is_ok()))
+                }
                 "append" => {
                     let ok = std::fs::OpenOptions::new()
                         .create(true)
@@ -511,6 +530,7 @@ impl<'p> Vm<'p> {
                         .and_then(|l| l.accept().ok());
                     match accepted {
                         Some((stream, peer)) => {
+                            let _ = stream.set_nonblocking(false);
                             let st = self.ensure_rust_state();
                             let sid = st.next_handle;
                             st.next_handle += 1;
@@ -518,6 +538,38 @@ impl<'p> Vm<'p> {
                             Ok(self.alloc_str(format!("{sid}|{peer}")))
                         }
                         None => Ok(Value::NULL),
+                    }
+                }
+                "set_nonblocking" => {
+                    let id: u32 = a.parse().unwrap_or(0);
+                    let nb = b == "1" || b == "true";
+                    let ok = self
+                        .rust_state
+                        .as_deref()
+                        .and_then(|s| s.listeners.get(&id))
+                        .is_some_and(|l| l.set_nonblocking(nb).is_ok());
+                    Ok(Value::bool(ok))
+                }
+                "try_accept" => {
+                    let id: u32 = a.parse().unwrap_or(0);
+                    let res = self
+                        .rust_state
+                        .as_deref()
+                        .and_then(|s| s.listeners.get(&id))
+                        .map(|l| l.accept());
+                    match res {
+                        Some(Ok((stream, peer))) => {
+                            let _ = stream.set_nonblocking(false);
+                            let st = self.ensure_rust_state();
+                            let sid = st.next_handle;
+                            st.next_handle += 1;
+                            st.streams.insert(sid, stream);
+                            Ok(self.alloc_str(format!("{sid}|{peer}")))
+                        }
+                        Some(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            Ok(self.alloc_str(String::new()))
+                        }
+                        _ => Ok(Value::NULL),
                     }
                 }
                 "connect" => match TcpStream::connect(&a) {
@@ -621,15 +673,88 @@ impl<'p> Vm<'p> {
         let b = self.to_js_string(b_v)?;
         let out = match op.as_str() {
             "sha256" => hex_encode(&sha256(a.as_bytes())),
+            "sha256_bytes_hex" => hex_encode(&sha256(&hex_decode(&a))),
             "sha512" => hex_encode(&sha512(a.as_bytes())),
             "hmac_sha256" => hex_encode(&hmac_sha256(a.as_bytes(), b.as_bytes())),
+            "hmac_sha256_hex" => hex_encode(&hmac_sha256(&hex_decode(&a), &hex_decode(&b))),
             "md5" => hex_encode(&md5(a.as_bytes())),
             "hex_encode" => hex_encode(a.as_bytes()),
             "hex_decode" => String::from_utf8_lossy(&hex_decode(&a)).into_owned(),
             "base64_encode" => base64_encode(a.as_bytes()),
+            "base64_encode_hex" => base64_encode(&hex_decode(&a)),
             "base64_decode" => String::from_utf8_lossy(&base64_decode(&a)).into_owned(),
+            "base64_decode_hex" => hex_encode(&base64_decode(&a)),
             "base64url_encode" => base64url_encode(a.as_bytes()),
+            "base64url_encode_hex" => base64url_encode(&hex_decode(&a)),
             "base64url_decode" => String::from_utf8_lossy(&base64url_decode(&a)).into_owned(),
+            "base64url_decode_hex" => hex_encode(&base64url_decode(&a)),
+            "argon2_hash" => {
+                #[cfg(all(
+                    feature = "rust-argon2",
+                    not(any(feature = "safe-sandbox", target_arch = "wasm32"))
+                ))]
+                {
+                    let mut m_cost = 19_456u32;
+                    let mut t_cost = 2u32;
+                    let mut p_cost = 1u32;
+                    if !b.is_empty() {
+                        let ps: Vec<&str> = b.split(',').collect();
+                        if let Some(v) = ps.first().and_then(|s| s.parse().ok()) {
+                            m_cost = v;
+                        }
+                        if let Some(v) = ps.get(1).and_then(|s| s.parse().ok()) {
+                            t_cost = v;
+                        }
+                        if let Some(v) = ps.get(2).and_then(|s| s.parse().ok()) {
+                            p_cost = v;
+                        }
+                    }
+                    use argon2::password_hash::{rand_core::OsRng, SaltString};
+                    use argon2::{Algorithm, Argon2, Params, PasswordHasher, Version};
+                    let params = Params::new(m_cost, t_cost, p_cost, None)
+                        .unwrap_or_else(|_| Params::default());
+                    let a2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+                    let salt = SaltString::generate(&mut OsRng);
+                    match a2.hash_password(a.as_bytes(), &salt) {
+                        Ok(ph) => ph.to_string(),
+                        Err(_) => return Ok(Value::NULL),
+                    }
+                }
+                #[cfg(not(all(
+                    feature = "rust-argon2",
+                    not(any(feature = "safe-sandbox", target_arch = "wasm32"))
+                )))]
+                {
+                    let st = self.ensure_rust_state();
+                    let mut salt = [0u8; 16];
+                    salt[..8].copy_from_slice(&st.next_rand_u64().to_le_bytes());
+                    salt[8..].copy_from_slice(&st.next_rand_u64().to_le_bytes());
+                    let salt_hex = hex_encode(&salt);
+                    let dk = pbkdf_sha256(a.as_bytes(), &salt, 10_000);
+                    format!("$zsha256$10000${salt_hex}${}", hex_encode(&dk))
+                }
+            }
+            "argon2_verify" => {
+                #[cfg(all(
+                    feature = "rust-argon2",
+                    not(any(feature = "safe-sandbox", target_arch = "wasm32"))
+                ))]
+                let ok = if b.starts_with("$argon2") {
+                    use argon2::password_hash::PasswordHash;
+                    use argon2::{Argon2, PasswordVerifier};
+                    PasswordHash::new(&b)
+                        .ok()
+                        .is_some_and(|ph| Argon2::default().verify_password(a.as_bytes(), &ph).is_ok())
+                } else {
+                    verify_password_hash(&a, &b)
+                };
+                #[cfg(not(all(
+                    feature = "rust-argon2",
+                    not(any(feature = "safe-sandbox", target_arch = "wasm32"))
+                )))]
+                let ok = verify_password_hash(&a, &b);
+                return Ok(Value::bool(ok));
+            }
             "hash_password" => {
                 let st = self.ensure_rust_state();
                 let mut salt = [0u8; 16];
@@ -651,6 +776,15 @@ impl<'p> Vm<'p> {
                 let sig = base64url_encode(&hmac_sha256(b.as_bytes(), signing_input.as_bytes()));
                 format!("{signing_input}.{sig}")
             }
+            "jwt_sign_hex" => {
+                // a = payload JSON string, b = hex-encoded raw secret bytes
+                let key = hex_decode(&b);
+                let hdr = base64url_encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+                let pay = base64url_encode(a.as_bytes());
+                let signing_input = format!("{hdr}.{pay}");
+                let sig = base64url_encode(&hmac_sha256(&key, signing_input.as_bytes()));
+                format!("{signing_input}.{sig}")
+            }
             "jwt_verify" => {
                 // a = token, b = secret -> returns payload JSON string or NULL
                 let parts: Vec<&str> = a.split('.').collect();
@@ -659,6 +793,21 @@ impl<'p> Vm<'p> {
                 }
                 let signing_input = format!("{}.{}", parts[0], parts[1]);
                 let expected = base64url_encode(&hmac_sha256(b.as_bytes(), signing_input.as_bytes()));
+                if !const_time_eq(expected.as_bytes(), parts[2].as_bytes()) {
+                    return Ok(Value::NULL);
+                }
+                let payload = String::from_utf8_lossy(&base64url_decode(parts[1])).into_owned();
+                payload
+            }
+            "jwt_verify_hex" => {
+                // a = token, b = hex-encoded raw secret bytes -> returns payload JSON string or NULL
+                let parts: Vec<&str> = a.split('.').collect();
+                if parts.len() != 3 {
+                    return Ok(Value::NULL);
+                }
+                let key = hex_decode(&b);
+                let signing_input = format!("{}.{}", parts[0], parts[1]);
+                let expected = base64url_encode(&hmac_sha256(&key, signing_input.as_bytes()));
                 if !const_time_eq(expected.as_bytes(), parts[2].as_bytes()) {
                     return Ok(Value::NULL);
                 }
@@ -749,6 +898,566 @@ impl<'p> Vm<'p> {
             }
         }
     }
+
+    fn rs_sqlite_native(
+        &mut self,
+        op_v: Value,
+        a_v: Value,
+        b_v: Value,
+        c_v: Value,
+    ) -> Result<Value, Thrown> {
+        let op = self.to_js_string(op_v)?;
+        let a = self.to_js_string(a_v)?;
+        let b = self.to_js_string(b_v)?;
+        let c = self.to_js_string(c_v)?;
+
+        // 1. External / sandboxed SQL plugin slot via the host capability bridge
+        //    (`app.sql.open`, `app.sql.execute`, `app.sql.query`, `app.sql.close`).
+        //    Works in ALL profiles including `safe-sandbox` and `wasm32`, sharing
+        //    ZIPP's unified instruction budget through `HostCtx::charge_steps`!
+        if self.host_ctx.is_some() || self.host.is_some() {
+            let kind = format!("app.sql.{op}");
+            let req_args = [a, b, c];
+            let reply = if let Some(mut host) = self.host_ctx.take() {
+                let r = host(self, &kind, &req_args);
+                self.host_ctx = Some(host);
+                r
+            } else if let Some(mut host) = self.host.take() {
+                let r = host(&kind, &req_args);
+                self.host = Some(host);
+                r
+            } else {
+                unreachable!()
+            };
+            // Surface budget exhaustion / terminal host errors directly so the guest
+            // cannot swallow an instruction-budget halt inside a SQL error Result.
+            #[cfg(feature = "instrument")]
+            if let Some(msg) = self.host_terminal_error() {
+                return Err(Thrown(msg.to_owned()));
+            }
+            return match reply {
+                Ok(s) => {
+                    self.preflight_guest_string_size(s.len())?;
+                    Ok(self.alloc_str(s))
+                }
+                Err(e) => {
+                    let mut out = String::from("{\"error\":");
+                    push_json_str(&mut out, &e);
+                    out.push('}');
+                    self.preflight_guest_string_size(out.len())?;
+                    Ok(self.alloc_str(out))
+                }
+            };
+        }
+
+        // 2. Optional built-in `rusqlite` fallback (only when built with `--features rust-sqlite`
+        //    outside `safe-sandbox` and `wasm32`).
+        #[cfg(not(all(
+            feature = "rust-sqlite",
+            not(any(feature = "safe-sandbox", target_arch = "wasm32"))
+        )))]
+        {
+            let _ = (op, a, b, c);
+            return Ok(self.alloc_str(
+                r#"{"error":"SQLite driver not attached: install a sandboxed SQL host plugin (app.sql.*) or build with --features rust-sqlite"}"#.to_owned(),
+            ));
+        }
+        #[cfg(all(
+            feature = "rust-sqlite",
+            not(any(feature = "safe-sandbox", target_arch = "wasm32"))
+        ))]
+        {
+            use rusqlite::{Connection, OpenFlags};
+            let ctx = self.program.rust_ctx.as_deref();
+            let allow_native = ctx.is_some_and(|ct| ct.allow_native_fs);
+            match op.as_str() {
+                "open" => {
+                    let raw = a
+                        .strip_prefix("sqlite://")
+                        .or_else(|| a.strip_prefix("sqlite:"))
+                        .unwrap_or(&a);
+                    let path_part = raw.split('?').next().unwrap_or(raw);
+                    let is_mem = path_part == ":memory:"
+                        || path_part.is_empty()
+                        || raw.contains("mode=memory");
+                    let res = if is_mem {
+                        Connection::open_in_memory()
+                    } else {
+                        if !allow_native {
+                            return Ok(self.alloc_str(
+                                r#"{"error":"filesystem SQLite disabled in sandboxed mode"}"#
+                                    .to_owned(),
+                            ));
+                        }
+                        let base = ctx.map(|ct| ct.base_dir.as_str()).unwrap_or(".");
+                        let p = {
+                            let path = Path::new(path_part);
+                            if path.is_absolute() {
+                                path.to_path_buf()
+                            } else {
+                                Path::new(base).join(path)
+                            }
+                        };
+                        let create = b != "0" && b != "false";
+                        if create {
+                            if let Some(parent) = p.parent() {
+                                if !parent.as_os_str().is_empty() {
+                                    let _ = std::fs::create_dir_all(parent);
+                                }
+                            }
+                        }
+                        let mut flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+                            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+                        if create {
+                            flags |= OpenFlags::SQLITE_OPEN_CREATE;
+                        }
+                        Connection::open_with_flags(&p, flags)
+                    };
+                    match res {
+                        Ok(conn) => {
+                            let st = self.ensure_rust_state();
+                            let id = st.next_handle;
+                            st.next_handle += 1;
+                            st.sqlite_conns.insert(id, conn);
+                            Ok(self.alloc_str(format!("{{\"id\":{id}}}")))
+                        }
+                        Err(e) => Ok(self.alloc_str(format_sqlite_error(&e))),
+                    }
+                }
+                "execute" => {
+                    let id: u32 = a.parse().unwrap_or(0);
+                    let params = parse_sqlite_params(&c);
+                    let res = self
+                        .rust_state
+                        .as_deref_mut()
+                        .and_then(|s| s.sqlite_conns.get_mut(&id))
+                        .map(|conn| sqlite_exec_conn(conn, &b, &params));
+                    match res {
+                        Some(Ok((rows_affected, last_rowid))) => Ok(self.alloc_str(format!(
+                            "{{\"rows_affected\":{rows_affected},\"last_insert_rowid\":{last_rowid}}}"
+                        ))),
+                        Some(Err(e)) => Ok(self.alloc_str(format_sqlite_error(&e))),
+                        None => Ok(self.alloc_str(r#"{"error":"SQLite connection closed"}"#.to_owned())),
+                    }
+                }
+                "query" => {
+                    let id: u32 = a.parse().unwrap_or(0);
+                    let params = parse_sqlite_params(&c);
+                    let res = self
+                        .rust_state
+                        .as_deref_mut()
+                        .and_then(|s| s.sqlite_conns.get_mut(&id))
+                        .map(|conn| sqlite_query_conn(conn, &b, &params));
+                    match res {
+                        Some(Ok(json)) => Ok(self.alloc_str(json)),
+                        Some(Err(e)) => Ok(self.alloc_str(format_sqlite_error(&e))),
+                        None => Ok(self.alloc_str(r#"{"error":"SQLite connection closed"}"#.to_owned())),
+                    }
+                }
+                "close" => {
+                    let id: u32 = a.parse().unwrap_or(0);
+                    if let Some(st) = self.rust_state.as_deref_mut() {
+                        st.sqlite_conns.remove(&id);
+                    }
+                    Ok(self.alloc_str(r#"{"ok":true}"#.to_owned()))
+                }
+                _ => Ok(self.alloc_str(r#"{"error":"unknown sqlite op"}"#.to_owned())),
+            }
+        }
+    }
+}
+
+#[cfg(all(
+    feature = "rust-sqlite",
+    not(any(feature = "safe-sandbox", target_arch = "wasm32"))
+))]
+fn format_sqlite_error(err: &rusqlite::Error) -> String {
+    let mut unique = false;
+    let mut code = 0i32;
+    if let rusqlite::Error::SqliteFailure(ffi_err, _) = err {
+        code = ffi_err.extended_code;
+        if matches!(
+            ffi_err.extended_code,
+            1555 | 2067 // SQLITE_CONSTRAINT_PRIMARYKEY | SQLITE_CONSTRAINT_UNIQUE
+        ) {
+            unique = true;
+        }
+    }
+    let msg = err.to_string();
+    if msg.contains("UNIQUE constraint failed") || msg.contains("PRIMARY KEY constraint failed") {
+        unique = true;
+    }
+    let mut out = String::from("{\"error\":");
+    push_json_str(&mut out, &msg);
+    out.push_str(&format!(",\"code\":{code},\"unique\":{unique}}}"));
+    out
+}
+
+#[cfg(all(
+    feature = "rust-sqlite",
+    not(any(feature = "safe-sandbox", target_arch = "wasm32"))
+))]
+fn sql_has_multiple_statements(sql: &str) -> bool {
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+    let mut in_sq = false;
+    let mut in_dq = false;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    let mut saw_semi = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_line_comment {
+            if b == b'\n' {
+                in_line_comment = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_block_comment {
+            if b == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                in_block_comment = false;
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if in_sq {
+            if b == b'\'' {
+                if bytes.get(i + 1) == Some(&b'\'') {
+                    i += 2;
+                    continue;
+                }
+                in_sq = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_dq {
+            if b == b'"' {
+                if bytes.get(i + 1) == Some(&b'"') {
+                    i += 2;
+                    continue;
+                }
+                in_dq = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'-' && bytes.get(i + 1) == Some(&b'-') {
+            in_line_comment = true;
+            i += 2;
+            continue;
+        }
+        if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            in_block_comment = true;
+            i += 2;
+            continue;
+        }
+        if b == b'\'' {
+            in_sq = true;
+            if saw_semi {
+                return true;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_dq = true;
+            if saw_semi {
+                return true;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b';' {
+            saw_semi = true;
+            i += 1;
+            continue;
+        }
+        if saw_semi && !b.is_ascii_whitespace() {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+#[cfg(all(
+    feature = "rust-sqlite",
+    not(any(feature = "safe-sandbox", target_arch = "wasm32"))
+))]
+fn sqlite_exec_conn(
+    conn: &mut rusqlite::Connection,
+    sql: &str,
+    params: &[rusqlite::types::Value],
+) -> rusqlite::Result<(u64, i64)> {
+    if params.is_empty() && sql_has_multiple_statements(sql) {
+        conn.execute_batch(sql)?;
+        return Ok((conn.changes(), conn.last_insert_rowid()));
+    }
+    let mut stmt = conn.prepare_cached(sql)?;
+    if stmt.column_count() > 0 {
+        let mut rows = stmt.query(rusqlite::params_from_iter(params.iter()))?;
+        while rows.next()?.is_some() {}
+        drop(rows);
+        drop(stmt);
+        return Ok((conn.changes(), conn.last_insert_rowid()));
+    }
+    let n = stmt.execute(rusqlite::params_from_iter(params.iter()))? as u64;
+    drop(stmt);
+    Ok((n, conn.last_insert_rowid()))
+}
+
+#[cfg(all(
+    feature = "rust-sqlite",
+    not(any(feature = "safe-sandbox", target_arch = "wasm32"))
+))]
+fn sqlite_query_conn(
+    conn: &mut rusqlite::Connection,
+    sql: &str,
+    params: &[rusqlite::types::Value],
+) -> rusqlite::Result<String> {
+    use rusqlite::types::ValueRef;
+    let mut stmt = conn.prepare_cached(sql)?;
+    let col_count = stmt.column_count();
+    let mut out = String::from("{\"columns\":[");
+    for i in 0..col_count {
+        if i > 0 {
+            out.push(',');
+        }
+        let cname = stmt.column_name(i).unwrap_or("");
+        push_json_str(&mut out, cname);
+    }
+    out.push_str("],\"rows\":[");
+    let mut rows = stmt.query(rusqlite::params_from_iter(params.iter()))?;
+    let mut first_row = true;
+    while let Some(row) = rows.next()? {
+        if !first_row {
+            out.push(',');
+        }
+        first_row = false;
+        out.push('[');
+        for i in 0..col_count {
+            if i > 0 {
+                out.push(',');
+            }
+            match row.get_ref(i)? {
+                ValueRef::Null => out.push_str("null"),
+                ValueRef::Integer(n) => {
+                    use std::fmt::Write;
+                    let _ = write!(out, "{n}");
+                }
+                ValueRef::Real(f) => {
+                    if f.is_finite() {
+                        use std::fmt::Write;
+                        let _ = write!(out, "{f}");
+                    } else {
+                        out.push_str("null");
+                    }
+                }
+                ValueRef::Text(bytes) => {
+                    push_json_str(&mut out, &String::from_utf8_lossy(bytes));
+                }
+                ValueRef::Blob(bytes) => {
+                    out.push_str("{\"__blob\":[");
+                    for (bi, &bv) in bytes.iter().enumerate() {
+                        if bi > 0 {
+                            out.push(',');
+                        }
+                        use std::fmt::Write;
+                        let _ = write!(out, "{bv}");
+                    }
+                    out.push_str("]}");
+                }
+            }
+        }
+        out.push(']');
+    }
+    out.push_str("]}");
+    Ok(out)
+}
+
+#[cfg(all(
+    feature = "rust-sqlite",
+    not(any(feature = "safe-sandbox", target_arch = "wasm32"))
+))]
+fn parse_sqlite_params(raw: &str) -> Vec<rusqlite::types::Value> {
+    use rusqlite::types::Value as SqlVal;
+    let bytes = raw.as_bytes();
+    let mut i = 0usize;
+    let skip_ws = |i: &mut usize| {
+        while *i < bytes.len() && bytes[*i].is_ascii_whitespace() {
+            *i += 1;
+        }
+    };
+    skip_ws(&mut i);
+    if bytes.get(i) != Some(&b'[') {
+        return Vec::new();
+    }
+    i += 1;
+    let mut out = Vec::new();
+    loop {
+        skip_ws(&mut i);
+        if i >= bytes.len() || bytes[i] == b']' {
+            break;
+        }
+        match bytes[i] {
+            b'n' if raw[i..].starts_with("null") => {
+                out.push(SqlVal::Null);
+                i += 4;
+            }
+            b't' if raw[i..].starts_with("true") => {
+                out.push(SqlVal::Integer(1));
+                i += 4;
+            }
+            b'f' if raw[i..].starts_with("false") => {
+                out.push(SqlVal::Integer(0));
+                i += 5;
+            }
+            b'"' => {
+                if let Some((s, next)) = read_json_str_utf16(raw, i) {
+                    out.push(SqlVal::Text(s));
+                    i = next;
+                } else {
+                    break;
+                }
+            }
+            b'{' => {
+                // `{"__blob":[b0,b1,...]}`
+                if let Some(pos) = raw[i..].find('[') {
+                    let mut j = i + pos + 1;
+                    let mut blob = Vec::new();
+                    while j < bytes.len() && bytes[j] != b']' {
+                        while j < bytes.len() && (bytes[j].is_ascii_whitespace() || bytes[j] == b',') {
+                            j += 1;
+                        }
+                        if j >= bytes.len() || bytes[j] == b']' {
+                            break;
+                        }
+                        let st = j;
+                        while j < bytes.len() && bytes[j].is_ascii_digit() {
+                            j += 1;
+                        }
+                        if let Ok(v) = raw[st..j].parse::<u8>() {
+                            blob.push(v);
+                        }
+                    }
+                    while j < bytes.len() && bytes[j] != b'}' {
+                        j += 1;
+                    }
+                    if j < bytes.len() {
+                        j += 1;
+                    }
+                    out.push(SqlVal::Blob(blob));
+                    i = j;
+                } else {
+                    break;
+                }
+            }
+            b'-' | b'0'..=b'9' => {
+                let st = i;
+                if bytes[i] == b'-' {
+                    i += 1;
+                }
+                let mut is_float = false;
+                while i < bytes.len() {
+                    match bytes[i] {
+                        b'0'..=b'9' => i += 1,
+                        b'.' | b'e' | b'E' | b'+' | b'-' => {
+                            is_float = true;
+                            i += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                let tok = &raw[st..i];
+                if !is_float {
+                    if let Ok(iv) = tok.parse::<i64>() {
+                        out.push(SqlVal::Integer(iv));
+                    } else if let Ok(fv) = tok.parse::<f64>() {
+                        out.push(SqlVal::Real(fv));
+                    } else {
+                        out.push(SqlVal::Null);
+                    }
+                } else if let Ok(fv) = tok.parse::<f64>() {
+                    out.push(SqlVal::Real(fv));
+                } else {
+                    out.push(SqlVal::Null);
+                }
+            }
+            _ => break,
+        }
+        skip_ws(&mut i);
+        if bytes.get(i) == Some(&b',') {
+            i += 1;
+        }
+    }
+    out
+}
+
+#[cfg(all(
+    feature = "rust-sqlite",
+    not(any(feature = "safe-sandbox", target_arch = "wasm32"))
+))]
+fn read_json_str_utf16(s: &str, start: usize) -> Option<(String, usize)> {
+    let bytes = s.as_bytes();
+    if bytes.get(start) != Some(&b'"') {
+        return None;
+    }
+    let mut i = start + 1;
+    let mut out = String::new();
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'"' {
+            return Some((out, i + 1));
+        }
+        if b == b'\\' && i + 1 < bytes.len() {
+            i += 1;
+            match bytes[i] {
+                b'n' => { out.push('\n'); i += 1; }
+                b'r' => { out.push('\r'); i += 1; }
+                b't' => { out.push('\t'); i += 1; }
+                b'b' => { out.push('\u{0008}'); i += 1; }
+                b'f' => { out.push('\u{000C}'); i += 1; }
+                b'"' => { out.push('"'); i += 1; }
+                b'\\' => { out.push('\\'); i += 1; }
+                b'/' => { out.push('/'); i += 1; }
+                b'u' if i + 5 <= bytes.len() => {
+                    let hex1 = &s[i + 1..i + 5];
+                    i += 5;
+                    if let Ok(u1) = u16::from_str_radix(hex1, 16) {
+                        if (0xD800..=0xDBFF).contains(&u1)
+                            && i + 6 <= bytes.len()
+                            && &bytes[i..i + 2] == b"\\u"
+                        {
+                            if let Ok(u2) = u16::from_str_radix(&s[i + 2..i + 6], 16) {
+                                if (0xDC00..=0xDFFF).contains(&u2) {
+                                    let cp = 0x10000
+                                        + (((u1 as u32 - 0xD800) << 10) | (u2 as u32 - 0xDC00));
+                                    if let Some(ch) = char::from_u32(cp) {
+                                        out.push(ch);
+                                    }
+                                    i += 6;
+                                    continue;
+                                }
+                            }
+                        }
+                        if let Some(ch) = char::from_u32(u1 as u32) {
+                            out.push(ch);
+                        }
+                    }
+                }
+                other => { out.push(other as char); i += 1; }
+            }
+        } else {
+            let ch = s[i..].chars().next()?;
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    None
 }
 
 #[cfg(not(any(feature = "safe-sandbox", target_arch = "wasm32")))]

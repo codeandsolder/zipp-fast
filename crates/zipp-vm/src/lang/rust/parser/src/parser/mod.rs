@@ -464,12 +464,21 @@ impl<'a> Parser<'a> {
 
     pub(crate) fn parse_type(&mut self) -> Result<Type, ParseError> {
         self.enter()?;
-        let res = self.parse_type_inner();
+        let res = self.parse_type_inner(true);
         self.leave();
         res
     }
 
-    fn parse_type_inner(&mut self) -> Result<Type, ParseError> {
+    /// Parse `TypeNoBounds` (used in `expr as Type` casts so `x as i64 + 1`
+    /// does not treat `+ 1` as a trait-object bound).
+    pub(crate) fn parse_type_no_bounds(&mut self) -> Result<Type, ParseError> {
+        self.enter()?;
+        let res = self.parse_type_inner(false);
+        self.leave();
+        res
+    }
+
+    fn parse_type_inner(&mut self, allow_plus: bool) -> Result<Type, ParseError> {
         let start = self.peek().span;
         // Skip higher-ranked trait bounds `for<'a> ...`
         if self.eat(&TokenKind::For) {
@@ -610,7 +619,7 @@ impl<'a> Parser<'a> {
             _ => {
                 let path = self.parse_path(true)?;
                 // Handle bare trait object bounds `Trait + Send + 'static`
-                if self.at(&TokenKind::Plus) {
+                if allow_plus && self.at(&TokenKind::Plus) {
                     let mut bounds = vec![path];
                     while self.eat(&TokenKind::Plus) {
                         if matches!(self.peek_kind(), TokenKind::Lifetime(_)) {

@@ -35,6 +35,8 @@ const RUNTIME_JS: &str = concat!(
     "\n",
     rssrc!("runtime/stdlib.js"),
     "\n",
+    rssrc!("runtime/ecosystem.js"),
+    "\n",
     rssrc!("runtime/entry.js"),
 );
 
@@ -147,6 +149,7 @@ pub(crate) fn compile_program(source: &str, config: RustProgramConfig) -> R<Prog
     let mut krate = parse(source, Limits::DEFAULT)
         .map_err(|e| e.format_with_source(source, &config.file))?;
 
+    let is_test_mode = config.mode == "test";
     // Discover Cargo.toml (in `dir` or its parent if `dir` is `.../src`) for `CARGO_PKG_*` env
     // vars and automatic sibling `src/lib.rs` crate module mounting!
     let mut pkg_env = Vec::new();
@@ -176,6 +179,7 @@ pub(crate) fn compile_program(source: &str, config: RustProgramConfig) -> R<Prog
                     &mut lib_krate.items,
                     &lib_dir,
                     true,
+                    is_test_mode,
                     config.vfs.as_ref(),
                     config.allow_native_fs,
                     0,
@@ -200,6 +204,7 @@ pub(crate) fn compile_program(source: &str, config: RustProgramConfig) -> R<Prog
         &mut krate.items,
         Path::new(&dir),
         true,
+        is_test_mode,
         config.vfs.as_ref(),
         config.allow_native_fs,
         0,
@@ -212,7 +217,6 @@ pub(crate) fn compile_program(source: &str, config: RustProgramConfig) -> R<Prog
     let name_global = program.functions[entry_fn].name_global;
 
     // Collect crate symbols and allocate global slots on `program`
-    let is_test_mode = config.mode == "test";
     let syms = CrateSymbols::collect(&krate.items, is_test_mode, lib_crate_name, &mut |gname| {
         let idx = program.global_names.len() as u32;
         program.global_names.push(gname);
@@ -407,6 +411,7 @@ fn resolve_external_mods(
     items: &mut [Item],
     cur_dir: &Path,
     is_dir_owner: bool,
+    is_test_mode: bool,
     vfs: Option<&HashMap<String, Vec<u8>>>,
     allow_native_fs: bool,
     depth: usize,
@@ -415,11 +420,22 @@ fn resolve_external_mods(
         return Err("Rust: module nesting depth exceeded".into());
     }
     for item in items.iter_mut() {
+        if !scope::item_cfg_enabled(&item.attrs, is_test_mode) {
+            continue;
+        }
         let path_override = extract_path_attr(&item.attrs);
         if let ItemKind::Mod(m) = &mut item.kind {
             if let Some(sub_items) = &mut m.items {
                 let sub_dir = cur_dir.join(&m.name);
-                resolve_external_mods(sub_items, &sub_dir, true, vfs, allow_native_fs, depth + 1)?;
+                resolve_external_mods(
+                    sub_items,
+                    &sub_dir,
+                    true,
+                    is_test_mode,
+                    vfs,
+                    allow_native_fs,
+                    depth + 1,
+                )?;
             } else {
                 let (mod_src, mod_file, next_dir, child_is_dir_owner) = load_external_mod(
                     &m.name,
@@ -435,6 +451,7 @@ fn resolve_external_mods(
                     &mut parsed.items,
                     &next_dir,
                     child_is_dir_owner,
+                    is_test_mode,
                     vfs,
                     allow_native_fs,
                     depth + 1,

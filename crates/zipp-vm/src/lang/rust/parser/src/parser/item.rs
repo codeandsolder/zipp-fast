@@ -6,10 +6,7 @@ use crate::token::{Span, Token, TokenKind};
 use crate::ParseError;
 
 impl<'a> Parser<'a> {
-    pub(crate) fn can_start_item(&self) -> bool {
-        if self.is_outer_attr() {
-            return true;
-        }
+    pub(crate) fn can_start_item_body(&self) -> bool {
         match self.peek_kind() {
             TokenKind::Pub
             | TokenKind::Fn
@@ -39,15 +36,23 @@ impl<'a> Parser<'a> {
     }
 
     pub(crate) fn parse_item(&mut self) -> Result<Item, ParseError> {
+        let start = self.peek().span;
+        let attrs = self.parse_outer_attrs()?;
+        self.parse_item_with_attrs(attrs, start)
+    }
+
+    pub(crate) fn parse_item_with_attrs(
+        &mut self,
+        attrs: Vec<Attribute>,
+        start: Span,
+    ) -> Result<Item, ParseError> {
         self.enter()?;
-        let res = self.parse_item_inner();
+        let res = self.parse_item_inner(attrs, start);
         self.leave();
         res
     }
 
-    fn parse_item_inner(&mut self) -> Result<Item, ParseError> {
-        let start = self.peek().span;
-        let attrs = self.parse_outer_attrs()?;
+    fn parse_item_inner(&mut self, attrs: Vec<Attribute>, start: Span) -> Result<Item, ParseError> {
         let vis = self.parse_visibility()?;
 
         // `macro_rules! name { ... }`

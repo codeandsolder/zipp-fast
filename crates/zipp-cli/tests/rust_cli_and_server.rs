@@ -506,3 +506,119 @@ fn cli_full_cargo_issue_tracker_app_end_to_end_and_persistence() {
     let _ = child2.wait();
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
+
+#[test]
+fn cli_rust_serve_watch_and_direct_watch_hot_reload_on_edit() {
+    let exe = env!("CARGO_BIN_EXE_zipp");
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let tmp_dir = std::env::temp_dir().join(format!("zipp_rs_watch_{unique}"));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+
+    // 1. Worker server hot-reload: `zipp rs --serve HOST:PORT --watch --workers 1 app.rs`
+    let app_rs = tmp_dir.join("app.rs");
+    let v1 = r#"
+use zipp_http::{Router, Response};
+pub fn router() -> Router {
+    Router::new().get("/version", |_req| Response::text("v1"))
+}
+"#;
+    let v2 = r#"
+use zipp_http::{Router, Response};
+pub fn router() -> Router {
+    Router::new().get("/version", |_req| Response::text("v2-reloaded"))
+}
+"#;
+    std::fs::write(&app_rs, v1).unwrap();
+
+    let port = find_free_port();
+    let mut child = Command::new(exe)
+        .args([
+            "rs",
+            "--serve",
+            &format!("127.0.0.1:{port}"),
+            "--watch",
+            "--workers",
+            "1",
+            app_rs.to_str().unwrap(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn zipp rs --serve --watch");
+    wait_for_port(port);
+
+    let r1 = http_req(port, "GET", "/version", None, None);
+    assert!(r1.starts_with("HTTP/1.1 200 OK"), "r1:\n{r1}");
+    assert!(r1.ends_with("v1"), "r1:\n{r1}");
+
+    // Edit the `.rs` file in-place without restarting `zipp` — ensure mtime advances.
+    std::thread::sleep(Duration::from_millis(50));
+    std::fs::write(&app_rs, v2).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut saw_v2 = false;
+    while Instant::now() < deadline {
+        let r = http_req(port, "GET", "/version", None, None);
+        if r.ends_with("v2-reloaded") {
+            saw_v2 = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(120));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(saw_v2, "zipp rs --serve --watch did not hot-reload on .rs edit");
+
+    // 2. Direct script watch: `zipp rs --watch script.rs` writes marker file on every edit.
+    let marker = tmp_dir.join("marker.txt");
+    let script_rs = tmp_dir.join("script.rs");
+    let s1 = format!(
+        "fn main() {{ std::fs::write({:?}, \"run-v1\").unwrap(); }}\n",
+        marker.to_str().unwrap()
+    );
+    let s2 = format!(
+        "fn main() {{ std::fs::write({:?}, \"run-v2\").unwrap(); }}\n",
+        marker.to_str().unwrap()
+    );
+    std::fs::write(&script_rs, &s1).unwrap();
+
+    let mut watcher = Command::new(exe)
+        .args(["rs", "--watch", script_rs.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn zipp rs --watch");
+
+    let deadline1 = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline1 {
+        if std::fs::read_to_string(&marker).ok().as_deref() == Some("run-v1") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(80));
+    }
+    assert_eq!(
+        std::fs::read_to_string(&marker).ok().as_deref(),
+        Some("run-v1"),
+        "initial zipp rs --watch run did not execute"
+    );
+
+    std::thread::sleep(Duration::from_millis(100));
+    std::fs::write(&script_rs, &s2).unwrap();
+
+    let deadline2 = Instant::now() + Duration::from_secs(10);
+    let mut reloaded = false;
+    while Instant::now() < deadline2 {
+        if std::fs::read_to_string(&marker).ok().as_deref() == Some("run-v2") {
+            reloaded = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = watcher.kill();
+    let _ = watcher.wait();
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    assert!(reloaded, "zipp rs --watch did not re-run script after .rs edit");
+}

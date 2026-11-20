@@ -2306,6 +2306,21 @@ pub trait HostCtx {
     /// Runs the guest re-entrantly inside the host call; the guest cannot make
     /// a nested host call while it does.
     fn call_global_numbers(&mut self, name: &str, args: &[f64]) -> Result<f64, String>;
+    /// Instructions still available under the running VM's step budget
+    /// (`u64::MAX` when no finite budget is attached or `instrument` is off).
+    /// Lets any synchronous host plugin (database, regex, compression, etc.)
+    /// bound its work to the VM's remaining instruction budget.
+    fn steps_remaining(&self) -> u64 {
+        u64::MAX
+    }
+    /// Deduct `n` work units from the running VM's unified instruction budget.
+    /// Returns `Err` with the VM's budget-exhausted message if charging `n`
+    /// crosses a finite ceiling (and marks the VM's budget exhausted so the
+    /// guest cannot catch its way past it).
+    fn charge_steps(&mut self, n: u64) -> Result<(), String> {
+        let _ = n;
+        Ok(())
+    }
 }
 
 /// The context-taking twin of [`crate::embed::HostCall`]: the same string
@@ -2497,5 +2512,28 @@ impl<'p> HostCtx for Vm<'p> {
             .map_err(|t| self.take_host_throw(t))?;
         self.to_number_strict(v)
             .map_err(|t| self.take_host_throw(t))
+    }
+
+    fn steps_remaining(&self) -> u64 {
+        #[cfg(feature = "instrument")]
+        {
+            self.host_steps_remaining()
+        }
+        #[cfg(not(feature = "instrument"))]
+        {
+            u64::MAX
+        }
+    }
+
+    fn charge_steps(&mut self, n: u64) -> Result<(), String> {
+        #[cfg(feature = "instrument")]
+        {
+            self.host_charge_steps(n)
+        }
+        #[cfg(not(feature = "instrument"))]
+        {
+            let _ = n;
+            Ok(())
+        }
     }
 }

@@ -5,9 +5,10 @@
 //!   reg 1..=N: positional parameters directly in registers (enables direct `Instr::Call` and native x86-64 JIT!)
 
 use super::scope::{
-    analyze_fn, extract_derives, extract_result_err_type, extract_serde_container,
-    extract_serde_field, has_attr, item_cfg_enabled, mangle, qualify, type_base_name, type_desc,
-    CrateSymbols, FnAnalysis, NumKind,
+    analyze_fn, extract_axum_params, extract_derives, extract_result_err_type,
+    extract_return_ok_desc, extract_serde_container, extract_serde_field, has_attr,
+    item_cfg_enabled, mangle, qualify, type_base_name, type_path_str, CrateSymbols,
+    FnAnalysis, NumKind,
 };
 use crate::bytecode::{FuncProto, Instr, Program, Reg};
 use std::cell::RefCell;
@@ -496,6 +497,8 @@ impl<'a> RsEmitter<'a> {
     // ---- Top-level / module item compilation ----
 
     pub fn emit_items(&mut self, items: &[Item]) -> R<()> {
+        // Deferred `#[serde(default = "fn_name")]` bindings wired in Pass 2 after functions exist.
+        let mut deferred_serde_defaults: Vec<(String, String, u32)> = Vec::new();
         // Pass 1: register struct & enum metadata, trait defaults, and compile all functions / impl methods
         // so forward calls work regardless of declaration order!
         for item in items {
@@ -505,7 +508,8 @@ impl<'a> RsEmitter<'a> {
             let derives = extract_derives(&item.attrs);
             match &item.kind {
                 ItemKind::Struct(s) => {
-                    let sname = self.string(&s.name)?;
+                    let sqname = qualify(&self.mod_prefix, &s.name);
+                    let sname = self.string(&sqname)?;
                     let cmeta = extract_serde_container(&item.attrs);
                     let serde_obj = self.new_js_obj()?;
                     if let Some(ref ra) = cmeta.rename_all {
@@ -518,7 +522,9 @@ impl<'a> RsEmitter<'a> {
                             let mut pairs = Vec::with_capacity(fs.len());
                             for f in fs {
                                 let fn_r = self.string(&f.name)?;
-                                let ft_r = self.string(&type_desc(&f.ty))?;
+                                let ft_r = self.string(
+                                    &self.syms.type_desc_resolved(&self.mod_prefix, &f.ty),
+                                )?;
                                 pairs.push(self.js_array(&[fn_r, ft_r])?);
                                 let fm = extract_serde_field(&f.attrs);
                                 if fm.rename.is_some()
@@ -528,6 +534,7 @@ impl<'a> RsEmitter<'a> {
                                     || fm.skip_deserializing
                                     || fm.skip_serializing_if.is_some()
                                     || fm.flatten
+                                    || fm.has_default
                                 {
                                     let fobj = self.new_js_obj()?;
                                     if let Some(ref rn) = fm.rename {
@@ -558,6 +565,23 @@ impl<'a> RsEmitter<'a> {
                                         let v = self.boolean(true)?;
                                         self.set_prop(fobj, "flatten", v)?;
                                     }
+                                    if fm.has_default {
+                                        let v = self.boolean(true)?;
+                                        self.set_prop(fobj, "has_default", v)?;
+                                    }
+                                    if let Some(ref df) = fm.default_fn {
+                                        let raw: Vec<String> =
+                                            df.split("::").map(|s| s.trim().to_owned()).collect();
+                                        if let Some((_, slot)) =
+                                            self.syms.lookup_fn_global(&self.mod_prefix, &raw)
+                                        {
+                                            deferred_serde_defaults.push((
+                                                sqname.clone(),
+                                                f.name.clone(),
+                                                slot,
+                                            ));
+                                        }
+                                    }
                                     self.set_prop(fields_meta_obj, &f.name, fobj)?;
                                 }
                             }
@@ -567,7 +591,9 @@ impl<'a> RsEmitter<'a> {
                             let mut pairs = Vec::with_capacity(fs.len());
                             for (i, f) in fs.iter().enumerate() {
                                 let fn_r = self.string(&i.to_string())?;
-                                let ft_r = self.string(&type_desc(&f.ty))?;
+                                let ft_r = self.string(
+                                    &self.syms.type_desc_resolved(&self.mod_prefix, &f.ty),
+                                )?;
                                 pairs.push(self.js_array(&[fn_r, ft_r])?);
                             }
                             (true, self.js_array(&pairs)?)
@@ -611,6 +637,17 @@ impl<'a> RsEmitter<'a> {
                     }
                     let d_arr = self.js_array(&d_regs)?;
                     self.helper("regEnum", &[ename, vobj, d_arr, serde_obj])?;
+                    // `thiserror` `#[derive(Error)]` `#[from]` automatic `From<Src> for Enum` registration!
+                    for v in &e.variants {
+                        if let StructFields::Tuple(tfs) = &v.fields {
+                            if tfs.len() == 1 && has_attr(&tfs[0].attrs, "from") {
+                                let src_path = type_path_str(&tfs[0].ty);
+                                let vn = self.string(&v.name)?;
+                                let sp = self.string(&src_path)?;
+                                self.helper("regEnumFrom", &[ename, vn, sp])?;
+                            }
+                        }
+                    }
                 }
                 ItemKind::Trait(tr) => {
                     for ti in &tr.items {
@@ -648,6 +685,16 @@ impl<'a> RsEmitter<'a> {
                         dst: fn_reg,
                         func_id,
                     })?;
+                    if let Some(ax_params) = extract_axum_params(self.syms, &self.mod_prefix, &f.params) {
+                        let mut p_regs = Vec::with_capacity(ax_params.len());
+                        for (kind, inner) in &ax_params {
+                            let kr = self.string(kind)?;
+                            let ir = self.string(inner)?;
+                            p_regs.push(self.js_array(&[kr, ir])?);
+                        }
+                        let parr = self.js_array(&p_regs)?;
+                        self.set_prop(fn_reg, "__rs_params", parr)?;
+                    }
                     if let Some(&slot) = self.syms.fn_globals.get(&qname) {
                         self.emit(Instr::StoreGlobal {
                             idx: slot,
@@ -754,7 +801,18 @@ impl<'a> RsEmitter<'a> {
             }
         }
 
-        // Pass 2: evaluate `const` and `static` initializers (after all functions & structs exist!)
+        // Pass 2: wire deferred `#[serde(default = "fn_name")]` callbacks and evaluate `const` / `static` initializers
+        // (after all functions & structs exist!).
+        for (sname, fname, slot) in deferred_serde_defaults {
+            let fn_r = self.alloc()?;
+            self.emit(Instr::LoadGlobal {
+                dst: fn_r,
+                idx: slot,
+            })?;
+            let sn = self.string(&sname)?;
+            let fn_name = self.string(&fname)?;
+            self.helper("setSerdeDefaultFn", &[sn, fn_name, fn_r])?;
+        }
         for item in items {
             if !item_cfg_enabled(&item.attrs, self.file.is_test_mode) {
                 continue;
@@ -777,15 +835,32 @@ impl<'a> RsEmitter<'a> {
                     }
                 }
                 ItemKind::Static(s) => {
-                    let vreg = self.emit_expr(&s.value)?;
                     let qname = qualify(&self.mod_prefix, &s.name);
                     if let Some(&slot) = self.syms.static_globals.get(&qname) {
+                        let vreg = self.emit_expr(&s.value)?;
                         self.emit(Instr::StoreGlobal {
                             idx: slot,
                             src: vreg,
                         })?;
                     } else {
-                        self.bind_local(&s.name, vreg, NumKind::from_type(&s.ty))?;
+                        // Function-local `static`: initialize once and persist across calls!
+                        let skey = format!("{}::{}@{}", self.mod_prefix, s.name, item.span.start);
+                        let k = self.string(&skey)?;
+                        let has = self.helper("hasStatic", &[k])?;
+                        let j_init = self.jump_if_false(has)?;
+                        let existing = self.helper("getStatic", &[k])?;
+                        let dst = self.alloc()?;
+                        self.emit(Instr::Move {
+                            dst,
+                            src: existing,
+                        })?;
+                        let j_done = self.jump()?;
+                        self.patch(j_init, self.here())?;
+                        let init_v = self.emit_expr(&s.value)?;
+                        self.helper("setStatic", &[k, init_v])?;
+                        self.emit(Instr::Move { dst, src: init_v })?;
+                        self.patch(j_done, self.here())?;
+                        self.bind_local(&s.name, dst, NumKind::from_type(&s.ty))?;
                     }
                 }
                 _ => {}
@@ -878,7 +953,8 @@ impl<'a> RsEmitter<'a> {
             }
             sub.emit_pat_bind(&param.pat, preg, nk)?;
         }
-        let ret = sub.emit_block(body)?;
+        let ret_ok_hint = extract_return_ok_desc(f.ret_type.as_ref());
+        let ret = sub.emit_block_with_hint(body, ret_ok_hint.as_deref())?;
         sub.emit(Instr::Return { src: ret })?;
         let proto = sub.finish();
         self.push_func(proto)

@@ -24,23 +24,31 @@ impl<'a> Parser<'a> {
             if self.eat(&TokenKind::Semi) {
                 continue;
             }
+            let stmt_start = self.peek().span;
+            let attrs = if self.is_outer_attr() {
+                self.parse_outer_attrs()?
+            } else {
+                Vec::new()
+            };
             if self.at(&TokenKind::Let) {
-                stmts.push(self.parse_let_stmt()?);
+                stmts.push(self.parse_let_stmt(attrs, stmt_start)?);
                 continue;
             }
-            if self.can_start_item() {
-                let item = self.parse_item()?;
+            if self.can_start_item_body() {
+                let item = self.parse_item_with_attrs(attrs, stmt_start)?;
                 let span = item.span;
                 stmts.push(Stmt {
+                    attrs: Vec::new(),
                     kind: StmtKind::Item(Box::new(item)),
                     span,
                 });
                 continue;
             }
             let expr = self.parse_stmt_expr()?;
-            let span = expr.span;
+            let span = stmt_start.merge(expr.span);
             if self.eat(&TokenKind::Semi) {
                 stmts.push(Stmt {
+                    attrs,
                     kind: StmtKind::Expr {
                         expr,
                         has_semi: true,
@@ -48,10 +56,22 @@ impl<'a> Parser<'a> {
                     span,
                 });
             } else if self.at(&TokenKind::RBrace) {
-                tail = Some(Box::new(expr));
+                if attrs.is_empty() {
+                    tail = Some(Box::new(expr));
+                } else {
+                    stmts.push(Stmt {
+                        attrs,
+                        kind: StmtKind::Expr {
+                            expr,
+                            has_semi: false,
+                        },
+                        span,
+                    });
+                }
                 break;
             } else if expr_needs_no_semi(&expr.kind) {
                 stmts.push(Stmt {
+                    attrs,
                     kind: StmtKind::Expr {
                         expr,
                         has_semi: false,
@@ -77,31 +97,44 @@ impl<'a> Parser<'a> {
         if self.eat(&TokenKind::Semi) {
             let span = self.tokens[self.pos.saturating_sub(1)].span;
             return Ok(Stmt {
+                attrs: Vec::new(),
                 kind: StmtKind::Empty,
                 span,
             });
         }
+        let stmt_start = self.peek().span;
+        let attrs = if self.is_outer_attr() {
+            self.parse_outer_attrs()?
+        } else {
+            Vec::new()
+        };
         if self.at(&TokenKind::Let) {
-            return self.parse_let_stmt();
+            return self.parse_let_stmt(attrs, stmt_start);
         }
-        if self.can_start_item() {
-            let item = self.parse_item()?;
+        if self.can_start_item_body() {
+            let item = self.parse_item_with_attrs(attrs, stmt_start)?;
             let span = item.span;
             return Ok(Stmt {
+                attrs: Vec::new(),
                 kind: StmtKind::Item(Box::new(item)),
                 span,
             });
         }
         let expr = self.parse_stmt_expr()?;
-        let span = expr.span;
+        let span = stmt_start.merge(expr.span);
         let has_semi = self.eat(&TokenKind::Semi);
         Ok(Stmt {
+            attrs,
             kind: StmtKind::Expr { expr, has_semi },
             span,
         })
     }
 
-    fn parse_let_stmt(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_let_stmt(
+        &mut self,
+        attrs: Vec<Attribute>,
+        stmt_start: crate::token::Span,
+    ) -> Result<Stmt, ParseError> {
         let start = self.expect(&TokenKind::Let, "`let`")?.span;
         let pat = self.parse_pat()?;
         let ty = if self.eat(&TokenKind::Colon) {
@@ -121,13 +154,14 @@ impl<'a> Parser<'a> {
         };
         let end = self.expect(&TokenKind::Semi, "`;`")?.span;
         Ok(Stmt {
+            attrs,
             kind: StmtKind::Let {
                 pat,
                 ty,
                 init,
                 else_block,
             },
-            span: start.merge(end),
+            span: stmt_start.merge(start).merge(end),
         })
     }
 

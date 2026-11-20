@@ -15,6 +15,11 @@ zipp-phpparse = { path = "src/lang/php/parser", optional = true }
 # ZIPP's own Rust front end (pure-Rust lexer, AST, parser).
 # Optional and off by default: it backs the `lang::rust` compiler.
 zipp-rsparse = { path = "src/lang/rust/parser", optional = true }
+# Optional native SQLite (bundled with FTS5, JSON1, R-Tree) + Argon2id for
+# `zipp rs` backend apps (`rust-native-db`). Enabled ONLY by `zipp-cli`; never
+# pulled into `zipp-wasm`, `wasm-lite`, or `safe-sandbox`.
+rusqlite = { version = "0.31", features = ["bundled"], optional = true }
+argon2 = { version = "0.5", features = ["std"], optional = true }
 # Decimal text to f64 without core's 10 KB power-of-five table (`num_parse`).
 # A crate of its own because zipp-pyparse uses it too.
 zipp-numparse = { path = "../zipp-numparse" }
@@ -97,6 +102,14 @@ php = ["dep:zipp-phpparse", "instrument"]
 # Experimental Rust language frontend & backend runtime (`lang/rust`).
 # Off by default so the JavaScript engine is unchanged.
 rust = ["dep:zipp-rsparse", "instrument"]
+# Pure safe Rust Argon2id password hashing for `zipp rs` backend apps.
+rust-argon2 = ["rust", "dep:argon2"]
+# Optional bundled C SQLite (FTS5/R-Tree/JSON1) fallback for `zipp rs` backend
+# apps when no external sandboxed SQL host plugin (`app.sql.*`) is attached.
+# Off by default so `zipp-cli`, `zipp-wasm`, and `safe-sandbox` stay C-free.
+rust-sqlite = ["rust", "dep:rusqlite"]
+# Convenience umbrella enabling both optional native DB + Argon2id helpers.
+rust-native-db = ["rust-sqlite", "rust-argon2"]
 # Trusted mixed-language programs sharing one VM scope; deliberately opt-in.
 python-js-interop = ["python"]
 # Artifact-internal (the zipp-wasm `python` variant): the Python frontend

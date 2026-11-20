@@ -205,6 +205,22 @@ impl<'a> RsEmitter<'a> {
                 let arr = self.js_array(&regs)?;
                 self.helper("mkTuple", &[arr])
             }
+            "try_join" => self.emit_try_join_macro(&mc.tokens),
+            "select" => self.emit_select_macro(&mc.tokens),
+            "format_description" => {
+                // `time::macros::format_description!("[year]-[month]-[day]")`
+                let chunks = split_top_level_commas(&mc.tokens);
+                let desc = chunks
+                    .iter()
+                    .find_map(|ch| {
+                        ch.last().and_then(|t| match &t.kind {
+                            TokenKind::Str(s) => Some(s.clone()),
+                            _ => None,
+                        })
+                    })
+                    .unwrap_or_default();
+                self.string(&desc)
+            }
             _ => Err(format!("Rust: unsupported macro `{name}!`")),
         }
     }
@@ -285,10 +301,297 @@ impl<'a> RsEmitter<'a> {
 
     fn emit_log_macro(&mut self, level: &str, tokens: &[Token]) -> R<Reg> {
         let lvl = self.string(level)?;
-        let formatted = self.emit_format_call("format", tokens, true)?;
-        let tmpl = self.string("{}")?;
-        let pos = self.js_array(&[formatted])?;
-        self.helper("logMsg", &[lvl, tmpl, pos])
+        let chunks = split_top_level_commas(tokens);
+        // Handle `tracing` structured fields (`target: "..."`, `key = %val`, `key = ?val`,
+        // `key = val`, `%val`, `?val`, bare `ident`) before an optional format message.
+        let mut msg_start = chunks.len();
+        let mut field_pairs: Vec<(String, Reg)> = Vec::new();
+        for (idx, ch) in chunks.iter().enumerate() {
+            if ch.is_empty() {
+                continue;
+            }
+            // String literal starts the format message!
+            if matches!(ch[0].kind, TokenKind::Str(_)) {
+                msg_start = idx;
+                break;
+            }
+            // `target: expr` / `parent: expr` -> skip metadata label
+            if ch.len() >= 2
+                && matches!(ch[0].kind, TokenKind::Ident(_))
+                && matches!(ch[1].kind, TokenKind::Colon)
+            {
+                continue;
+            }
+            // `key = [%/?]expr` (also dotted keys like `http.status = expr`)
+            if let Some(eq_pos) = find_top_level_token(ch, &TokenKind::Eq) {
+                let key = tokens_to_source(self.file.source, &ch[..eq_pos]);
+                let mut val_toks = &ch[eq_pos + 1..];
+                if matches!(
+                    val_toks.first().map(|t| &t.kind),
+                    Some(TokenKind::Percent | TokenKind::Question)
+                ) {
+                    val_toks = &val_toks[1..];
+                }
+                if !val_toks.is_empty() {
+                    let e = parse_expr_tokens(self.file.source, val_toks.to_vec(), Limits::DEFAULT)
+                        .map_err(|e| format!("tracing field `{key}` error: {e}"))?;
+                    let r = self.emit_expr(&e)?;
+                    field_pairs.push((key, r));
+                }
+                continue;
+            }
+            // Shorthand `%expr` or `?expr`
+            if matches!(ch[0].kind, TokenKind::Percent | TokenKind::Question) && ch.len() >= 2 {
+                let val_toks = &ch[1..];
+                let key = tokens_to_source(self.file.source, val_toks);
+                let e = parse_expr_tokens(self.file.source, val_toks.to_vec(), Limits::DEFAULT)
+                    .map_err(|e| format!("tracing field `{key}` error: {e}"))?;
+                let r = self.emit_expr(&e)?;
+                field_pairs.push((key, r));
+                continue;
+            }
+            // Bare identifier field shorthand (e.g. `tracing::warn!(current, shipped, "msg")`)
+            if ch.len() == 1 && matches!(ch[0].kind, TokenKind::Ident(_)) {
+                let TokenKind::Ident(ref k) = ch[0].kind else {
+                    unreachable!()
+                };
+                let e = parse_expr_tokens(self.file.source, ch.clone(), Limits::DEFAULT)
+                    .map_err(|e| format!("tracing field `{k}` error: {e}"))?;
+                let r = self.emit_expr(&e)?;
+                field_pairs.push((k.clone(), r));
+                continue;
+            }
+            // Otherwise treat from here on as a format call
+            msg_start = idx;
+            break;
+        }
+        let msg_reg = if msg_start < chunks.len() {
+            let msg_toks = join_chunks_with_commas(&chunks[msg_start..]);
+            self.emit_format_call("format", &msg_toks, true)?
+        } else {
+            self.string("")?
+        };
+        if field_pairs.is_empty() {
+            let tmpl = self.string("{}")?;
+            let pos = self.js_array(&[msg_reg])?;
+            self.helper("logMsg", &[lvl, tmpl, pos])
+        } else {
+            let mut tmpl_s = String::new();
+            let mut pos_regs = Vec::with_capacity(field_pairs.len() + 1);
+            for (k, r) in field_pairs {
+                if !tmpl_s.is_empty() {
+                    tmpl_s.push(' ');
+                }
+                tmpl_s.push_str(&k);
+                tmpl_s.push_str("={}");
+                pos_regs.push(r);
+            }
+            tmpl_s.push_str(" {}");
+            pos_regs.push(msg_reg);
+            let tmpl = self.string(&tmpl_s)?;
+            let pos = self.js_array(&pos_regs)?;
+            self.helper("logMsg", &[lvl, tmpl, pos])
+        }
+    }
+
+    /// `tokio::try_join!(f1, f2, ...)` -> awaits each future, short-circuits on `Err`,
+    /// otherwise returns `Ok((v1, v2, ...))`.
+    fn emit_try_join_macro(&mut self, tokens: &[Token]) -> R<Reg> {
+        let parts = split_top_level_commas(tokens);
+        let dst = self.alloc()?;
+        let mut ok_regs = Vec::with_capacity(parts.len());
+        let mut err_jumps = Vec::new();
+        for p in parts {
+            if p.is_empty() {
+                continue;
+            }
+            let e = parse_expr_tokens(self.file.source, p, Limits::DEFAULT)
+                .map_err(|e| format!("try_join! arg error: {e}"))?;
+            let r = self.emit_expr(&e)?;
+            let awaited = if self.proto.is_async {
+                let d = self.alloc()?;
+                self.emit(crate::bytecode::Instr::Await { dst: d, val: r })?;
+                d
+            } else {
+                r
+            };
+            let is_err = self.helper("isErr", &[awaited])?;
+            let j_ok = self.jump_if_false(is_err)?;
+            self.emit(crate::bytecode::Instr::Move { dst, src: awaited })?;
+            err_jumps.push(self.jump()?);
+            self.patch(j_ok, self.here())?;
+            let val = self.helper("unwrapOk", &[awaited])?;
+            ok_regs.push(val);
+        }
+        let arr = self.js_array(&ok_regs)?;
+        let tup = self.helper("mkTuple", &[arr])?;
+        let ok = self.helper("Ok", &[tup])?;
+        self.emit(crate::bytecode::Instr::Move { dst, src: ok })?;
+        let end = self.here();
+        for j in err_jumps {
+            self.patch(j, end)?;
+        }
+        Ok(dst)
+    }
+
+    /// `tokio::select! { pat = fut => body, ... }`
+    /// Races all arm futures via `__zipp_rs.selectRace([...])` and executes the
+    /// winning arm's pattern bind + body.
+    fn emit_select_macro(&mut self, tokens: &[Token]) -> R<Reg> {
+        // Split tokens into `pat = fut => body [,]` arms.
+        let mut arms: Vec<(Vec<Token>, Vec<Token>, Vec<Token>)> = Vec::new();
+        let mut i = 0usize;
+        while i < tokens.len() {
+            while i < tokens.len() && matches!(tokens[i].kind, TokenKind::Comma | TokenKind::Semi) {
+                i += 1;
+            }
+            if i >= tokens.len() {
+                break;
+            }
+            // Skip optional `biased;`
+            if matches!(&tokens[i].kind, TokenKind::Ident(s) if s == "biased")
+                && matches!(tokens.get(i + 1).map(|t| &t.kind), Some(TokenKind::Semi))
+            {
+                i += 2;
+                continue;
+            }
+            // Find top-level `=` (pat = fut)
+            let eq_rel = find_top_level_token(&tokens[i..], &TokenKind::Eq)
+                .ok_or_else(|| "select! arm missing `=`".to_owned())?;
+            let pat_toks = tokens[i..i + eq_rel].to_vec();
+            i += eq_rel + 1;
+            // Find top-level `=>` (fut [if guard] => body)
+            let arrow_rel = find_top_level_token(&tokens[i..], &TokenKind::FatArrow)
+                .ok_or_else(|| "select! arm missing `=>`".to_owned())?;
+            let fut_toks = tokens[i..i + arrow_rel].to_vec();
+            i += arrow_rel + 1;
+            // Parse body: either `{ ... }` block or expression up to `,`
+            if i >= tokens.len() {
+                return Err("select! arm missing body".into());
+            }
+            let body_toks = if matches!(tokens[i].kind, TokenKind::LBrace) {
+                let mut depth = 0usize;
+                let start = i;
+                while i < tokens.len() {
+                    match tokens[i].kind {
+                        TokenKind::LBrace => depth += 1,
+                        TokenKind::RBrace => {
+                            depth -= 1;
+                            if depth == 0 {
+                                i += 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                tokens[start..i].to_vec()
+            } else {
+                let mut depth = 0usize;
+                let start = i;
+                while i < tokens.len() {
+                    match tokens[i].kind {
+                        TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => depth += 1,
+                        TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
+                            depth = depth.saturating_sub(1);
+                        }
+                        TokenKind::Comma if depth == 0 => break,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                tokens[start..i].to_vec()
+            };
+            arms.push((pat_toks, fut_toks, body_toks));
+        }
+
+        if arms.is_empty() {
+            return self.undefined();
+        }
+        // Emit all arm futures into a JS array and await `__zipp_rs.selectRace(futs)`
+        // which returns `[winning_idx, resolved_val]`.
+        let mut fut_regs = Vec::with_capacity(arms.len());
+        for (_, fut_toks, _) in &arms {
+            // Strip optional `, if guard` from fut_toks if present
+            let fut_e = parse_expr_tokens(self.file.source, fut_toks.clone(), Limits::DEFAULT)
+                .map_err(|e| format!("select! future error: {e}"))?;
+            fut_regs.push(self.emit_expr(&fut_e)?);
+        }
+        let fut_arr = self.js_array(&fut_regs)?;
+        let raced_p = self.helper("selectRace", &[fut_arr])?;
+        let raced = if self.proto.is_async {
+            let d = self.alloc()?;
+            self.emit(crate::bytecode::Instr::Await { dst: d, val: raced_p })?;
+            d
+        } else {
+            raced_p
+        };
+        let zero = self.small_int(0)?;
+        let one = self.small_int(1)?;
+        let win_idx = self.alloc()?;
+        self.emit(crate::bytecode::Instr::GetIndex {
+            dst: win_idx,
+            obj: raced,
+            key: zero,
+        })?;
+        let win_val = self.alloc()?;
+        self.emit(crate::bytecode::Instr::GetIndex {
+            dst: win_val,
+            obj: raced,
+            key: one,
+        })?;
+
+        let dst = self.undefined()?;
+        let mut end_jumps = Vec::new();
+        for (arm_i, (pat_toks, _, body_toks)) in arms.iter().enumerate() {
+            let idx_r = self.small_int(arm_i as i32)?;
+            let eq_r = self.alloc()?;
+            self.emit(crate::bytecode::Instr::Eq {
+                dst: eq_r,
+                a: win_idx,
+                b: idx_r,
+            })?;
+            let j_next = self.jump_if_false(eq_r)?;
+
+            // Parse `pat` and `body` via synthetic `match __sel_v { pat => body, _ => {} }`
+            let pat_src = tokens_to_source(self.file.source, pat_toks);
+            let body_src = tokens_to_source(self.file.source, body_toks);
+            let synth = format!("fn _s() {{ match __sel_v {{ {pat_src} => {body_src}, _ => {{}} }} }}");
+            let parsed = zipp_rsparse::parse(&synth, Limits::DEFAULT)
+                .map_err(|e| format!("select! arm {arm_i} parse error: {e}"))?;
+            if let Some(Item {
+                kind: ItemKind::Fn(f),
+                ..
+            }) = parsed.items.first()
+            {
+                if let Some(Expr {
+                    kind: ExprKind::Match { arms: m_arms, .. },
+                    ..
+                }) = f.body.as_ref().and_then(|b| b.tail.as_deref())
+                {
+                    if let Some(arm) = m_arms.first() {
+                        self.push_scope();
+                        let mut fails = Vec::new();
+                        self.emit_pat_match(&arm.pat, win_val, &mut fails)?;
+                        let res = self.emit_expr(&arm.body)?;
+                        self.emit(crate::bytecode::Instr::Move { dst, src: res })?;
+                        self.pop_scope();
+                        let fail_pc = self.here();
+                        for fj in fails {
+                            self.patch(fj, fail_pc)?;
+                        }
+                    }
+                }
+            }
+            end_jumps.push(self.jump()?);
+            self.patch(j_next, self.here())?;
+        }
+        let end_pc = self.here();
+        for j in end_jumps {
+            self.patch(j, end_pc)?;
+        }
+        Ok(dst)
     }
 
     fn emit_write_macro(&mut self, tokens: &[Token], newline: bool) -> R<Reg> {
@@ -543,7 +846,8 @@ pub(super) fn split_top_level_commas(tokens: &[Token]) -> Vec<Vec<Token>> {
     let mut parts = Vec::new();
     let mut cur = Vec::new();
     let mut depth = 0usize;
-    for tok in tokens {
+    let mut angle_depth = 0usize;
+    for (i, tok) in tokens.iter().enumerate() {
         match tok.kind {
             TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => {
                 depth += 1;
@@ -553,7 +857,28 @@ pub(super) fn split_top_level_commas(tokens: &[Token]) -> Vec<Vec<Token>> {
                 depth = depth.saturating_sub(1);
                 cur.push(tok.clone());
             }
-            TokenKind::Comma if depth == 0 => {
+            TokenKind::Lt => {
+                // Track turbofish `::<T, U>` and nested generic angle brackets
+                if angle_depth > 0
+                    || (i > 0 && matches!(tokens[i - 1].kind, TokenKind::ColonColon))
+                {
+                    angle_depth += 1;
+                }
+                cur.push(tok.clone());
+            }
+            TokenKind::Gt => {
+                if angle_depth > 0 {
+                    angle_depth -= 1;
+                }
+                cur.push(tok.clone());
+            }
+            TokenKind::Shr => {
+                if angle_depth > 0 {
+                    angle_depth = angle_depth.saturating_sub(2);
+                }
+                cur.push(tok.clone());
+            }
+            TokenKind::Comma if depth == 0 && angle_depth == 0 => {
                 parts.push(std::mem::take(&mut cur));
             }
             _ => cur.push(tok.clone()),
@@ -567,14 +892,32 @@ pub(super) fn split_top_level_commas(tokens: &[Token]) -> Vec<Vec<Token>> {
 
 fn find_top_level_token(tokens: &[Token], needle: &TokenKind) -> Option<usize> {
     let mut depth = 0usize;
+    let mut angle_depth = 0usize;
     for (i, tok) in tokens.iter().enumerate() {
-        if depth == 0 && &tok.kind == needle {
+        if depth == 0 && angle_depth == 0 && &tok.kind == needle {
             return Some(i);
         }
         match tok.kind {
             TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => depth += 1,
             TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
                 depth = depth.saturating_sub(1);
+            }
+            TokenKind::Lt => {
+                if angle_depth > 0
+                    || (i > 0 && matches!(tokens[i - 1].kind, TokenKind::ColonColon))
+                {
+                    angle_depth += 1;
+                }
+            }
+            TokenKind::Gt => {
+                if angle_depth > 0 {
+                    angle_depth -= 1;
+                }
+            }
+            TokenKind::Shr => {
+                if angle_depth > 0 {
+                    angle_depth = angle_depth.saturating_sub(2);
+                }
             }
             _ => {}
         }

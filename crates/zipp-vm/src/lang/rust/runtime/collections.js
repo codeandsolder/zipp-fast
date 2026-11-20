@@ -386,7 +386,8 @@
                 return it.peek ? it.peek() : None;
             case "collect": {
                 const all = drainIter(it);
-                const target = typeArgs && typeArgs.length > 0 ? typeArgs[0] : "";
+                const rawTarget = typeArgs && typeArgs.length > 0 ? typeArgs[0] : "";
+                const target = rawTarget.split("<")[0].trim();
                 if (target === "String") {
                     return R.mkString(all.map(strVal).join(""));
                 }
@@ -687,6 +688,15 @@
             return Ok(target === "f32" ? Math.fround(n) : n);
         }
         if (target === "String") return Ok(R.mkString(s));
+        if (target === "SocketAddr" || target === "std::net::SocketAddr") {
+            return rt.parseSocketAddr ? rt.parseSocketAddr(t) : Err(R.mkString("invalid socket address: " + s));
+        }
+        if (target === "IpAddr" || target === "Ipv4Addr" || target === "Ipv6Addr") {
+            return rt.parseIpAddr ? rt.parseIpAddr(t, target) : Err(R.mkString("invalid ip address: " + s));
+        }
+        if (target === "Uuid" || target === "uuid::Uuid") {
+            return rt.parseUuid ? rt.parseUuid(t) : Ok({ __rs: 15, kind: "uuid", s: t });
+        }
         if (target === "i128" || target === "u128") {
             try { return Ok(BigInt(t)); } catch (_) { return Err(R.mkString("invalid digit found in string")); }
         }
@@ -703,6 +713,38 @@
             if (t !== "" && !Number.isNaN(f)) return Ok(f);
         }
         return Err(R.mkString("invalid digit found in string: " + s));
+    }
+
+    function matchCharPat(ch, pat) {
+        if (typeof pat === "function") return !!deref(pat(R.mkChar(ch)));
+        const dp = deref(pat);
+        if (dp && dp.__rs === 7) {
+            for (let i = 0; i < dp.items.length; i++) {
+                if (strVal(dp.items[i]) === ch) return true;
+            }
+            return false;
+        }
+        return strVal(dp).indexOf(ch) >= 0;
+    }
+
+    function splitByPat(s, patArg) {
+        const dp = deref(patArg);
+        if (typeof patArg === "function" || (dp && dp.__rs === 7)) {
+            const parts = [];
+            let cur = "";
+            const chars = Array.from(s);
+            for (let i = 0; i < chars.length; i++) {
+                if (matchCharPat(chars[i], patArg)) {
+                    parts.push(cur);
+                    cur = "";
+                } else {
+                    cur += chars[i];
+                }
+            }
+            parts.push(cur);
+            return parts;
+        }
+        return s.split(strVal(dp));
     }
 
     function callStrMethod(obj, name, args, typeArgs) {
@@ -745,20 +787,34 @@
             case "trim_start": case "trim_left": return s.trimStart();
             case "trim_end": case "trim_right": return s.trimEnd();
             case "trim_matches": {
-                const pat = strVal(args[0]);
-                let start = 0, end = s.length;
-                while (start < end && pat.indexOf(s[start]) >= 0) start++;
-                while (end > start && pat.indexOf(s[end - 1]) >= 0) end--;
-                return s.slice(start, end);
+                const chars = Array.from(s);
+                let start = 0, end = chars.length;
+                while (start < end && matchCharPat(chars[start], args[0])) start++;
+                while (end > start && matchCharPat(chars[end - 1], args[0])) end--;
+                return chars.slice(start, end).join("");
             }
             case "trim_start_matches": {
-                const pat = strVal(args[0]);
+                const dp = deref(args[0]);
+                if (typeof args[0] === "function" || (dp && dp.__rs === 7)) {
+                    const chars = Array.from(s);
+                    let start = 0;
+                    while (start < chars.length && matchCharPat(chars[start], args[0])) start++;
+                    return chars.slice(start).join("");
+                }
+                const pat = strVal(dp);
                 let out = s;
                 while (pat.length > 0 && out.startsWith(pat)) out = out.slice(pat.length);
                 return out;
             }
             case "trim_end_matches": {
-                const pat = strVal(args[0]);
+                const dp = deref(args[0]);
+                if (typeof args[0] === "function" || (dp && dp.__rs === 7)) {
+                    const chars = Array.from(s);
+                    let end = chars.length;
+                    while (end > 0 && matchCharPat(chars[end - 1], args[0])) end--;
+                    return chars.slice(0, end).join("");
+                }
+                const pat = strVal(dp);
                 let out = s;
                 while (pat.length > 0 && out.endsWith(pat)) out = out.slice(0, -pat.length);
                 return out;
@@ -831,8 +887,17 @@
                 return s.endsWith(p) ? Some(s.slice(0, s.length - p.length)) : None;
             }
             case "replace": {
-                const from = strVal(args[0]), to = strVal(args[1]);
-                return R.mkString(s.split(from).join(to));
+                const dp = deref(args[0]);
+                const to = strVal(args[1]);
+                if (typeof args[0] === "function" || (dp && dp.__rs === 7)) {
+                    const chars = Array.from(s);
+                    let out = "";
+                    for (let i = 0; i < chars.length; i++) {
+                        out += matchCharPat(chars[i], args[0]) ? to : chars[i];
+                    }
+                    return R.mkString(out);
+                }
+                return R.mkString(s.split(strVal(dp)).join(to));
             }
             case "replacen": {
                 const from = strVal(args[0]), to = strVal(args[1]);
@@ -849,14 +914,12 @@
             }
             case "repeat": return R.mkString(s.repeat(Number(deref(args[0]))));
             case "split": {
-                const sep = strVal(args[0]);
-                const parts = s.split(sep);
+                const parts = splitByPat(s, args[0]);
                 let i = 0;
                 return mkIter(function () { return i >= parts.length ? ITER_DONE : parts[i++]; });
             }
             case "rsplit": {
-                const sep = strVal(args[0]);
-                const parts = s.split(sep).reverse();
+                const parts = splitByPat(s, args[0]).reverse();
                 let i = 0;
                 return mkIter(function () { return i >= parts.length ? ITER_DONE : parts[i++]; });
             }
@@ -923,6 +986,21 @@
             case "as_bytes":
             case "into_bytes":
                 return { __rs: 7, items: rt.strToUtf8Bytes(s) };
+            case "as_os_str":
+            case "to_string_lossy":
+                return R.mkString(s);
+            case "encode_wide": {
+                const codes = [];
+                for (let i = 0; i < s.length; i++) codes.push(s.charCodeAt(i));
+                let idx = 0;
+                return mkIter(function () { return idx >= codes.length ? ITER_DONE : codes[idx++]; });
+            }
+            case "into_response":
+                return rt.mkResponse(200, s, "text/plain; charset=utf-8");
+            case "into": {
+                const dst = typeArgs && typeArgs[0] ? typeArgs[0] : "";
+                return dst ? R.convertInto(obj, dst) : R.mkString(s);
+            }
             case "parse":
                 return parseStrAs(s, typeArgs && typeArgs[0] ? typeArgs[0] : "");
             case "cmp": return rt.mkOrdering(cmpVal(s, args[0]));
@@ -1074,6 +1152,15 @@
             case "clone": return v;
             case "cmp": return rt.mkOrdering(cmpVal(v, a0));
             case "partial_cmp": return Number.isNaN(n) || Number.isNaN(Number(a0)) ? None : Some(rt.mkOrdering(cmpVal(v, a0)));
+            // `http::StatusCode` methods (represented as u16 JS numbers)
+            case "as_u16": return n | 0;
+            case "as_str": return String(n | 0);
+            case "is_informational": return n >= 100 && n < 200;
+            case "is_success": return n >= 200 && n < 300;
+            case "is_redirection": return n >= 300 && n < 400;
+            case "is_client_error": return n >= 400 && n < 500;
+            case "is_server_error": return n >= 500 && n < 600;
+            case "canonical_reason": return rt.statusReason ? Some(rt.statusReason(n | 0)) : None;
         }
         R.panic("unknown numeric method `" + name + "`");
     }
@@ -1086,6 +1173,11 @@
             case "is_some": return isSome;
             case "is_none": return !isSome;
             case "is_some_and": return isSome && !!deref(args[0](inner));
+            case "is_none_or": return !isSome || !!deref(args[0](inner));
+            case "context":
+                return isSome ? Ok(inner) : Err({ __rs: 15, kind: "anyhow_error", msg: strVal(args[0]), inner: null });
+            case "with_context":
+                return isSome ? Ok(inner) : Err({ __rs: 15, kind: "anyhow_error", msg: strVal(args[0]()), inner: null });
             case "unwrap":
                 if (!isSome) R.panic("called `Option::unwrap()` on a `None` value");
                 return inner;
@@ -1106,6 +1198,14 @@
             case "ok_or_else": return isSome ? Ok(inner) : Err(args[0]());
             case "filter": return (isSome && deref(args[0](inner))) ? opt : None;
             case "flatten": return isSome ? inner : None;
+            case "transpose": {
+                if (!isSome) return Ok(None);
+                const r = deref(inner);
+                if (r && r.__rs === 2 && r.__enum === "Result") {
+                    return r.__var === "Ok" ? Ok(Some(r.__data[0])) : Err(r.__data[0]);
+                }
+                return Ok(Some(inner));
+            }
             case "zip": {
                 const other = deref(args[0]);
                 return (isSome && other && other.__rs === 2 && other.__var === "Some")
@@ -1149,6 +1249,12 @@
             case "is_err": return !isOk;
             case "is_ok_and": return isOk && !!deref(args[0](inner));
             case "is_err_and": return !isOk && !!deref(args[0](inner));
+            case "context":
+                return isOk ? res : Err({ __rs: 15, kind: "anyhow_error", msg: strVal(args[0]) + ": " + rt.fmtDisplay(inner), inner: inner });
+            case "with_context":
+                return isOk ? res : Err({ __rs: 15, kind: "anyhow_error", msg: strVal(args[0]()) + ": " + rt.fmtDisplay(inner), inner: inner });
+            case "as_deref":
+                return isOk ? Ok(deref(inner)) : res;
             case "unwrap":
                 if (!isOk) R.panic("called `Result::unwrap()` on an `Err` value: " + rt.fmtDebug(inner));
                 return inner;
@@ -1173,6 +1279,14 @@
             case "or_else": return isOk ? res : args[0](inner);
             case "ok": return isOk ? Some(inner) : None;
             case "err": return isOk ? None : Some(inner);
+            case "transpose": {
+                if (!isOk) return Some(Err(inner));
+                const o = deref(inner);
+                if (o && o.__rs === 2 && o.__enum === "Option") {
+                    return o.__var === "Some" ? Some(Ok(o.__data[0])) : None;
+                }
+                return Some(Ok(inner));
+            }
             case "as_ref": return res;
             case "copied":
             case "cloned": return cloneVal(res);
@@ -1404,9 +1518,17 @@
                 let i = 0;
                 return mkIter(function () { return i >= drained.length ? ITER_DONE : drained[i++]; });
             }
-            case "as_slice": return v;
+            case "as_slice":
+            case "as_ptr":
+            case "as_mut_ptr":
+            case "into_boxed_slice":
+                return v;
             case "to_vec":
+            case "to_owned":
             case "clone": return cloneVal(v);
+            case "reserve":
+            case "shrink_to_fit":
+                return undefined;
             case "fill": {
                 const val = args[0];
                 for (let i = 0; i < items.length; i++) items[i] = cloneVal(val);
@@ -1684,13 +1806,33 @@
                 }
                 if (name === "into_inner") return Ok(sp.v);
                 break;
+            case "tokio_mutex":
+                if (name === "lock") {
+                    return Promise.resolve({ __rs: 14, kind: "guard", get: function () { return sp.v; }, set: function (x) { sp.v = x; } });
+                }
+                if (name === "try_lock") {
+                    return Ok({ __rs: 14, kind: "guard", get: function () { return sp.v; }, set: function (x) { sp.v = x; } });
+                }
+                if (name === "into_inner") return sp.v;
+                break;
             case "rwlock":
                 if (name === "read" || name === "write") {
                     return Ok({ __rs: 14, kind: "guard", get: function () { return sp.v; }, set: function (x) { sp.v = x; } });
                 }
                 if (name === "into_inner") return Ok(sp.v);
                 break;
+            case "tokio_rwlock":
+                if (name === "read" || name === "write") {
+                    return Promise.resolve({ __rs: 14, kind: "guard", get: function () { return sp.v; }, set: function (x) { sp.v = x; } });
+                }
+                if (name === "try_read" || name === "try_write") {
+                    return Ok({ __rs: 14, kind: "guard", get: function () { return sp.v; }, set: function (x) { sp.v = x; } });
+                }
+                if (name === "into_inner") return sp.v;
+                break;
             case "guard":
+                if (name === "clone") return cloneVal(sp.get());
+                if (name === "deref") return sp.get();
                 return R.callMethod(sp.get(), name, args, []);
             case "oncelock":
                 if (name === "get") return sp.has ? Some(sp.v) : None;
@@ -1742,7 +1884,11 @@
         }
         const t = typeof v;
         if (t === "string") return callStrMethod(v, name, args, typeArgs);
-        if (t === "number" || t === "bigint") return callNumMethod(v, name, args);
+        if (t === "number" || t === "bigint") {
+            if (name === "into_response") return rt.mkResponse(Number(v) | 0, "", null);
+            if (name === "as_u16") return Number(v) & 0xFFFF;
+            return callNumMethod(v, name, args);
+        }
         if (t === "boolean") {
             if (name === "then") return v ? Some(args[0]()) : None;
             if (name === "then_some") return v ? Some(args[0]) : None;
@@ -1759,6 +1905,7 @@
                     }
                     if (name === "clone") return cloneVal(v);
                     if (name === "to_string") return R.mkString(rt.fmtDisplay(v));
+                    if (name === "into_response" && rt.intoResponse) return rt.intoResponse(v);
                     if (name === "eq") return eq(v, args[0]);
                     if (name === "cmp") return rt.mkOrdering(cmpVal(v, args[0]));
                     if (name === "partial_cmp") return Some(rt.mkOrdering(cmpVal(v, args[0])));
@@ -1773,6 +1920,15 @@
                 case 2: {
                     if (v.__enum === "Option") return callOptionMethod(v, name, args, rawRecv, typeArgs);
                     if (v.__enum === "Result") return callResultMethod(v, name, args, typeArgs);
+                    if (v.__sqlx) {
+                        if (name === "as_database_error") return v.dbErr ? Some(v.dbErr) : None;
+                        if (name === "to_string") return R.mkString(v.msg || "database error");
+                    }
+                    if (v.__enum === "Method") {
+                        if (name === "as_str") return v.__var;
+                        if (name === "to_string") return R.mkString(v.__var);
+                        if (name === "clone") return v;
+                    }
                     const m = rt.lookupUserMethod(v.__enum, name);
                     if (m) {
                         const selfArg = m.__rs_mut_self ? rawRecv : v;
@@ -1780,6 +1936,7 @@
                     }
                     if (name === "clone") return cloneVal(v);
                     if (name === "to_string") return R.mkString(rt.fmtDisplay(v));
+                    if (name === "into_response" && rt.intoResponse) return rt.intoResponse(v);
                     if (name === "eq") return eq(v, args[0]);
                     if (rt.lookupUserMethod(v.__enum, "next")) {
                         return callIterMethod(intoIter(rawRecv), name, args, typeArgs);
@@ -1788,6 +1945,7 @@
                 }
                 case 3:
                     if (name === "clone") return cloneVal(v);
+                    if (name === "into_response" && rt.intoResponse) return rt.intoResponse(v);
                     break;
                 case 4: return callStrMethod(v, name, args, typeArgs);
                 case 5: return callCharMethod(v, name, args);

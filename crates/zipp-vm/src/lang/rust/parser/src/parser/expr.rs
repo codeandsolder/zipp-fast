@@ -103,7 +103,7 @@ impl<'a> Parser<'a> {
                     break;
                 }
                 self.bump();
-                let ty = self.parse_type()?;
+                let ty = self.parse_type_no_bounds()?;
                 let span = lhs.span.merge(ty.span);
                 lhs = Expr {
                     kind: ExprKind::Cast {

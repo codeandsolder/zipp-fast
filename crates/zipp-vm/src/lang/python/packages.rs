@@ -234,3 +234,40 @@ pub fn set_kernel_bridge(bridge: KernelBridge) {
 pub(crate) fn kernel_bridge() -> Option<KernelBridge> {
     *BRIDGE.lock().unwrap_or_else(|e| e.into_inner())
 }
+
+/// Host callback for a named Python package installed via [`install`] (for
+/// example, a `sqlite3` package backed by an external database engine).
+/// Receives the active VM's [`crate::embed::HostCtx`] (for shared instruction
+/// budgeting), the operation name, and string arguments; returns a string
+/// (typically JSON) or an error message.
+pub type PackageCallBridge = std::sync::Arc<
+    dyn Fn(&mut dyn crate::embed::HostCtx, &str, &[String]) -> Result<String, String>
+        + Send
+        + Sync,
+>;
+
+static PACKAGE_BRIDGES: Mutex<Option<std::collections::HashMap<String, PackageCallBridge>>> =
+    Mutex::new(None);
+
+/// Register (or replace) the native call bridge for Python package `name`.
+/// Package runtime JavaScript invokes it through
+/// `__zipp_py_pkg_call(name, op, ...args)`.
+pub fn set_package_bridge(name: impl Into<String>, bridge: PackageCallBridge) {
+    let mut guard = PACKAGE_BRIDGES.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(name.into(), bridge);
+}
+
+/// Remove a previously registered native call bridge for `name`, if any.
+pub fn remove_package_bridge(name: &str) {
+    let mut guard = PACKAGE_BRIDGES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = guard.as_mut() {
+        map.remove(name);
+    }
+}
+
+pub(crate) fn package_bridge(name: &str) -> Option<PackageCallBridge> {
+    let guard = PACKAGE_BRIDGES.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref()?.get(name).cloned()
+}

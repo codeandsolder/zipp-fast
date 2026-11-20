@@ -3137,6 +3137,7 @@ impl<'p> Vm<'p> {
                 (native::RS_NET_NAME, native::RS_NET),
                 (native::RS_CRYPTO_NAME, native::RS_CRYPTO),
                 (native::RS_PROC_NAME, native::RS_PROC),
+                (native::RS_SQLITE_NAME, native::RS_SQLITE),
             ] {
                 let slot = self
                     .program
@@ -3184,6 +3185,16 @@ impl<'p> Vm<'p> {
             if let Some(slot) = slot.filter(|&slot| slot < self.globals.len()) {
                 let read = self.heap.alloc(HeapObj::Native(native::PY_VFS_READ));
                 self.globals[slot] = Value::heap(read);
+                self.bump_global_gen(slot as u32);
+            }
+            let slot = self
+                .program
+                .global_names
+                .iter()
+                .position(|name| name == native::PY_PKG_CALL_NAME);
+            if let Some(slot) = slot.filter(|&slot| slot < self.globals.len()) {
+                let call = self.heap.alloc(HeapObj::Native(native::PY_PKG_CALL));
+                self.globals[slot] = Value::heap(call);
                 self.bump_global_gen(slot as u32);
             }
             let slot = self

@@ -60,26 +60,147 @@ pub(super) fn type_desc(ty: &Type) -> String {
         }
         TypeKind::Ref { inner, .. } | TypeKind::Ptr { inner, .. } => type_desc(inner),
         TypeKind::Tuple(v) if v.is_empty() => "()".to_owned(),
-        TypeKind::Tuple(_) => "tuple".to_owned(),
+        TypeKind::Tuple(v) => {
+            let inner: Vec<String> = v.iter().map(type_desc).collect();
+            format!("({})", inner.join(", "))
+        }
         TypeKind::Array(elem, _) | TypeKind::Slice(elem) => format!("Vec<{}>", type_desc(elem)),
         _ => String::new(),
     }
 }
 
-/// Extract the error type name `E` from `-> Result<T, E>` (or `AppResult<T>`), if present.
+/// Full path string for a type (e.g. `sqlx::Error`, `anyhow::Error`, `std::io::Error`),
+/// used by `thiserror` `#[from]` auto-conversion registration.
+pub(super) fn type_path_str(ty: &Type) -> String {
+    match &ty.kind {
+        TypeKind::Path(p) => p
+            .segments
+            .iter()
+            .map(|s| s.ident.as_str())
+            .collect::<Vec<_>>()
+            .join("::"),
+        TypeKind::Ref { inner, .. } | TypeKind::Ptr { inner, .. } => type_path_str(inner),
+        _ => type_base_name(ty),
+    }
+}
+
+/// Extract the error type name `E` from `-> Result<T, E>` or `-> anyhow::Result<T>`.
 pub(super) fn extract_result_err_type(ret_ty: Option<&Type>) -> Option<String> {
     let ty = ret_ty?;
     let TypeKind::Path(p) = &ty.kind else {
         return None;
     };
     let last = p.segments.last()?;
-    if last.ident == "Result" && last.type_args.len() >= 2 {
-        let name = type_base_name(&last.type_args[1]);
-        if !name.is_empty() && name != "_" {
-            return Some(name);
+    if last.ident == "Result" {
+        if last.type_args.len() >= 2 {
+            let name = type_base_name(&last.type_args[1]);
+            if !name.is_empty() && name != "_" {
+                return Some(name);
+            }
+        } else if p.segments.first().map(|s| s.ident.as_str()) == Some("anyhow") {
+            return Some("anyhow::Error".to_owned());
         }
     }
     None
+}
+
+/// Extract the Ok / return type descriptor `T` from `-> Result<T, E>` or `-> T`,
+/// used to propagate target types into trailing `sqlx::query_as` / `serde_json::from_str` returns.
+pub(super) fn extract_return_ok_desc(ret_ty: Option<&Type>) -> Option<String> {
+    let ty = ret_ty?;
+    if let TypeKind::Path(p) = &ty.kind {
+        if let Some(last) = p.segments.last() {
+            if last.ident == "Result" && !last.type_args.is_empty() {
+                let d = type_desc(&last.type_args[0]);
+                return (!d.is_empty()).then_some(d);
+            }
+        }
+    }
+    let d = type_desc(ty);
+    (!d.is_empty()).then_some(d)
+}
+
+/// Inspect a function's parameter list for Axum extractors (`State`, `Path`, `Query`, `Json`,
+/// `Extension`, `ConnectInfo`, `HeaderMap`, `Request`, `Next`, `WebSocketUpgrade`, etc.).
+/// Returns `Some(vec![(extractor_kind, inner_type_desc), ...])` if the function looks like
+/// an Axum handler or middleware.
+pub(super) fn extract_axum_params(
+    syms: &CrateSymbols,
+    mod_prefix: &str,
+    params: &[FnParam],
+) -> Option<Vec<(String, String)>> {
+    let mut out = Vec::with_capacity(params.len());
+    let mut has_axum = false;
+    for p in params {
+        if p.is_self {
+            return None;
+        }
+        let Some(ref ty) = p.ty else {
+            return None;
+        };
+        let (kind, inner) = classify_axum_param(syms, mod_prefix, ty);
+        // Note: a bare `Request` parameter without any Axum-specific extractor
+        // (`State`, `Path`, `Query`, `Json`, `Next`, ...) may be a `zipp_http`
+        // `(req: Request, state: Arc<...>)` handler, so only Axum-specific
+        // extractors opt a function into Axum extractor dispatch.
+        if matches!(
+            kind.as_str(),
+            "State"
+                | "Path"
+                | "Query"
+                | "Json"
+                | "Extension"
+                | "ConnectInfo"
+                | "HeaderMap"
+                | "Next"
+                | "WebSocketUpgrade"
+                | "OriginalUri"
+                | "Uri"
+                | "Method"
+                | "RawQuery"
+        ) || kind.starts_with("Option:")
+        {
+            has_axum = true;
+        }
+        out.push((kind, inner));
+    }
+    if has_axum {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+fn classify_axum_param(syms: &CrateSymbols, mod_prefix: &str, ty: &Type) -> (String, String) {
+    let TypeKind::Path(p) = &ty.kind else {
+        return ("Unknown".to_owned(), syms.type_desc_resolved(mod_prefix, ty));
+    };
+    let Some(last) = p.segments.last() else {
+        return ("Unknown".to_owned(), String::new());
+    };
+    let inner = last
+        .type_args
+        .first()
+        .map(|t| syms.type_desc_resolved(mod_prefix, t))
+        .unwrap_or_default();
+    match last.ident.as_str() {
+        "State" | "Path" | "Query" | "Json" | "Extension" | "ConnectInfo" | "TypedHeader" => {
+            (last.ident.clone(), inner)
+        }
+        "HeaderMap" | "Request" | "Next" | "WebSocketUpgrade" | "OriginalUri" | "Uri"
+        | "Method" | "RawQuery" => (last.ident.clone(), inner),
+        "Option" => {
+            if let Some(first_arg) = last.type_args.first() {
+                let (ik, ii) = classify_axum_param(syms, mod_prefix, first_arg);
+                if ik != "Unknown" {
+                    return (format!("Option:{ik}"), ii);
+                }
+            }
+            ("Unknown".to_owned(), syms.type_desc_resolved(mod_prefix, ty))
+        }
+        "String" | "Bytes" => ("Body".to_owned(), last.ident.clone()),
+        _ => ("Unknown".to_owned(), syms.type_desc_resolved(mod_prefix, ty)),
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -91,6 +212,8 @@ pub(super) struct SerdeFieldMeta {
     pub skip_deserializing: bool,
     pub skip_serializing_if: Option<String>,
     pub flatten: bool,
+    pub has_default: bool,
+    pub default_fn: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -142,6 +265,21 @@ pub(super) fn extract_serde_field(attrs: &[Attribute]) -> SerdeFieldMeta {
                             "skip_serializing" => meta.skip_serializing = true,
                             "skip_deserializing" => meta.skip_deserializing = true,
                             "flatten" => meta.flatten = true,
+                            "default" => {
+                                meta.has_default = true;
+                                if matches!(
+                                    toks.get(i + 1).map(|t| &t.kind),
+                                    Some(zipp_rsparse::token::TokenKind::Eq)
+                                ) {
+                                    if let Some(zipp_rsparse::token::TokenKind::Str(v)) =
+                                        toks.get(i + 2).map(|t| &t.kind)
+                                    {
+                                        meta.default_fn = Some(v.clone());
+                                        i += 3;
+                                        continue;
+                                    }
+                                }
+                            }
                             "rename" | "alias" | "skip_serializing_if" => {
                                 if matches!(
                                     toks.get(i + 1).map(|t| &t.kind),
@@ -174,27 +312,84 @@ pub(super) fn extract_serde_field(attrs: &[Attribute]) -> SerdeFieldMeta {
     meta
 }
 
-/// Evaluate `#[cfg(...)]` attributes on an item (supporting `#[cfg(test)]` and `#[cfg(not(test))]`).
+/// Evaluate `#[cfg(...)]` attributes on an item or statement (supporting `test`,
+/// `windows`, `unix`, `target_os`, `target_family`, `target_arch`, `debug_assertions`,
+/// and nested `not(...)`, `all(...)`, `any(...)`).
 pub(super) fn item_cfg_enabled(attrs: &[Attribute], is_test_mode: bool) -> bool {
     for a in attrs {
         if a.path.last().map(|s| s.as_str()) == Some("cfg") {
             if let AttrArgs::Delimited(toks) = &a.args {
-                if toks.len() == 1 {
-                    if let zipp_rsparse::token::TokenKind::Ident(id) = &toks[0].kind {
-                        if id == "test" && !is_test_mode {
-                            return false;
-                        }
-                    }
-                } else if toks.len() == 4 {
-                    if matches!(&toks[0].kind, zipp_rsparse::token::TokenKind::Ident(s) if s == "not")
-                        && matches!(&toks[1].kind, zipp_rsparse::token::TokenKind::LParen)
-                        && matches!(&toks[2].kind, zipp_rsparse::token::TokenKind::Ident(s) if s == "test")
-                        && matches!(&toks[3].kind, zipp_rsparse::token::TokenKind::RParen)
-                        && is_test_mode
-                    {
-                        return false;
-                    }
+                if !eval_cfg_tokens(toks, is_test_mode) {
+                    return false;
                 }
+            }
+        }
+    }
+    true
+}
+
+fn eval_cfg_tokens(toks: &[zipp_rsparse::token::Token], is_test_mode: bool) -> bool {
+    use zipp_rsparse::token::TokenKind;
+    if toks.is_empty() {
+        return true;
+    }
+    // Single ident: `test`, `windows`, `unix`, `debug_assertions`
+    if toks.len() == 1 {
+        if let TokenKind::Ident(id) = &toks[0].kind {
+            return match id.as_str() {
+                "test" => is_test_mode,
+                "windows" => cfg!(windows),
+                "unix" => cfg!(unix),
+                "debug_assertions" => false,
+                _ => true,
+            };
+        }
+    }
+    // Key-value: `target_os = "linux"`, `target_family = "unix"`, `target_arch = "x86_64"`
+    if toks.len() == 3 && matches!(toks[1].kind, TokenKind::Eq) {
+        if let (TokenKind::Ident(k), TokenKind::Str(v)) = (&toks[0].kind, &toks[2].kind) {
+            return match k.as_str() {
+                "target_os" => match v.as_str() {
+                    "windows" => cfg!(target_os = "windows"),
+                    "linux" => cfg!(target_os = "linux"),
+                    "macos" => cfg!(target_os = "macos"),
+                    "freebsd" => cfg!(target_os = "freebsd"),
+                    _ => false,
+                },
+                "target_family" => match v.as_str() {
+                    "windows" => cfg!(target_family = "windows"),
+                    "unix" => cfg!(target_family = "unix"),
+                    "wasm" => cfg!(target_family = "wasm"),
+                    _ => false,
+                },
+                "target_arch" => match v.as_str() {
+                    "x86_64" => cfg!(target_arch = "x86_64"),
+                    "aarch64" => cfg!(target_arch = "aarch64"),
+                    "wasm32" => cfg!(target_arch = "wasm32"),
+                    _ => false,
+                },
+                _ => true,
+            };
+        }
+    }
+    // Combinators: `not(...)`, `all(...)`, `any(...)`
+    if toks.len() >= 3
+        && matches!(toks[1].kind, TokenKind::LParen)
+        && matches!(toks.last().map(|t| &t.kind), Some(TokenKind::RParen))
+    {
+        if let TokenKind::Ident(op) = &toks[0].kind {
+            let inner = &toks[2..toks.len() - 1];
+            match op.as_str() {
+                "not" => return !eval_cfg_tokens(inner, is_test_mode),
+                "all" => {
+                    let parts = super::macros::split_top_level_commas(inner);
+                    return parts.iter().all(|p| eval_cfg_tokens(p, is_test_mode));
+                }
+                "any" => {
+                    let parts = super::macros::split_top_level_commas(inner);
+                    return parts.iter().any(|p| eval_cfg_tokens(p, is_test_mode));
+                }
+                _ => {}
             }
         }
     }
@@ -241,10 +436,10 @@ pub(super) struct CrateSymbols {
     pub structs: HashMap<String, StructInfo>,
     /// Qualified enum name (and short name) -> EnumInfo.
     pub enums: HashMap<String, EnumInfo>,
-    /// Per-module `use` aliases: `module_prefix -> (local_alias -> target_segments)`.
-    pub use_aliases: HashMap<String, HashMap<String, Vec<String>>>,
-    /// Per-module `use Enum::*;` glob imports: `module_prefix -> Vec<Vec<String>>`.
-    pub use_globs: HashMap<String, Vec<Vec<String>>>,
+    /// Per-module `use` aliases: `module_prefix -> (local_alias -> (is_crate_rooted, target_segments))`.
+    pub use_aliases: HashMap<String, HashMap<String, (bool, Vec<String>)>>,
+    /// Per-module `use Enum::*;` glob imports: `module_prefix -> Vec<(is_crate_rooted, Vec<String>)>`.
+    pub use_globs: HashMap<String, Vec<(bool, Vec<String>)>>,
     /// User-defined `macro_rules!` definitions by name.
     pub macro_rules: HashMap<String, Vec<MacroRule>>,
     /// Method names in this crate that take `&mut self` (so receivers calling them are boxed!).
@@ -388,6 +583,35 @@ impl CrateSymbols {
                 ItemKind::MacroRules(mr) => {
                     self.macro_rules.insert(mr.name.clone(), mr.rules.clone());
                 }
+                ItemKind::TypeAlias(ta) => {
+                    if let Some(Type {
+                        kind: TypeKind::Path(p),
+                        ..
+                    }) = &ta.target
+                    {
+                        if !p.segments.is_empty()
+                            && !matches!(ta.name.as_str(), "Result" | "Option")
+                        {
+                            let raw_segs: Vec<String> =
+                                p.segments.iter().map(|s| s.ident.clone()).collect();
+                            let rooted = matches!(
+                                raw_segs.first().map(|s| s.as_str()),
+                                Some("crate" | "self" | "super")
+                            ) || self.lib_crate_name.as_deref()
+                                == raw_segs.first().map(|s| s.as_str());
+                            let resolved = resolve_mod_relative(
+                                mod_prefix,
+                                &raw_segs,
+                                self.lib_crate_name.as_deref(),
+                            );
+                            self.use_aliases
+                                .entry(mod_prefix.to_owned())
+                                .or_default()
+                                .entry(ta.name.clone())
+                                .or_insert((rooted, resolved));
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -416,19 +640,29 @@ impl CrateSymbols {
                     (full, name)
                 };
                 if !local_name.is_empty() && !target.is_empty() {
+                    let rooted = matches!(
+                        target.first().map(|s| s.as_str()),
+                        Some("crate" | "self" | "super")
+                    ) || self.lib_crate_name.as_deref()
+                        == target.first().map(|s| s.as_str());
                     let resolved = resolve_mod_relative(mod_prefix, &target, self.lib_crate_name.as_deref());
                     self.use_aliases
                         .entry(mod_prefix.to_owned())
                         .or_default()
-                        .insert(local_name, resolved);
+                        .insert(local_name, (rooted, resolved));
                 }
             }
             UseTreeKind::Glob => {
+                let rooted = matches!(
+                    full.first().map(|s| s.as_str()),
+                    Some("crate" | "self" | "super")
+                ) || self.lib_crate_name.as_deref()
+                    == full.first().map(|s| s.as_str());
                 let resolved = resolve_mod_relative(mod_prefix, &full, self.lib_crate_name.as_deref());
                 self.use_globs
                     .entry(mod_prefix.to_owned())
                     .or_default()
-                    .push(resolved);
+                    .push((rooted, resolved));
             }
             UseTreeKind::Group(children) => {
                 for ch in children {
@@ -465,8 +699,12 @@ impl CrateSymbols {
             return Vec::new();
         }
         let mut cur = if let Some(aliases) = self.use_aliases.get(mod_prefix) {
-            if let Some(target) = aliases.get(&raw[0]) {
-                let mut out = self.expand_if_child_mod(mod_prefix, target);
+            if let Some((rooted, target)) = aliases.get(&raw[0]) {
+                let mut out = if *rooted {
+                    target.clone()
+                } else {
+                    self.expand_if_child_mod(mod_prefix, target)
+                };
                 out.extend_from_slice(&raw[1..]);
                 out
             } else {
@@ -489,8 +727,12 @@ impl CrateSymbols {
         // Check glob imports `use foo::*;` for single-segment names
         if raw.len() == 1 && cur.len() == 1 && cur[0] == raw[0] {
             if let Some(globs) = self.use_globs.get(mod_prefix) {
-                for g in globs {
-                    let g_exp = self.expand_if_child_mod(mod_prefix, g);
+                for (rooted, g) in globs {
+                    let g_exp = if *rooted {
+                        g.clone()
+                    } else {
+                        self.expand_if_child_mod(mod_prefix, g)
+                    };
                     let mut cand = g_exp.clone();
                     cand.push(raw[0].clone());
                     let q = cand.join("::");
@@ -517,8 +759,12 @@ impl CrateSymbols {
                 for k in (1..cur.len()).rev() {
                     let mp = cur[..k].join("::");
                     if let Some(mod_aliases) = self.use_aliases.get(&mp) {
-                        if let Some(target) = mod_aliases.get(&cur[k]) {
-                            let mut next = self.expand_if_child_mod(&mp, target);
+                        if let Some((rooted, target)) = mod_aliases.get(&cur[k]) {
+                            let mut next = if *rooted {
+                                target.clone()
+                            } else {
+                                self.expand_if_child_mod(&mp, target)
+                            };
                             next.extend_from_slice(&cur[k + 1..]);
                             if next != cur {
                                 cur = next;
@@ -528,8 +774,12 @@ impl CrateSymbols {
                         }
                     }
                     if let Some(mod_globs) = self.use_globs.get(&mp) {
-                        for g in mod_globs {
-                            let g_exp = self.expand_if_child_mod(&mp, g);
+                        for (rooted, g) in mod_globs {
+                            let g_exp = if *rooted {
+                                g.clone()
+                            } else {
+                                self.expand_if_child_mod(&mp, g)
+                            };
                             let mut cand = g_exp;
                             cand.push(cur[k].clone());
                             let q = cand.join("::");
@@ -598,6 +848,61 @@ impl CrateSymbols {
             }
         }
         None
+    }
+
+    /// Like `type_desc(ty)`, but resolves user-defined structs/enums in `mod_prefix`
+    /// to their unique module-qualified name (e.g. `http::tasks::CreateBody`),
+    /// preventing collisions when multiple modules define `Q`, `ListQ`, or `CreateBody`.
+    pub fn type_desc_resolved(&self, mod_prefix: &str, ty: &Type) -> String {
+        match &ty.kind {
+            TypeKind::Path(p) => {
+                let Some(last) = p.segments.last() else {
+                    return String::new();
+                };
+                let raw: Vec<String> = p.segments.iter().map(|s| s.ident.clone()).collect();
+                let resolved = self.resolve_path(mod_prefix, &raw);
+                let q = resolved.join("::");
+                let base = if !mod_prefix.is_empty() && resolved.len() == 1 {
+                    let local_q = qualify(mod_prefix, &resolved[0]);
+                    if self.structs.contains_key(&local_q) || self.enums.contains_key(&local_q) {
+                        local_q
+                    } else if self.structs.contains_key(&q) || self.enums.contains_key(&q) {
+                        q
+                    } else {
+                        last.ident.clone()
+                    }
+                } else if self.structs.contains_key(&q) || self.enums.contains_key(&q) {
+                    q
+                } else {
+                    last.ident.clone()
+                };
+                if last.type_args.is_empty() {
+                    base
+                } else {
+                    let inner: Vec<String> = last
+                        .type_args
+                        .iter()
+                        .map(|t| self.type_desc_resolved(mod_prefix, t))
+                        .collect();
+                    format!("{base}<{}>", inner.join(", "))
+                }
+            }
+            TypeKind::Ref { inner, .. } | TypeKind::Ptr { inner, .. } => {
+                self.type_desc_resolved(mod_prefix, inner)
+            }
+            TypeKind::Tuple(v) if v.is_empty() => "()".to_owned(),
+            TypeKind::Tuple(v) => {
+                let inner: Vec<String> = v
+                    .iter()
+                    .map(|t| self.type_desc_resolved(mod_prefix, t))
+                    .collect();
+                format!("({})", inner.join(", "))
+            }
+            TypeKind::Array(elem, _) | TypeKind::Slice(elem) => {
+                format!("Vec<{}>", self.type_desc_resolved(mod_prefix, elem))
+            }
+            _ => String::new(),
+        }
     }
 }
 

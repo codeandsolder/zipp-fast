@@ -416,6 +416,10 @@ pub const RS_CRYPTO_NAME: &str = "__zipp_rs_crypto";
 pub const RS_PROC: u16 = 2306;
 #[cfg_attr(not(feature = "rust"), allow(dead_code))]
 pub const RS_PROC_NAME: &str = "__zipp_rs_proc";
+#[cfg_attr(not(feature = "rust"), allow(dead_code))]
+pub const RS_SQLITE: u16 = 2307;
+#[cfg_attr(not(feature = "rust"), allow(dead_code))]
+pub const RS_SQLITE_NAME: &str = "__zipp_rs_sqlite";
 /// The Python runtime's native tensor loops (`vm::py_tensor`), bound to the
 /// reserved global below only in a program the Python frontend built
 /// (`Program::python_natives`): an ordinary JavaScript program never sees it.
@@ -439,6 +443,15 @@ pub const PY_COMPILE_NAME: &str = "__zipp_py_compile";
 pub const PY_VFS_READ: u16 = 1991;
 #[cfg_attr(not(feature = "python"), allow(dead_code))]
 pub const PY_VFS_READ_NAME: &str = "__zipp_py_vfs_read";
+/// Named native bridge call for installed Python packages
+/// (`__zipp_py_pkg_call(pkg, op, ...args)`): dispatches to a bridge registered
+/// with `python_packages::set_package_bridge(pkg, ...)` or falls back to the
+/// VM's sandboxed host hook under `app.<pkg>.<op>`. Bound like [`PY_TENSOR`],
+/// only in a Python program.
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_PKG_CALL: u16 = 1992;
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_PKG_CALL_NAME: &str = "__zipp_py_pkg_call";
 /// The Python runtime's string query (`vm::py_ops`): whether a string holds
 /// any UTF-16 surrogate unit, answered from the heap string's ASCII flag
 /// when it can be. Bound like [`PY_TENSOR`], only in a Python program.
@@ -1922,12 +1935,16 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         RS_CRYPTO => ("", 3),
         #[cfg(feature = "rust")]
         RS_PROC => ("", 2),
+        #[cfg(feature = "rust")]
+        RS_SQLITE => ("", 4),
         #[cfg(feature = "python")]
         PY_TENSOR => ("", 0),
         #[cfg(feature = "python")]
         PY_COMPILE => ("", 1),
         #[cfg(feature = "python")]
         PY_VFS_READ => ("", 1),
+        #[cfg(feature = "python")]
+        PY_PKG_CALL => ("", 2),
         #[cfg(feature = "python")]
         PY_STR => ("", 1),
         #[cfg(feature = "python")]

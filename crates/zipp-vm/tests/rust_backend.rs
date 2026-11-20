@@ -400,3 +400,288 @@ fn async_handlers_into_response_nested_routers_and_static_files() {
     assert!(r_form_ok.contains("\"status\":200"), "{r_form_ok}");
     assert!(r_form_ok.contains(r#"\"user\":\"grace hopper\""#), "{r_form_ok}");
 }
+
+#[test]
+fn external_sandboxed_sql_plugin_and_shared_step_budget() {
+    use std::sync::{Arc, Mutex};
+
+    let src = r#"
+        use sqlx::SqlitePool;
+
+        #[tokio::main]
+        async fn main() -> Result<(), Box<dyn std::error::Error>> {
+            let pool = SqlitePool::connect("sqlite::memory:").await?;
+            sqlx::query("INSERT INTO items (name) VALUES (?)")
+                .bind("alpha")
+                .execute(&pool)
+                .await?;
+            let rows: Vec<(i64, String)> = sqlx::query_as("SELECT id, name FROM items")
+                .fetch_all(&pool)
+                .await?;
+            println!("count={} first={}:{}", rows.len(), rows[0].0, rows[0].1);
+            Ok(())
+        }
+    "#;
+
+    // 1. Run Rust `sqlx` against an external sandboxed SQL plugin (`app.sql.*`) —
+    //    no `rusqlite` needed, and the plugin deducts work from ZIPP's unified step budget!
+    let log: Arc<Mutex<Vec<(String, u64)>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_cb = Arc::clone(&log);
+
+    let mut compiled = compile_rust_program(
+        src,
+        RustProgramConfig {
+            allow_native_fs: false,
+            allow_net: false,
+            ..Default::default()
+        },
+    )
+    .expect("compile rust sqlx program");
+    let st = compiled.state_mut();
+    st.set_limits(5_000_000, None);
+    st.set_host_call_ctx(Box::new(move |ctx, kind, args| {
+        let rem = ctx.steps_remaining();
+        assert!(rem > 0 && rem < u64::MAX, "expected finite budget, got {rem}");
+        ctx.charge_steps(10_000)?;
+        log_cb.lock().unwrap().push((kind.to_owned(), rem));
+        match kind {
+            "app.sql.open" => Ok(r#"{"id":7}"#.to_owned()),
+            "app.sql.execute" => {
+                assert_eq!(args[0], "7");
+                assert!(args[1].contains("INSERT INTO items"));
+                Ok(r#"{"rows_affected":1,"last_insert_rowid":1}"#.to_owned())
+            }
+            "app.sql.query" => {
+                assert_eq!(args[0], "7");
+                Ok(r#"{"cols":["id","name"],"rows":[[1,"alpha"]]}"#.to_owned())
+            }
+            "app.sql.close" => Ok(r#"{"ok":true}"#.to_owned()),
+            other => Err(format!("unexpected host call: {other}")),
+        }
+    }));
+
+    st.run_init().expect("run against external SQL plugin");
+    let out = String::from_utf8_lossy(&st.take_rust_output()).into_owned();
+    assert_eq!(out.trim(), "count=1 first=1:alpha");
+    let seen = log.lock().unwrap();
+    assert!(seen.iter().any(|(k, _)| k == "app.sql.open"), "{seen:?}");
+    assert!(seen.iter().any(|(k, _)| k == "app.sql.execute"), "{seen:?}");
+    assert!(seen.iter().any(|(k, _)| k == "app.sql.query"), "{seen:?}");
+    // 3 SQL calls * 10,000 charged steps must show up in ZIPP's unified step counter.
+    assert!(
+        st.resource_usage().steps_used >= 30_000,
+        "steps_used={}",
+        st.resource_usage().steps_used
+    );
+
+    // 2. When the external plugin charges past ZIPP's finite step ceiling, the VM must
+    //    halt with an uncatchable budget error (not swallowed into `sqlx::Error`)!
+    let mut compiled2 = compile_rust_program(
+        r#"
+            use sqlx::SqlitePool;
+            #[tokio::main]
+            async fn main() {
+                let res = SqlitePool::connect("sqlite::memory:").await;
+                println!("SHOULD_NOT_REACH:{:?}", res.is_ok());
+            }
+        "#,
+        RustProgramConfig {
+            allow_native_fs: false,
+            allow_net: false,
+            ..Default::default()
+        },
+    )
+    .expect("compile budget exhaustion test");
+    let st2 = compiled2.state_mut();
+    st2.set_limits(200_000, None);
+    st2.set_host_call_ctx(Box::new(|ctx, kind, _args| {
+        if kind == "app.sql.open" {
+            ctx.charge_steps(500_000)?;
+        }
+        Ok(r#"{"id":1}"#.to_owned())
+    }));
+    let err = st2
+        .run_init()
+        .expect_err("plugin step-budget exhaustion must terminate guest");
+    assert!(
+        err.contains("instruction budget"),
+        "expected instruction budget error, got: {err}"
+    );
+    assert!(
+        st2.resource_limit_error()
+            .is_some_and(|m| m.contains("instruction budget")),
+        "expected sticky resource_limit_error, got: {:?}",
+        st2.resource_limit_error()
+    );
+    assert!(
+        !String::from_utf8_lossy(&st2.take_rust_output()).contains("SHOULD_NOT_REACH"),
+        "guest must not catch past budget exhaustion"
+    );
+}
+
+#[test]
+fn rust_pit_server_regressions_cfg_self_variant_local_fn_extractors() {
+    let src = r#"
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use axum::{
+            async_trait,
+            extract::{FromRequestParts, Query, State},
+            http::{request::Parts, StatusCode},
+            response::{IntoResponse, Response},
+            routing::get,
+            Json, Router,
+        };
+        use serde::Deserialize;
+        use serde_json::{json, Map, Value};
+        use time::OffsetDateTime;
+
+        #[derive(Clone)]
+        struct AppState {
+            tag: String,
+        }
+
+        struct CustomHeader(pub String);
+
+        #[async_trait]
+        impl FromRequestParts<AppState> for CustomHeader {
+            type Rejection = StatusCode;
+            async fn from_request_parts(parts: &mut Parts, _state: &AppState) -> Result<Self, Self::Rejection> {
+                let v = parts.headers.get("x-custom")
+                    .and_then(|h| h.to_str().ok())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| "default".to_string());
+                Ok(CustomHeader(v))
+            }
+        }
+
+        enum ApiErr {
+            Unauthorized { detail: String },
+        }
+        impl ApiErr {
+            fn unauth(msg: &str) -> Self {
+                Self::Unauthorized { detail: msg.to_string() }
+            }
+        }
+        impl IntoResponse for ApiErr {
+            fn into_response(self) -> Response {
+                match self {
+                    Self::Unauthorized { detail } => (StatusCode::UNAUTHORIZED, detail).into_response(),
+                }
+            }
+        }
+
+        mod alpha {
+            use super::*;
+            #[derive(Deserialize)]
+            pub struct Q {
+                pub site_id: Option<i64>,
+                pub filter: Option<String>,
+            }
+            pub async fn handler(
+                State(st): State<AppState>,
+                Query(q): Query<Q>,
+                CustomHeader(hdr): CustomHeader,
+            ) -> Result<Json<Value>, ApiErr> {
+                if q.site_id.is_none() {
+                    return Err(ApiErr::unauth("missing site"));
+                }
+                // Local `fn` followed immediately by `Vec::with_capacity` (register watermark regression)
+                fn double(n: i64) -> i64 { n * 2 }
+                let mut items: Vec<i64> = Vec::with_capacity(2);
+                items.push(double(q.site_id.unwrap()));
+                let f = q.filter.unwrap_or_else(|| "all".to_string());
+
+                // `tokio::try_join!` + `Option::transpose` + `serde_json::Map::new` + `as f64 + 0.5`
+                let a = async { Ok::<i64, ApiErr>(10) };
+                let b = async { Ok::<i64, ApiErr>(20) };
+                let (x, y) = tokio::try_join!(a, b)?;
+                let mut m = Map::new();
+                m.insert("tag".to_string(), Value::String(st.tag));
+                m.insert("hdr".to_string(), Value::String(hdr));
+                m.insert("filter".to_string(), Value::String(f));
+                m.insert("sum".to_string(), json!((x + y) as f64 + 0.5));
+                m.insert("doubled".to_string(), json!(items[0]));
+                let tr: Result<Option<i64>, &str> = Some(Ok(7i64)).transpose();
+                m.insert("transposed".to_string(), json!(tr.unwrap().unwrap()));
+                let sc = StatusCode::OK;
+                m.insert("ok_code".to_string(), json!(sc.is_success()));
+                let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+                let dt = OffsetDateTime::from_unix_timestamp_nanos(dur.as_nanos() as i128).unwrap();
+                m.insert("has_iso".to_string(), json!(!dt.to_rfc3339().is_empty()));
+                #[cfg(not(test))]
+                m.insert("cfg_ok".to_string(), json!(true));
+                Ok(Json(Value::Object(m)))
+            }
+        }
+
+        mod beta {
+            use super::*;
+            // Same struct name `Q` with completely different fields!
+            #[derive(Deserialize)]
+            pub struct Q {
+                pub label: Option<String>,
+            }
+            pub async fn handler(Query(q): Query<Q>) -> Json<Value> {
+                Json(json!({ "label": q.label.unwrap_or_else(|| "none".to_string()) }))
+            }
+        }
+
+        pub fn router() -> Router {
+            let st = AppState { tag: "pit-ok".to_string() };
+            Router::new()
+                .route("/alpha", get(alpha::handler))
+                .route("/beta", get(beta::handler))
+                .with_state(st)
+        }
+    "#;
+
+    let mut compiled = compile_rust_program(
+        src,
+        RustProgramConfig {
+            mode: "worker_boot".to_owned(),
+            ..Default::default()
+        },
+    )
+    .expect("compile regression router");
+    compiled.state_mut().run_init().expect("boot regression router");
+
+    let dispatch = |state: &mut zipp_vm::embed::ScriptState, uri: &str, headers: &str| {
+        let req_json = format!(
+            r#"{{"method":"GET","uri":"{uri}","headers":{headers},"body":""}}"#
+        );
+        match state
+            .call_global("__zipp_rs_worker_request", &[JsValue::String(req_json)])
+            .expect("dispatch")
+        {
+            JsValue::String(s) => s,
+            other => panic!("unexpected response: {other:?}"),
+        }
+    };
+
+    // Unauth / missing site_id -> Self::Unauthorized IntoResponse 401
+    let r_err = dispatch(compiled.state_mut(), "/alpha", "{}");
+    assert!(r_err.contains("\"status\":401"), "{r_err}");
+    assert!(r_err.contains("missing site"), "{r_err}");
+
+    // Full alpha request with custom header + Query<alpha::Q>
+    let r_a = dispatch(
+        compiled.state_mut(),
+        "/alpha?site_id=21",
+        r#"{"x-custom":"mine-7"}"#,
+    );
+    assert!(r_a.contains("\"status\":200"), "{r_a}");
+    assert!(r_a.contains(r#"\"tag\":\"pit-ok\""#), "{r_a}");
+    assert!(r_a.contains(r#"\"hdr\":\"mine-7\""#), "{r_a}");
+    assert!(r_a.contains(r#"\"filter\":\"all\""#), "{r_a}");
+    assert!(r_a.contains(r#"\"sum\":30.5"#), "{r_a}");
+    assert!(r_a.contains(r#"\"doubled\":42"#), "{r_a}");
+    assert!(r_a.contains(r#"\"transposed\":7"#), "{r_a}");
+    assert!(r_a.contains(r#"\"ok_code\":true"#), "{r_a}");
+    assert!(r_a.contains(r#"\"has_iso\":true"#), "{r_a}");
+    assert!(r_a.contains(r#"\"cfg_ok\":true"#), "{r_a}");
+
+    // Colliding Query<beta::Q> in sibling module stays completely distinct
+    let r_b = dispatch(compiled.state_mut(), "/beta?label=shovel", "{}");
+    assert!(r_b.contains("\"status\":200"), "{r_b}");
+    assert!(r_b.contains(r#"\"label\":\"shovel\""#), "{r_b}");
+}

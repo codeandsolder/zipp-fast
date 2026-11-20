@@ -209,7 +209,7 @@ impl<'a> RsEmitter<'a> {
                     return Ok(());
                 }
                 // Known enum unit variant (`Enum::Variant` or glob-imported `Variant`)
-                if let Some((ename, vname, _)) = self.syms.lookup_enum_variant(&self.mod_prefix, &raw) {
+                if let Some((ename, vname, _)) = self.syms.lookup_enum_variant(&self.mod_prefix, &resolved) {
                     let en = self.string(&ename)?;
                     let vn = self.string(&vname)?;
                     let ok = self.helper("patEnumMatch", &[val, en, vn])?;
@@ -290,7 +290,7 @@ impl<'a> RsEmitter<'a> {
                 let raw: Vec<String> = path.segments.iter().map(|s| s.ident.clone()).collect();
                 let resolved = self.resolve_segments(&raw);
                 let last = resolved.last().map(|s| s.as_str()).unwrap_or("");
-                let is_enum_var = self.syms.lookup_enum_variant(&self.mod_prefix, &raw).is_some()
+                let is_enum_var = self.syms.lookup_enum_variant(&self.mod_prefix, &resolved).is_some()
                     || (resolved.len() >= 2 && self.syms.enums.contains_key(&resolved[resolved.len() - 2]));
                 if is_enum_var {
                     let ename = if resolved.len() >= 2 {

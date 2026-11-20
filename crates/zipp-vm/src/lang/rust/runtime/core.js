@@ -37,7 +37,18 @@ var __zipp_rs = (function () {
         if (v && typeof v === "object") {
             if (v.__rs === 4) return v.s;
             if (v.__rs === 5) return v.ch;
-            if (v.__rs === 15 && v.kind === "path") return v.p;
+            if (v.__rs === 2 && v.__enum === "Method") return v.__var;
+            if (v.__rs === 15) {
+                if (v.kind === "path") return v.p;
+                if (v.kind === "uri") return v.raw;
+                if (v.kind === "header_value") return v.v;
+                if (v.kind === "header_name") return v.n;
+                if (v.kind === "uuid" || v.kind === "argon2_hash") return v.s;
+                if (v.kind === "ip_addr") return v.ip;
+                if (v.kind === "socket_addr") return v.ip.indexOf(":") >= 0 ? ("[" + v.ip + "]:" + v.port) : (v.ip + ":" + v.port);
+                if (v.kind === "digest_bytes") return v.hex;
+                if (v.kind === "anyhow_error" || v.kind === "io_error" || v.kind === "sqlx_db_error") return v.msg;
+            }
         }
         return String(v);
     }
@@ -247,6 +258,38 @@ var __zipp_rs = (function () {
                 out[k] = fieldsObj[k];
             }
         }
+        const stMeta = structs[typeName];
+        if (stMeta && stMeta.fields) {
+            for (let i = 0; i < stMeta.fields.length; i++) {
+                const fn = stMeta.fields[i][0];
+                const ft = stMeta.fields[i][1];
+                if (ft && (ft.indexOf("HashMap<") >= 0 || ft.indexOf("BTreeMap<") >= 0)) {
+                    let cur = out[fn];
+                    let guard = 0;
+                    while (cur && typeof cur === "object" && (cur.__rs === 14 || cur.__rs === 6) && guard++ < 8) {
+                        cur = cur.get ? cur.get() : cur.v;
+                    }
+                    if (cur && cur.__rs === 10 && !cur.valType) {
+                        const mIdx = Math.max(ft.indexOf("HashMap<"), ft.indexOf("BTreeMap<"));
+                        const sub = ft.slice(mIdx);
+                        const lt = sub.indexOf("<");
+                        if (lt >= 0) {
+                            let depth = 0, comma = -1, end = sub.length;
+                            for (let j = lt + 1; j < sub.length; j++) {
+                                const ch = sub[j];
+                                if (ch === "<") depth++;
+                                else if (ch === ">") { if (depth === 0) { end = j; break; } depth--; }
+                                else if (ch === "," && depth === 0 && comma < 0) comma = j;
+                            }
+                            if (comma >= 0) {
+                                const vt = sub.slice(comma + 1, end).trim().split("<")[0].trim();
+                                if (vt) cur.valType = vt;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         return out;
     };
 
@@ -317,12 +360,31 @@ var __zipp_rs = (function () {
         );
         if (typeof __zipp_rs_io === "function") {
             let spins = 0;
-            while (!done && spins++ < 64) {
+            while (!done && spins++ < 256) {
+                if (typeof rt.pollTimers === "function") rt.pollTimers();
                 __zipp_rs_io("drain_microtasks", "");
+                if (!done && typeof rt.nextTimerMs === "function") {
+                    const wait = rt.nextTimerMs();
+                    if (wait !== null && wait <= 5000 && typeof __zipp_rs_time === "function") {
+                        if (wait > 0) __zipp_rs_time("sleep_ms", Math.min(wait, 50));
+                        rt.pollTimers();
+                        __zipp_rs_io("drain_microtasks", "");
+                    }
+                }
             }
         }
         if (hasErr) throw err;
         return out;
+    };
+
+    R.selectRace = function (branches) {
+        if (!branches || branches.length === 0) return Promise.resolve(undefined);
+        const wrapped = branches.map(function (b, idx) {
+            return Promise.resolve(b[0]).then(function (val) { return [idx, val]; });
+        });
+        return Promise.race(wrapped).then(function (pair) {
+            return branches[pair[0]][1](pair[1]);
+        });
     };
 
     // ---- Dynamic callable invocation (auto-derefs Box<dyn Fn> / Arc<dyn Fn> / refs) ----
@@ -503,6 +565,7 @@ var __zipp_rs = (function () {
     const fromImpls = Object.create(null);     // dstType -> [{ src, fn }, ...]
     const tryFromImpls = Object.create(null);  // dstType -> [{ src, fn }, ...]
     const consts = Object.create(null);        // qualifiedName -> val
+    const localStatics = Object.create(null);  // uniqueKey -> val
     const tests = [];                          // [{ name, fn, shouldPanic, ignore }]
     let activeRouter = null;
     const CONVERT_MISS = { __rs_conv_miss: true };
@@ -517,14 +580,38 @@ var __zipp_rs = (function () {
     rt.getRouter = function () { return activeRouter; };
     rt.setRouter = function (r) { activeRouter = r; };
 
+    R.hasStatic = function (k) { return Object.prototype.hasOwnProperty.call(localStatics, k); };
+    R.getStatic = function (k) { return localStatics[k]; };
+    R.setStatic = function (k, v) { localStatics[k] = v; };
+
+    R.isErr = function (v) {
+        v = deref(v);
+        return !!(v && v.__rs === 2 && v.__enum === "Result" && v.__var === "Err");
+    };
+    R.unwrapOk = function (v) {
+        v = deref(v);
+        return (v && v.__rs === 2 && v.__enum === "Result" && v.__var === "Ok") ? v.__data[0] : v;
+    };
     R.regStruct = function (name, fields, isTuple, derives, serdeMeta) {
-        structs[name] = {
+        const shortName = name.indexOf("::") >= 0 ? name.slice(name.lastIndexOf("::") + 2) : name;
+        const info = {
             name: name,
+            shortName: shortName,
             fields: fields,
             isTuple: !!isTuple,
             derives: derives || [],
             serde: serdeMeta || null
         };
+        structs[name] = info;
+        if (shortName !== name) structs[shortName] = info;
+    };
+    R.setSerdeDefaultFn = function (structName, fieldName, fn) {
+        const st = structs[structName];
+        if (!st) return;
+        if (!st.serde) st.serde = { fields: {} };
+        if (!st.serde.fields) st.serde.fields = {};
+        if (!st.serde.fields[fieldName]) st.serde.fields[fieldName] = {};
+        st.serde.fields[fieldName].default_fn = fn;
     };
     R.regEnum = function (name, variants, derives, serdeMeta) {
         enums[name] = {
@@ -533,6 +620,11 @@ var __zipp_rs = (function () {
             derives: derives || [],
             serde: serdeMeta || null
         };
+    };
+    R.regEnumFrom = function (enumName, varName, srcPath) {
+        R.regFrom(enumName, srcPath, function (v) {
+            return R.mkEnumTuple(enumName, varName, [v]);
+        });
     };
     R.regMethod = function (typeName, methodName, fn, mutSelf) {
         if (mutSelf) fn.__rs_mut_self = true;
@@ -566,22 +658,45 @@ var __zipp_rs = (function () {
         const tag = typeTagOf(v);
         if (tag === srcName) return true;
         if ((srcName === "str" || srcName === "&str" || srcName === "String") && (tag === "str" || tag === "String")) return true;
-        if ((srcName === "Error" || srcName === "io::Error") && tag === "std:io_error") return true;
+        if ((srcName === "sqlx::Error") && (v && v.__sqlx)) return true;
+        if ((srcName === "anyhow::Error") && tag === "std:anyhow_error") return true;
+        if ((srcName === "Error" || srcName === "io::Error" || srcName === "std::io::Error") && tag === "std:io_error") return true;
+        if (srcName === "Error" && (v && v.__sqlx)) return true;
+        if (srcName === "Error" && tag === "std:anyhow_error") return true;
         if (/^[iu](8|16|32|64|128|size)$|^f(32|64)$/.test(srcName) && (tag === "number" || tag === "bigint")) return true;
         if (srcName === "Value" && tag === "std:json") return true;
         return false;
     }
 
     function tryConvertFrom(dstType, val) {
-        const list = fromImpls[dstType];
+        const shortDst = dstType && dstType.indexOf("::") >= 0 ? dstType.slice(dstType.lastIndexOf("::") + 2) : dstType;
+        const list = fromImpls[dstType] || (shortDst !== dstType ? fromImpls[shortDst] : null);
         if (list) {
             for (let i = 0; i < list.length; i++) {
                 if (matchesSrcType(val, list[i].src)) return list[i].fn(val);
             }
+            // If converting an error to a thiserror enum with `anyhow::Error` fallback variant, convert via anyhow!
+            for (let i = 0; i < list.length; i++) {
+                if (list[i].src === "anyhow::Error") {
+                    const ah = { __rs: 15, kind: "anyhow_error", msg: fmtDisplay(val), inner: val };
+                    return list[i].fn(ah);
+                }
+            }
             if (list.length === 1) return list[0].fn(val);
         }
-        if (dstType === "String") return mkString(fmtDisplay(val));
-        if (dstType === "PathBuf") return { __rs: 15, kind: "path", p: strVal(val) };
+        if (dstType === "anyhow::Error") {
+            const dv = deref(val);
+            if (dv && dv.__rs === 15 && dv.kind === "anyhow_error") return dv;
+            return { __rs: 15, kind: "anyhow_error", msg: fmtDisplay(dv), inner: dv };
+        }
+        if (shortDst === "String") return mkString(fmtDisplay(val));
+        if (shortDst === "PathBuf") return { __rs: 15, kind: "path", p: strVal(val) };
+        if (shortDst === "HeaderValue") return { __rs: 15, kind: "header_value", v: strVal(val) };
+        if (shortDst === "Body") {
+            const dv = deref(val);
+            const s = (dv && dv.__rs === 7) ? utf8BytesToStr(dv.items) : strVal(dv);
+            return { __rs: 15, kind: "body", data: s };
+        }
         return CONVERT_MISS;
     }
     rt.tryConvertFrom = tryConvertFrom;
@@ -594,7 +709,8 @@ var __zipp_rs = (function () {
         return deref(val);
     };
     rt.tryConvertTryFrom = function (dstType, val) {
-        const list = tryFromImpls[dstType];
+        const shortDst = dstType && dstType.indexOf("::") >= 0 ? dstType.slice(dstType.lastIndexOf("::") + 2) : dstType;
+        const list = tryFromImpls[dstType] || (shortDst !== dstType ? tryFromImpls[shortDst] : null);
         if (list) {
             for (let i = 0; i < list.length; i++) {
                 if (matchesSrcType(val, list[i].src)) return list[i].fn(val);
@@ -681,7 +797,8 @@ var __zipp_rs = (function () {
         if ((ta === "number" && tb === "bigint") || (ta === "bigint" && tb === "number")) {
             return BigInt(Math.trunc(Number(a))) === BigInt(Math.trunc(Number(b))) && Number(a) == Number(b);
         }
-        if ((ta === "string" || (a && a.__rs === 4)) && (tb === "string" || (b && b.__rs === 4))) {
+        if ((ta === "string" || (a && (a.__rs === 4 || (a.__rs === 2 && a.__enum === "Method") || (a.__rs === 15 && (a.kind === "uri" || a.kind === "header_value" || a.kind === "header_name" || a.kind === "uuid")))))
+            && (tb === "string" || (b && (b.__rs === 4 || (b.__rs === 2 && b.__enum === "Method") || (b.__rs === 15 && (b.kind === "uri" || b.kind === "header_value" || b.kind === "header_name" || b.kind === "uuid")))))) {
             return strVal(a) === strVal(b);
         }
         if (ta !== "object" || tb !== "object") return false;
@@ -751,7 +868,10 @@ var __zipp_rs = (function () {
             case 15: {
                 if (a.kind !== b.kind) return false;
                 if (a.kind === "path") return a.p === b.p;
-                if (a.kind === "duration") return a.ns === b.ns;
+                if (a.kind === "duration" || a.kind === "instant" || a.kind === "offset_datetime" || a.kind === "datetime") return a.ns === b.ns;
+                if (a.kind === "socket_addr") return a.ip === b.ip && a.port === b.port;
+                if (a.kind === "ip_addr") return a.ip === b.ip;
+                if (a.kind === "uuid") return a.s === b.s;
                 if (a.kind === "json") return JSON.stringify(a.v) === JSON.stringify(b.v);
                 return a === b;
             }
@@ -796,8 +916,12 @@ var __zipp_rs = (function () {
             }
             return a.items.length - b.items.length;
         }
-        if (a && b && a.__rs === 15 && b.__rs === 15 && a.kind === "duration" && b.kind === "duration") {
+        if (a && b && a.__rs === 15 && b.__rs === 15 && a.kind === b.kind &&
+            (a.kind === "duration" || a.kind === "instant" || a.kind === "offset_datetime" || a.kind === "datetime")) {
             return a.ns < b.ns ? -1 : a.ns > b.ns ? 1 : 0;
+        }
+        if (a && b && a.__rs === 1 && b.__rs === 1 && a.__type === "Reverse" && b.__type === "Reverse") {
+            return cmpVal(b[0], a[0]);
         }
         if (a && b && a.__rs === 1 && b.__rs === 1 && a.__type === b.__type) {
             const ord = lookupTraitMethod("Ord", a.__type, "cmp");
@@ -935,7 +1059,10 @@ var __zipp_rs = (function () {
     rt.cloneVal = cloneVal;
 
     function defaultOf(typeName) {
-        switch (typeName) {
+        const raw = typeName ? String(typeName).trim() : "";
+        const base = raw.split("<")[0].trim();
+        const shortBase = base.indexOf("::") >= 0 ? base.slice(base.lastIndexOf("::") + 2) : base;
+        switch (shortBase) {
             case "i8": case "i16": case "i32": case "i64": case "isize":
             case "u8": case "u16": case "u32": case "u64": case "usize":
             case "f32": case "f64": return 0;
@@ -954,18 +1081,18 @@ var __zipp_rs = (function () {
             case "BinaryHeap": return { __rs: 13, items: [] };
             case "()": return undefined;
         }
-        const custom = lookupTraitMethod("Default", typeName, "default") || lookupUserMethod(typeName, "default");
+        const custom = lookupTraitMethod("Default", shortBase, "default") || lookupUserMethod(shortBase, "default");
         if (custom) return custom();
-        const st = structs[typeName];
+        const st = structs[shortBase] || structs[base] || structs[raw];
         if (st) {
             if (st.isTuple) {
                 const items = [];
                 for (let i = 0; i < st.fields.length; i++) items.push(defaultOf(st.fields[i][1]));
-                return R.mkTupleStruct(typeName, items);
+                return R.mkTupleStruct(shortBase, items);
             }
             const obj = {};
             for (let i = 0; i < st.fields.length; i++) obj[st.fields[i][0]] = defaultOf(st.fields[i][1]);
-            return R.mkStruct(typeName, obj);
+            return R.mkStruct(shortBase, obj);
         }
         return undefined;
     }
@@ -981,6 +1108,12 @@ var __zipp_rs = (function () {
         if (a && a.__rs === 15 && a.kind === "duration" && b && b.__rs === 15 && b.kind === "duration") {
             return { __rs: 15, kind: "duration", ns: a.ns + b.ns };
         }
+        if (a && a.__rs === 15 && a.kind === "instant" && b && b.__rs === 15 && b.kind === "duration") {
+            return { __rs: 15, kind: "instant", ns: a.ns + b.ns };
+        }
+        if (a && a.__rs === 15 && a.kind === "offset_datetime" && b && b.__rs === 15 && b.kind === "duration") {
+            return { __rs: 15, kind: "offset_datetime", ns: a.ns + b.ns };
+        }
         if (a && a.__rs === 1) {
             const m = lookupTraitMethod("Add", a.__type, "add");
             if (m) return m(a, b);
@@ -993,6 +1126,18 @@ var __zipp_rs = (function () {
         if (typeof a === "number" && typeof b === "number") return a - b;
         if (typeof a === "bigint" && typeof b === "bigint") return a - b;
         if (a && a.__rs === 15 && a.kind === "duration" && b && b.__rs === 15 && b.kind === "duration") {
+            return { __rs: 15, kind: "duration", ns: a.ns - b.ns };
+        }
+        if (a && a.__rs === 15 && a.kind === "instant" && b && b.__rs === 15 && b.kind === "instant") {
+            return { __rs: 15, kind: "duration", ns: a.ns >= b.ns ? (a.ns - b.ns) : 0n };
+        }
+        if (a && a.__rs === 15 && a.kind === "instant" && b && b.__rs === 15 && b.kind === "duration") {
+            return { __rs: 15, kind: "instant", ns: a.ns - b.ns };
+        }
+        if (a && a.__rs === 15 && a.kind === "offset_datetime" && b && b.__rs === 15 && b.kind === "duration") {
+            return { __rs: 15, kind: "offset_datetime", ns: a.ns - b.ns };
+        }
+        if (a && a.__rs === 15 && a.kind === "offset_datetime" && b && b.__rs === 15 && b.kind === "offset_datetime") {
             return { __rs: 15, kind: "duration", ns: a.ns - b.ns };
         }
         if (a && a.__rs === 1) {
@@ -1137,6 +1282,8 @@ var __zipp_rs = (function () {
             return fmtDebug(v, false, 0);
         }
         if (v.__rs === 2) {
+            if (v.__enum === "Method") return v.__var;
+            if (v.__sqlx && v.msg) return v.msg;
             const disp = lookupTraitMethod("Display", v.__enum, "fmt");
             if (disp) {
                 const buf = mkString("");
@@ -1147,8 +1294,18 @@ var __zipp_rs = (function () {
         }
         if (v.__rs === 15) {
             if (v.kind === "path") return v.p;
-            if (v.kind === "io_error") return v.msg;
+            if (v.kind === "io_error" || v.kind === "anyhow_error" || v.kind === "sqlx_db_error") return v.msg;
             if (v.kind === "json") return JSON.stringify(v.v);
+            if (v.kind === "socket_addr") return v.ip.indexOf(":") >= 0 ? ("[" + v.ip + "]:" + v.port) : (v.ip + ":" + v.port);
+            if (v.kind === "ip_addr") return v.ip;
+            if (v.kind === "uri") return v.raw;
+            if (v.kind === "header_value") return v.v;
+            if (v.kind === "header_name") return v.n;
+            if (v.kind === "uuid" || v.kind === "argon2_hash") return v.s;
+            if (v.kind === "digest_bytes") return v.hex;
+            if (v.kind === "offset_datetime" || v.kind === "datetime") {
+                return rt.callStdMethod ? strVal(rt.callStdMethod(v, "to_rfc3339", [])) : String(v.ns);
+            }
         }
         return fmtDebug(v, false, 0);
     }
@@ -1318,11 +1475,15 @@ var __zipp_rs = (function () {
         if (ty === "?") {
             out = fmtDebug(v, alt, 0);
         } else if (ty === "x" || ty === "X") {
-            let n = typeof v === "bigint" ? v : BigInt(Math.trunc(Number(v)));
-            if (n < 0n) n = BigInt.asUintN(64, n);
-            let h = n.toString(16);
-            if (ty === "X") h = h.toUpperCase();
-            out = (alt ? "0x" : "") + h;
+            if (v && typeof v === "object" && v.__rs === 15 && v.kind === "digest_bytes") {
+                out = ty === "X" ? v.hex.toUpperCase() : v.hex.toLowerCase();
+            } else {
+                let n = typeof v === "bigint" ? v : BigInt(Math.trunc(Number(v)));
+                if (n < 0n) n = BigInt.asUintN(64, n);
+                let h = n.toString(16);
+                if (ty === "X") h = h.toUpperCase();
+                out = (alt ? "0x" : "") + h;
+            }
         } else if (ty === "b") {
             let n = typeof v === "bigint" ? v : BigInt(Math.trunc(Number(v)));
             if (n < 0n) n = BigInt.asUintN(64, n);

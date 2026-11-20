@@ -10,14 +10,39 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex, RwLock};
 use zipp_vm::embed::JsValue;
-use zipp_vm::frontend::{compile_rust_program, RustProgramConfig};
+use zipp_vm::frontend::{compile_rust_program, CompiledSource, RustProgramConfig};
 
 pub(crate) struct ServerConfig {
     pub addr: String,
     pub entry: PathBuf,
     pub workers: Option<usize>,
+    pub watch: bool,
+}
+
+fn boot_worker_vm(entry: &Path, source: &str) -> Result<CompiledSource, String> {
+    let file_str = normalize_path(entry);
+    let base_dir = entry
+        .parent()
+        .map(normalize_path)
+        .unwrap_or_else(|| ".".to_owned());
+    let mut compiled = compile_rust_program(
+        source,
+        RustProgramConfig {
+            file: file_str,
+            base_dir,
+            allow_native_fs: true,
+            allow_net: true,
+            stream_stdout: false,
+            mode: "worker_boot".to_owned(),
+            ..Default::default()
+        },
+    )?;
+    compiled.state_mut().run_init()?;
+    let _ = compiled.state_mut().take_rust_output();
+    Ok(compiled)
 }
 
 pub(crate) fn serve(cfg: ServerConfig) -> Result<(), String> {
@@ -40,51 +65,73 @@ pub(crate) fn serve(cfg: ServerConfig) -> Result<(), String> {
     });
 
     eprintln!(
-        "ZIPP Rust Worker Server ({worker_count} workers) listening on http://{local_addr} ({})",
+        "ZIPP Rust Worker Server ({worker_count} workers{}) listening on http://{local_addr} ({})",
+        if cfg.watch { ", live-reload" } else { "" },
         entry.display()
     );
 
     let (tx, rx) = mpsc::channel::<TcpStream>();
     let rx = Arc::new(Mutex::new(rx));
-    let source = Arc::new(source);
+    let shared_source = Arc::new(RwLock::new(source));
+    let generation = Arc::new(AtomicU64::new(0));
     let entry = Arc::new(entry);
+
+    if cfg.watch {
+        let watch_root = super::frontend_cli::rust_watch_root(&entry);
+        let watch_entry = Arc::clone(&entry);
+        let watch_source = Arc::clone(&shared_source);
+        let watch_gen = Arc::clone(&generation);
+        let mut snap = super::frontend_cli::snapshot_rust_sources(&watch_root);
+        eprintln!(
+            "[zipp rs --serve --watch] watching {} ({} files) — edit any .rs file to hot-reload workers",
+            watch_root.display(),
+            snap.len()
+        );
+        std::thread::Builder::new()
+            .name("zipp-rs-watcher".to_owned())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                let next = super::frontend_cli::snapshot_rust_sources(&watch_root);
+                if let Some(changed) = super::frontend_cli::diff_rust_snapshot(&snap, &next) {
+                    snap = next;
+                    if let Ok(fresh) = std::fs::read_to_string(&*watch_entry) {
+                        if let Ok(mut guard) = watch_source.write() {
+                            *guard = fresh;
+                        }
+                        watch_gen.fetch_add(1, Ordering::Release);
+                        let label = changed
+                            .strip_prefix(&watch_root)
+                            .unwrap_or(&changed)
+                            .display();
+                        eprintln!("[zipp rs --serve --watch] hot-reloading ({label})");
+                    }
+                }
+            })
+            .map_err(|e| format!("failed to spawn Rust watch thread: {e}"))?;
+    }
 
     for i in 0..worker_count {
         let rx = Arc::clone(&rx);
-        let source = Arc::clone(&source);
+        let shared_source = Arc::clone(&shared_source);
+        let generation = Arc::clone(&generation);
         let entry = Arc::clone(&entry);
         std::thread::Builder::new()
             .name(format!("zipp-rs-worker-{i}"))
             .stack_size(16 * 1024 * 1024)
             .spawn(move || {
-                let file_str = normalize_path(&entry);
-                let base_dir = entry
-                    .parent()
-                    .map(normalize_path)
-                    .unwrap_or_else(|| ".".to_owned());
-                let mut compiled = match compile_rust_program(
-                    &source,
-                    RustProgramConfig {
-                        file: file_str,
-                        base_dir,
-                        allow_native_fs: true,
-                        allow_net: true,
-                        stream_stdout: false,
-                        mode: "worker_boot".to_owned(),
-                        ..Default::default()
-                    },
-                ) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("zipp rs worker compile error: {e}");
+                let mut local_gen = generation.load(Ordering::Acquire);
+                let initial_src = shared_source
+                    .read()
+                    .map(|g| g.clone())
+                    .unwrap_or_default();
+                let mut compiled: Result<CompiledSource, String> =
+                    boot_worker_vm(&entry, &initial_src);
+                if let Err(ref e) = compiled {
+                    eprintln!("zipp rs worker boot error: {e}");
+                    if !cfg.watch {
                         return;
                     }
-                };
-                if let Err(e) = compiled.state_mut().run_init() {
-                    eprintln!("zipp rs worker boot error: {e}");
-                    return;
                 }
-                let _ = compiled.state_mut().take_rust_output();
 
                 loop {
                     let stream = {
@@ -92,7 +139,33 @@ pub(crate) fn serve(cfg: ServerConfig) -> Result<(), String> {
                         guard.recv()
                     };
                     match stream {
-                        Ok(s) => handle_worker_connection(s, compiled.state_mut()),
+                        Ok(mut s) => {
+                            let cur_gen = generation.load(Ordering::Acquire);
+                            if cur_gen != local_gen {
+                                local_gen = cur_gen;
+                                let fresh_src = shared_source
+                                    .read()
+                                    .map(|g| g.clone())
+                                    .unwrap_or_default();
+                                compiled = boot_worker_vm(&entry, &fresh_src);
+                                if let Err(ref e) = compiled {
+                                    eprintln!("zipp rs worker hot-reload error: {e}");
+                                }
+                            }
+                            match compiled.as_mut() {
+                                Ok(prog) => handle_worker_connection(s, prog.state_mut()),
+                                Err(e) => {
+                                    let _ = read_http_request(&mut s);
+                                    let err_json = serde_json::json!({
+                                        "status": 500,
+                                        "headers": [["Content-Type", "text/plain; charset=utf-8"]],
+                                        "body": format!("Rust hot-reload error: {e}")
+                                    })
+                                    .to_string();
+                                    write_http_response(&mut s, &err_json);
+                                }
+                            }
+                        }
                         Err(_) => break,
                     }
                 }

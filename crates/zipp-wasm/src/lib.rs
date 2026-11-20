@@ -22,7 +22,7 @@
 //! an asynchronous one cannot be read inline.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use wasm_bindgen::prelude::*;
@@ -411,6 +411,10 @@ struct Bridges {
     /// The application bridge: `call(kind, args)` answers `app.<kind>`
     /// operations the host defines. See [`Engine::set_app_bridge`].
     app: Option<js_sys::Object>,
+    /// Per-namespace application bridges registered through
+    /// [`Engine::add_app_bridge`]: `app.<ns>.<rest>` (and `app.<ns>`) routes to
+    /// `app_namespaces[ns]` first and falls back to `app`.
+    app_namespaces: HashMap<String, js_sys::Object>,
     /// Exact synchronous operations this Engine was explicitly granted. A
     /// bridge handle and authority are deliberately separate: merely
     /// installing a host object must not expose all of its methods to a guest.
@@ -688,6 +692,36 @@ impl Engine {
     pub fn set_app_bridge(&mut self, bridge: JsValue) -> Result<(), JsValue> {
         self.ensure_host_configuration_open()?;
         self.bridges.borrow_mut().app = Some(require_bridge(bridge, "app")?);
+        Ok(())
+    }
+
+    /// Register a namespaced application bridge for `app.<namespace>.*` calls
+    /// (and `app.<namespace>`), so independent plugins (for example `"sql"`,
+    /// `"fs"`, `"kv"`) can coexist without replacing one another.
+    ///
+    /// `namespace` must be a single lowercase identifier segment matching the
+    /// first segment of `app.<namespace>.*` (`[a-z][a-z0-9_-]*`). Like
+    /// [`Self::set_app_bridge`], `bridge.call(kind, args)` receives the kind
+    /// without the `app.` prefix (e.g. `"sql.query"`) and an array of string
+    /// arguments, so the same plugin adapter works with both `setAppBridge` and
+    /// `addAppBridge`. Registering a bridge grants no capabilities on its own;
+    /// allow each operation explicitly through `setSyncHostCapabilities`.
+    /// While `bridge.call` runs, the plugin may inspect and deduct from the
+    /// VM's unified instruction budget via `hostStepsRemaining()` and
+    /// `hostChargeSteps(n)`.
+    #[wasm_bindgen(js_name = addAppBridge)]
+    pub fn add_app_bridge(&mut self, namespace: &str, bridge: JsValue) -> Result<(), JsValue> {
+        self.ensure_host_configuration_open()?;
+        if !is_app_namespace(namespace) {
+            return Err(self.usage_error(&format!(
+                "TypeError: invalid app bridge namespace '{namespace}'"
+            )));
+        }
+        let obj = require_bridge(bridge, "app")?;
+        self.bridges
+            .borrow_mut()
+            .app_namespaces
+            .insert(namespace.to_owned(), obj);
         Ok(())
     }
 
@@ -2524,6 +2558,18 @@ fn is_app_host_call(kind: &str) -> bool {
         })
 }
 
+/// First dotted segment of an `app.<namespace>.*` operation name, validated
+/// for [`Engine::add_app_bridge`].
+fn is_app_namespace(ns: &str) -> bool {
+    let bytes = ns.as_bytes();
+    !bytes.is_empty()
+        && "app.".len() + bytes.len() <= MAX_SYNC_BRIDGE_KIND_BYTES
+        && bytes[0].is_ascii_lowercase()
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-'))
+}
+
 /// Exact wire arity for every synchronous operation. Guest code can call
 /// `__zippHostCall` directly, so wrapper arity is not a sufficient boundary.
 fn sync_host_call_arity(kind: &str) -> Option<usize> {
@@ -2550,6 +2596,34 @@ thread_local! {
     /// cleared after it; a callback outside that window is refused.
     static ACCEL_CTX: std::cell::Cell<Option<*mut (dyn HostCtx + 'static)>> =
         const { std::cell::Cell::new(None) };
+    /// The active VM's [`HostCtx`] for the duration of a synchronous plugin /
+    /// bridge call (`app.*`, `accel.run`, or a Python package bridge), used by
+    /// [`host_steps_remaining`] and [`host_charge_steps`]. Kept separate from
+    /// `ACCEL_CTX` so `accelGuestCall` stays confined to `accel.run`.
+    static ACTIVE_HOST_CTX: std::cell::Cell<Option<*mut (dyn HostCtx + 'static)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+struct ActiveHostCtxGuard(Option<*mut (dyn HostCtx + 'static)>);
+
+impl Drop for ActiveHostCtxGuard {
+    fn drop(&mut self) {
+        ACTIVE_HOST_CTX.with(|c| c.set(self.0));
+    }
+}
+
+/// Expose `ctx` to [`host_steps_remaining`] and [`host_charge_steps`] for the
+/// dynamic extent of `f`, restoring any outer context on return or unwind.
+pub(crate) fn with_active_host_ctx<R>(ctx: &mut dyn HostCtx, f: impl FnOnce() -> R) -> R {
+    let raw: *mut (dyn HostCtx + '_) = ctx;
+    // SAFETY: the lifetime is erased only for thread-local storage across the
+    // synchronous callback `f`; `ActiveHostCtxGuard` unconditionally restores
+    // the previous pointer before this function returns, and `ctx` is not used
+    // directly while `f` runs.
+    let raw: *mut (dyn HostCtx + 'static) = unsafe { std::mem::transmute(raw) };
+    let previous = ACTIVE_HOST_CTX.with(|c| c.replace(Some(raw)));
+    let _guard = ActiveHostCtxGuard(previous);
+    f()
 }
 
 #[derive(Clone, Copy)]
@@ -2649,6 +2723,46 @@ pub fn accel_guest_call(name: &str, args: &[f64]) -> Result<f64, JsValue> {
     // returns), and the holder does not touch its own reference meanwhile.
     let ctx = unsafe { &mut *raw };
     ctx.call_global_numbers(name, args)
+        .map_err(|e| JsValue::from_str(&e))
+}
+
+/// Instructions remaining in the active engine's unified step budget
+/// (`Infinity` when unmetered, `0` when exhausted). Callable only while a
+/// synchronous host bridge (`app.*`, `accel.run`, or a Python package bridge)
+/// is executing.
+#[wasm_bindgen(js_name = hostStepsRemaining)]
+pub fn host_steps_remaining() -> Result<f64, JsValue> {
+    let raw = ACTIVE_HOST_CTX
+        .with(|c| c.get())
+        .ok_or_else(|| JsValue::from_str("Error: hostStepsRemaining outside a host bridge call"))?;
+    // SAFETY: pointer installed by `with_active_host_ctx` for the active call.
+    let ctx = unsafe { &*raw };
+    let rem = ctx.steps_remaining();
+    Ok(if rem == u64::MAX {
+        f64::INFINITY
+    } else {
+        rem as f64
+    })
+}
+
+/// Deduct `steps` work units from the active engine's unified instruction
+/// budget while a synchronous host bridge (`app.*`, `accel.run`, or a Python
+/// package bridge) is running. Throws the VM's budget-exhausted `RangeError`
+/// (and marks the VM's budget exhausted) if charging `steps` crosses the
+/// engine's finite ceiling.
+#[wasm_bindgen(js_name = hostChargeSteps)]
+pub fn host_charge_steps(steps: f64) -> Result<(), JsValue> {
+    if !steps.is_finite() || steps < 0.0 || steps.fract() != 0.0 || steps > MAX_HOST_CALL_ID {
+        return Err(JsValue::from_str(
+            "TypeError: hostChargeSteps expects a non-negative safe integer",
+        ));
+    }
+    let raw = ACTIVE_HOST_CTX
+        .with(|c| c.get())
+        .ok_or_else(|| JsValue::from_str("Error: hostChargeSteps outside a host bridge call"))?;
+    // SAFETY: pointer installed by `with_active_host_ctx` for the active call.
+    let ctx = unsafe { &mut *raw };
+    ctx.charge_steps(steps as u64)
         .map_err(|e| JsValue::from_str(&e))
 }
 
@@ -2945,7 +3059,7 @@ fn host_dispatch_ctx(
     args: &[String],
 ) -> Result<String, String> {
     let Some(method) = kind.strip_prefix("accel.") else {
-        return host_dispatch(bridges, kind, args);
+        return host_dispatch_with_ctx(bridges, Some(ctx), kind, args);
     };
     let Some(expected_arity) = sync_host_call_arity(kind) else {
         return Err(format!("TypeError: unknown host call '{kind}'"));
@@ -3020,7 +3134,7 @@ fn host_dispatch_ctx(
             // again until then.
             let raw: *mut (dyn HostCtx + 'static) = unsafe { std::mem::transmute(raw) };
             let previous = ACCEL_CTX.with(|c| c.replace(Some(raw)));
-            let r = f.call2(&target, &id, &hops);
+            let r = with_active_host_ctx(ctx, || f.call2(&target, &id, &hops));
             ACCEL_CTX.with(|c| c.set(previous));
             r
         }
@@ -3033,7 +3147,7 @@ fn host_dispatch_ctx(
 /// Both synchronous bridge paths use the same reply ceiling. Check the JS
 /// string's UTF-16 length before copying it into WASM, then check the exact
 /// UTF-8 byte count after conversion (non-ASCII may use several bytes/unit).
-fn serialize_host_bridge_reply(
+pub(crate) fn serialize_host_bridge_reply(
     ret: &JsValue,
     unserializable_error: &'static str,
 ) -> Result<String, String> {
@@ -3060,8 +3174,18 @@ fn serialize_host_bridge_reply(
     Ok(reply)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn host_dispatch(
     bridges: &Rc<RefCell<Bridges>>,
+    kind: &str,
+    args: &[String],
+) -> Result<String, String> {
+    host_dispatch_with_ctx(bridges, None, kind, args)
+}
+
+fn host_dispatch_with_ctx(
+    bridges: &Rc<RefCell<Bridges>>,
+    ctx: Option<&mut dyn HostCtx>,
     kind: &str,
     args: &[String],
 ) -> Result<String, String> {
@@ -3122,7 +3246,15 @@ fn host_dispatch(
             // object rather than requiring a second bespoke nav-shaped API.
             Some(("nav", "clipboardWrite")) => (bridges.clipboard.clone(), "writeText"),
             Some(("nav", "clipboardRead")) => (bridges.clipboard.clone(), "readText"),
-            Some(("app", _)) if app_call => (bridges.app.clone(), "call"),
+            Some(("app", rest)) if app_call => {
+                let ns = rest.split('.').next().unwrap_or(rest);
+                let bridge = bridges
+                    .app_namespaces
+                    .get(ns)
+                    .cloned()
+                    .or_else(|| bridges.app.clone());
+                (bridge, "call")
+            }
             _ => return Err(format!("TypeError: unknown host call '{kind}'")),
         }
     };
@@ -3151,7 +3283,12 @@ fn host_dispatch(
             for arg in args {
                 list.push(&JsValue::from_str(arg));
             }
-            f.call2(&target, &JsValue::from_str(&kind["app.".len()..]), &list)
+            let sub_kind = JsValue::from_str(&kind["app.".len()..]);
+            if let Some(ctx) = ctx {
+                with_active_host_ctx(ctx, || f.call2(&target, &sub_kind, &list))
+            } else {
+                f.call2(&target, &sub_kind, &list)
+            }
         }
         "db.query" | "db.create" | "db.update" => f.call2(
             &target,
@@ -4203,5 +4340,67 @@ mod tests {
         let args = vec!["collection".into(), "null".into()];
         let err = host_dispatch(&bridges, "db.query", &args).unwrap_err();
         assert_eq!(err, "SecurityError: synchronous host capability denied");
+    }
+
+    #[test]
+    fn app_bridge_namespace_validation_is_strict() {
+        for ok in ["sql", "fs", "kv-2", "my_db", "a", "a0_b-1"] {
+            assert!(super::is_app_namespace(ok), "valid namespace rejected: {ok:?}");
+        }
+        let too_long = "a".repeat(super::MAX_SYNC_BRIDGE_KIND_BYTES);
+        for bad in [
+            "",
+            "SQL",
+            "Sql",
+            "sql.query",
+            "__proto__",
+            "_sql",
+            "-sql",
+            "1db",
+            "a b",
+            "sql/query",
+            too_long.as_str(),
+        ] {
+            assert!(!super::is_app_namespace(bad), "invalid namespace admitted: {bad:?}");
+        }
+    }
+
+    #[test]
+    fn active_host_ctx_scopes_step_budget_and_clears_on_exit() {
+        struct BudgetCtx {
+            remaining: u64,
+        }
+        impl HostCtx for BudgetCtx {
+            fn typed_array_region(&mut self, _: &str) -> Result<(usize, usize, u8), String> {
+                Err("unused".into())
+            }
+            fn call_global_numbers(&mut self, _: &str, _: &[f64]) -> Result<f64, String> {
+                Err("unused".into())
+            }
+            fn steps_remaining(&self) -> u64 {
+                self.remaining
+            }
+            fn charge_steps(&mut self, n: u64) -> Result<(), String> {
+                if n > self.remaining {
+                    self.remaining = 0;
+                    return Err("RangeError: script exceeded its instruction budget".into());
+                }
+                self.remaining -= n;
+                Ok(())
+            }
+        }
+        assert!(super::ACTIVE_HOST_CTX.with(|c| c.get()).is_none());
+        let mut ctx = BudgetCtx { remaining: 100 };
+        super::with_active_host_ctx(&mut ctx, || {
+            let raw = super::ACTIVE_HOST_CTX.with(|c| c.get()).expect("active ctx");
+            let active = unsafe { &mut *raw };
+            assert_eq!(active.steps_remaining(), 100);
+            assert_eq!(active.charge_steps(40), Ok(()));
+            assert_eq!(active.steps_remaining(), 60);
+            assert!(active.charge_steps(61).is_err());
+            assert_eq!(active.steps_remaining(), 0);
+        });
+        assert!(super::ACTIVE_HOST_CTX.with(|c| c.get()).is_none());
+        assert_eq!(ctx.remaining, 0);
     }
 }

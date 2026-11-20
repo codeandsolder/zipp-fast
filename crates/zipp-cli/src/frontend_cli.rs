@@ -124,6 +124,166 @@ pub(crate) fn resolve_rust_entry(path: &Path, test_mode: bool) -> Result<PathBuf
     ))
 }
 
+#[cfg(feature = "rust")]
+pub(crate) fn rust_watch_root(entry: &Path) -> PathBuf {
+    let canon = std::fs::canonicalize(entry).unwrap_or_else(|_| entry.to_path_buf());
+    if canon.is_dir() {
+        return canon;
+    }
+    let parent = canon.parent().unwrap_or_else(|| Path::new("."));
+    if parent.file_name().and_then(|n| n.to_str()) == Some("src") {
+        if let Some(proj) = parent.parent() {
+            if proj.join("Cargo.toml").is_file() {
+                return proj.to_path_buf();
+            }
+        }
+    }
+    parent.to_path_buf()
+}
+
+#[cfg(feature = "rust")]
+pub(crate) fn snapshot_rust_sources(root: &Path) -> Vec<(PathBuf, u128, u64)> {
+    fn walk(dir: &Path, out: &mut Vec<(PathBuf, u128, u64)>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if ft.is_dir() {
+                let name = entry.file_name();
+                if matches!(
+                    name.to_str(),
+                    Some("target" | ".git" | "node_modules" | ".idea" | ".vscode")
+                ) {
+                    continue;
+                }
+                walk(&path, out);
+            } else if ft.is_file() {
+                let is_rs = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("rs"));
+                let is_manifest = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n == "Cargo.toml");
+                if is_rs || is_manifest {
+                    if let Ok(meta) = entry.metadata() {
+                        let mtime = meta
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_nanos())
+                            .unwrap_or(0);
+                        out.push((path, mtime, meta.len()));
+                    }
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    if root.is_file() {
+        if let Ok(meta) = std::fs::metadata(root) {
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            out.push((root.to_path_buf(), mtime, meta.len()));
+        }
+    } else {
+        walk(root, &mut out);
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+#[cfg(feature = "rust")]
+pub(crate) fn diff_rust_snapshot(
+    old: &[(PathBuf, u128, u64)],
+    new: &[(PathBuf, u128, u64)],
+) -> Option<PathBuf> {
+    if old == new {
+        return None;
+    }
+    let old_map: std::collections::HashMap<&Path, (u128, u64)> =
+        old.iter().map(|(p, m, l)| (p.as_path(), (*m, *l))).collect();
+    for (p, m, l) in new {
+        if old_map.get(p.as_path()) != Some(&(*m, *l)) {
+            return Some(p.clone());
+        }
+    }
+    let new_set: HashSet<&Path> = new.iter().map(|(p, _, _)| p.as_path()).collect();
+    for (p, _, _) in old {
+        if !new_set.contains(p.as_path()) {
+            return Some(p.clone());
+        }
+    }
+    None
+}
+
+#[cfg(feature = "rust")]
+fn run_rust_watch(entry: &Path, args: &[String], test_mode: bool) -> Result<(), String> {
+    let watch_root = rust_watch_root(entry);
+    let exe = std::env::current_exe().map_err(|e| format!("failed to locate zipp exe: {e}"))?;
+    let mut snap = snapshot_rust_sources(&watch_root);
+    eprintln!(
+        "[zipp rs --watch] watching {} ({} files) — edit any .rs file to reload",
+        watch_root.display(),
+        snap.len()
+    );
+
+    let spawn_child = |exe: &Path, entry: &Path, args: &[String], test_mode: bool| {
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("rs");
+        if test_mode {
+            cmd.arg("--test");
+        }
+        cmd.arg(entry);
+        cmd.args(args);
+        cmd.spawn()
+            .map_err(|e| format!("zipp rs --watch failed to spawn child: {e}"))
+    };
+
+    let mut child: Option<std::process::Child> = Some(spawn_child(&exe, entry, args, test_mode)?);
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        if let Some(ch) = child.as_mut() {
+            if let Ok(Some(status)) = ch.try_wait() {
+                eprintln!(
+                    "[zipp rs --watch] process exited ({status}); waiting for .rs file changes..."
+                );
+                child = None;
+            }
+        }
+        let next = snapshot_rust_sources(&watch_root);
+        if let Some(changed) = diff_rust_snapshot(&snap, &next) {
+            snap = next;
+            let label = changed
+                .strip_prefix(&watch_root)
+                .unwrap_or(&changed)
+                .display();
+            eprintln!("[zipp rs --watch] change detected ({label}) — reloading...");
+            if let Some(mut ch) = child.take() {
+                let _ = ch.kill();
+                let _ = ch.wait();
+                // Allow the OS a moment to release bound TCP ports before respawning.
+                std::thread::sleep(std::time::Duration::from_millis(60));
+            }
+            child = Some(spawn_child(&exe, entry, args, test_mode)?);
+        }
+    }
+}
+
+#[cfg(not(feature = "rust"))]
+fn run_rust_watch(_entry: &Path, _args: &[String], _test_mode: bool) -> Result<(), String> {
+    Err("Rust support is not built; enable the `rust` Cargo feature".into())
+}
+
 fn run_rust_server_cmd(args: &[String]) -> Result<(), String> {
     #[cfg(not(feature = "rust"))]
     {
@@ -135,6 +295,7 @@ fn run_rust_server_cmd(args: &[String]) -> Result<(), String> {
         let mut addr: Option<String> = None;
         let mut entry: Option<PathBuf> = None;
         let mut workers: Option<usize> = None;
+        let mut watch = false;
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
@@ -155,6 +316,9 @@ fn run_rust_server_cmd(args: &[String]) -> Result<(), String> {
                         .map_err(|_| "--workers must be a positive integer")?;
                     workers = Some(n.max(1));
                 }
+                "--watch" | "-W" => {
+                    watch = true;
+                }
                 other if !other.starts_with('-') && entry.is_none() => {
                     entry = Some(PathBuf::from(other));
                 }
@@ -164,12 +328,13 @@ fn run_rust_server_cmd(args: &[String]) -> Result<(), String> {
             }
             i += 1;
         }
-        let addr = addr.ok_or("usage: zipp rs --serve HOST:PORT [--workers N] APP.rs")?;
-        let entry = entry.ok_or("usage: zipp rs --serve HOST:PORT [--workers N] APP.rs")?;
+        let addr = addr.ok_or("usage: zipp rs --serve HOST:PORT [--watch] [--workers N] APP.rs")?;
+        let entry = entry.ok_or("usage: zipp rs --serve HOST:PORT [--watch] [--workers N] APP.rs")?;
         super::rust_server::serve(super::rust_server::ServerConfig {
             addr,
             entry,
             workers,
+            watch,
         })
     }
 }
@@ -257,6 +422,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut options = true;
     let mut bytecode = false;
     let mut rust_test = false;
+    let mut rust_watch = false;
     // `--no-gpu`: keep a torch/zipp_gpu program on the CPU graph evaluator
     // even when a GPU adapter is available (as `ZIPP_GPU=0` does).
     let mut gpu = true;
@@ -275,6 +441,11 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         if options && arg == "--test" {
             rust_test = true;
+            index += 1;
+            continue;
+        }
+        if options && (arg == "--watch" || arg == "-W") {
+            rust_watch = true;
             index += 1;
             continue;
         }
@@ -312,7 +483,7 @@ fn run(args: &[String]) -> Result<(), String> {
         index += 1;
     }
     let filename = filename.ok_or(
-        "usage: zipp py [--bc] [--no-gpu] FILE|DIR [ARGS...] | zipp ts [--bc] FILE | zipp php [-S HOST:PORT] FILE | zipp rs [--bc] [--test] [--serve HOST:PORT] FILE [ARGS...] | zipp run [--lang=python|javascript|typescript|php|rust] FILE [ARGS...]",
+        "usage: zipp py [--bc] [--no-gpu] FILE|DIR [ARGS...] | zipp ts [--bc] FILE | zipp php [-S HOST:PORT] FILE | zipp rs [--bc] [--test] [--watch] [--serve HOST:PORT] FILE|DIR [ARGS...] | zipp run [--lang=python|javascript|typescript|php|rust] FILE [ARGS...]",
     )?;
     let stdin = filename == "-";
     // A directory can be either a Rust Cargo project (`Cargo.toml` / `src/main.rs`
@@ -325,6 +496,9 @@ fn run(args: &[String]) -> Result<(), String> {
         if is_rust_dir {
             if bytecode {
                 return Err("--bc takes a file, not a directory".into());
+            }
+            if rust_watch {
+                return run_rust_watch(dir, &program_args, rust_test);
             }
             let entry = resolve_rust_entry(dir, rust_test)?;
             let src = std::fs::read_to_string(&entry)
@@ -414,6 +588,9 @@ fn run(args: &[String]) -> Result<(), String> {
     // Rust script run from a file gets real filesystem, env, TCP/HTTP networking,
     // external `mod foo;` loading, `argv`, `--test` mode, and streaming stdout/stderr.
     if detected.language == LanguageId::Rust && !stdin && !bytecode {
+        if rust_watch {
+            return run_rust_watch(Path::new(&filename), &program_args, rust_test);
+        }
         return run_rust_file(Path::new(&filename), &source, &program_args, rust_test);
     }
     let frontend = match detected.language {
