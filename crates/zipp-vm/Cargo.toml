@@ -12,6 +12,9 @@ zipp-pyparse = { path = "src/lang/python/parser", optional = true }
 # ZIPP's own PHP 8.x front end (dual-mode HTML/PHP lexer, AST, parser).
 # Optional and off by default: it backs the `lang::php` compiler.
 zipp-phpparse = { path = "src/lang/php/parser", optional = true }
+# ZIPP's own Rust front end (pure-Rust lexer, AST, parser).
+# Optional and off by default: it backs the `lang::rust` compiler.
+zipp-rsparse = { path = "src/lang/rust/parser", optional = true }
 # Decimal text to f64 without core's 10 KB power-of-five table (`num_parse`).
 # A crate of its own because zipp-pyparse uses it too.
 zipp-numparse = { path = "../zipp-numparse" }
@@ -91,6 +94,9 @@ python = ["dep:zipp-pyparse", "instrument"]
 # Experimental PHP 8.x frontend & HTTP SAPI runtime (`lang/php`).
 # Off by default so the JavaScript engine is unchanged.
 php = ["dep:zipp-phpparse", "instrument"]
+# Experimental Rust language frontend & backend runtime (`lang/rust`).
+# Off by default so the JavaScript engine is unchanged.
+rust = ["dep:zipp-rsparse", "instrument"]
 # Trusted mixed-language programs sharing one VM scope; deliberately opt-in.
 python-js-interop = ["python"]
 # Artifact-internal (the zipp-wasm `python` variant): the Python frontend

@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ZIPP Rust Issue Tracker</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Issue Tracker <span class="badge">Rust on ZIPP VM</span></h1>
+      <div id="user-bar" class="meta">Not signed in</div>
+    </header>
+
+    <div class="stats" id="stats"></div>
+
+    <div class="grid">
+      <aside>
+        <div class="card" id="auth-card">
+          <h2>Account</h2>
+          <div id="auth-err" class="error-msg"></div>
+          <label>Username</label>
+          <input id="auth-user" placeholder="alice">
+          <label>Password</label>
+          <input id="auth-pass" type="password" placeholder="secret123">
+          <div class="actions">
+            <button onclick="doAuth('login')">Login</button>
+            <button class="secondary" onclick="doAuth('register')">Register</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>New Issue</h2>
+          <div id="create-err" class="error-msg"></div>
+          <label>Title</label>
+          <input id="issue-title" placeholder="Fix parser edge case">
+          <label>Description</label>
+          <textarea id="issue-desc" rows="3" placeholder="Steps to reproduce..."></textarea>
+          <label>Priority</label>
+          <select id="issue-priority">
+            <option value="low">Low</option>
+            <option value="medium" selected>Medium</option>
+            <option value="high">High</option>
+            <option value="critical">Critical</option>
+          </select>
+          <button onclick="createIssue()">Create Issue</button>
+        </div>
+      </aside>
+
+      <main>
+        <div class="card">
+          <div style="display:flex; gap:10px; align-items:center;">
+            <input id="filter-q" placeholder="Search issues..." style="margin:0" oninput="refresh()">
+            <select id="filter-status" style="width:160px; margin:0" onchange="refresh()">
+              <option value="">All statuses</option>
+              <option value="open">Open</option>
+              <option value="in_progress">In Progress</option>
+              <option value="closed">Closed</option>
+            </select>
+          </div>
+        </div>
+        <div id="issues"></div>
+      </main>
+    </div>
+  </div>
+
+  <script>
+    let token = localStorage.getItem('zipp_it_token') || '';
+    let me = null;
+
+    async function api(path, opts = {}) {
+      const headers = Object.assign({ 'Content-Type': 'application/json' }, opts.headers || {});
+      if (token) headers['Authorization'] = 'Bearer ' + token;
+      const res = await fetch(path, Object.assign({}, opts, { headers }));
+      const text = await res.text();
+      let data = null;
+      try { data = text ? JSON.parse(text) : null; } catch (_) { data = text; }
+      if (!res.ok) throw new Error((data && data.error) || ('HTTP ' + res.status));
+      return data;
+    }
+
+    async function doAuth(mode) {
+      const err = document.getElementById('auth-err');
+      err.textContent = '';
+      try {
+        const username = document.getElementById('auth-user').value.trim();
+        const password = document.getElementById('auth-pass').value;
+        const data = await api('/api/auth/' + mode, {
+          method: 'POST',
+          body: JSON.stringify({ username, password })
+        });
+        token = data.token;
+        localStorage.setItem('zipp_it_token', token);
+        await loadMe();
+        await refresh();
+      } catch (e) { err.textContent = e.message; }
+    }
+
+    async function loadMe() {
+      const bar = document.getElementById('user-bar');
+      if (!token) { bar.textContent = 'Not signed in'; me = null; return; }
+      try {
+        me = await api('/api/auth/me');
+        bar.innerHTML = 'Signed in as <b>' + me.username + '</b> <button class="secondary" style="margin-left:8px;padding:3px 8px" onclick="logout()">Logout</button>';
+      } catch (_) { logout(); }
+    }
+
+    function logout() {
+      token = ''; me = null;
+      localStorage.removeItem('zipp_it_token');
+      document.getElementById('user-bar').textContent = 'Not signed in';
+    }
+
+    async function createIssue() {
+      const err = document.getElementById('create-err');
+      err.textContent = '';
+      try {
+        await api('/api/issues', {
+          method: 'POST',
+          body: JSON.stringify({
+            title: document.getElementById('issue-title').value,
+            description: document.getElementById('issue-desc').value,
+            priority: document.getElementById('issue-priority').value
+          })
+        });
+        document.getElementById('issue-title').value = '';
+        document.getElementById('issue-desc').value = '';
+        await refresh();
+      } catch (e) { err.textContent = e.message; }
+    }
+
+    async function transition(id, status) {
+      await api('/api/issues/' + id, { method: 'PATCH', body: JSON.stringify({ status }) });
+      await refresh();
+    }
+
+    async function removeIssue(id) {
+      await api('/api/issues/' + id, { method: 'DELETE' });
+      await refresh();
+    }
+
+    async function refresh() {
+      const q = document.getElementById('filter-q').value.trim();
+      const st = document.getElementById('filter-status').value;
+      const qs = new URLSearchParams();
+      if (q) qs.set('q', q);
+      if (st) qs.set('status', st);
+      const [stats, list] = await Promise.all([
+        api('/api/issues/stats'),
+        api('/api/issues' + (qs.toString() ? '?' + qs.toString() : ''))
+      ]);
+      document.getElementById('stats').innerHTML = [
+        ['Total', stats.total], ['Open', stats.open],
+        ['In Progress', stats.inProgress], ['Closed', stats.closed],
+        ['Users', stats.users]
+      ].map(([l, n]) => `<div class="stat"><div class="num">${n}</div><div class="lbl">${l}</div></div>`).join('');
+
+      document.getElementById('issues').innerHTML = list.length === 0
+        ? '<div class="card meta">No issues found.</div>'
+        : list.map(i => `
+          <div class="issue">
+            <div class="issue-head">
+              <span class="issue-title">#${i.id} ${i.title}</span>
+              <div>
+                <span class="pill ${i.priority}">${i.priority}</span>
+                <span class="pill ${i.status}">${i.status.replace('_', ' ')}</span>
+              </div>
+            </div>
+            <div class="meta">by ${i.author} &middot; ${i.createdAt}</div>
+            <div>${i.description}</div>
+            <div class="actions">
+              ${i.status === 'open' ? `<button class="secondary" onclick="transition(${i.id}, 'in_progress')">Start</button>` : ''}
+              ${i.status !== 'closed' ? `<button class="secondary" onclick="transition(${i.id}, 'closed')">Close</button>` : `<button class="secondary" onclick="transition(${i.id}, 'open')">Reopen</button>`}
+              <button class="danger" onclick="removeIssue(${i.id})">Delete</button>
+            </div>
+            ${i.comments && i.comments.length ? `<div class="comments">${i.comments.map(c => `<div class="comment"><b>${c.author}:</b> ${c.body}</div>`).join('')}</div>` : ''}
+          </div>`).join('');
+    }
+
+    loadMe().then(refresh);
+  </script>
+</body>
+</html>

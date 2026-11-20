@@ -2291,6 +2291,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "zipp-rsparse"
+version = "0.0.36"
+dependencies = [
+ "zipp-numparse",
+]
+
+[[package]]
 name = "zipp-vm"
 version = "0.0.36"
 dependencies = [
@@ -2311,6 +2318,7 @@ dependencies = [
  "zipp-phpparse",
  "zipp-pyparse",
  "zipp-regress",
+ "zipp-rsparse",
 ]
 
 [[package]]

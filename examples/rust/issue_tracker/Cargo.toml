@@ -1,0 +1,10 @@
+[package]
+name = "issue-tracker"
+version = "0.1.0"
+edition = "2021"
+description = "Full-stack Rust Issue Tracker API + Web UI running directly on the ZIPP VM"
+
+[dependencies]
+# Provided natively by the ZIPP Rust runtime:
+# http (Router/Request/Response), serde / serde_json, crypto (PBKDF-HMAC-SHA256, HS256 JWT, UUIDv4),
+# chrono-style Utc::now, regex, html::escape, std::fs, std::sync, std::env.

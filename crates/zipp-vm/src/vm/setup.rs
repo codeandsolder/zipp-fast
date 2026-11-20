@@ -3125,6 +3125,31 @@ impl<'p> Vm<'p> {
                 }
             }
         }
+        // The Rust runtime's private natives (`lang/rust/vm/rust_natives.rs`): bound
+        // by slot ONLY when `Program::rust_natives == true`.
+        #[cfg(feature = "rust")]
+        if self.program.rust_natives {
+            for &(name, id) in &[
+                (native::RS_IO_NAME, native::RS_IO),
+                (native::RS_FS_NAME, native::RS_FS),
+                (native::RS_ENV_NAME, native::RS_ENV),
+                (native::RS_TIME_NAME, native::RS_TIME),
+                (native::RS_NET_NAME, native::RS_NET),
+                (native::RS_CRYPTO_NAME, native::RS_CRYPTO),
+                (native::RS_PROC_NAME, native::RS_PROC),
+            ] {
+                let slot = self
+                    .program
+                    .global_names
+                    .iter()
+                    .position(|n| n == name);
+                if let Some(slot) = slot.filter(|&slot| slot < self.globals.len()) {
+                    let h = self.heap.alloc(HeapObj::Native(id));
+                    self.globals[slot] = Value::heap(h);
+                    self.bump_global_gen(slot as u32);
+                }
+            }
+        }
         // The Python runtime's native tensor loops (`vm::py_tensor`): bound
         // by slot, only in the program the Python frontend built, and never
         // entered in `builtin_globals`, so no other program (nor an eval)

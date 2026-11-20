@@ -773,6 +773,22 @@ impl ScriptState {
             .unwrap_or_default()
     }
 
+    /// Drain buffered stdout bytes emitted by a Rust program (`println!`, `print!`,
+    /// `std::io::stdout()`) when not streaming directly to OS stdout.
+    #[cfg(feature = "rust")]
+    pub fn take_rust_output(&mut self) -> Vec<u8> {
+        self.with_vm(|vm| std::mem::take(&mut vm.rust_output))
+            .unwrap_or_default()
+    }
+
+    /// Drain buffered stderr bytes emitted by a Rust program (`eprintln!`, `dbg!`,
+    /// panics) when not streaming directly to OS stderr.
+    #[cfg(feature = "rust")]
+    pub fn take_rust_stderr(&mut self) -> Vec<u8> {
+        self.with_vm(|vm| std::mem::take(&mut vm.rust_stderr))
+            .unwrap_or_default()
+    }
+
     /// Take the `console.error`/`console.warn` lines produced so far.
     pub fn take_errput(&mut self) -> Vec<String> {
         self.with_vm(|vm| {

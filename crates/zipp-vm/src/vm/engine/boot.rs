@@ -82,6 +82,7 @@ fn jit_wanted(program: &Program) -> bool {
     }
     if program.python_natives
         || program.php_natives
+        || program.rust_natives
         || program.functions.len() < JIT_LARGE_PROGRAM_FUNCS
         || crate::env_var_os("ZIPP_JIT_LARGE").is_some()
     {
@@ -888,10 +889,12 @@ impl<'p> Vm<'p> {
                 jit.set_python_program(program.python_natives, &program.functions);
                 #[cfg(feature = "php")]
                 jit.set_php_program(program.php_natives, &program.functions);
+                #[cfg(feature = "rust")]
+                jit.set_rust_program(program.rust_natives, &program.functions);
                 jit.set_large_program_thresholds(
                     program.functions.len(),
                     program.python_natives,
-                    program.php_natives,
+                    program.php_natives || program.rust_natives,
                 );
                 jit
             },
@@ -971,6 +974,12 @@ impl<'p> Vm<'p> {
             php_output: Vec::new(),
             #[cfg(feature = "php")]
             php_included: rustc_hash::FxHashSet::default(),
+            #[cfg(feature = "rust")]
+            rust_output: Vec::new(),
+            #[cfg(feature = "rust")]
+            rust_stderr: Vec::new(),
+            #[cfg(feature = "rust")]
+            rust_state: None,
             #[cfg(feature = "webassembly")]
             wasm: None,
             #[cfg(feature = "webassembly")]

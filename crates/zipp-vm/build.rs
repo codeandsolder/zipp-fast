@@ -42,6 +42,14 @@ fn main() {
         println!("cargo:rerun-if-changed={}", php_rt.display());
         mirror(php_rt, &php_out);
     }
+    let rust_rt = Path::new("src/lang/rust/runtime");
+    if rust_rt.is_dir() {
+        let rust_out = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"))
+            .join("rssrc")
+            .join("runtime");
+        println!("cargo:rerun-if-changed={}", rust_rt.display());
+        mirror(rust_rt, &rust_out);
+    }
     let gen = out.parent().unwrap();
     // The bytecode codec's per-instruction code (src/bytecode_codec.rs).
     let bytecode = std::fs::read_to_string("src/bytecode.rs").expect("read src/bytecode.rs");

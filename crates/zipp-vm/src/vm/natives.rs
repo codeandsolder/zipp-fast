@@ -4978,6 +4978,8 @@ impl<'p> Vm<'p> {
             NODE_HOST_WRITE..=NODE_HOST_TIMER => self.node_host_native(id, args)?,
             #[cfg(feature = "php")]
             PHP_OUTPUT..=PHP_MAP_KV => self.php_native_call(id, args)?,
+            #[cfg(feature = "rust")]
+            RS_IO..=RS_PROC => self.rust_native_call(id, args)?,
             #[cfg(feature = "webassembly")]
             WASM_HOST_OP => self.wasm_host_op(args)?,
             WR_DEREF => {

@@ -33,9 +33,10 @@ zipp-gpu = { path = "../zipp-gpu", optional = true }
 # The experimental Python-subset frontend (`zipp py file.py`, `zipp run`,
 # `--lang=python`). Default-on for the CLI only; `--no-default-features`
 # yields the JavaScript-only binary.
-default = ["python", "php", "gpu"]
+default = ["python", "php", "rust", "gpu"]
 python = ["zipp-vm/python"]
 php = ["zipp-vm/php"]
+rust = ["zipp-vm/rust"]
 # Run `zipp py` graphs on a hardware GPU (Vulkan, Direct3D 12 or Metal,
 # loaded at run time) when one is present, synchronously, exactly where the
 # CPU evaluator would have run them; the CPU evaluator otherwise.

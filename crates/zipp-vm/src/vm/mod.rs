@@ -4188,6 +4188,13 @@ pub struct Vm<'p> {
     /// Canonical paths already included in this PHP VM (`include_once`/`require_once`).
     #[cfg(feature = "php")]
     pub(crate) php_included: rustc_hash::FxHashSet<String>,
+    /// Buffered stdout/stderr and native handle tables for Rust programs (`lang/rust/vm/rust_natives.rs`).
+    #[cfg(feature = "rust")]
+    pub(crate) rust_output: Vec<u8>,
+    #[cfg(feature = "rust")]
+    pub(crate) rust_stderr: Vec<u8>,
+    #[cfg(feature = "rust")]
+    pub(crate) rust_state: Option<Box<rust_natives::RustVmState>>,
     /// `WebAssembly`'s runtime, made on first use (vm/webassembly).
     #[cfg(feature = "webassembly")]
     pub(crate) wasm: Option<Box<webassembly::WasmRuntime>>,
@@ -4457,6 +4464,10 @@ pub(crate) mod node;
 #[cfg(feature = "php")]
 #[path = "../lang/php/vm/php_natives.rs"]
 mod php_natives;
+// ── Rust's half of the VM ── private natives (`__zipp_rs_*`).
+#[cfg(feature = "rust")]
+#[path = "../lang/rust/vm/rust_natives.rs"]
+mod rust_natives;
 // ── Python's half of the VM ── its instructions' semantics, runtime
 // tables and library natives. The files live with the rest of the language
 // in `lang/python/vm/`; they are modules of `vm` because they implement the

@@ -222,6 +222,8 @@ fn finish_program(c: &mut Compiler) -> Program {
         python_lazy: None,
         php_natives: false,
         php_ctx: None,
+        rust_natives: false,
+        rust_ctx: None,
     }
 }
 
@@ -539,6 +541,8 @@ pub fn compile_eval(
         python_lazy: None,
         php_natives: false,
         php_ctx: None,
+        rust_natives: false,
+        rust_ctx: None,
     })
 }
 

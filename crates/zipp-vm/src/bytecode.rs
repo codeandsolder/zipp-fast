@@ -5575,6 +5575,42 @@ pub struct Program {
     /// optional VFS, and optional HTTP SAPI request payload (see [`PhpCtx`]).
     #[cfg_attr(not(feature = "php"), allow(dead_code))]
     pub php_ctx: Option<Box<PhpCtx>>,
+    /// Set only on the Rust frontend's runtime program: the VM then binds the
+    /// reserved `__zipp_rs_*` private natives by slot.
+    #[cfg_attr(not(feature = "rust"), allow(dead_code))]
+    pub rust_natives: bool,
+    /// Set only on a Rust program: file context, argv, optional VFS, FS/net
+    /// capability flags, and run mode (see [`RustCtx`]).
+    #[cfg_attr(not(feature = "rust"), allow(dead_code))]
+    pub rust_ctx: Option<Box<RustCtx>>,
+}
+
+/// Runtime context owned by a compiled Rust [`Program`].
+#[derive(Clone)]
+#[cfg_attr(not(feature = "rust"), allow(dead_code))]
+pub struct RustCtx {
+    pub file: String,
+    pub base_dir: String,
+    pub argv: Vec<String>,
+    pub vfs: Option<std::sync::Arc<std::collections::HashMap<String, Vec<u8>>>>,
+    pub allow_native_fs: bool,
+    pub allow_net: bool,
+    pub stream_stdout: bool,
+    pub mode: String,
+    pub pkg_env: Vec<(String, String)>,
+}
+
+#[cfg_attr(not(feature = "rust"), allow(dead_code))]
+impl std::fmt::Debug for RustCtx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RustCtx")
+            .field("file", &self.file)
+            .field("base_dir", &self.base_dir)
+            .field("allow_native_fs", &self.allow_native_fs)
+            .field("allow_net", &self.allow_net)
+            .field("mode", &self.mode)
+            .finish()
+    }
 }
 
 /// Runtime context owned by a compiled PHP [`Program`].

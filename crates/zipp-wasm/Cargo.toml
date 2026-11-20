@@ -91,3 +91,5 @@ python-js-interop = ["python", "zipp-vm/python-js-interop"]
 python-base = ["python", "zipp-vm/python-no-torch"]
 # `Engine.initSource(source, "php")`: the PHP 8.x frontend (`lang/php`).
 php = ["zipp-vm/php"]
+# `Engine.initSource(source, "rust")`: the Rust frontend (`lang/rust`).
+rust = ["zipp-vm/rust"]

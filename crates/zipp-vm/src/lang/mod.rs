@@ -19,10 +19,13 @@ use std::str::FromStr;
 mod js;
 mod php;
 mod python;
+mod rust;
 pub(crate) mod ts;
 
 #[cfg(feature = "php")]
 pub use php::frontend::PhpProgramConfig;
+#[cfg(feature = "rust")]
+pub use rust::frontend::RustProgramConfig;
 
 pub use ts::run_file as run_typescript_file;
 
@@ -71,7 +74,13 @@ pub trait Language: Sync {
 
 /// Every language, the base language first.
 pub fn languages() -> &'static [&'static dyn Language] {
-    &[&js::JavaScript, &python::Python, &ts::TypeScript, &php::Php]
+    &[
+        &js::JavaScript,
+        &python::Python,
+        &ts::TypeScript,
+        &php::Php,
+        &rust::Rust,
+    ]
 }
 
 /// The language `id` names.
@@ -89,6 +98,7 @@ pub enum LanguageId {
     Python,
     TypeScript,
     Php,
+    Rust,
 }
 impl FromStr for LanguageId {
     type Err = String;
@@ -97,7 +107,7 @@ impl FromStr for LanguageId {
         match languages().iter().find(|l| l.names().contains(&key.as_str())) {
             Some(l) => Ok(l.id()),
             None => Err(format!(
-                "unknown language {value:?}; expected javascript, typescript, python or php"
+                "unknown language {value:?}; expected javascript, typescript, python, php or rust"
             )),
         }
     }
@@ -110,6 +120,10 @@ pub enum PythonMode {
 pub enum PhpMode {
     Script,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RustMode {
+    Script,
+}
 #[derive(Debug, Clone, Copy)]
 pub enum Frontend {
     JavaScript { goal: ScriptGoal },
@@ -118,6 +132,8 @@ pub enum Frontend {
     TypeScript,
     /// A PHP 8.x script or template (`lang/php`).
     Php { mode: PhpMode },
+    /// A Rust script or backend program (`lang/rust`).
+    Rust { mode: RustMode },
 }
 impl Frontend {
     pub fn language(self) -> LanguageId {
@@ -126,6 +142,7 @@ impl Frontend {
             Self::Python { .. } => LanguageId::Python,
             Self::TypeScript => LanguageId::TypeScript,
             Self::Php { .. } => LanguageId::Php,
+            Self::Rust { .. } => LanguageId::Rust,
         }
     }
 }
@@ -156,6 +173,9 @@ pub fn compile_source(source: &str, frontend: Frontend) -> Result<CompiledSource
         | Frontend::TypeScript
         | Frontend::Php {
             mode: PhpMode::Script,
+        }
+        | Frontend::Rust {
+            mode: RustMode::Script,
         } => self::language(language).compile(source)?,
     };
     Ok(CompiledSource { language, state })
@@ -172,6 +192,21 @@ pub fn compile_php_program(
     let state = ScriptState::from_program(program);
     Ok(CompiledSource {
         language: LanguageId::Php,
+        state,
+    })
+}
+
+/// Compile a Rust script, test suite, or backend program with explicit
+/// configuration (file path, base dir, CLI argv, VFS, FS/network permissions, mode).
+#[cfg(feature = "rust")]
+pub fn compile_rust_program(
+    source: &str,
+    config: RustProgramConfig,
+) -> Result<CompiledSource, String> {
+    let program = rust::compile_program(source, config)?;
+    let state = ScriptState::from_program(program);
+    Ok(CompiledSource {
+        language: LanguageId::Rust,
         state,
     })
 }
@@ -297,6 +332,22 @@ pub fn flush_php_opcache() {
     #[cfg(feature = "php")]
     php::frontend::flush_opcache_pack();
 }
+/// Whether Rust compiles keep the compiled runtime seed in memory for reuse in
+/// the same process. On by default; one-shot CLI runs turn it off.
+pub fn set_rust_runtime_memo(enabled: bool) {
+    #[cfg(feature = "rust")]
+    rust::frontend::set_runtime_memo(enabled);
+    #[cfg(not(feature = "rust"))]
+    let _ = enabled;
+}
+/// Keep compiled Rust runtime bytecode in `dir` between processes, or disable
+/// disk caching with `None`.
+pub fn set_rust_runtime_cache(dir: Option<std::path::PathBuf>) {
+    #[cfg(feature = "rust")]
+    rust::frontend::set_runtime_cache(dir);
+    #[cfg(not(feature = "rust"))]
+    let _ = dir;
+}
 /// Get Python ready ahead of the first program: compile the runtime every
 /// Python program starts from (about 0.7 MB of JavaScript) into the
 /// per-process memo ([`set_python_runtime_memo`], on by default), then run
@@ -380,6 +431,7 @@ pub fn compile_source_to_text(source: &str, frontend: Frontend) -> Result<String
         Frontend::Python { .. } => language(LanguageId::Python).compile_to_text(source),
         Frontend::TypeScript => language(LanguageId::TypeScript).compile_to_text(source),
         Frontend::Php { .. } => language(LanguageId::Php).compile_to_text(source),
+        Frontend::Rust { .. } => language(LanguageId::Rust).compile_to_text(source),
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -491,7 +543,13 @@ mod tests {
     }
     #[test]
     fn the_table_lists_each_language_once() {
-        for id in [LanguageId::JavaScript, LanguageId::Python, LanguageId::TypeScript, LanguageId::Php] {
+        for id in [
+            LanguageId::JavaScript,
+            LanguageId::Python,
+            LanguageId::TypeScript,
+            LanguageId::Php,
+            LanguageId::Rust,
+        ] {
             assert_eq!(languages().iter().filter(|l| l.id() == id).count(), 1);
             for name in language(id).names() {
                 assert_eq!(name.parse::<LanguageId>().unwrap(), id, "{name}");

@@ -806,6 +806,13 @@ impl Engine {
                 },
             )
             .map(|compiled| compiled.into_state()),
+            zipp_vm::frontend::LanguageId::Rust => zipp_vm::frontend::compile_source(
+                source,
+                zipp_vm::frontend::Frontend::Rust {
+                    mode: zipp_vm::frontend::RustMode::Script,
+                },
+            )
+            .map(|compiled| compiled.into_state()),
         })
     }
 

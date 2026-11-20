@@ -12,6 +12,8 @@ mod sandbox;
 mod frontend_cli;
 #[cfg(feature = "php")]
 mod php_server;
+#[cfg(feature = "rust")]
+mod rust_server;
 #[cfg(feature = "gpu")]
 mod gpu;
 
@@ -741,7 +743,9 @@ fn run(args: &[String]) -> Result<(), String> {
             #[cfg(feature = "gpu")]
             println!("                                  torch.compile graphs run on a GPU when one is present (--no-gpu or ZIPP_GPU=0: CPU)");
             println!("  zipp ts  <file.ts>              run TypeScript directly (also `zipp <file.ts>`)");
-            println!("  zipp run [--lang=L] <file>      run; L = javascript|typescript|python, else by extension/shebang");
+            println!("  zipp php <file.php>             run PHP 8.x (`-S HOST:PORT` for HTTP SAPI / `--worker`)");
+            println!("  zipp rs  <file.rs>              run Rust scripts & backends (`--test`, `--bc`, `--serve HOST:PORT`)");
+            println!("  zipp run [--lang=L] <file>      run; L = javascript|typescript|python|php|rust, else by extension/shebang");
             println!("  zipp bc  <file.js> [--module]   compile only, print the bytecode");
             println!("  zipp bcdiff <path>...           compile a corpus twice, diff the result");
             println!(

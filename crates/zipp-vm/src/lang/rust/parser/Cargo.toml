@@ -1,0 +1,9 @@
+[package]
+name = "zipp-rsparse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ZIPP's own Rust front end: pure-Rust lexer, AST, and recursive-descent/Pratt parser."
+
+[dependencies]
+zipp-numparse = { path = "../../../../../zipp-numparse" }

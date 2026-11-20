@@ -36,6 +36,9 @@ compile_error!("ZIPP Lite omits Python; build the python variant separately");
 #[cfg(all(feature = "wasm-lite", feature = "php"))]
 compile_error!("ZIPP Lite omits PHP; build the php variant separately");
 
+#[cfg(all(feature = "wasm-lite", feature = "rust"))]
+compile_error!("ZIPP Lite omits Rust; build the rust variant separately");
+
 /// Rust's bare WASM target has no process environment. Lite resolves native
 /// benchmark switches to their existing absent-variable defaults, removing
 /// cached checks and unreachable alternatives. (An earlier full-build attempt

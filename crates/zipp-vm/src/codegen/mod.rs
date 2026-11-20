@@ -4206,6 +4206,13 @@ pub struct Jit {
     /// When true, non-companion PHP/runtime functions stay interpreted.
     #[cfg_attr(not(feature = "php"), allow(dead_code))]
     php_only: bool,
+    /// A Rust program (see `set_rust_program`): its JavaScript runtime stays
+    /// interpreted while user Rust functions (`__rs_fn_*`, `__rs_closure`)
+    /// compile natively through Tier A and Tier C.
+    rust_program: bool,
+    /// When true, JS runtime functions in a Rust program stay interpreted.
+    #[cfg_attr(not(feature = "rust"), allow(dead_code))]
+    rust_only: bool,
     /// Per main-program function of a Python/PHP program: `INTERP_*` flags
     /// (answered as dead by `fn_state` / `region_dead`). In a JavaScript
     /// program, the `RUNTIME_*` flags of `eval` and `new Function` code
@@ -4336,12 +4343,45 @@ impl Jit {
         }
     }
 
+    /// Mark this VM as running a Rust program (`lang/rust`): its JS runtime
+    /// stays interpreted to avoid startup JIT overhead while user Rust functions
+    /// (`__rs_fn_*`, `__rs_closure`) compile natively through Tier A and Tier C.
+    /// `ZIPP_RS_JIT_RUNTIME=1` compiles all bodies.
+    #[cfg(feature = "rust")]
+    pub fn set_rust_program<'a>(
+        &mut self,
+        rust: bool,
+        functions: impl IntoIterator<Item = &'a FuncProto>,
+    ) {
+        if !rust {
+            return;
+        }
+        self.rust_program = true;
+        self.rust_only = crate::env_var_os("ZIPP_RS_JIT_RUNTIME").is_none();
+        self.interp_only = functions
+            .into_iter()
+            .map(|f| self.rust_interp_flags(f))
+            .collect();
+    }
+
+    #[cfg(feature = "rust")]
+    fn rust_interp_flags(&self, f: &FuncProto) -> u8 {
+        if !self.rust_only
+            || f.name.starts_with("__rs_fn_")
+            || f.name.starts_with("__rs_closure")
+        {
+            0
+        } else {
+            INTERP_NO_FN | INTERP_NO_REGIONS
+        }
+    }
+
     /// `eval` or `new Function` code installed as `func_id` in a JavaScript
     /// program: flag it `RUNTIME_CODE`, and `RUNTIME_MANY_LOOPS` past
     /// [`MAX_LOOPS_FOR_REGIONS`] loops; a long one waits its extra calls
     /// ([`RUNTIME_FN_INSTRS_PER_CALL`]).
     pub fn note_runtime_code(&mut self, func_id: u32, code: &[Instr]) {
-        if self.python_program || self.php_program {
+        if self.python_program || self.php_program || self.rust_program {
             return;
         }
         let i = func_id as usize;
