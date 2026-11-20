@@ -1029,7 +1029,7 @@ impl<'s> Parser<'s> {
                     let is_break = kw == Keyword::Break;
                     self.bump_before_operand()?;
                     let label = if self.is_binding_ident() && !self.cur().newline_before {
-                        let (n, pos) = self.binding_ident()?;
+                        let (n, pos) = self.label_ident()?;
                         if !self.labels.iter().any(|l| **l == *n) {
                             return Err(SyntaxError::new(
                                 format!("SyntaxError: undefined label '{n}'"),

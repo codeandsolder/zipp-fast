@@ -29,7 +29,7 @@ and Bun.
 
 **Languages today: JavaScript (with TypeScript and JSX) and Python.**
 
-- **JavaScript** is complete and modern: ES2025, passing **99.999% of test262**: 96,227 / 96,228 executions of the official conformance suite,
+- **JavaScript** is complete and modern: ES2025, passing **99.999% of test262**: 96,563 / 96,564 executions of the official conformance suite,
   unmodified.
 - **TypeScript and TSX** run as they are: the JavaScript parser reads the
   types and drops them, and lowers `enum`, `namespace`, parameter

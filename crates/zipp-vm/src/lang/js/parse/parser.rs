@@ -1462,6 +1462,21 @@ impl<'s> Parser<'s> {
         Ok((name.into(), pos))
     }
 
+    /// Consume a `LabelIdentifier`: same identifier rules as `is_binding_ident()`,
+    /// except `eval` and `arguments` are valid labels even in strict mode (a label
+    /// is not a binding or `IdentifierReference`).
+    pub(crate) fn label_ident(&mut self) -> PResult<(Name, u32)> {
+        if !self.is_binding_ident() {
+            return Err(self.err_here("SyntaxError: unexpected token, expected a label"));
+        }
+        let pos = self.tok.span.start;
+        let tok = self.bump_after_operand()?;
+        let TokenKind::Ident { name, .. } = tok.kind else {
+            unreachable!()
+        };
+        Ok((name.into(), pos))
+    }
+
     /// Consume any identifier-shaped token as a PROPERTY name, where reserved
     /// words are legal (`x.default`, `{ if: 1 }`).
     pub(crate) fn ident_name(&mut self) -> PResult<Name> {

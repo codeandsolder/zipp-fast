@@ -45,7 +45,7 @@ env:
   CARGO_TERM_COLOR: always
   WASM_BINDGEN_CLI: "0.2.126"
   # The Test262 corpus security.yml pins; keep the two in step.
-  TEST262_REF: 0b4e0812022b18236b5276d2804948fdd9f71603
+  TEST262_REF: 2e58f87d8350ad51224617a041c6e041d52f8444
 
 jobs:
   identify:

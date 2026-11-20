@@ -98,3 +98,79 @@ fn an_array_in_the_prototype_chain_keeps_named_lookup_going() {
         ]
     );
 }
+
+#[test]
+fn strict_arguments_and_eval_are_valid_break_continue_labels() {
+    let src = r#"
+        "use strict";
+        let breaks = 0, conts = 0, evalBreaks = 0;
+        class C {
+            static {
+                arguments: for (;;) { breaks++; break arguments; }
+                arguments: for (let i = 0; i < 2; i++) { conts++; continue arguments; }
+                eval: { evalBreaks++; break eval; evalBreaks += 99; }
+            }
+            x = () => {
+                arguments: for (;;) { breaks++; break arguments; }
+                arguments: for (let i = 0; i < 2; i++) { conts++; continue arguments; }
+            };
+        }
+        new C().x();
+        console.log(breaks, conts, evalBreaks);
+    "#;
+    assert_eq!(run_lines(src), ["2 4 1"]);
+}
+
+#[test]
+fn temporal_duration_rejects_dangling_time_designator() {
+    let src = r#"
+        const bad = ["PT", "Pt", "-PT", "+PT", "P1DT", "P1Dt", "P1Y2M3DT"];
+        let threw = 0;
+        for (const s of bad) {
+            try { Temporal.Duration.from(s); }
+            catch (e) { if (e instanceof RangeError) threw++; }
+        }
+        console.log(threw, bad.length, Temporal.Duration.from("P1DT2H").hours);
+    "#;
+    assert_eq!(run_lines(src), ["7 7 2"]);
+}
+
+#[test]
+fn iterator_helpers_complete_after_abrupt_completion() {
+    let src = r#"
+        function check(makeHelper) {
+            let nexts = 0, returns = 0;
+            class Boom extends Iterator {
+                next() { nexts++; throw new Error("boom"); }
+                return() { returns++; return { done: true }; }
+            }
+            const h = makeHelper(new Boom());
+            let caught = false;
+            try { h.next(); } catch (e) { caught = e.message === "boom"; }
+            const afterNext = h.next();
+            const afterRet = h.return();
+            return `${caught},${nexts},${returns},${afterNext.done},${afterNext.value},${afterRet.done},${afterRet.value}`;
+        }
+        const results = [
+            check(it => it.map(x => x)),
+            check(it => it.filter(() => true)),
+            check(it => it.take(2)),
+            check(it => it.drop(1)),
+            check(it => it.flatMap(x => [x])),
+            check(it => Iterator.concat(it)),
+        ];
+        // Iterator.from wrapper (WrapForValidIterator) is NOT a generator and keeps forwarding.
+        let wrapNexts = 0;
+        const wrapped = Iterator.from({
+            next() {
+                wrapNexts++;
+                if (wrapNexts === 1) throw new Error("first");
+                return { value: 42, done: false };
+            }
+        });
+        try { wrapped.next(); } catch (_) {}
+        const second = wrapped.next();
+        console.log(results.every(r => r === "true,1,0,true,undefined,true,undefined"), wrapNexts, second.value, second.done);
+    "#;
+    assert_eq!(run_lines(src), ["true 2 42 false"]);
+}

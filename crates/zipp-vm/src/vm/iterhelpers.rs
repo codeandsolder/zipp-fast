@@ -1526,20 +1526,23 @@ impl<'p> Vm<'p> {
     /// a step is in flight gets a TypeError (GeneratorValidate "executing"), not a
     /// stack overflow / silent wrong answer. The `running` brand is always cleared.
     pub(crate) fn iter_helper_next(&mut self, idx: u32) -> Result<Value, Thrown> {
-        match self.heap.get(idx) {
+        let is_wrapper = match self.heap.get(idx) {
             HeapObj::IterHelper(ih) if ih.running => {
                 return Err(Thrown::from_static("TypeError: Iterator is already running"));
             }
-            HeapObj::IterHelper(_) => {}
+            HeapObj::IterHelper(ih) => ih.kind == 5,
             _ => {
                 return Err(Thrown::from_static(
                     "TypeError: Iterator Helper next called on incompatible receiver",
                 ))
             }
-        }
+        };
         self.ih_set_running(idx, true);
         let r = self.iter_helper_next_inner(idx);
         self.ih_set_running(idx, false);
+        if r.is_err() && !is_wrapper {
+            self.ih_set_done(idx);
+        }
         r
     }
 

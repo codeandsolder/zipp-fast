@@ -1,16 +1,16 @@
 # Correctness and language coverage
 
 The unmodified pinned core Test262 corpus passes
-**99.999% of test262**: 96,227 / 96,228 executions, with one documented expected
+**99.999% of test262**: 96,563 / 96,564 executions, with one documented expected
 failure and zero skips. The original DateTimeFormat ECMA-402 shard also passes
-**490 / 490**, without changes or skips. The corpus is pinned to
-`0b4e0812022b18236b5276d2804948fdd9f71603` (26 October 2026), including staging
+**492 / 492**, without changes or skips. The corpus is pinned to
+`2e58f87d8350ad51224617a041c6e041d52f8444` (11 November 2026), including staging
 and excluding the separate ECMA-402 suite; hosted CI runs it once, unmodified.
 
 | Validation profile | Passed | Failed | Skipped |
 | --- | ---: | ---: | ---: |
-| Original pinned core Test262 | 96,227 | 1 | 0 |
-| Original DateTimeFormat ECMA-402 tests | 490 | 0 | 0 |
+| Original pinned core Test262 | 96,563 | 1 | 0 |
+| Original DateTimeFormat ECMA-402 tests | 492 | 0 | 0 |
 
 The one failure, `annexB/language/function-code/block-decl-func-skip-arguments.js`
 in sloppy mode, asserts ES2017 wording that ES2018 deleted
@@ -37,6 +37,14 @@ beneath it, as a typed array's do (tc39/ecma262#3972, which has consensus).
 The engine threw a `TypeError` there, failing 12 executions; it now answers
 0, and the old pin's two detached-buffer tests, merged into one, leave the
 corpus two executions smaller.
+
+The 11 November 2026 pin (`2e58f87d`, +23 upstream commits, +336 core
+executions and +2 DateTimeFormat executions) surfaced 18 new failures across
+three spec edges: `break`/`continue` labels named `arguments`/`eval` in strict
+mode (and class elements/static blocks), dangling `T`/`t` time designators in
+`Temporal.Duration.from` (`"P1DT"`, `"PT"`), and generator-backed iterator
+helpers (`map`, `filter`, `take`, `drop`, `flatMap`, `concat`) transitioning to
+`completed` on abrupt completion. All 18 are fixed with local regression tests.
 
 The [12 September 2026 correctness audit](archive/audits/2026-09-12-correctness.md)
 recorded an earlier **95,939 / 95,942** result against corpus `defaaf1571`.

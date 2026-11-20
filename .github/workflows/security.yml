@@ -439,7 +439,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: tc39/test262
-          ref: 0b4e0812022b18236b5276d2804948fdd9f71603
+          ref: 2e58f87d8350ad51224617a041c6e041d52f8444
           # Keep the external corpus out of the engine's source-identity scan.
           path: target/test262
           persist-credentials: false
@@ -458,7 +458,7 @@ jobs:
           PY
       - name: Test conformance scoring and corpus provenance checks
         run: python3 -m unittest discover -s tools -p 'test_run_test262*.py'
-      # One run of the unmodified corpus (96,228 executions), allowed exactly
+      # One run of the unmodified corpus (96,564 executions), allowed exactly
       # the failures the manifest documents: an unexpected failure, a stale
       # entry or a skip fails the gate. Two workers: four were tried
       # (3856993d) and took as long, so the runner's throughput here is not
