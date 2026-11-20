@@ -18,7 +18,7 @@ zipp-rsparse = { path = "src/lang/rust/parser", optional = true }
 # Optional native SQLite (bundled with FTS5, JSON1, R-Tree) + Argon2id for
 # `zipp rs` backend apps (`rust-native-db`). Enabled ONLY by `zipp-cli`; never
 # pulled into `zipp-wasm`, `wasm-lite`, or `safe-sandbox`.
-rusqlite = { version = "0.31", features = ["bundled"], optional = true }
+rusqlite = { version = "0.43", default-features = false, features = ["bundled", "cache"], optional = true }
 argon2 = { version = "0.5", features = ["std"], optional = true }
 # Decimal text to f64 without core's 10 KB power-of-five table (`num_parse`).
 # A crate of its own because zipp-pyparse uses it too.

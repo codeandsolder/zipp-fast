@@ -1588,7 +1588,7 @@ pub(crate) fn own_pos_in(cache: &[std::cell::Cell<OwnSlot>], m: &ObjMap, key: &s
 }
 
 /// Outcome of a single read-only probe into `Vm::own_slot_cache`.
-#[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+#[cfg(all(feature = "jit", target_arch = "x86_64", not(feature = "safe-sandbox")))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OwnSlotProbe {
     /// Own data property `(slot, writable)`.
@@ -1607,7 +1607,7 @@ impl<'p> Vm<'p> {
     /// Single-lookup read-only probe of `(sh, key)` in `own_slot_cache`:
     /// distinguishes own DATA property (`Data(slot, writable)`), proved own absence
     /// (`Miss`), and cache miss / accessor (`Unknown`).
-    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    #[cfg(all(feature = "jit", target_arch = "x86_64", not(feature = "safe-sandbox")))]
     #[inline(always)]
     pub(crate) fn own_slot_probe(&self, sh: u32, key: &str) -> OwnSlotProbe {
         let b = key.as_bytes();
@@ -1632,7 +1632,7 @@ impl<'p> Vm<'p> {
     /// Whether `%Object.prototype%` is a plain unchained root object that does
     /// not have `key` as an own property (so an absent own property on any
     /// default-prototype plain object resolves directly to `undefined`).
-    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    #[cfg(all(feature = "jit", target_arch = "x86_64", not(feature = "safe-sandbox")))]
     #[inline]
     pub(crate) fn obj_proto_lacks_key(&self, key: &str) -> bool {
         let op = self.obj_proto;

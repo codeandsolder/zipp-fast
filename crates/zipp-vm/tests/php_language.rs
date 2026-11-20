@@ -50,17 +50,37 @@ fn run_system_php(source: &str) -> Option<String> {
     Some(String::from_utf8(out.stdout).expect("system php output UTF-8"))
 }
 
+fn system_php_version_id() -> Option<u32> {
+    static VERSION: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *VERSION.get_or_init(|| {
+        let out = Command::new("php")
+            .args(["-r", "echo PHP_VERSION_ID;"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        String::from_utf8(out.stdout).ok()?.trim().parse().ok()
+    })
+}
+
 fn check_case(name: &str, source: &str, expected: &str) {
+    check_case_min_php(name, source, expected, 80000);
+}
+
+fn check_case_min_php(name: &str, source: &str, expected: &str, min_php_version: u32) {
     let got = run_zipp_php(source);
     assert_eq!(
         got, expected,
         "[{name}] ZIPP PHP output mismatch\n--- got ---\n{got}\n--- expected ---\n{expected}"
     );
-    if let Some(sys) = run_system_php(source) {
-        assert_eq!(
-            got, sys,
-            "[{name}] ZIPP PHP diverged from system php\n--- zipp ---\n{got}\n--- php ---\n{sys}"
-        );
+    if system_php_version_id().is_some_and(|v| v >= min_php_version) {
+        if let Some(sys) = run_system_php(source) {
+            assert_eq!(
+                got, sys,
+                "[{name}] ZIPP PHP diverged from system php\n--- zipp ---\n{got}\n--- php ---\n{sys}"
+            );
+        }
     }
 }
 
@@ -454,7 +474,7 @@ try {
 
 #[test]
 fn php83_84_syntax_hooks_asymmetric_vis_dynamic_const_new_chaining_and_goto() {
-    check_case(
+    check_case_min_php(
         "php83_84_modern_syntax",
         r#"<?php
 class Box {
@@ -530,6 +550,7 @@ $log[] = "end";
 echo implode(',', $log), "\n";
 "#,
         "20|twenty\nadmin|Ada Lovelace\nGrace Hopper\nblocked\nlocked\n[true,true,42,6,5,true,0]\nn1,n2,n3,try,fin,end\n",
+        80400,
     );
 }
 
@@ -615,7 +636,7 @@ echo ($store->contains($v) ? 'has' : 'no'), ':', $store[$v], "\n";
 
 #[test]
 fn framework_stdlib_pcre_possessive_unicode_ctype_mb_and_array84() {
-    check_case(
+    check_case_min_php(
         "framework_stdlib_and_pcre",
         r#"<?php
 // Symfony RouteCompiler possessive quantifier `[^/]++` + `{...}sDu` delimiters
@@ -646,6 +667,7 @@ echo implode('/', mb_split('[\s_]+', 'foo_bar baz')), '|',
      (version_compare('8.4.15', '8.4.1', '>=') ? 'ok' : 'no'), "\n";
 "#,
         "1:ada_lovelace\n2:0\nhello-laravel-11\n10|2\nYYL\nhello ZIPP|10\nfoo/bar/baz|ok\n",
+        80400,
     );
 }
 

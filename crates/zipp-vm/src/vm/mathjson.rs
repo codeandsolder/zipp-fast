@@ -2902,9 +2902,11 @@ impl<'p> Vm<'p> {
         let ctx = self.alloc_object_current_realm(crate::heap::ObjMap::new());
         if let Some(JsonSrc::Prim(s, _)) = src {
             let sv = self.alloc_str(s.clone());
-            if let HeapObj::Object(m) = self.heap.get_mut(ctx.heap_index()) {
+            let idx = ctx.heap_index();
+            if let HeapObj::Object(m) = self.heap.get_mut(idx) {
                 m.set("source", sv);
             }
+            self.heap.refresh_mirror(idx);
         }
         ctx
     }

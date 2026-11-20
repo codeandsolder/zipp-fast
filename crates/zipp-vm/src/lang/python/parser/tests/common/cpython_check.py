@@ -178,6 +178,19 @@ def grammar_gap(tree):
     return False
 
 
+def has_type_param_default(x):
+    """True when ZIPP's arena AST contains a PEP 696 type-parameter default
+    (Python 3.13+ syntax that CPython 3.12 rejects with SyntaxError)."""
+    if isinstance(x, list):
+        if len(x) == 2 and isinstance(x[0], str) and isinstance(x[1], dict):
+            name, fields = x
+            if name in ("TypeVar", "ParamSpec", "TypeVarTuple") and fields.get("default_value") is not None:
+                return True
+            return any(has_type_param_default(v) for v in fields.values())
+        return any(has_type_param_default(v) for v in x)
+    return False
+
+
 def main():
     for line in open(sys.argv[1], encoding="utf-8"):
         try:
@@ -215,6 +228,8 @@ def main():
             # Assignment targets are checked by ZIPP's compiler, as they were
             # with the RustPython parser; CPython's parser checks them itself.
             if label.endswith("[where CPython accepts]"):
+                continue
+            if sys.version_info < (3, 13) and has_type_param_default(ours):
                 continue
             if ours != "reject" and not any(t in msg for t in TARGET_CHECKS):
                 print(f"{label}: CPython rejects ({msg}, line {getattr(e, 'lineno', '?')}) what ZIPP accepts")
