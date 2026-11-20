@@ -94,18 +94,19 @@ console.log(seen+"|"+ipMatches+"|"+octSum+"|"+m[0]);"#,
 
 fn slow_add_src() -> &'static str {
     r#"var N=48,lines=new Array(N);
-for(var j=0;j<N;j++)lines[j]="1.2.3.4";
-var reIp=/(\d+).(\d+).(\d+).(\d+)/,octSum=0,ipMatches=0,m,i=0;
-function scan(){for(i=0;i<N;i++){m=reIp.exec(lines[i]);if(m){
+for(var j=0;j<N;j++)if(j!==20)lines[j]=j===21?"9.8.7.6":"1.2.3.4";
+var reIp=/(\d+).(\d+).(\d+).(\d+)/,octSum=0,ipMatches=0,m,seen="",caught="";
+Object.defineProperty(Array.prototype,"20",{configurable:true,get:function(){
+  octSum={valueOf:function(){
+    seen=m[0]+"|"+m[1]+"|"+m[2]+"|"+m[3]+"|"+m[4]+"|"+m.index+"|"+Object.keys(m).join(",");
+    throw new Error("boom");
+  }};
+  return "no address";
+}});
+try{for(var i=0;i<N;i++){m=reIp.exec(lines[i]);if(m){
   ipMatches++;octSum=(octSum+(+m[1])+(+m[2])+(+m[3])+(+m[4]))|0;
-}}}
-scan();
-N=2;lines=["no address","9.8.7.6"];i=0;ipMatches=0;var seen="",caught="";
-octSum={valueOf:function(){
-  seen=m[0]+"|"+m[1]+"|"+m[2]+"|"+m[3]+"|"+m[4]+"|"+m.index+"|"+Object.keys(m).join(",");
-  throw new Error("boom");
-}};
-try{scan();}catch(e){caught=e.message;}
+}}}catch(e){caught=e.message;}
+delete Array.prototype[20];
 console.log(seen+"|"+caught+"|"+ipMatches);"#
 }
 

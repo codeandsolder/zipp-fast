@@ -115,10 +115,13 @@ fn htmldda_semantics_match_with_scalar_fallback_nojit_and_gc_stress() {
     }
 }
 
-fn probe(disabled: bool) -> (u64, u64) {
+fn probe(disabled: bool, nojit: bool) -> (u64, u64) {
     let mut env = vec![(PROBE_ENV, "1"), ("ZIPP_ICSTATS", "1")];
     if disabled {
         env.push(("ZIPP_NO_HTMLDDA_SCALAR", "1"));
+    }
+    if nojit {
+        env.push(("ZIPP_NOJIT", "1"));
     }
     let stdout = assert_child(
         if disabled {
@@ -142,10 +145,14 @@ fn probe(disabled: bool) -> (u64, u64) {
 
 #[test]
 fn mechanism_counter_and_kill_switch_select_exactly_one_membership_route() {
-    let (scalar_on, set_on) = probe(false);
-    let (scalar_off, set_off) = probe(true);
+    // Under JIT, Tier C/O inline scalar HTMLDDA compares bypass `is_htmldda_index`
+    // directly against `JIT_HTMLDDA_IDX_OFFSET` while remaining checks hit the
+    // scalar mirror and zero probe the HashSet; the kill switch disables both
+    // inline and helper scalar checks and routes everything through the HashSet.
+    let (scalar_on, set_on) = probe(false, false);
+    let (scalar_off, set_off) = probe(true, false);
     assert!(
-        scalar_on > 20_000,
+        scalar_on > 10_000,
         "scalar mirror did not serve the hot membership checks: {scalar_on}"
     );
     assert_eq!(set_on, 0, "enabled mode unexpectedly probed the HashSet");
@@ -156,5 +163,19 @@ fn mechanism_counter_and_kill_switch_select_exactly_one_membership_route() {
     assert!(
         set_off > 20_000,
         "kill switch did not restore HashSet membership checks: {set_off}"
+    );
+
+    // Without JIT, every check routes through `is_htmldda_index`.
+    let (interp_scalar_on, interp_set_on) = probe(false, true);
+    let (interp_scalar_off, interp_set_off) = probe(true, true);
+    assert!(
+        interp_scalar_on > 20_000,
+        "interpreter scalar mirror did not serve all checks: {interp_scalar_on}"
+    );
+    assert_eq!(interp_set_on, 0, "interpreter enabled mode probed HashSet");
+    assert_eq!(interp_scalar_off, 0, "interpreter kill switch used scalar mirror");
+    assert!(
+        interp_set_off > 20_000,
+        "interpreter kill switch did not restore HashSet checks: {interp_set_off}"
     );
 }

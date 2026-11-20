@@ -1405,6 +1405,7 @@ var __zipp_py = (function () {
         } else {
             t = typeOf(obj);
         }
+        if (!getPlan(t)) return call(getattr(obj, name), args, kwargs);
         let attr = cachedType(t, name);
         if (attr === MISSING_ATTR) attr = lookupType(t, name);
         if (attr !== undefined && attr !== null && typeof attr === "object") {

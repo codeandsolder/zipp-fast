@@ -8761,10 +8761,11 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
                 // holding writable data `slot`; `store_barrier` ran above.
                 unsafe { *(mir.vals as *mut Value).add(slot as usize) = Value::from_bits(val_bits) };
                 return 0;
-            } else if vm.jit.ic_thrashing(site_idx) && !vm.jit.direct_miss_gate_ready(site_idx) {
-                if crate::codegen::ic_refill_gate_enabled() {
-                    vm.jit.ic_rot_bump(site_idx);
-                }
+            } else if vm.jit.ic_thrashing(site_idx)
+                && crate::codegen::ic_refill_gate_enabled()
+                && !vm.jit.direct_miss_gate_ready(site_idx)
+            {
+                vm.jit.ic_rot_bump(site_idx);
                 // SAFETY: settled mirror shape proves `vals` is the live column
                 // holding writable data `slot`; `store_barrier` ran above.
                 unsafe { *(mir.vals as *mut Value).add(slot as usize) = Value::from_bits(val_bits) };
