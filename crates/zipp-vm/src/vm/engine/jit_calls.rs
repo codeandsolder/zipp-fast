@@ -1014,11 +1014,23 @@ impl<'p> Vm<'p> {
         // before decoding the instruction or touching `Heap::objs`.
         #[cfg(not(feature = "safe-sandbox"))]
         if let Some((_fid, _closure, callee)) = self.ic_call_method_mirror(func_id, ip, recv) {
+            if let Some(Instr::CallMethod { name, .. }) =
+                self.func(func_id as usize).code.get(ip).copied()
+            {
+                if let Some(key) = self
+                    .func(func_id as usize)
+                    .string_constants
+                    .get(name as usize)
+                {
+                    let key = key.as_str();
+                    crate::vm::helpers_misc::warm_mega_method_memo(self, recv, func_id, name, key);
+                }
+            }
             return callee.bits();
         }
         // `func()` borrows for the program's lifetime (as in
         // `jit_cross_method_call_impl`).
-        let key = {
+        let (name, key) = {
             let proto = self.func(func_id as usize);
             let Some(Instr::CallMethod { name, .. }) = proto.code.get(ip).copied() else {
                 return SELF_CALL_DEOPT;
@@ -1026,11 +1038,13 @@ impl<'p> Vm<'p> {
             let Some(key) = proto.string_constants.get(name as usize) else {
                 return SELF_CALL_DEOPT;
             };
-            key.as_str()
+            (name, key.as_str())
         };
         let Some((_fid, _closure, callee)) = self.ic_call_method(func_id, ip, recv, key) else {
-            return SELF_CALL_DEOPT;
+            return crate::vm::helpers_misc::warm_mega_method_memo(self, recv, func_id, name, key)
+                .map_or(SELF_CALL_DEOPT, Value::bits);
         };
+        crate::vm::helpers_misc::warm_mega_method_memo(self, recv, func_id, name, key);
         if crate::vm::method_memo_enabled() {
             if let Some((recv_shape, class, ver, epoch)) = self.ic_class_method_guards(func_id, ip, recv, callee) {
                 if self.jit_method_memo.is_empty() {
@@ -1185,6 +1199,7 @@ impl<'p> Vm<'p> {
         #[cfg(feature = "safe-sandbox")]
         let mirror_hit: Option<(u32, u32, Value)> = None;
         let callee = if let Some((_fid, _closure, callee)) = mirror_hit {
+            crate::vm::helpers_misc::warm_mega_method_memo(self, recv, func_id, name, key);
             callee
         } else if crate::vm::helpers_misc::is_private_key(key) {
             // `recv.#m(...)`: the private method, brand-checked, as the
@@ -1199,11 +1214,15 @@ impl<'p> Vm<'p> {
                 Some(f) => f,
                 None => return SELF_CALL_DEOPT,
             }
-        } else {
-            let Some((_fid, _closure, callee)) = self.ic_call_method(func_id, ip, recv, key) else {
-                return SELF_CALL_DEOPT;
-            };
+        } else if let Some((_fid, _closure, callee)) = self.ic_call_method(func_id, ip, recv, key) {
+            crate::vm::helpers_misc::warm_mega_method_memo(self, recv, func_id, name, key);
             callee
+        } else if let Some(callee) =
+            crate::vm::helpers_misc::warm_mega_method_memo(self, recv, func_id, name, key)
+        {
+            callee
+        } else {
+            return SELF_CALL_DEOPT;
         };
         let packed = argc as u64 | ((caller_regs as u64) << 16);
         self.jit_cross_call_impl::<false>(caller_base_ptr, args, packed, callee.bits(), Some(recv))
@@ -2781,6 +2800,7 @@ impl<'p> Vm<'p> {
                     // interpreter, and a mid-body deopt would replay a
                     // cross-caller's already-run effects (the B181 class).
                     let _ = fid;
+                    crate::vm::helpers_misc::warm_mega_method_memo(self, recv, func_id, name, key);
                     let called = self.with_argv(base, arg_base, argc, |vm, argv| {
                         vm.call_value(callee, recv, argv)
                     });
@@ -2789,8 +2809,39 @@ impl<'p> Vm<'p> {
                         Err(t) => self.jit_thrown_to_sentinel(t),
                     };
                 }
-                Some((fid, closure, callee)) => (fid, closure, recv, callee),
+                Some((fid, closure, callee)) => {
+                    crate::vm::helpers_misc::warm_mega_method_memo(self, recv, func_id, name, key);
+                    (fid, closure, recv, callee)
+                }
                 None => {
+                    if let Some(callee) = crate::vm::helpers_misc::warm_mega_method_memo(
+                        self, recv, func_id, name, key,
+                    ) {
+                        if let Some((fid, closure)) = self.ic_plain_fn(callee) {
+                            if self.func(fid as usize).lexical_this {
+                                let called = self.with_argv(base, arg_base, argc, |vm, argv| {
+                                    vm.call_value(callee, recv, argv)
+                                });
+                                return match called {
+                                    Ok(v) => v.bits(),
+                                    Err(t) => self.jit_thrown_to_sentinel(t),
+                                };
+                            }
+                            let packed = argc as u64 | ((self.func(func_id as usize).reg_count.max(1) as u64) << 16);
+                            let args_ptr = unsafe { caller_base_ptr.add(arg_base as usize) };
+                            let fast = self.jit_cross_call_impl::<false>(
+                                caller_base_ptr,
+                                args_ptr,
+                                packed,
+                                callee.bits(),
+                                Some(recv),
+                            );
+                            if fast != SELF_CALL_DEOPT {
+                                return fast;
+                            }
+                            let _ = (fid, closure);
+                        }
+                    }
                     if jit_call_log() {
                         eprintln!("[call] METHOD MISS fn{func_id}@{ip} key={key}");
                     }

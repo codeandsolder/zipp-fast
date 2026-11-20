@@ -169,7 +169,7 @@ pub(crate) fn compile_main_program_lazy<'a>(
 ) -> R<(Program, Option<super::lazy::LazySession<'a>>)> {
     let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Compile);
     let index = super::lazy::ProgramIndex::of(prog);
-    if index.functions() < min_functions {
+    if index.functions() < min_functions && !index.has_skipped_bodies() {
         return compile_main_program(prog, source).map(|p| (p, None));
     }
     // A regular expression literal's early error is the program's however

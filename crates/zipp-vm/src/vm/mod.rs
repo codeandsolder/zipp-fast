@@ -90,7 +90,7 @@ impl InstanceofPairMemo {
 
 /// Slots of `Vm::es5_proto_memo`, direct-mapped by `(first_proto, key_id)`.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) const ES5_PROTO_MEMO_SLOTS: usize = 4096;
+pub(crate) const ES5_PROTO_MEMO_SLOTS: usize = 16384;
 
 /// Cached ES5 prototype-chain lookup result (`vals_ptr` + `slot`, or
 /// `slot == u32::MAX` for proved absence) keyed by `(first_proto, key_id)`
@@ -122,7 +122,7 @@ impl Es5ProtoMemo {
 
 /// Slots of `Vm::dict_prop_memo`, direct-mapped by `(idx, key_id)`.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) const DICT_PROP_MEMO_SLOTS: usize = 4096;
+pub(crate) const DICT_PROP_MEMO_SLOTS: usize = 16384;
 
 /// Cached own DATA property slot for dictionary-mode (`shape::DICT`) objects
 /// (`NodePath`, `Scope`, `Parser`, `Printer`, `File`, `opts`), guarded by
@@ -152,9 +152,14 @@ impl DictPropMemo {
     };
 }
 
-/// Slots of `Vm::shape_prop_memo`, direct-mapped by `(shape, key_id)`.
+/// Buckets of `Vm::shape_prop_memo` (2-way set associative by `(shape, key_id)`).
+/// Each bucket holds 2 consecutive 16B `ShapePropMemo` ways (32 bytes total).
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) const SHAPE_PROP_MEMO_SLOTS: usize = 16384;
+pub(crate) const SHAPE_PROP_MEMO_BUCKETS: usize = 32768;
+
+/// Total slots of `Vm::shape_prop_memo` (`SHAPE_PROP_MEMO_BUCKETS * 2`).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const SHAPE_PROP_MEMO_SLOTS: usize = SHAPE_PROP_MEMO_BUCKETS * 2;
 
 /// Sentinel `ShapePropMemo::slot` for a proved-absent key on a default/null
 /// prototype plain object (`FID_MIRROR_NONE`).
@@ -173,7 +178,7 @@ pub(crate) const SHAPE_PROP_CLASS_MISS: u32 = 0x8000_0002;
 
 /// Slots of `Vm::class_prop_memo`, direct-mapped by `(class_id, key_id)`.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) const CLASS_PROP_MEMO_SLOTS: usize = 4096;
+pub(crate) const CLASS_PROP_MEMO_SLOTS: usize = 16384;
 
 /// Cached class-chain method or proved-absent lookup result (`value_bits`)
 /// keyed by `(class_id, key_id)`, guarded by `version_of(class_id)`,
@@ -2695,7 +2700,7 @@ pub struct Vm<'p> {
     /// the coll_* helpers every mutation routes through. Holds NO `Value`s
     /// (u32 hash tags -> u32 slot positions): GC only needs the sweep-time
     /// hygiene retain in gc.rs.
-    collection_index: rustc_hash::FxHashMap<u32, collections::CollIndex>,
+    collection_index: crate::slot_table::SlotTable<collections::CollIndex>,
     /// Monotone counter minting a fresh private brand per class evaluation (1 = first;
     /// 0 = unbranded).
     next_private_brand: u64,
@@ -3068,9 +3073,14 @@ pub struct Vm<'p> {
     /// version cache sound here, exactly as the string-method doc warns).
     /// Pure cache: entries self-validate, nothing invalidates them.
     coll_intrinsic_memo: [[Option<(u32, u32, u64)>; COLL_MEMO_NAMES]; 2],
-    /// The same memo for %WeakMap.prototype%'s get/set/has/delete
-    /// (`weakmap_method_is_intrinsic`).
-    weakmap_intrinsic_memo: [Option<(u32, u32, u64)>; 4],
+    /// The same memo for %WeakMap.prototype%'s get/set/has/delete and
+    /// %WeakSet.prototype%'s has (`weakmap_method_is_intrinsic` / `weak_collection_method_is_intrinsic`).
+    weakmap_intrinsic_memo: [Option<(u32, u32, u64)>; 5],
+    /// Memo for `%ArrayIteratorPrototype%.next`: `(arr_iter_proto_ver, data_slot)`.
+    /// Reading `map.val_at(data_slot)` while `version_of(arr_iter_proto) == ver`
+    /// observes in-place data overwrites with zero string lookup.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    arr_iter_next_memo: (u32, u32),
     /// B191: boot-time snapshots of %String.prototype% / %Array.prototype%'s
     /// own method slots (`name` → the installed native's Value bits, captured
     /// at the end of `setup_globals`, when the native heap slots are pinned
@@ -3379,6 +3389,11 @@ pub struct Vm<'p> {
     /// ids outside every range (entry script / eval code) use the Vm-wide
     /// `import_meta` singleton.
     module_func_ranges: Vec<(u32, u32, u32)>,
+    /// Unified-function-id ranges of main-program nested functions installed
+    /// past `main_func_count` by `LazySession` when pre-parser-skipped bodies
+    /// compile on demand. Merged when contiguous so this holds only a few entries.
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    lazy_func_ranges: Vec<(u32, u32)>,
     /// The lazily-created `import.meta` object (for NON-loader code: the entry
     /// script / direct `run_module` pipeline; host-defined, ordinary extensible
     /// null-proto). 0 = not yet allocated. Loader-loaded modules each get a
@@ -4596,9 +4611,9 @@ impl<'p> Vm<'p> {
         id
     }
 
-    /// Precompute canonical VM-wide property key IDs for every `GetProp` /
-    /// `SetProp` string constant in `func_id`, returning a dense slice indexed
-    /// by `name_idx` (`0` for unused non-property constants).
+    /// Precompute canonical VM-wide property key IDs for every `GetProp`,
+    /// `SetProp`, and `CallMethod` string constant in `func_id`, returning a
+    /// dense slice indexed by `name_idx` (`0` for unused non-property constants).
     pub(crate) fn build_prop_key_ids(&mut self, func_id: u32) -> Vec<u32> {
         let f = func_id as usize;
         let code_len = self.func(f).code.len();
@@ -4607,7 +4622,8 @@ impl<'p> Vm<'p> {
         for ip in 0..code_len {
             let name = match self.func(f).code[ip] {
                 crate::bytecode::Instr::GetProp { name, .. }
-                | crate::bytecode::Instr::SetProp { name, .. } => name as usize,
+                | crate::bytecode::Instr::SetProp { name, .. }
+                | crate::bytecode::Instr::CallMethod { name, .. } => name as usize,
                 _ => continue,
             };
             has_prop = true;
@@ -4622,7 +4638,8 @@ impl<'p> Vm<'p> {
         for ip in 0..code_len {
             let name = match self.func(f).code[ip] {
                 crate::bytecode::Instr::GetProp { name, .. }
-                | crate::bytecode::Instr::SetProp { name, .. } => name,
+                | crate::bytecode::Instr::SetProp { name, .. }
+                | crate::bytecode::Instr::CallMethod { name, .. } => name,
                 _ => continue,
             };
             if out[name as usize] == 0 {

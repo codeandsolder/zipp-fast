@@ -110,11 +110,24 @@ pub(crate) fn parse_script_with_located(
     allow_return: bool,
     force_strict: bool,
 ) -> Result<Program, ParseFailure> {
+    parse_script_with_located_opts(src, allow_return, force_strict, false)
+}
+
+fn parse_script_with_located_opts(
+    src: &str,
+    allow_return: bool,
+    force_strict: bool,
+    skip_fn_bodies: bool,
+) -> Result<Program, ParseFailure> {
+    #[cfg(any(feature = "meter-only", feature = "safe-sandbox"))]
+    let _ = skip_fn_bodies;
     parse(
         src,
         ParseOptions {
             allow_return,
             force_strict,
+            #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+            skip_fn_bodies,
             ..ParseOptions::script()
         },
     )
@@ -162,7 +175,15 @@ pub(crate) fn parse_auto(src: &str) -> Result<Program, String> {
 
 /// [`parse_auto`], keeping a syntax error's position.
 pub(crate) fn parse_auto_located(src: &str) -> Result<Program, ParseFailure> {
-    match parse_script_with_located(src, !pure_script_goal(), false) {
+    parse_auto_located_for_run(src, false)
+}
+
+/// [`parse_auto_located`] with optional pre-parser skipping of nested function bodies.
+pub(crate) fn parse_auto_located_for_run(
+    src: &str,
+    skip_fn_bodies: bool,
+) -> Result<Program, ParseFailure> {
+    match parse_script_with_located_opts(src, !pure_script_goal(), false, skip_fn_bodies) {
         Ok(p) => Ok(p),
         // Under the pure Script goal there is no second guess: a script that
         // fails to parse is a SyntaxError, not a module. This is what makes
@@ -218,6 +239,7 @@ pub(crate) fn parse_eval(
             ts_legacy_decorators: false,
             ts_decorator_metadata: false,
             jsx: None,
+            ..ParseOptions::default()
         },
     )
     .map_err(err_str)

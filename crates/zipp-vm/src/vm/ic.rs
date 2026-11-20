@@ -1392,7 +1392,7 @@ impl<'p> Vm<'p> {
             self.site_ics.resize_with(func_count, || None);
         }
         let code_len = self.func(f).code.len();
-        if f >= self.main_func_count {
+        if !self.is_main_func(func_id) {
             // Runtime-installed code draws its cache storage from the fixed
             // per-VM budget: charge what THIS call would allocate (the
             // function's ip table and/or this site's payload) before
@@ -2898,7 +2898,7 @@ impl<'p> Vm<'p> {
     #[cfg(all(feature = "jit", not(any(feature = "safe-sandbox", feature = "meter-only"))))]
     #[inline(always)]
     pub(crate) fn ic_get_prop_own_slot(&self, func_id: u32, ip: usize, recv: Value) -> Option<Value> {
-        if !recv.is_heap() || func_id as usize >= self.main_func_count {
+        if !recv.is_heap() || !self.is_main_func(func_id) {
             return None;
         }
         let mir = self.heap.hot_mirror_of(recv.heap_index());
@@ -2933,7 +2933,7 @@ impl<'p> Vm<'p> {
     #[cfg(all(feature = "jit", not(any(feature = "safe-sandbox", feature = "meter-only"))))]
     #[inline(always)]
     pub(crate) fn ic_get_prop_proto_slot(&self, func_id: u32, ip: usize, recv: Value) -> Option<Value> {
-        if !recv.is_heap() || func_id as usize >= self.main_func_count {
+        if !recv.is_heap() || !self.is_main_func(func_id) {
             return None;
         }
         let mir = self.heap.hot_mirror_of(recv.heap_index());
@@ -3053,7 +3053,7 @@ impl<'p> Vm<'p> {
     #[cfg(all(not(feature = "jit"), not(any(feature = "safe-sandbox", feature = "meter-only"))))]
     #[inline(always)]
     pub(crate) fn ic_get_prop_own_slot(&self, func_id: u32, ip: usize, recv: Value) -> Option<Value> {
-        if func_id as usize >= self.main_func_count {
+        if !self.is_main_func(func_id) {
             return None;
         }
         let (_, m) = self.ic_recv_map(recv)?;

@@ -162,6 +162,14 @@ impl SavedCx {
     }
 }
 
+/// Metadata needed to parse and compile a pre-parser-skipped function body
+/// without referencing any outer AST node.
+#[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+pub(super) struct SkippedJob {
+    body_span: (u32, u32),
+    params: ast::Params,
+}
+
 /// One deferred body.
 pub(super) struct LazyJob {
     /// The id its stub holds in `Compiler::functions`.
@@ -177,6 +185,9 @@ pub(super) struct LazyJob {
     /// Its upvalues, resolved at the deferral point.
     seed: Vec<(String, UpvalSource)>,
     cx: SavedCx,
+    /// Present when the pre-parser skipped the body (`FnBody::lazy_span`).
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    skipped: Option<Box<SkippedJob>>,
 }
 
 /// Names a strict body may not bind or assign, `eval` and `arguments` (whose
@@ -341,6 +352,7 @@ impl FnCompiler<'_> {
         free: Vec<String>,
         nested: Option<u32>,
         span: (u32, u32),
+        skipped_body: Option<(u32, u32)>,
         stub_name: &str,
         is_arrow: bool,
         params: &ast::Params,
@@ -422,6 +434,8 @@ impl FnCompiler<'_> {
             fused: Default::default(),
             call_sites: Box::new([]),
         };
+        #[cfg(any(feature = "meter-only", feature = "safe-sandbox"))]
+        let _ = skipped_body;
         self.cx.lazy_jobs.push_back(LazyJob {
             func_id: self.cx.functions.len() as u32,
             reserved,
@@ -430,6 +444,13 @@ impl FnCompiler<'_> {
             enclosing: enclosing.to_vec(),
             seed,
             cx: SavedCx::of(self.cx),
+            #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+            skipped: skipped_body.map(|body_span| {
+                Box::new(SkippedJob {
+                    body_span,
+                    params: params.clone(),
+                })
+            }),
         });
         Some(stub)
     }
@@ -455,6 +476,12 @@ impl Compiler {
     /// Whether function `f`'s body may be deferred, as far as its own subtree
     /// goes, and if so how many functions are nested in it.
     pub(super) fn lazy_scan_fn(&mut self, f: &ast::Function) -> Option<u32> {
+        #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+        if f.body.lazy_span().is_some() {
+            return Some(0);
+        } else if self.lazy_only_skipped {
+            return None;
+        }
         let facts = self.scan_facts(FnNode::Function(f));
         // Read in a function nested in this one, `arguments` is that
         // function's own; read in this one's scope (an arrow's included), it
@@ -469,6 +496,12 @@ impl Compiler {
 
     /// [`Compiler::lazy_scan_fn`] for an arrow.
     pub(super) fn lazy_scan_arrow(&mut self, a: &ast::Arrow) -> Option<u32> {
+        #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+        if matches!(&a.body, ast::ArrowBody::Block(b) if b.lazy_span().is_some()) {
+            return Some(0);
+        } else if self.lazy_only_skipped {
+            return None;
+        }
         let facts = self.scan_facts(FnNode::Arrow(a));
         // An arrow's own `arguments` is its enclosing function's.
         let own = facts.ok
@@ -592,17 +625,28 @@ impl FnNode<'_> {
 pub(super) struct ProgramIndex<'a> {
     nodes: rustc_hash::FxHashMap<(u32, u32), FnNode<'a>>,
     regexes: Vec<&'a ast::Expr>,
+    has_skipped_bodies: bool,
 }
 
 impl<'a> ProgramIndex<'a> {
     pub(super) fn of(prog: &'a ast::Program) -> ProgramIndex<'a> {
-        let mut index = ProgramIndex { nodes: rustc_hash::FxHashMap::default(), regexes: Vec::new() };
+        let mut index = ProgramIndex {
+            nodes: rustc_hash::FxHashMap::default(),
+            regexes: Vec::new(),
+            has_skipped_bodies: false,
+        };
         visit::stmts(&prog.body, visit::arg(&mut |n| {
             match n {
                 Node::Function(f) => {
+                    if f.body.lazy_span().is_some() {
+                        index.has_skipped_bodies = true;
+                    }
                     index.nodes.insert((f.span.start, f.span.end), FnNode::Function(f));
                 }
                 Node::Arrow(a) => {
+                    if matches!(&a.body, ast::ArrowBody::Block(b) if b.lazy_span().is_some()) {
+                        index.has_skipped_bodies = true;
+                    }
                     index.nodes.insert((a.span.start, a.span.end), FnNode::Arrow(a));
                 }
                 Node::Expr(e @ ast::Expr::Regex { .. }) => index.regexes.push(e),
@@ -616,6 +660,11 @@ impl<'a> ProgramIndex<'a> {
     /// How many functions and arrows the program has.
     pub(super) fn functions(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// Whether any function or arrow body in `prog` was skipped by the pre-parser.
+    pub(super) fn has_skipped_bodies(&self) -> bool {
+        self.has_skipped_bodies
     }
 
     /// The first early error among the program's regular expression literals.
@@ -666,6 +715,110 @@ impl Compiler {
         self.lazy_freeze = false;
         // Taken by the body's `FnCompiler::new`, unless the compile failed first.
         self.lazy_seed = None;
+        r
+    }
+
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    fn compile_skipped_job(&mut self, job: LazyJob, sk: SkippedJob) -> R<(FuncProto, u32)> {
+        job.cx.restore(self);
+        let parsed_body = crate::parse::stmt::parse_lazy_fn_body(
+            &self.source,
+            sk.body_span,
+            &sk.params,
+            self.in_strict,
+            true,
+        )
+        .map_err(|e| crate::front::failure(e).message)?;
+        // Scope memo entries for this temporary AST so they drop before `parsed_body` drops.
+        let _memo = crate::capture::Session::new_with_source(self.source.clone());
+        let saved_only = self.lazy_only_skipped;
+        self.lazy_only_skipped = true;
+        self.lazy_seed = Some(job.seed);
+        self.lazy_freeze = true;
+        let r = match job.kind {
+            LazyKind::FuncExpr { name, self_name } => {
+                let params = param_slot_names(&sk.params)?;
+                let rest = rest_name(&sk.params)?;
+                let mut names = with_rest(&params, &rest);
+                names.extend(param_pattern_leaves(&sk.params));
+                if let Some(sn) = &self_name {
+                    names.push(sn.clone());
+                }
+                names.extend(hoisted_var_names(&parsed_body.stmts));
+                let captured =
+                    capture::captured_locals(&names, Some(&sk.params), &parsed_body.stmts);
+                let p = self.compile_function_body(
+                    name.as_deref(),
+                    self_name.as_deref(),
+                    &params,
+                    rest.as_deref(),
+                    Some(&sk.params),
+                    &parsed_body.stmts,
+                    &parsed_body.directives,
+                    false,
+                    false,
+                    false,
+                    captured,
+                    job.enclosing,
+                )?;
+                Ok((p, job.span.0))
+            }
+            LazyKind::FuncDecl { name } => {
+                let params = param_slot_names(&sk.params)?;
+                let rest = rest_name(&sk.params)?;
+                let mut names = with_rest(&params, &rest);
+                names.extend(param_pattern_leaves(&sk.params));
+                names.extend(hoisted_var_names(&parsed_body.stmts));
+                let captured =
+                    capture::captured_locals(&names, Some(&sk.params), &parsed_body.stmts);
+                let p = self.compile_function_body(
+                    name.as_deref(),
+                    None,
+                    &params,
+                    rest.as_deref(),
+                    Some(&sk.params),
+                    &parsed_body.stmts,
+                    &parsed_body.directives,
+                    false,
+                    false,
+                    false,
+                    captured,
+                    job.enclosing,
+                )?;
+                Ok((p, job.span.0))
+            }
+            LazyKind::Arrow => {
+                let params = param_slot_names(&sk.params)?;
+                let rest = rest_name(&sk.params)?;
+                let mut names = with_rest(&params, &rest);
+                names.extend(param_pattern_leaves(&sk.params));
+                names.extend(hoisted_var_names(&parsed_body.stmts));
+                let temp_arrow = ast::Arrow {
+                    params: sk.params,
+                    body: ast::ArrowBody::Block(parsed_body),
+                    is_async: false,
+                    span: crate::parse::token::Span::new(job.span.0, job.span.1),
+                };
+                let captured =
+                    capture::captured_locals_arrow(&names, &temp_arrow.params, &temp_arrow.body);
+                let p = self.compile_arrow_body(
+                    &params,
+                    rest.as_deref(),
+                    &temp_arrow,
+                    captured,
+                    job.enclosing,
+                    None,
+                    false,
+                    false,
+                    false,
+                    false,
+                )?;
+                Ok((p, job.span.0))
+            }
+        };
+        self.lazy_freeze = false;
+        self.lazy_seed = None;
+        self.lazy_only_skipped = saved_only;
         r
     }
 
@@ -781,6 +934,8 @@ pub(crate) struct LazySession<'a> {
     nodes: rustc_hash::FxHashMap<(u32, u32), FnNode<'a>>,
     jobs: rustc_hash::FxHashMap<u32, LazyJob>,
     main_globals: u32,
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    has_skipped_bodies: bool,
 }
 
 /// One compiled deferred body, ready to install.
@@ -823,19 +978,46 @@ impl<'a> LazySession<'a> {
         self.cx.globals.get(slot as usize).map(String::as_str)
     }
 
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    pub(crate) fn source_len(&self) -> usize {
+        self.cx.source.len()
+    }
+
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    pub(crate) fn has_skipped_bodies(&self) -> bool {
+        self.has_skipped_bodies
+    }
+
     /// Compile the body of stub `fid`. `next_free` is the first id past the
     /// running function table, where the body's functions go if it outgrew
     /// its reservation.
     pub(crate) fn compile(&mut self, fid: u32, next_free: u32) -> R<LazyBody> {
-        let job = self.jobs.remove(&fid).ok_or_else(|| format!("internal: function {fid} has no deferred body"))?;
-        let node = *self
-            .nodes
-            .get(&job.span)
-            .ok_or_else(|| format!("internal: no function at {:?} for a deferred body", job.span))?;
+        #[allow(unused_mut)]
+        let mut job = self.jobs.remove(&fid).ok_or_else(|| format!("internal: function {fid} has no deferred body"))?;
         let (reserved, span) = (job.reserved, job.span);
-        // The memo's names point into this session's syntax tree.
-        self.cx.capture_memo.activate();
-        let compiled = self.cx.compile_job(job, node);
+        #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+        let skipped = job.skipped.take();
+        #[cfg(any(feature = "meter-only", feature = "safe-sandbox"))]
+        let skipped: Option<()> = None;
+        let compiled = if let Some(sk) = skipped {
+            #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+            {
+                self.cx.compile_skipped_job(job, *sk)
+            }
+            #[cfg(any(feature = "meter-only", feature = "safe-sandbox"))]
+            {
+                let _ = sk;
+                unreachable!()
+            }
+        } else {
+            let node = *self
+                .nodes
+                .get(&job.span)
+                .ok_or_else(|| format!("internal: no function at {:?} for a deferred body", job.span))?;
+            // The memo's names point into this session's syntax tree.
+            self.cx.capture_memo.activate();
+            self.cx.compile_job(job, node)
+        };
         let misses = std::mem::take(&mut self.cx.lazy_misses);
         let mut nested = std::mem::take(&mut self.cx.functions);
         let (mut root, start) = match compiled {
@@ -976,7 +1158,14 @@ impl Compiler {
         }
         let jobs = self.lazy_jobs.drain(..).map(|j| (j.func_id, j)).collect();
         self.lazy_deferred = 0;
-        Some(LazySession { cx: self, nodes: index.nodes, jobs, main_globals })
+        Some(LazySession {
+            cx: self,
+            nodes: index.nodes,
+            jobs,
+            main_globals,
+            #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+            has_skipped_bodies: index.has_skipped_bodies,
+        })
     }
 }
 
@@ -1253,6 +1442,62 @@ mod lazy_tests {
         let src = "function never() { return /a{2,1}/.test('a'); } 1;";
         let prog = crate::front::parse_script(src).expect("parses");
         let err = super::super::entry::compile_main_program_lazy(&prog, src, 0).err().expect("an early error");
+        assert!(err.contains("SyntaxError"), "{err}");
+    }
+
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    #[test]
+    fn skip_body_preparser_matches_eager() {
+        let sources = [
+            // Nested closures, upvalue forwarding, and nested skipped functions.
+            "(() => { var g = 1; function outer(a) { var b = a + g; function mid() { return function inner(c) { return a + b + c + g; }; } return mid; } console.log(outer(1)()(2), outer(5)()(6)); })();",
+            // Template literals with nested substitutions & object literals inside ${...}.
+            "(() => { var tag = 'ok'; function fmt(x) { let m = { v: x }; return `${tag}:${`[${m.v + 1}]`}:${({ k: x * 2 }).k}`; } console.log(fmt(7)); })();",
+            // Division, property names that are keywords (map.delete, obj.class, obj.arguments), let decls.
+            "(() => { function calc(a, b) { let m = new Map([['k', a / b]]); let r = m.get('k'); m.delete('k'); let o = {}; o.class = 3; o.arguments = 4; return [r, m.size, o.class + o.arguments].join(','); } console.log(calc(10, 2)); })();",
+            // Function.prototype.toString exact parity on skipped & nested skipped functions.
+            "(() => { function outer(x) { function inner(y) { return x + y; } return [String(inner), inner(3)].join('|'); } console.log(String(outer), outer(4)); })();",
+            // Copy-box / late-box interaction with skipped closures writing outer params.
+            "(() => { function bump(x) { var f = function() { x = x + 10; return x; }; return f() + x; } console.log(bump(5)); })();",
+            // Block arrow + expression arrow nested inside a skipped function.
+            "(() => { var scale = 3; var run = (xs) => { let out = xs.map(v => v * scale); return out.reduce((a, b) => { return a + b; }, 0); }; console.log(run([1, 2, 3])); })();",
+            // Bailout cases (directive prologue, regex, arguments, new.target) mixed with skipped siblings.
+            "(() => { function skipped(x) { return x * 2; } function strictFn() { 'use strict'; return this; } function reFn(s) { return /b+/g.exec(s)[0].length; } function argFn() { return arguments.length; } function Nt() { return Boolean(new.target); } console.log(skipped(6), strictFn(), reFn('abbbc'), argFn(1, 2), new Nt()); })();",
+        ];
+        for src in sources {
+            let eager_ast = crate::front::parse_script(src).expect("eager parses");
+            let eager = super::super::entry::compile_main_program(&eager_ast, src).expect("eager compiles");
+            let mut vm = crate::vm::Vm::new(&eager);
+            let expected = match vm.run() {
+                Ok(_) => vm.output.join("\n"),
+                Err(e) => format!("{}\nerror: {}", vm.output.join("\n"), e.0),
+            };
+
+            let skip_ast = crate::front::parse_auto_located_for_run(src, true)
+                .map_err(|f| f.message)
+                .expect("skip parses");
+            assert!(
+                ProgramIndex::of(&skip_ast).has_skipped_bodies(),
+                "expected at least one skipped body in: {src}"
+            );
+            let (lazy, session) =
+                super::super::entry::compile_main_program_lazy(&skip_ast, src, 0).expect("lazy compiles");
+            let mut vm = crate::vm::Vm::new(&lazy);
+            vm.set_lazy_session(session.expect("lazy session"));
+            let actual = match vm.run() {
+                Ok(_) => vm.output.join("\n"),
+                Err(e) => format!("{}\nerror: {}", vm.output.join("\n"), e.0),
+            };
+            assert_eq!(expected, actual, "mismatch on: {src}");
+        }
+        // Invalid regex inside a nested function still triggers early SyntaxError.
+        let bad_re = "(() => { function never() { return /a{2,1}/.test('a'); } })();";
+        let ast = crate::front::parse_auto_located_for_run(bad_re, true)
+            .map_err(|f| f.message)
+            .expect("parses");
+        let err = super::super::entry::compile_main_program_lazy(&ast, bad_re, 0)
+            .err()
+            .expect("invalid regex early error");
         assert!(err.contains("SyntaxError"), "{err}");
     }
 }

@@ -209,7 +209,7 @@ impl Em<'_> {
     /// a lane that makes the call leaves its result in the window's `dst`
     /// register and jumps to the returned label; every miss falls through to
     /// the call-out's helper after them. A throw leaves the body at `ip`.
-    fn cross_lanes(&mut self, lane: CallLane, ip: u32, argc: u16) -> Option<(DynamicLabel, u16)> {
+    fn cross_lanes(&mut self, lane: CallLane, ip: u32, packed: u64, argc: u16) -> Option<(DynamicLabel, u16)> {
         use super::super::{emit_cross3_call, emit_cross3_method_call, Cross3Callee};
         let f = self.f;
         let heap = f.heap.as_ref()?;
@@ -224,10 +224,19 @@ impl Em<'_> {
         let class_method = site.is_some_and(|s| s.class_method);
         let has_class_lane = class_method
             && (arms || (dyn_ok && (class_guard.is_some() || proto_guard.is_some())));
+        let mega_key_id = match lane {
+            CallLane::Method { mega_ok: true, .. }
+                if dyn_ok && !crate::vm::icstats_enabled() =>
+            {
+                self.prop_key_id((packed >> 32) as u32)
+            }
+            _ => 0,
+        };
+        let has_method_lane = has_class_lane || mega_key_id != 0;
         let dst = match lane {
             CallLane::None => return None,
             CallLane::Plain { dst, .. } if arms || dyn_ok => dst,
-            CallLane::Method { dst, .. } if own.is_some() || has_class_lane => dst,
+            CallLane::Method { dst, .. } if own.is_some() || has_method_lane => dst,
             _ => return None,
         };
         let (cross_done, bail, over) = (
@@ -317,26 +326,51 @@ impl Em<'_> {
                         None,
                     );
                 }
-                if has_class_lane {
+                if has_method_lane {
                     let lookup_miss = self.ops.new_dynamic_label();
                     let have_callee = self.ops.new_dynamic_label();
-                    let dyn_only = !arms;
-                    if let Some(lane) = class_guard {
-                        let guard_miss = if dyn_only { lookup_miss } else { self.ops.new_dynamic_label() };
+                    let dyn_only = !(has_class_lane && arms);
+                    let have_mega = mega_key_id != 0;
+                    if let Some(lane) = has_class_lane.then_some(class_guard).flatten() {
+                        let guard_miss = if dyn_only && !have_mega {
+                            lookup_miss
+                        } else {
+                            self.ops.new_dynamic_label()
+                        };
                         crate::codegen::proto_mem::emit_class_read_guard(&mut self.ops, obj, &lane, guard_miss);
                         dynasm!(self.ops
                             ; mov rax, QWORD lane.value as i64
                             ; jmp => have_callee
                         );
-                        if !dyn_only {
+                        if !dyn_only || have_mega {
                             dynasm!(self.ops ; => guard_miss);
                         }
-                    } else if let Some(plane) = proto_guard {
-                        let guard_miss = if dyn_only { lookup_miss } else { self.ops.new_dynamic_label() };
+                    } else if let Some(plane) = has_class_lane.then_some(proto_guard).flatten() {
+                        let guard_miss = if dyn_only && !have_mega {
+                            lookup_miss
+                        } else {
+                            self.ops.new_dynamic_label()
+                        };
                         crate::codegen::proto_mem::emit_proto_read_guard(&mut self.ops, obj, &plane, guard_miss);
                         dynasm!(self.ops ; jmp => have_callee);
-                        if !dyn_only {
+                        if !dyn_only || have_mega {
                             dynasm!(self.ops ; => guard_miss);
+                        }
+                    }
+                    if have_mega {
+                        let full_lbl = self.mega_prop_lbl(true);
+                        dynasm!(self.ops
+                            ; mov rdx, [rbx + 8 * obj as i32]
+                            ; mov ecx, mega_key_id as i32
+                            ; mov r8d, -1
+                            ; call => full_lbl
+                            ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
+                            ; cmp rax, r10
+                        );
+                        if dyn_only {
+                            dynasm!(self.ops ; je => lookup_miss);
+                        } else {
+                            dynasm!(self.ops ; jne => have_callee);
                         }
                     }
                     if !dyn_only {
@@ -353,8 +387,8 @@ impl Em<'_> {
                         );
                     }
                     dynasm!(self.ops ; => have_callee);
-                    if let Some(site) = site {
-                        if !site.cross3.is_empty() {
+                    if !dyn_only {
+                        if let Some(site) = site {
                             dynasm!(self.ops ; mov [rsp + c3 + 48], rax);
                             for arm in site.cross3.iter() {
                                 emit_cross3_call(
@@ -1640,6 +1674,7 @@ impl Em<'_> {
                     arg_base,
                     dst,
                     intr: Some(m),
+                    ..
                 } = lane
                 {
                     if let Some(l) = self.method_intr(m, obj, arg_base, dst, ip) {
@@ -1669,7 +1704,7 @@ impl Em<'_> {
                     };
                     made.push((l, dst));
                 }
-                made.extend(self.cross_lanes(lane, ip, argc));
+                made.extend(self.cross_lanes(lane, ip, packed, argc));
                 self.call_written(helper, ip, packed, argc);
                 if let Some(&(_, dst)) = made.first() {
                     let join = self.ops.new_dynamic_label();

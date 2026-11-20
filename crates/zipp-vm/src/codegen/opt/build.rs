@@ -150,12 +150,13 @@ pub(crate) enum CallLane {
         dst: u16,
     },
     /// `CallMethod`: a dedicated helper for its name (`intr`), then the
-    /// own-method lane and the class-method arms.
+    /// own-method lane, class-method arms, and inline megamorphic lookup.
     Method {
         obj: u16,
         arg_base: u16,
         dst: u16,
         intr: Option<MethodIntr>,
+        mega_ok: bool,
     },
     /// `GetProp` read by its slow helper: Tier C's inline cache probe
     /// first (`Func::ic_sites`), receivers of any kind, chains included.
@@ -3427,6 +3428,18 @@ fn translate(
                                 .string_constants
                                 .get(name as usize)
                                 .and_then(|k| method_intr(k, argc)),
+                            mega_ok: f.p.string_constants.get(name as usize).is_some_and(|k| {
+                                let s = k.as_str();
+                                !matches!(
+                                    s,
+                                    "call"
+                                        | "apply"
+                                        | "bind"
+                                        | "hasOwnProperty"
+                                        | "propertyIsEnumerable"
+                                        | "isPrototypeOf"
+                                ) && !crate::vm::is_private_key(s)
+                            }),
                         },
                     },
                     Rep::Tagged,

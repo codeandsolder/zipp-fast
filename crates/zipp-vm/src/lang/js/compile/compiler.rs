@@ -80,8 +80,9 @@ impl Compiler {
     }
 
     pub(crate) fn new(source: &str) -> Compiler {
+        let source: std::sync::Arc<str> = std::sync::Arc::from(source);
         Compiler {
-            capture_memo: crate::capture::Session::new(),
+            capture_memo: crate::capture::Session::new_with_source(source.clone()),
             functions: Vec::new(),
             static_key_plan_sites: 0,
             static_key_plan_retained_bytes: 0,
@@ -91,7 +92,7 @@ impl Compiler {
             class_names: Vec::new(),
             hoisted_globals: Vec::new(),
             hoisted_set: rustc_hash::FxHashSet::default(),
-            source: std::sync::Arc::from(source),
+            source,
             source_index: std::cell::OnceCell::new(),
             origin: None,
             eval_mode: false,
@@ -141,6 +142,8 @@ impl Compiler {
             lazy_misses: Vec::new(),
             lazy_deferred: 0,
             lazy_scan: rustc_hash::FxHashMap::default(),
+            #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+            lazy_only_skipped: false,
         }
     }
 
@@ -1784,43 +1787,7 @@ impl Compiler {
                 // every `function f(){ …G… } … const G = …` pair in a bundle hit
                 // this — it is why react-router could not resolve its own helpers.
                 {
-                    let mut lex = rustc_hash::FxHashSet::default();
-                    let mut early_cell = rustc_hash::FxHashSet::default();
-                    let mut prior_refs = rustc_hash::FxHashSet::default();
-                    for s in &b.stmts {
-                        match s {
-                            ast::Stmt::VarDecl(d) if d.kind.is_lexical() => {
-                                let mut declared_here = rustc_hash::FxHashSet::default();
-                                for decl in &d.decls {
-                                    capture::collect_pattern_names(&decl.id, &mut declared_here);
-                                }
-                                lex.extend(declared_here.iter().cloned());
-
-                                // Multiple declarators and destructuring have
-                                // intra-statement TDZ/order edges. Keep their
-                                // established cell lowering; the hot package
-                                // shape is the common single-identifier case.
-                                let simple_single = d.decls.len() == 1
-                                    && matches!(&d.decls[0].id, ast::Pattern::Ident(_));
-                                for name in declared_here {
-                                    if !simple_single || prior_refs.contains(&name) {
-                                        early_cell.insert(name);
-                                    }
-                                }
-                            }
-                            ast::Stmt::ClassDecl(c) => {
-                                if let Some(id) = &c.name {
-                                    let name = id.to_string();
-                                    lex.insert(name.clone());
-                                    // Class heritage, computed names and static
-                                    // initialization have richer self-TDZ rules.
-                                    early_cell.insert(name);
-                                }
-                            }
-                            _ => {}
-                        }
-                        prior_refs.extend(capture::stmts_refs_all(std::slice::from_ref(s)));
-                    }
+                    let (lex, early_cell) = capture::arrow_entry_lexicals(&b.stmts);
                     // Sorted: alloc_reg() below, so raw HashSet order would permute cell registers.
                     for name in &crate::compile::helpers::sorted_name_vec(&lex) {
                         // Captures/direct eval need address-stable storage;

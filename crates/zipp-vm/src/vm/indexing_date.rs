@@ -546,9 +546,17 @@ impl<'p> Vm<'p> {
                 .is_some_and(|b| !(b.is_ascii_digit() || *b == b'-' || *b == b'#'))
             || !self.deferred_ns_state.is_empty()
             || !self.ic_obj_ok(idx)
-            || map.class.is_some()
             || map.is_ctor
         {
+            return None;
+        }
+        if let Some(cls) = map.class {
+            if self.realm_global_objs.is_empty() {
+                let mut hops = [(0u32, 0u32); 5];
+                if self.class_chain_proof(idx, cls, key, &mut hops, true).is_some() {
+                    return Some(Value::UNDEFINED);
+                }
+            }
             return None;
         }
         let mut cur = idx;

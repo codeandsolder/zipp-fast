@@ -174,6 +174,30 @@ impl<'p> Vm<'p> {
         module_func_range_contains(&self.module_func_ranges, func_id)
     }
 
+    /// Whether `func_id` belongs to the main program (either initially compiled
+    /// under `main_func_count`, or a nested function of a pre-parser-skipped
+    /// main-program body lazily installed at runtime).
+    #[inline(always)]
+    pub(crate) fn is_main_func(&self, func_id: u32) -> bool {
+        if (func_id as usize) < self.main_func_count {
+            return true;
+        }
+        #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+        if !self.lazy_func_ranges.is_empty() {
+            return self.is_lazy_main_func_cold(func_id);
+        }
+        false
+    }
+
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    #[cold]
+    #[inline(never)]
+    fn is_lazy_main_func_cold(&self, func_id: u32) -> bool {
+        self.lazy_func_ranges
+            .iter()
+            .any(|&(start, end)| func_id >= start && func_id < end)
+    }
+
     /// Whether `func_id` belongs to immutable code the native tiers may compile.
     ///
     /// Main-program functions have always been eligible. Runtime-installed
@@ -497,7 +521,7 @@ impl<'p> Vm<'p> {
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             lazy_handlers: Vec::new(),
             regex_program_audit_scratch: std::cell::RefCell::new(Vec::new()),
-            collection_index: rustc_hash::FxHashMap::default(),
+            collection_index: crate::slot_table::SlotTable::default(),
             next_private_brand: 1,
             method_brand: crate::slot_table::SlotTable::default(),
             ctor_owner: crate::slot_table::SlotTable::default(),
@@ -547,6 +571,8 @@ impl<'p> Vm<'p> {
             module_source_slots: std::collections::HashMap::new(),
             module_metas: Default::default(),
             module_func_ranges: Vec::new(),
+            #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+            lazy_func_ranges: Vec::new(),
             import_meta: 0,
             can_block: crate::env_var("ZIPP_CAN_BLOCK").map_or(true, |v| v != "0"),
             module_loading: std::collections::HashSet::new(),
@@ -613,7 +639,9 @@ impl<'p> Vm<'p> {
             str_proto: 0,
             map_proto: 0,
             coll_intrinsic_memo: [[None; crate::vm::COLL_MEMO_NAMES]; 2],
-            weakmap_intrinsic_memo: [None; 4],
+            weakmap_intrinsic_memo: [None; 5],
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            arr_iter_next_memo: (0, u32::MAX),
             str_proto_baseline: rustc_hash::FxHashMap::default(),
             arr_proto_baseline: rustc_hash::FxHashMap::default(),
             str_intrinsic_memo: [None; crate::vm::STR_MEMO_NAMES],
@@ -1153,7 +1181,7 @@ impl<'p> Vm<'p> {
     /// only the VM-owned hash directory and each index's flat bucket Vec.
     fn collection_index_resident_bytes(&self) -> usize {
         self.collection_index.values().fold(
-            Self::hash_map_resident_bytes(&self.collection_index),
+            self.collection_index.resident_bytes(),
             |n, index| n.saturating_add(index.resident_bytes()),
         )
     }

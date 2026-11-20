@@ -1972,6 +1972,30 @@ impl<'p> Vm<'p> {
         let result = if index == usize::MAX {
             (Value::UNDEFINED, true)
         } else {
+            // Fast dense-Array value iteration (99%+ of JS `for-of` loops):
+            // reads `items[index]` directly without `js_array_len` or `get_index`.
+            if kind == 1
+                && (self.array_js_len.is_empty() || !self.array_js_len.has(coll))
+                && (self.arr_props.is_empty() || !self.arr_props.has(coll))
+                && (self.arguments_objs.is_empty() || !self.arguments_objs.has(coll))
+            {
+                if let HeapObj::Array(items) = self.heap.get(coll) {
+                    if index >= items.len() {
+                        if let HeapObj::Iterator { index: i, .. } = self.heap.get_mut(it_idx) {
+                            *i = usize::MAX;
+                        }
+                        return Ok((Value::UNDEFINED, true));
+                    }
+                    let v = items[index];
+                    if !v.is_hole() {
+                        let next_i = index + 1;
+                        if let HeapObj::Iterator { index: i, .. } = self.heap.get_mut(it_idx) {
+                            *i = next_i;
+                        }
+                        return Ok((v, false));
+                    }
+                }
+            }
             let n = match self.heap.get(coll) {
                 // Sparse/very large Arrays keep their live JS length outside
                 // the dense prefix. Re-read that authoritative length every

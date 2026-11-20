@@ -4508,7 +4508,7 @@ impl<'p> Vm<'p> {
                     }
                     opt_callees.class_epoch = self.mi_class_epoch;
                     for fid in crate::codegen::opt_plan_callee_ids(&cross_plan, &class_read, &opt_callees.getters) {
-                        if (fid as usize) < self.main_func_count {
+                        if self.is_main_func(fid) {
                             let callee: &'p crate::bytecode::FuncProto = self.func(fid as usize);
                             if callee.code.len() <= 64
                                 && !callee.is_generator

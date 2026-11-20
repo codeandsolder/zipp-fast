@@ -342,10 +342,7 @@ impl<'s> Parser<'s> {
         if !self.at(Punct::LBrace) {
             self.semicolon()?;
             self.ts_state.bodiless = true;
-            return Ok(FnBody {
-                directives: Vec::new(),
-                stmts: Vec::new(),
-            });
+            return Ok(FnBody::new(Vec::new(), Vec::new()));
         }
         let mut body = self.parse_fn_body_with_params(Some(params))?;
         if !props.is_empty() {

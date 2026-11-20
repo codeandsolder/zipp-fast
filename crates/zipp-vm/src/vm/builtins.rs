@@ -1239,6 +1239,12 @@ impl<'p> Vm<'p> {
             | HeapObj::CombinatorResolver { .. } => self.fn_data_read(o, key),
             HeapObj::Iterator { proto, .. } => {
                 let proto = *proto;
+                #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                if key == "next" && proto == self.array_iter_proto && proto != 0 {
+                    if let Some(v) = self.arr_iter_next_fast(o.heap_index(), proto) {
+                        return Some(v);
+                    }
+                }
                 self.iterator_data_read(o, proto, key)
             }
             // `m.size`, as the member walk's collection arm answers it
@@ -1310,6 +1316,38 @@ impl<'p> Vm<'p> {
     /// the member walk's iterator arm, which has no own storage beyond
     /// `arr_props` and starts at a `proto_of` override, else the iterator's
     /// own prototype.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn arr_iter_next_fast(&mut self, idx: u32, proto: u32) -> Option<Value> {
+        if self.realm_global_objs.nonempty_raw != 0
+            || self.active_realm.is_some()
+            || !self.deferred_ns_state.is_empty()
+            || (!self.arr_props.is_empty() && self.arr_props.has(idx))
+            || self.proto_of.raw_bits(idx) != 0
+        {
+            return None;
+        }
+        let ver = self.heap.version_of(proto);
+        let HeapObj::Object(m) = self.heap.get(proto) else {
+            return None;
+        };
+        let (mver, mslot) = self.arr_iter_next_memo;
+        if mver == ver && mslot != u32::MAX {
+            let v = m.val_at(mslot as usize);
+            return (!v.is_uninitialized()).then_some(v);
+        }
+        if let Some(i) = self.own_pos(m, "next") {
+            if !m.attr_at(i).accessor {
+                let v = m.val_at(i);
+                if !v.is_uninitialized() {
+                    self.arr_iter_next_memo = (ver, i as u32);
+                    return Some(v);
+                }
+            }
+        }
+        None
+    }
+
     #[inline(never)]
     fn iterator_data_read(&self, o: Value, proto: u32, key: &str) -> Option<Value> {
         if !self.callable_member_lane_ok(key) {
@@ -1574,12 +1612,16 @@ impl<'p> Vm<'p> {
                     _ => None,
                 },
             ),
-            HeapObj::WeakSet(_) => (self.weakset_proto, None),
+            HeapObj::WeakSet(_) => (
+                self.weakset_proto,
+                (want == crate::vm::native::WS_HAS).then_some(4usize),
+            ),
             _ => return false,
         };
         if proto == 0
             || self.realm_global_objs.nonempty_raw != 0
             || (!self.arr_props.is_empty()
+                && self.arr_props.has(idx)
                 && self
                     .arr_props
                     .get(&idx)

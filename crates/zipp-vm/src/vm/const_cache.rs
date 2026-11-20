@@ -105,7 +105,7 @@ impl<'p> Vm<'p> {
     /// `eval` / `new Function` stream's, so the caches' function caps need
     /// not bound it.
     fn const_func_source_bounded(&self, func_id: u32) -> bool {
-        (func_id as usize) < self.main_func_count || self.loader_module_func(func_id)
+        self.is_main_func(func_id) || self.loader_module_func(func_id)
     }
 
     #[cfg(not(feature = "jit"))]

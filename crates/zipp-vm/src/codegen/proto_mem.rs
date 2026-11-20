@@ -7922,11 +7922,31 @@ pub(crate) fn compile_proto_mem(
                             None,
                         );
                     }
-                    // A class-method site: the method its cache resolves for
-                    // the receiver, looked up and not called
-                    // (`jit_method_callee`), then called natively by the arm
-                    // that names its fid, the receiver as `this`. A lookup that
-                    // declines and a method no arm names take the route below.
+                    // A class-method or megamorphic object-method site: monomorphic
+                    // `class_read` / `proto_read` guard first, then inline x86-64
+                    // `mega_prop_full(r8d = -1)` across `shape_prop_memo` (2-way),
+                    // `class_prop_memo`, `es5_proto_memo`, and `dict_prop_memo`,
+                    // falling back to `jit_method_callee` only when static cross3
+                    // arms exist. Resolved callees run through static cross3 arms
+                    // or `cross3_dyn_stub` with ZERO Rust FFI.
+                    let mega_method_key_id = if use_mega_prop
+                        && can_cross3_dyn
+                        && argc <= 255
+                        && !matches!(
+                            key,
+                            "call"
+                                | "apply"
+                                | "bind"
+                                | "hasOwnProperty"
+                                | "propertyIsEnumerable"
+                                | "isPrototypeOf"
+                        )
+                        && !crate::vm::is_private_key(key)
+                    {
+                        prop_key_ids.get(name as usize).copied().unwrap_or(0)
+                    } else {
+                        0
+                    };
                     let class_lane = cross_plan.get(&ip).copied().filter(|site| {
                         do_cross3
                             && site.class_method
@@ -7936,19 +7956,22 @@ pub(crate) fn compile_proto_mem(
                                     && (class_read.contains_key(&ip)
                                         || site.proto_read.is_some())))
                     });
+                    let has_method_lane = class_lane.is_some() || mega_method_key_id != 0;
                     let class_done = ops.new_dynamic_label();
-                    if let Some(site) = class_lane {
+                    if has_method_lane {
                         let lookup_miss = ops.new_dynamic_label();
                         let have_callee = ops.new_dynamic_label();
-                        let dyn_only = site.cross3.is_empty();
+                        let static_arms = class_lane.is_some_and(|s| !s.cross3.is_empty());
+                        let dyn_only = !static_arms;
+                        let have_mega = mega_method_key_id != 0;
                         // The method the class-method or prototype-method lane's
                         // guards name (`ClassReadPlan` / `ProtoReadLane`) without
-                        // an FFI lookup; a receiver they do not hold for takes
-                        // `jit_method_callee` when static cross3 arms exist, or
-                        // falls straight through to `jit_call_method_ic` when
-                        // `dyn_only` (avoiding a double FFI miss).
-                        if let Some(lane) = class_read.get(&ip) {
-                            let guard_miss = if dyn_only {
+                        // an FFI lookup; a receiver they do not hold for tries
+                        // `mega_prop_full` (if available), then `jit_method_callee`
+                        // when static cross3 arms exist, or falls straight through
+                        // to `emit_tierc_general_method` when `dyn_only`.
+                        if let Some(lane) = class_lane.and_then(|_| class_read.get(&ip)) {
+                            let guard_miss = if dyn_only && !have_mega {
                                 lookup_miss
                             } else {
                                 ops.new_dynamic_label()
@@ -7958,19 +7981,37 @@ pub(crate) fn compile_proto_mem(
                                 ; mov rax, QWORD lane.value as i64
                                 ; jmp => have_callee
                             );
-                            if !dyn_only {
+                            if !dyn_only || have_mega {
                                 dynasm!(ops ; => guard_miss);
                             }
-                        } else if let Some(plane) = site.proto_read {
-                            let guard_miss = if dyn_only {
+                        } else if let Some(plane) = class_lane.and_then(|s| s.proto_read) {
+                            let guard_miss = if dyn_only && !have_mega {
                                 lookup_miss
                             } else {
                                 ops.new_dynamic_label()
                             };
                             emit_proto_read_guard(&mut ops, obj, &plane, guard_miss);
                             dynasm!(ops ; jmp => have_callee);
-                            if !dyn_only {
+                            if !dyn_only || have_mega {
                                 dynasm!(ops ; => guard_miss);
+                            }
+                        }
+                        if have_mega {
+                            let (full_lbl, _) = *mega_prop_stubs.get_or_insert_with(|| {
+                                (ops.new_dynamic_label(), ops.new_dynamic_label())
+                            });
+                            dynasm!(ops
+                                ; mov rdx, [rbx + dreg(obj)]
+                                ; mov ecx, mega_method_key_id as i32
+                                ; mov r8d, -1
+                                ; call => full_lbl
+                                ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                                ; cmp rax, r10
+                            );
+                            if dyn_only {
+                                dynasm!(ops ; je => lookup_miss);
+                            } else {
+                                dynasm!(ops ; jne => have_callee);
                             }
                         }
                         if !dyn_only {
@@ -7989,22 +8030,24 @@ pub(crate) fn compile_proto_mem(
                         } else {
                             dynasm!(ops ; => have_callee);
                         }
-                        for c3plan in site.cross3.iter() {
-                            emit_cross3_call(
-                                &mut ops,
-                                c3plan,
-                                Cross3Callee::Stash,
-                                Some(obj),
-                                arg_base,
-                                dst,
-                                proto.reg_count.max(1),
-                                c3_off,
-                                &heap,
-                                bail,
-                                class_done,
-                                refetch.is_some(),
-                                None,
-                            );
+                        if let Some(site) = class_lane {
+                            for c3plan in site.cross3.iter() {
+                                emit_cross3_call(
+                                    &mut ops,
+                                    c3plan,
+                                    Cross3Callee::Stash,
+                                    Some(obj),
+                                    arg_base,
+                                    dst,
+                                    proto.reg_count.max(1),
+                                    c3_off,
+                                    &heap,
+                                    bail,
+                                    class_done,
+                                    refetch.is_some(),
+                                    None,
+                                );
+                            }
                         }
                         if can_cross3_dyn && argc <= 255 {
                             let dyn_lbl = *cross3_dyn_stub
@@ -8046,7 +8089,7 @@ pub(crate) fn compile_proto_mem(
                         method_own_slot_direct
                             && !cross_plan.get(&ip).is_some_and(|site| site.class_method),
                     );
-                    if class_lane.is_some() {
+                    if has_method_lane {
                         dynasm!(ops ; => class_done);
                     }
                     if own_lane.is_some() {
@@ -10807,11 +10850,16 @@ pub(crate) fn emit_mega_get_prop_stub(
     };
     let dict_body = ops.new_dynamic_label();
     let dict_special = ops.new_dynamic_label();
+    let shape_way1 = ops.new_dynamic_label();
+    let shape_hit = ops.new_dynamic_label();
+    let dict_shape_way1 = ops.new_dynamic_label();
+    let dict_shape_hit = ops.new_dynamic_label();
     let shape_special = ops.new_dynamic_label();
     let class_prop = ops.new_dynamic_label();
     let class_hit = ops.new_dynamic_label();
     let es5_proto = ops.new_dynamic_label();
     let ret_undef = ops.new_dynamic_label();
+    let ret_deopt = ops.new_dynamic_label();
     let slow = ops.new_dynamic_label();
     dynasm!(ops
         ; => full_lbl
@@ -10830,22 +10878,29 @@ pub(crate) fn emit_mega_get_prop_stub(
         ; mov eax, DWORD [r10]
         ; test eax, eax
         ; jz => dict_body
-        // Megamorphic shaped read: probe `shape_prop_memo` (16384 × 16B) by `(shape, key_id)`.
+        // Megamorphic shaped read: probe 2-way `shape_prop_memo` (32768 × 32B) by `(shape, key_id)`.
         ; imul eax, eax, 0x9E37_79B1u32 as i32
         ; imul r11d, ecx, 0xC2B2_AE35u32 as i32
         ; xor eax, r11d
         ; imul eax, eax, 0x27D4_EB2Fu32 as i32
-        ; shr eax, 18
-        ; shl rax, 4
+        ; shr eax, 17
+        ; shl rax, 5
         ; mov r11, [rdi + JIT_SHAPE_PROP_MEMO_RAW_OFFSET as i32]
         ; test r11, r11
         ; jz => slow
         ; add r11, rax
         ; mov eax, DWORD [r10]
         ; cmp DWORD [r11], eax
+        ; jne => shape_way1
+        ; cmp DWORD [r11 + 4], ecx
+        ; je => shape_hit
+        ; => shape_way1
+        ; add r11, 16
+        ; cmp DWORD [r11], eax
         ; jne => slow
         ; cmp DWORD [r11 + 4], ecx
         ; jne => slow
+        ; => shape_hit
         ; mov eax, DWORD [r11 + 8]
         ; test eax, eax
         ; js => shape_special
@@ -10882,14 +10937,14 @@ pub(crate) fn emit_mega_get_prop_stub(
         ; ret
 
         // Class instance with proved-absent own key (`SHAPE_PROP_*` sentinel):
-        // probe canonical `(class_id, key_id)` `class_prop_memo` (4096 × 32B).
+        // probe canonical `(class_id, key_id)` `class_prop_memo` (16384 × 32B).
         ; => class_prop
         ; and r10d, 0x7FFF_FFFF
         ; imul eax, r10d, 0x9E37_79B1u32 as i32
         ; imul r11d, ecx, 0xC2B2_AE35u32 as i32
         ; xor eax, r11d
         ; imul eax, eax, 0x27D4_EB2Fu32 as i32
-        ; shr eax, 20
+        ; shr eax, 18
         ; shl rax, 5
         ; mov r11, [rdi + JIT_CLASS_PROP_MEMO_RAW_OFFSET as i32]
         ; test r11, r11
@@ -10934,7 +10989,7 @@ pub(crate) fn emit_mega_get_prop_stub(
         ; imul r11d, ecx, 0xC2B2_AE35u32 as i32
         ; xor eax, r11d
         ; imul eax, eax, 0x27D4_EB2Fu32 as i32
-        ; shr eax, 20
+        ; shr eax, 18
         ; shl rax, 5
         ; mov r11, [rdi + JIT_ES5_PROTO_MEMO_RAW_OFFSET as i32]
         ; test r11, r11
@@ -10974,7 +11029,7 @@ pub(crate) fn emit_mega_get_prop_stub(
         ; test eax, eax
         ; jz => dict_body
         // Shaped object on a `direct == false` site: identity ways never cache
-        // class methods or class absent reads, so probe `shape_prop_memo` ->
+        // class methods or class absent reads, so probe 2-way `shape_prop_memo` ->
         // `class_prop_memo` for class instances (`fid != FID_MIRROR_NONE`) when
         // the own key is proved absent (`slot < 0`). Own data props fall to
         // `=> slow` so identity ways and `direct_miss_gate` still warm up.
@@ -10984,17 +11039,24 @@ pub(crate) fn emit_mega_get_prop_stub(
         ; imul r11d, ecx, 0xC2B2_AE35u32 as i32
         ; xor eax, r11d
         ; imul eax, eax, 0x27D4_EB2Fu32 as i32
-        ; shr eax, 18
-        ; shl rax, 4
+        ; shr eax, 17
+        ; shl rax, 5
         ; mov r11, [rdi + JIT_SHAPE_PROP_MEMO_RAW_OFFSET as i32]
         ; test r11, r11
         ; jz => slow
         ; add r11, rax
         ; mov eax, DWORD [r10]
         ; cmp DWORD [r11], eax
+        ; jne => dict_shape_way1
+        ; cmp DWORD [r11 + 4], ecx
+        ; je => dict_shape_hit
+        ; => dict_shape_way1
+        ; add r11, 16
+        ; cmp DWORD [r11], eax
         ; jne => slow
         ; cmp DWORD [r11 + 4], ecx
         ; jne => slow
+        ; => dict_shape_hit
         ; mov eax, DWORD [r11 + 8]
         ; test eax, eax
         ; js => shape_special
@@ -11005,7 +11067,7 @@ pub(crate) fn emit_mega_get_prop_stub(
         ; imul r11d, ecx, 0xC2B2_AE35u32 as i32
         ; xor eax, r11d
         ; imul eax, eax, 0x27D4_EB2Fu32 as i32
-        ; shr eax, 20
+        ; shr eax, 18
         ; shl rax, 5
         ; mov r11, [rdi + JIT_DICT_PROP_MEMO_RAW_OFFSET as i32]
         ; test r11, r11
@@ -11038,9 +11100,15 @@ pub(crate) fn emit_mega_get_prop_stub(
         ; jmp => shape_special
 
         ; => slow
+        ; cmp r8d, -1
+        ; je => ret_deopt
         ; mov rcx, rdi
         ; mov rax, QWORD get_prop_miss_helper as i64
         ; jmp rax
+
+        ; => ret_deopt
+        ; mov rax, QWORD SELF_CALL_DEOPT as i64
+        ; ret
     );
 }
 
@@ -11067,6 +11135,8 @@ pub(crate) fn emit_mega_set_prop_stub(
         JIT_SHAPE_PROP_MEMO_RAW_OFFSET, JIT_VERSIONS_RAW_OFFSET,
     };
     let dict_body = ops.new_dynamic_label();
+    let set_shape_way1 = ops.new_dynamic_label();
+    let set_shape_hit = ops.new_dynamic_label();
     let barrier = ops.new_dynamic_label();
     let ret_ok = ops.new_dynamic_label();
     let slow = ops.new_dynamic_label();
@@ -11091,17 +11161,24 @@ pub(crate) fn emit_mega_set_prop_stub(
         ; imul r11d, ecx, 0xC2B2_AE35u32 as i32
         ; xor eax, r11d
         ; imul eax, eax, 0x27D4_EB2Fu32 as i32
-        ; shr eax, 18
-        ; shl rax, 4
+        ; shr eax, 17
+        ; shl rax, 5
         ; mov r11, [rdi + JIT_SHAPE_PROP_MEMO_RAW_OFFSET as i32]
         ; test r11, r11
         ; jz => slow
         ; add r11, rax
         ; mov eax, DWORD [r10]
         ; cmp DWORD [r11], eax
+        ; jne => set_shape_way1
+        ; cmp DWORD [r11 + 4], ecx
+        ; je => set_shape_hit
+        ; => set_shape_way1
+        ; add r11, 16
+        ; cmp DWORD [r11], eax
         ; jne => slow
         ; cmp DWORD [r11 + 4], ecx
         ; jne => slow
+        ; => set_shape_hit
         ; cmp DWORD [r11 + 12], 1
         ; jne => slow
         ; mov eax, DWORD [r11 + 8]
@@ -11130,7 +11207,7 @@ pub(crate) fn emit_mega_set_prop_stub(
         ; imul r11d, ecx, 0xC2B2_AE35u32 as i32
         ; xor eax, r11d
         ; imul eax, eax, 0x27D4_EB2Fu32 as i32
-        ; shr eax, 20
+        ; shr eax, 18
         ; shl rax, 5
         ; mov r11, [rdi + JIT_DICT_PROP_MEMO_RAW_OFFSET as i32]
         ; test r11, r11

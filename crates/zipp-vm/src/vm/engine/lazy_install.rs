@@ -14,6 +14,15 @@ use crate::bytecode::FuncProto;
 impl<'p> Vm<'p> {
     /// Give this VM the session that compiles its program's deferred bodies.
     pub(crate) fn set_lazy_session(&mut self, session: crate::compile::LazySession<'p>) {
+        #[cfg(all(feature = "jit", target_arch = "x86_64", not(any(feature = "meter-only", feature = "safe-sandbox"))))]
+        if session.has_skipped_bodies() {
+            let est = self.funcs.len().max(session.source_len() / 1024);
+            self.jit.set_large_program_thresholds(
+                est,
+                self.program.python_natives,
+                self.program.php_natives,
+            );
+        }
         self.lazy = Some(Box::new(session));
     }
 
@@ -93,6 +102,19 @@ impl<'p> Vm<'p> {
         root.non_constructable |= stub.non_constructable;
         let mut protos: Vec<(u32, FuncProto)> =
             nested.into_iter().enumerate().map(|(i, f)| (base + i as u32, f)).collect();
+        #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+        if base as usize >= self.main_func_count && !protos.is_empty() {
+            let end = base + protos.len() as u32;
+            if let Some(last) = self.lazy_func_ranges.last_mut() {
+                if last.1 == base {
+                    last.1 = end;
+                } else {
+                    self.lazy_func_ranges.push((base, end));
+                }
+            } else {
+                self.lazy_func_ranges.push((base, end));
+            }
+        }
         protos.push((fid, root));
         for (_, f) in protos.iter_mut() {
             for ins in f.code.iter_mut() {

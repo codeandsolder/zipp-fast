@@ -256,6 +256,33 @@ impl<'s> Lexer<'s> {
         lx
     }
 
+    /// Construct a lexer starting at byte offset `start` of `src`, keeping
+    /// exact file-relative byte offsets while sizing its intern tables for the
+    /// remaining slice `src.len() - start` rather than the whole file.
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    pub fn new_at(src: &'s str, start: u32) -> Lexer<'s> {
+        let start = (start as usize).min(src.len());
+        let body_len = src.len() - start;
+        let large = body_len >= 16_384;
+        Lexer {
+            src: src.as_bytes(),
+            pos: start,
+            saw_newline: false,
+            legacy_escape: false,
+            html_comments: true,
+            exact: None,
+            input_start: start,
+            few: Vec::new(),
+            names: if large {
+                let cap = (body_len / 256).clamp(256, 16_384);
+                rustc_hash::FxHashSet::with_capacity_and_hasher(cap, Default::default())
+            } else {
+                rustc_hash::FxHashSet::default()
+            },
+            intern_l1: if large { vec![None; INTERN_L1_SLOTS] } else { Vec::new() },
+        }
+    }
+
     pub fn pos(&self) -> u32 {
         self.pos as u32
     }

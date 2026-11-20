@@ -11513,20 +11513,23 @@ impl Heap {
             self.free.push(idx);
             return;
         }
-        if matches!(
-            &self.objs[idx as usize],
+        if match &self.objs[idx as usize] {
             HeapObj::Promise {
                 reactions: Reactions::None | Reactions::One(_),
                 ..
-            } | HeapObj::BoundResolver { .. }
-                | HeapObj::CombinatorResolver { .. }
-                | HeapObj::Func(_)
-                | HeapObj::Cons { .. }
-                | HeapObj::Native(_)
-                | HeapObj::Date(_)
-                | HeapObj::BigInt(_)
-                | HeapObj::Boxed { .. }
-        ) {
+            }
+            | HeapObj::BoundResolver { .. }
+            | HeapObj::CombinatorResolver { .. }
+            | HeapObj::Func(_)
+            | HeapObj::Cons { .. }
+            | HeapObj::Native(_)
+            | HeapObj::Date(_)
+            | HeapObj::BigInt(_)
+            | HeapObj::Boxed { .. } => true,
+            HeapObj::Bound { args, .. } => args.capacity() == 0,
+            HeapObj::Iterator { items, .. } => items.capacity() == 0,
+            _ => false,
+        } {
             #[cfg(feature = "jit")]
             {
                 self.hot_mirror[idx as usize] = HotMirror::CLEAR;

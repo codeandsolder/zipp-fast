@@ -698,6 +698,10 @@ pub struct ParseOptions {
     /// Read JSX (a `.jsx` or `.tsx` file), lowered as these options say
     /// (see `jsx.rs`).
     pub jsx: Option<super::jsx::JsxOptions>,
+    /// Skip nested simple-parameter function bodies during the initial parse,
+    /// recording only their source byte ranges for on-demand lazy parsing.
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    pub skip_fn_bodies: bool,
 }
 
 impl Default for ParseOptions {
@@ -716,6 +720,8 @@ impl Default for ParseOptions {
             ts_legacy_decorators: false,
             ts_decorator_metadata: false,
             jsx: None,
+            #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+            skip_fn_bodies: false,
         }
     }
 }
@@ -803,6 +809,12 @@ pub struct Parser<'s> {
     pub(crate) ts_state: crate::lang::ts::TsState,
     /// JSX's settings and what its lowering has used, when the file has JSX.
     pub(crate) jsx: Option<Box<super::jsx::JsxState>>,
+    /// Pre-parser skip mode for nested function bodies (`ParseOptions::skip_fn_bodies`).
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    pub(crate) skip_fn_bodies: bool,
+    /// Current nesting depth of function/arrow bodies (0 at script top level).
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    pub(crate) fn_depth: u32,
 }
 
 /// Where a speculative parse started, to go back to: TypeScript decides some
@@ -905,6 +917,60 @@ impl<'s> Parser<'s> {
             jsx: opts
                 .jsx
                 .map(|o| Box::new(super::jsx::JsxState::new(o, src))),
+            #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+            skip_fn_bodies: opts.skip_fn_bodies,
+            #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+            fn_depth: 0,
+        })
+    }
+
+    /// Construct a parser positioned at byte offset `start` of `src`, keeping
+    /// exact file-relative byte offsets for lazy function-body parsing.
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    pub fn new_at(src: &'s str, start: u32, opts: ParseOptions) -> PResult<Parser<'s>> {
+        let mut lx = Lexer::new_at(src, start);
+        lx.set_html_comments(opts.goal != Goal::Module);
+        let tok = lx.next_token(true)?;
+        let ctx = Ctx {
+            strict: opts.force_strict || opts.goal == Goal::Module,
+            await_: opts.allow_await_expr || opts.goal == Goal::Module,
+            yield_: opts.allow_yield_expr,
+            return_: opts.allow_return || opts.goal == Goal::FunctionBody,
+            new_target: opts.allow_new_target,
+            super_prop: opts.allow_super_property,
+            super_call: opts.allow_super_call,
+            ..Ctx::default()
+        };
+        let goal = opts.goal;
+        Ok(Parser {
+            lx,
+            src,
+            tok,
+            prev_end: start,
+            ctx,
+            scopes: ScopeStack {
+                ts_on: opts.typescript,
+                ..ScopeStack::default()
+            },
+            cover: Cover::default(),
+            labels: Vec::new(),
+            parenthesized: false,
+            goal,
+            stmt_pos: StmtPos::ListItem,
+            exported_names: Vec::new(),
+            pending_export_locals: Vec::new(),
+            accessor_seq: 0,
+            pending_class_decorators: None,
+            syntax_recursion: 0,
+            tree_depth: 0,
+            stmt_scratch: Vec::new(),
+            arg_scratch: Vec::new(),
+            member_scratch: Vec::new(),
+            ts_on: opts.typescript,
+            ts_state: crate::lang::ts::TsState::default(),
+            jsx: None,
+            skip_fn_bodies: opts.skip_fn_bodies,
+            fn_depth: 0,
         })
     }
 

@@ -224,10 +224,7 @@ impl<'s> Parser<'s> {
                         func: Box::new(Function {
                             name: None,
                             params,
-                            body: FnBody {
-                                directives: Vec::new(),
-                                stmts,
-                            },
+                            body: FnBody::new(Vec::new(), stmts),
                             is_async: false,
                             is_generator: false,
                             span: Span::new(start, start + 1),

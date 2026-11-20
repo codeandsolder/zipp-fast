@@ -1211,7 +1211,7 @@ impl Vm<'_> {
         self.regexp_exact_source.retain_marked(&marks);
         // Collection hash index (u32 hash tags -> u32 slots, no Values): drop
         // a dead Map/Set's index so a recycled slot can't inherit a stale one.
-        self.collection_index.retain_marked(&marks);
+        self.collection_index.retain(|&k, _| marks[k as usize]);
         self.async_stacks.retain_marked(&marks);
         self.shadow_realms.retain_marked(&marks);
         self.realm_globals.retain_marked(&marks);
@@ -1590,7 +1590,7 @@ impl Vm<'_> {
         prune_map!(self.closure_new_target);
         prune_map!(self.dispose_stacks);
         prune_map!(self.regexp_exact_source);
-        prune_map!(self.collection_index);
+        self.collection_index.prune_freed(freed, live_bits);
         prune_set!(self.async_stacks);
         prune_set!(self.shadow_realms);
         prune_map!(self.realm_globals);
