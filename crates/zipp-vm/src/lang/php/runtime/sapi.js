@@ -329,9 +329,16 @@
         else rt.arrSetInPlace(envCell.v, s.slice(0, eq), s.slice(eq + 1));
         return true;
     });
+    rt.consts.set("CONNECTION_NORMAL", 0n);
+    rt.consts.set("CONNECTION_ABORTED", 1n);
+    rt.consts.set("CONNECTION_TIMEOUT", 2n);
+    reg("connection_status", function () { return 0n; });
+    reg("connection_aborted", function () { return 0n; });
     reg("error_reporting", function (lvl) { return rt.errorReporting(lvl); });
     reg("set_error_handler", function (cb) { return rt.setErrorHandler(cb); });
+    reg("restore_error_handler", function () { return rt.restoreErrorHandler(); });
     reg("set_exception_handler", function (cb) { return rt.setExceptionHandler(cb); });
+    reg("restore_exception_handler", function () { return rt.restoreExceptionHandler(); });
     reg("register_shutdown_function", function (cb) { rt.registerShutdown(cb, Array.from(arguments).slice(1)); return null; });
 
     // ---- Worker Mode registration (`zipp_handle_requests(callable $handler)`) ----
