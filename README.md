@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>Zippy Interpreter for Polyglot Programming</strong><br>
-  A portable polyglot runtime: one fast virtual machine for many languages, starting with JavaScript and Python.
+  A portable polyglot runtime: one fast virtual machine for JavaScript, TypeScript, Python, PHP 8.x and Rust.
 </p>
 
 <p align="center">
@@ -21,22 +21,33 @@
 ---
 
 **ZIPP compiles every language it supports into one shared bytecode and runs it
-on one virtual machine, written in Rust.** A JavaScript library and a Python
-script run on the same engine, with the same sandbox, the same limits and the
+on one virtual machine, written in Rust.** JavaScript, TypeScript, Python, PHP 8.x
+and Rust programs run on the same engine, with the same sandbox, the same limits and the
 same embedding API, wherever that engine goes: a native command line on
 Windows and Linux, a Rust library, or WebAssembly in browsers, Node.js, Deno
 and Bun.
 
-**Languages today: JavaScript (with TypeScript and JSX) and Python.**
+**Languages today: JavaScript (with TypeScript and JSX), Python 3.13, PHP 8.x and Rust.**
 
 - **JavaScript** is complete and modern: ES2025, passing **99.999% of test262**: 96,563 / 96,564 executions of the official conformance suite,
-  unmodified.
+  unmodified (pinned to `2e58f87d83`).
 - **TypeScript and TSX** run as they are: the JavaScript parser reads the
   types and drops them, and lowers `enum`, `namespace`, parameter
   properties and JSX as tsc emits them, with no transpile step.
-- **Python** is an experimental subset, compiled straight to ZIPP bytecode (no
-  CPython inside), with a bundled `torch` subset for tensors, autograd and
-  training. Its 196-program test corpus prints exactly what CPython 3.13 prints.
+- **Python 3.13** compiles straight to ZIPP bytecode (no CPython inside), with
+  `async`/`await`, `except*`, PEP 695 type parameters, `asyncio`/`fractions`/`numbers`,
+  native x86-64 JIT fast paths (`py_leaf` / `py_rec`), and a bundled `torch`
+  subset for tensors, autograd and training.
+- **PHP 8.x** compiles directly into ZIPP bytecode with dual-mode HTML
+  templates, CoW arrays, OOP/traits/enums/attributes/Reflection, Composer PSR-4
+  autoloading (verified across Laravel 11, Slim 4 and CakePHP 5), selective
+  x86-64 JIT + disk OPcache, built-in HTTP/1.1 SAPI & Worker Mode, and a
+  browser WebAssembly module (`PhpApp` + `PDO`/`mysqli` over host SQL bridges)
+  ([PHP on ZIPP](docs/PHP.md)).
+- **Rust** runs scripts, multi-file Cargo projects, `#[test]` suites, and
+  HTTP/1.1 Axum/SQLx backend servers directly on the ZIPP VM and native JIT
+  with zero external `rustc`/`cargo` invocation, plus a browser WebAssembly
+  module ([Rust on ZIPP](docs/RUST.md)).
 
 The virtual machine is built to take more languages: each one is a frontend
 that compiles to the shared bytecode and inherits everything below it
@@ -46,7 +57,7 @@ that compiles to the shared bytecode and inherits everything below it
 
 | | |
 | --- | --- |
-| **One VM, many languages** | JavaScript and Python share one runtime, one object model and one garbage collector. Write the part that suits each language in that language. |
+| **One VM, many languages** | JavaScript, TypeScript, Python, PHP 8.x and Rust share one runtime, one object model and one garbage collector. Write the part that suits each language in that language. |
 | **Fast** | A register VM with inline caches and, on x86-64, a native JIT. In its 0.0.31 capture ZIPP runs the 30 benchmark rows in 0.63× Node's time (the 13 everyday rows in 0.54×), starts in **9.1 ms** median process launch, and as a pure interpreter takes 0.57× the time of Bellard's QuickJS. [Performance](docs/PERFORMANCE.md) |
 | **Correct** | 99.999% of the pinned test262 corpus, unmodified; the one failure is a documented upstream expectation. [Correctness](docs/CORRECTNESS.md) |
 | **Sandboxed by default** | Embedded programs reach nothing you have not allowed: no storage, files, network or host functions until you grant each one, with step and time limits. |
@@ -96,10 +107,14 @@ chmod +x zipp
 ## Run programs
 
 ```sh
-zipp js app.js        # a JavaScript script
-zipp mjs app.mjs      # a JavaScript module (import/export, top-level await)
-zipp app.ts           # TypeScript, or app.tsx / app.jsx
-zipp py main.py       # a Python program (experimental), with the files beside it as its project
+zipp js app.js                                     # a JavaScript script
+zipp mjs app.mjs                                   # a JavaScript module (import/export, top-level await)
+zipp app.ts                                        # TypeScript, or app.tsx / app.jsx
+zipp py main.py                                    # a Python 3.13 program, with the files beside it as its project
+zipp php app.php                                   # a PHP 8.x script or template
+zipp php --worker -S 127.0.0.1:8000 -t . index.php # built-in PHP HTTP/1.1 Worker Mode server
+zipp rs examples/rust/issue_tracker                # a Rust script or Cargo project directory
+zipp rs --serve 127.0.0.1:8080 ./app               # built-in Rust Axum/HTTP worker server (add --watch for live reload)
 zipp --help
 ```
 
@@ -152,8 +167,13 @@ try {
 ```
 
 For Python, load a `-python` engine and pass `{ language: "python" }` to
-`createSandbox`. Then grant only what the program needs, one permission at a
-time:
+`createSandbox`. For full-stack PHP 8.x or Rust backends in the browser, load
+`zipp-0.0.37-javascript-php.wasm` (`PhpApp` SAPI + `PDO`/`mysqli`) or
+`zipp-0.0.37-javascript-rust.wasm` (Axum/SQLx worker-boot) and attach host
+capabilities through composable `addAppBridge(namespace, bridge)` plugins (for
+example XDB SQLite), sharing the guest VM's instruction budget without expanding
+the audited 51-function WASM import surface. Then grant only what the program
+needs, one permission at a time:
 
 ```js
 const sandbox = await zipp.createSandbox({
@@ -243,8 +263,10 @@ The full tables, confidence intervals and the remaining gaps are in
 
 ```mermaid
 flowchart LR
-    JS[JavaScript] --> B[Shared register bytecode]
-    PY[Python] --> B
+    JS[JavaScript / TypeScript] --> B[Shared register bytecode]
+    PY[Python 3.13] --> B
+    PHP[PHP 8.x] --> B
+    RS[Rust] --> B
     MORE[More languages] -.-> B
     B --> VM[Interpreter]
     VM --> JIT[Native JIT: x86-64, arm64]
@@ -284,6 +306,8 @@ builds every WebAssembly release file locally.
 | --- | --- |
 | [Docs index](docs/README.md) | Everything, in one list |
 | [Reference](docs/REFERENCE.md) | Architecture, language support, embedding, the CLI |
+| [PHP on ZIPP](docs/PHP.md) | PHP 8.x frontend, Laravel/Slim/CakePHP parity, HTTP SAPI & Worker Mode |
+| [Rust on ZIPP](docs/RUST.md) | Rust frontend, Cargo projects, `#[test]` runner, Axum/SQLx worker server |
 | [Execution profiles](docs/PROFILES.md) | Which build to use for trusted and untrusted code |
 | [Security](SECURITY.md) | The threat model and how to report a problem |
 | [Release notes](docs/releases/) | What changed in each version |

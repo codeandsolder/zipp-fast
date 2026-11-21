@@ -2,7 +2,7 @@
 
 React + TypeScript, with Vite and a Cloudflare Worker. The landing page introduces
 ZIPP, the Zippy Interpreter for Polyglot Programming: a portable polyglot runtime
-that runs JavaScript and Python today. It embeds the full folder playground and
+that runs JavaScript, TypeScript, Python 3.13, PHP 8.x and Rust today. It embeds the full folder playground and
 provides a dedicated `/playground/` route and a `/sandbox/playground/` route.
 Existing Softn/Outerstead showcases, repository activity, dated native benchmarks
 and the optional JavaScript story scratchpad remain available.
@@ -206,8 +206,8 @@ canonical pairs (`84012a2d`, 21 October 2026, recorded as v0.0.28, `f1739644`, 1
 2026, v0.0.26, and `fa8e3b86`, 15 October 2026, v0.0.24) stay in
 `../bench/` as prior series points.
 
-The optional JavaScript story scratchpad's browser engine is v0.0.35, 4,800,505 raw bytes, SHA-256
-`e7c5352ec108960be04a27c328bc3790ce8d162ca10afb746c160233670ad77d`.
+The optional JavaScript story scratchpad's browser engine is v0.0.37, 4,856,227 raw bytes, SHA-256
+`a8095ef563bf9bb485475e98ca9593158d687d4d8095f1974c2fb8bf4d5394ba`.
 Its file pair is fingerprinted together in Vite configuration to avoid loading
 mismatched glue and WASM files. Each run uses a disposable Worker, a 6-second
 host deadline, and the module's instruction and heap limits.

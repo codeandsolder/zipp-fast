@@ -1,8 +1,8 @@
 import { useEffect, useId, useRef, useState } from 'react'
 import {
-  EMBED_CSP, EMBED_RELEASE, ENGINES, KIT, PYTHON_BASE, RELEASE_TAG_URL, STARTER, TORCH_PACKAGE,
-  capabilityBlurb, capabilityExample, capabilityOutput, capabilityTitle, defaultExample, defaultOutput,
-  engineById, formatMegabytes, releaseAssetUrl, type EmbedEngine,
+  EMBED_CSP, EMBED_RELEASE, ENGINES, KIT, PHP_ENGINE, PYTHON_BASE, RELEASE_TAG_URL, RUST_ENGINE, STARTER,
+  TORCH_PACKAGE, TYPESCRIPT_ENGINE, capabilityBlurb, capabilityExample, capabilityOutput, capabilityTitle,
+  defaultExample, defaultOutput, engineById, formatMegabytes, releaseAssetUrl, type EmbedEngine,
 } from './embed-data.mjs'
 
 type CopyState = 'idle' | 'copied' | 'selected'
@@ -107,6 +107,12 @@ export function EmbedSection() {
                 demand: <code>{'loadZipp({ engine, packages: [torch] })'}</code>.
               </p>
             )}
+            <p className="embed-note">
+              Also in v{EMBED_RELEASE}:{' '}
+              <a href={releaseAssetUrl(TYPESCRIPT_ENGINE.file)}>TypeScript + TSX</a> ({formatMegabytes(TYPESCRIPT_ENGINE.brBytes)} Brotli),{' '}
+              <a href={releaseAssetUrl(PHP_ENGINE.file)}>PHP 8.x</a> ({formatMegabytes(PHP_ENGINE.brBytes)} Brotli, <code>PhpApp</code> SAPI) and{' '}
+              <a href={releaseAssetUrl(RUST_ENGINE.file)}>Rust</a> ({formatMegabytes(RUST_ENGINE.brBytes)} Brotli, Axum/SQLx worker-boot).
+            </p>
           </fieldset>
 
           <div className="embed-step">

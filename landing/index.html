@@ -8,10 +8,10 @@
       http-equiv="Content-Security-Policy"
       content="default-src 'self'; base-uri 'none'; object-src 'none'; form-action 'none'; img-src 'self' data:; script-src 'self' 'wasm-unsafe-eval' https://static.cloudflareinsights.com; worker-src 'self'; style-src 'self'; connect-src 'self' https://cloudflareinsights.com; upgrade-insecure-requests"
     />
-    <title>ZIPP: Portable Polyglot Runtime for JavaScript and Python</title>
+    <title>ZIPP: Portable Polyglot Runtime for JS, Python, PHP and Rust</title>
     <meta
       name="description"
-      content="ZIPP, the Zippy Interpreter for Polyglot Programming: one Rust register VM that JavaScript and Python compile to, run natively, embedded in Rust or in WebAssembly."
+      content="ZIPP, the Zippy Interpreter for Polyglot Programming: one Rust register VM that JavaScript, TypeScript, Python, PHP 8.x and Rust compile to, run natively, embedded in Rust or in WebAssembly."
     />
     <link rel="canonical" href="https://www.zipp.org/" />
     <link rel="alternate" type="application/rss+xml" title="Zipp engineering journal" href="https://www.zipp.org/journal/feed.xml" />
@@ -21,18 +21,18 @@
     <meta property="og:site_name" content="Zipp" />
     <meta property="og:type" content="website" />
     <meta property="og:url" content="https://www.zipp.org/" />
-    <meta property="og:title" content="ZIPP: Portable Polyglot Runtime for JavaScript and Python" />
+    <meta property="og:title" content="ZIPP: Portable Polyglot Runtime for JS, Python, PHP and Rust" />
     <meta
       property="og:description"
-      content="One Rust register VM for several languages, with one sandbox and one set of embeddings: JavaScript (ES2025, 99.999% unmodified Test262) and experimental Python today."
+      content="One Rust register VM for JavaScript (ES2025, 99.999% unmodified Test262), TypeScript, Python 3.13, PHP 8.x and Rust — native CLI, Rust library, or WebAssembly."
     />
     <meta property="og:image" content="https://www.zipp.org/zipp-og-card.png" />
     <meta property="og:image:width" content="1200" />
     <meta property="og:image:height" content="630" />
     <meta property="og:image:alt" content="A luminous purple-to-cyan lightning mark moving across a dark field" />
     <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:title" content="ZIPP: Portable Polyglot Runtime for JavaScript and Python" />
-    <meta name="twitter:description" content="JavaScript and Python on one portable Rust VM: the native CLI, a Rust embedding, or WebAssembly in browsers, Node, Deno and Bun." />
+    <meta name="twitter:title" content="ZIPP: Portable Polyglot Runtime for JS, Python, PHP and Rust" />
+    <meta name="twitter:description" content="JavaScript, TypeScript, Python 3.13, PHP 8.x and Rust on one portable Rust VM: native CLI, Rust library, or WebAssembly." />
     <meta name="twitter:image" content="https://www.zipp.org/zipp-og-card.png" />
     <meta name="twitter:image:alt" content="A luminous purple-to-cyan lightning mark moving across a dark field" />
     <link rel="icon" href="/zipp-bolt.svg" type="image/svg+xml" />
@@ -64,14 +64,14 @@
             "name": "Zipp",
             "alternateName": ["ZIPP", "Zippy Interpreter for Polyglot Programming"],
             "url": "https://www.zipp.org/",
-            "description": "A portable polyglot runtime: one Rust register-bytecode VM that JavaScript and Python compile to, sharing one sandbox and one set of embeddings, with x86-64 and ARM64 JIT tiers and a WebAssembly build for browsers, Node, Deno and Bun.",
+            "description": "A portable polyglot runtime: one Rust register-bytecode VM that JavaScript, TypeScript, Python 3.13, PHP 8.x and Rust compile to, sharing one sandbox and one set of embeddings, with x86-64 and ARM64 JIT tiers and WebAssembly builds for browsers, Node, Deno and Bun.",
             "applicationCategory": "DeveloperApplication",
             "applicationSubCategory": "Language runtime",
             "operatingSystem": "Windows, Linux, WebAssembly",
             "programmingLanguage": "Rust",
-            "softwareVersion": "0.0.35",
+            "softwareVersion": "0.0.37",
             "datePublished": "2026-08-30",
-            "dateModified": "2026-10-18",
+            "dateModified": "2026-11-21",
             "license": "https://www.apache.org/licenses/LICENSE-2.0",
             "isAccessibleForFree": true,
             "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
@@ -80,12 +80,14 @@
             "author": { "@id": "https://f2i.com/#organization" },
             "featureList": [
               "One register-bytecode VM, sandbox and set of embeddings shared by every language it runs",
-              "ES2015 through ES2025 JavaScript with 96,227 of 96,228 unmodified Test262 executions passing",
-              "Experimental Python 3 subset compiling to the same bytecode, with a bundled torch subset",
-              "Explicit-frame register VM with NaN-boxed values",
+              "ES2015 through ES2025 JavaScript with 96,563 of 96,564 unmodified Test262 executions passing",
+              "TypeScript and TSX run directly with no separate transpile step",
+              "Python 3.13 compiling to the same bytecode, with async/await, JIT fast paths and a bundled torch subset",
+              "PHP 8.x frontend with Composer PSR-4, Laravel/Slim/CakePHP parity, HTTP SAPI Worker Mode and PhpApp WASM",
+              "Rust frontend with multi-file Cargo projects, #[test] runner, Axum/SQLx backend support and WASM worker-boot",
+              "Explicit-frame register VM with NaN-boxed values and non-moving generational garbage collector",
               "x86-64 tiered JIT with on-stack replacement and an ARM64 baseline JIT",
-              "Non-moving generational garbage collector",
-              "Interpreter-only WebAssembly sandbox with no unsafe code",
+              "Interpreter-only WebAssembly sandbox with no unsafe code and composable addAppBridge plugins",
               "WebGPU and WebGL2 compute graphs from Python and JavaScript"
             ]
           }
@@ -106,13 +108,16 @@
         ZIPP, the Zippy Interpreter for Polyglot Programming, is one Rust register-bytecode VM that
         several languages compile to, so programs in different languages share one runtime, one sandbox
         and one set of embeddings: the native CLI, a Rust library, and WebAssembly in browsers, Node,
-        Deno and Bun. JavaScript (ES2025, 99.999% of the pinned Test262 corpus) and Python (an
-        experimental subset with a bundled torch subset) are the languages it supports today, and the
-        VM is designed for more. Open source under Apache-2.0.
+        Deno and Bun. JavaScript (ES2025, 99.999% of the pinned Test262 corpus), TypeScript, Python 3.13
+        (with a bundled torch subset), PHP 8.x (with Composer PSR-4, Laravel/Slim/CakePHP parity and
+        HTTP Worker Mode) and Rust (scripts, Cargo projects and Axum/SQLx backends) run on it today.
+        Open source under Apache-2.0.
       </p>
       <nav aria-label="Documentation">
         <a href="/javascript-engine/">JavaScript engine</a>
         <a href="/python/">Python frontend</a>
+        <a href="/php/">PHP 8.x frontend</a>
+        <a href="/rust/">Rust frontend</a>
         <a href="/wasm/">WebAssembly runtime</a>
         <a href="/webgpu/">GPU compute</a>
         <a href="/test262/">Test262 conformance</a>

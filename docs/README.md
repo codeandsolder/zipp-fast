@@ -1,7 +1,7 @@
 # ZIPP documentation
 
 ZIPP, the Zippy Interpreter for Polyglot Programming, is a portable polyglot
-runtime: one virtual machine for JavaScript and Python today. The
+runtime: one virtual machine for JavaScript, TypeScript, Python 3.13, PHP 8.x and Rust today. The
 [root README](../README.md) is the short introduction and download guide.
 Everything else:
 
