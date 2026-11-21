@@ -27,6 +27,9 @@ export const KIT: { file: string; folder: string; bytes: number; loader: string 
 export const STARTER: { folder: string; path: string }
 export const PYTHON_BASE: EmbedAsset
 export const TORCH_PACKAGE: EmbedAsset
+export const TYPESCRIPT_ENGINE: EmbedAsset
+export const PHP_ENGINE: EmbedAsset
+export const RUST_ENGINE: EmbedAsset
 export const ENGINES: EmbedEngine[]
 export const DEFAULT_ENGINE: EmbedEngine
 export function engineById(id: string): EmbedEngine

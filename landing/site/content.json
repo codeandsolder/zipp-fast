@@ -3,11 +3,11 @@
     "name": "ZIPP",
     "origin": "https://www.zipp.org",
     "tagline": "Portable Polyglot Runtime",
-    "description": "ZIPP, the Zippy Interpreter for Polyglot Programming, is a portable polyglot runtime: one Rust register VM that runs JavaScript and Python today, natively, embedded or in WebAssembly.",
+    "description": "ZIPP, the Zippy Interpreter for Polyglot Programming, is a portable polyglot runtime: one Rust register VM for JavaScript, TypeScript, Python 3.13, PHP 8.x and Rust.",
     "image": "/zipp-og-card.png",
     "imageAlt": "A luminous purple-to-cyan lightning mark moving across a dark field",
     "repo": "https://github.com/f2i-com/zipp.org",
-    "homeDateModified": "2026-10-18",
+    "homeDateModified": "2026-11-21",
     "organization": {
       "name": "f2i",
       "url": "https://f2i.com"
@@ -23,6 +23,14 @@
       {
         "label": "Python",
         "href": "/python/"
+      },
+      {
+        "label": "PHP",
+        "href": "/php/"
+      },
+      {
+        "label": "Rust",
+        "href": "/rust/"
       },
       {
         "label": "WebAssembly",
@@ -50,7 +58,7 @@
       }
     ],
     "footer": {
-      "text": "ZIPP, the Zippy Interpreter for Polyglot Programming, is a portable polyglot runtime written in Rust: one VM for JavaScript and Python today, released under Apache-2.0 and built in the open by [f2i](https://f2i.com). Documentation last updated 18 October 2026.",
+      "text": "ZIPP, the Zippy Interpreter for Polyglot Programming, is a portable polyglot runtime written in Rust: one VM for JavaScript, TypeScript, Python 3.13, PHP 8.x and Rust, released under Apache-2.0 and built in the open by [f2i](https://f2i.com). Documentation last updated 21 November 2026.",
       "links": [
         {
           "label": "Home",
@@ -100,7 +108,7 @@
     },
     "notFound": {
       "title": "Page not found · Zipp",
-      "description": "That page does not exist on zipp.org. Start from the JavaScript engine overview, the Python frontend, or the engineering journal.",
+      "description": "That page does not exist on zipp.org. Start from the JavaScript engine overview, the Python, PHP or Rust frontends, or the engineering journal.",
       "h1": "That page is not here.",
       "lede": "The address may have changed, or it never existed. Everything on zipp.org is reachable from the pages below.",
       "blocks": [
@@ -120,7 +128,7 @@
             {
               "title": "Test262 conformance",
               "href": "/test262/",
-              "text": "96,228 executions of the pinned ECMAScript suite."
+              "text": "96,564 executions of the pinned ECMAScript suite."
             },
             {
               "title": "Engineering journal",
@@ -149,7 +157,7 @@
         "ECMAScript Test262 engine"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-11-11",
+      "dateModified": "2026-11-21",
       "priority": "0.9",
       "sections": [
         {
@@ -157,23 +165,23 @@
           "blocks": [
             {
               "type": "p",
-              "text": "ZIPP, the **Zippy Interpreter for Polyglot Programming**, is a portable polyglot runtime: one Rust register-bytecode VM that several languages compile to, so programs in different languages share one runtime, one sandbox and one set of embeddings, from the native CLI and a Rust library to WebAssembly in browsers, Node, Deno and Bun. JavaScript and Python are the languages it supports today. JavaScript is ES2025, passing 99.999% of the pinned Test262 corpus unmodified; Python is an experimental subset with a bundled torch subset. The design is for more languages: [docs/LANGUAGES.md](https://github.com/f2i-com/zipp.org/blob/main/docs/LANGUAGES.md) describes how one plugs in. This page is about the JavaScript engine."
+              "text": "ZIPP, the **Zippy Interpreter for Polyglot Programming**, is a portable polyglot runtime: one Rust register-bytecode VM that several languages compile to, so programs in different languages share one runtime, one sandbox and one set of embeddings, from the native CLI and a Rust library to WebAssembly in browsers, Node, Deno and Bun. JavaScript (ES2025, passing 99.999% of the pinned Test262 corpus unmodified), TypeScript/TSX, [Python 3.13](/python/) (with a bundled torch subset), [PHP 8.x](/php/) (with Composer PSR-4, Laravel/Slim/CakePHP parity and HTTP Worker Mode) and [Rust](/rust/) (scripts, multi-file Cargo projects and Axum/SQLx backends) run on it today. [docs/LANGUAGES.md](https://github.com/f2i-com/zipp.org/blob/main/docs/LANGUAGES.md) describes how each language plugs in. This page is about the JavaScript engine."
             },
             {
               "type": "p",
-              "text": "Zipp began on 29 May 2026 as a small typed language and became a JavaScript engine the next day. Since then it has grown into roughly 424,000 lines of Rust in the `zipp-vm` crate, tests included, plus a CLI, a WebAssembly embedding, a hardened sandbox runner and an experimental Python frontend that compiles to the same bytecode."
+              "text": "Zipp began on 29 May 2026 as a small typed language and became a JavaScript engine the next day. Since then it has grown into a full polyglot workspace in Rust — `zipp-vm`, a CLI, a WebAssembly embedding, a hardened sandbox runner, and frontends for JavaScript/TypeScript, Python 3.13, PHP 8.x and Rust compiling to the same register bytecode."
             },
             {
               "type": "p",
-              "text": "It is not a binding to V8, SpiderMonkey or JavaScriptCore, and it does not wrap QuickJS. Every stage from source text to native machine code is Zipp's own, with one vendored exception: a fork of the `regress` regular-expression engine. The Python frontend's lexer and parser are Zipp's own as well."
+              "text": "It is not a binding to V8, SpiderMonkey or JavaScriptCore, and it does not wrap QuickJS. Every stage from source text to native machine code is Zipp's own, with one vendored exception: a fork of the `regress` regular-expression engine. The Python, PHP and Rust parsers are Zipp's own pure-Rust parsers as well."
             },
             {
               "type": "stats",
               "items": [
                 {
-                  "value": "96,227 / 96,228",
+                  "value": "96,563 / 96,564",
                   "label": "Test262 executions passing, unmodified upstream",
-                  "note": "One documented expected failure. Corpus pinned to tc39/test262 0b4e081."
+                  "note": "One documented expected failure. Corpus pinned to tc39/test262 2e58f87d83."
                 },
                 {
                   "value": "0.629×",
@@ -186,9 +194,9 @@
                   "note": "Node 32.3 ms, Bun 53.0 ms, Deno 84.9 ms on the same machine."
                 },
                 {
-                  "value": "1.25 MB",
+                  "value": "1.27 MB",
                   "label": "WebAssembly engine on the wire (Brotli)",
-                  "note": "JavaScript-only engine file of v0.0.35, bindings included, 4.9 MB raw. ZIPP Lite: 0.78 MB."
+                  "note": "JavaScript-only engine file of v0.0.37, bindings included, 4.9 MB raw. ZIPP Lite: 0.79 MB."
                 }
               ]
             },
@@ -230,7 +238,7 @@
               "type": "callout",
               "tone": "warning",
               "title": "What is not complete",
-              "text": "Internationalization is partial. `Intl.DateTimeFormat` ships generated CLDR 48 data for English, German, Japanese, Chinese and Egyptian Arabic and passes its 490-execution Test262 shard; the other Intl services ship English locale data only. Zipp does not claim full ECMA-402 conformance."
+              "text": "Internationalization is partial. `Intl.DateTimeFormat` ships generated CLDR 48 data for English, German, Japanese, Chinese and Egyptian Arabic and passes its 492-execution Test262 shard; the other Intl services ship English locale data only. Zipp does not claim full ECMA-402 conformance."
             }
           ]
         },
@@ -305,7 +313,7 @@
             },
             {
               "type": "p",
-              "text": "The CLI also runs ES modules (`zipp mjs`), TypeScript and TSX (`zipp app.ts`), Python (`zipp py`), and picks a frontend from the file extension or shebang with `zipp run`; `zipp app.js` runs a program as `node` does. Bare source such as `x = 1` never silently defaults to one language. Native builds are published for Windows x86-64 and Linux x86-64, arm64 and armv7 on the [releases page](/releases/)."
+              "text": "The CLI also runs ES modules (`zipp mjs`), TypeScript and TSX (`zipp app.ts`), Python (`zipp py`), PHP 8.x (`zipp php`, including `-S` and `--worker`), Rust (`zipp rs`, including `--test`, `--serve` and `--watch`), and picks a frontend from the file extension or shebang with `zipp run`; `zipp app.js` runs a program as `node` does. Bare source such as `x = 1` never silently defaults to one language. Native builds are published for Windows x86-64 and Linux x86-64, arm64 and armv7 on the [releases page](/releases/)."
             }
           ]
         },
@@ -337,7 +345,7 @@
             },
             {
               "type": "p",
-              "text": "Since v0.0.26 each engine is one `.wasm` file that carries its own bindings. In v0.0.35 the JavaScript-only engine is 4,855,175 bytes raw and 1,254,950 bytes after Brotli, and ZIPP Lite, the JavaScript core without `Intl` and `Temporal` built for size, 2,832,722 and 778,494; the engine that also includes Python with torch built in is 8,617,556 bytes raw and 2,022,547 on the wire, and Python without torch 1,645,970. The bindings account for 12,522 to 14,411 of those bytes after Brotli. The JavaScript engine with TypeScript, `javascript-typescript`, is 5,192,500 bytes raw and 1,325,298 after Brotli. v0.0.33 left Node's layer, which a browser cannot run, out of every WebAssembly engine, and code they can never reach with it: the JavaScript engine is 10.7% smaller on the wire than v0.0.32's, ZIPP Lite 13.5%; v0.0.34 and v0.0.35 are the same size. The JavaScript-only engine is about three times the size of QuickJS-NG's WebAssembly reactor, a trade-off documented plainly on the [WebAssembly page](/wasm/), which also explains the loader, the Worker-termination deadline model and the resource limits."
+              "text": "Since v0.0.26 each engine is one `.wasm` file that carries its own bindings. In v0.0.37 the JavaScript-only engine is 4,913,223 bytes raw and 1,268,242 bytes after Brotli, and ZIPP Lite, the JavaScript core without `Intl` and `Temporal` built for size, 2,878,928 and 788,538; `javascript-typescript` is 5,250,935 raw and 1,338,703 after Brotli; `javascript-php` is 6,038,525 raw and 1,480,745 after Brotli; `javascript-rust` is 5,954,532 raw and 1,466,783 after Brotli; `javascript-python` with torch built in is 8,942,154 bytes raw and 2,078,280 on the wire, and `javascript-python-base` without torch is 6,905,076 raw and 1,702,286 after Brotli (with the torch package 403,538 bytes after Brotli). The JavaScript-only engine is about three times the size of QuickJS-NG's WebAssembly reactor, a trade-off documented plainly on the [WebAssembly page](/wasm/), which also explains the loader, composable `addAppBridge` plugins, the Worker-termination deadline model and the resource limits."
             }
           ]
         },
@@ -346,7 +354,7 @@
           "blocks": [
             {
               "type": "p",
-              "text": "Zipp runs the pinned tc39/test262 corpus in both sloppy and strict mode: 96,228 executions, including `staging`, with zero skips. Against the unmodified corpus 96,227 pass. The one remaining execution is an Annex B test whose final assertion is ES2017 wording that ES2018 deleted, and it is the single entry in a checked-in expected-failure manifest; no test file is patched. The [Test262 page](/test262/) documents that failure, the CI gate, and how the number climbed from a mis-scored 100% to an honest 96.97% and back up."
+              "text": "Zipp runs the pinned tc39/test262 corpus in both sloppy and strict mode: 96,564 executions, including `staging`, with zero skips. Against the unmodified corpus 96,563 pass. The one remaining execution is an Annex B test whose final assertion is ES2017 wording that ES2018 deleted, and it is the single entry in a checked-in expected-failure manifest; no test file is patched. The [Test262 page](/test262/) documents that failure, the CI gate, and how the number climbed from a mis-scored 100% to an honest 96.97% and back up."
             },
             {
               "type": "p",
@@ -362,7 +370,7 @@
               "items": [
                 {
                   "q": "Is Zipp production-ready?",
-                  "a": "It is a 0.0.x project, first committed on 29 May 2026; v0.0.35 shipped on 11 November 2026. The JavaScript engine is conformance-complete and benchmarked, the browser sandbox has been through two external correctness audits, and the Python frontend is explicitly experimental. Read the [release notes](/releases/) and decide per use case."
+                  "a": "It is a 0.0.x project, first committed on 29 May 2026; v0.0.37 shipped on 20 November 2026. The JavaScript engine is conformance-complete and benchmarked, the browser sandbox has been through two external correctness audits, and the Python, PHP and Rust frontends are actively tested against CPython, PHP 8.4 and Rust parity suites. Read the [release notes](/releases/) and decide per use case."
                 },
                 {
                   "q": "Does Zipp have a JIT?",
@@ -664,8 +672,8 @@
     },
     {
       "slug": "python",
-      "title": "Zipp Python: Python 3 on a Rust Register VM",
-      "description": "Zipp compiles Python 3 to the same register bytecode as its JavaScript engine, with a Python JIT tier, a broad Torch layer and GPU compute.",
+      "title": "Zipp Python: Python 3.13 on a Rust Register VM",
+      "description": "ZIPP compiles Python 3.13 directly to its shared register bytecode with async/await, except*, PEP 695 generics, JIT fast paths and WebAssembly torch.",
       "h1": "Python on the Zipp VM",
       "breadcrumb": "Python",
       "lede": "Zipp's Python frontend is its own implementation of Python 3, validated on 13 September 2026. Python source is parsed by Zipp's own parser and lowered by Zipp's compiler straight to register bytecode, so Python and JavaScript run on one virtual machine, natively or in the browser.",
@@ -677,7 +685,7 @@
         "Rust Python runtime"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-11-11",
+      "dateModified": "2026-11-21",
       "sections": [
         {
           "heading": "How Python reaches the VM",
@@ -710,10 +718,10 @@
               "items": [
                 "Arbitrary-precision `int`, `float`, `bool`, `complex` with the whole of `cmath`, the full operator set, and the full `str` method set with `%`, `format` and f-strings.",
                 "`list`, `tuple`, `dict`, `set`, `frozenset`, `range`, slices and comprehensions.",
-                "Every function signature form, closures with `nonlocal` and `global`, decorators, and generators with `send`, `throw`, `close` and `yield from`.",
-                "Classes with C3 multiple inheritance, `super()`, properties, descriptors, `__slots__`, metaclasses, `__init_subclass__` and `__set_name__`.",
-                "The builtin exception hierarchy with `raise ... from`, chained `__cause__` and `__context__`, and CPython's traceback layout, traceback objects and the `traceback` module, with CPython's \"Did you mean\" suggestions.",
-                "Modules and packages by folder with CPython-like import cycles, full `match` pattern support, and `dataclasses`, `enum`, `typing`, `itertools`, `functools`, `collections`, `json`, `re`, `struct`, `hashlib`, `pathlib`, `argparse` and more from the standard library."
+                "Every function signature form, closures with `nonlocal` and `global`, decorators, generators with `send`, `throw`, `close` and `yield from`, and Python 3.13 `async`/`await` coroutines with `asyncio`.",
+                "Classes with C3 multiple inheritance, `super()`, properties, descriptors, `__slots__`, metaclasses, `__init_subclass__`, `__set_name__` and PEP 695 type parameters (`def f[T](x: T)`, `class Box[T]`, `type Alias[T] = ...`).",
+                "The builtin exception hierarchy with `raise ... from`, chained `__cause__` and `__context__`, `ExceptionGroup` / `except*`, and CPython's traceback layout, traceback objects and the `traceback` module, with CPython's \"Did you mean\" suggestions.",
+                "Modules and packages by folder with CPython-like import cycles, full `match` pattern support, and `asyncio`, `fractions`, `numbers`, `dataclasses`, `enum`, `typing`, `itertools`, `functools`, `collections`, `json`, `re`, `struct`, `hashlib`, `pathlib`, `argparse` and more from the standard library."
               ]
             },
             {
@@ -724,7 +732,7 @@
               "type": "callout",
               "tone": "warning",
               "title": "Not yet supported",
-              "text": "`async` / `await`, type-parameter syntax and `except*`. Sockets, processes, threads, and any file outside the project folder. `input()` raises `EOFError`. `__getattribute__` overrides, weak references and `__del__` are absent, and set iteration order can differ from CPython for strings."
+              "text": "Sockets, processes, threads, and any file outside the project folder. `input()` raises `EOFError`. `__getattribute__` overrides, weak references and `__del__` are absent, and set iteration order can differ from CPython for strings."
             }
           ]
         },
@@ -737,7 +745,7 @@
             },
             {
               "type": "p",
-              "text": "What moved it: direct calls with fixed-arity entries and per-class inline caches; fused Python-only VM instructions for globals, attributes, subscripts, exceptions and generators; native `json`, string and sort helpers; a JIT tier for hot loops; integers within ±2^46 stored in the value word instead of as heap BigInts; dicts and sets in a native compact hash table modelled on CPython 3.13's; `PyCall`, a direct call instruction with per-site caches; and hidden-class layouts for instances, whose attribute reads and writes compiled loops inline. Every fused instruction and compiled loop falls back to the interpreter's own step, so the results are always the interpreter's."
+              "text": "What moved it: direct calls with fixed-arity entries and per-class inline caches; fused Python-only VM instructions for globals, attributes, subscripts, exceptions and generators; native `json`, string and sort helpers; a JIT tier for hot loops; integers within ±2^46 stored in the value word instead of as heap BigInts; dicts and sets in a native compact hash table modelled on CPython 3.13's; `PyCall`, a direct call instruction with per-site caches; hidden-class layouts for instances whose attribute reads and writes compiled loops inline; and in v0.0.37, frame-less acyclic leaf calls (`py_leaf`), a self-recursive x86-64 micro-JIT (`py_rec`), inline list/tuple/math JIT paths and fast generator stepping. Every fused instruction and compiled loop falls back to the interpreter's own step, so the results are always the interpreter's."
             },
             {
               "type": "p",
@@ -750,13 +758,13 @@
           "blocks": [
             {
               "type": "p",
-              "text": "Two WebAssembly engines include the Python frontend. `zipp-<v>-javascript-python-base.wasm` leaves torch out (1,645,970 bytes after Brotli in v0.0.35, bindings included) and adds it at run time from the 403,192-byte torch package, `zipp-<v>-torch-package.wasm`, through `addPythonPackage`, which checks the package's format, engine ABI hash and the SHA-256 of every file first; the embed kit's `zipp.mjs` loads the pair in one step with `loadZipp({ engine, packages })`. `zipp-<v>-javascript-python.wasm` has torch built in (2,022,547 bytes after Brotli). A browser host calls `engine.initSource(source, \"python\")` for one file or `engine.initPythonProject(files, entry, argv)` for a folder, then drains output and host requests. `prewarmPython()` compiles the Python runtime ahead of use; the playground calls it when idle, so the first Python run takes about 20 ms instead of 220."
+              "text": "Two WebAssembly engines include the Python frontend. `zipp-<v>-javascript-python-base.wasm` leaves torch out (1,702,286 bytes after Brotli in v0.0.37, bindings included) and adds it at run time from the 403,538-byte torch package, `zipp-<v>-torch-package.wasm`, through `addPythonPackage`, which checks the package's format, engine ABI hash and the SHA-256 of every file first; the embed kit's `zipp.mjs` loads the pair in one step with `loadZipp({ engine, packages })`. `zipp-<v>-javascript-python.wasm` has torch built in (2,078,280 bytes after Brotli). A browser host calls `engine.initSource(source, \"python\")` for one file or `engine.initPythonProject(files, entry, argv)` for a folder, then drains output and host requests. `prewarmPython()` compiles the Python runtime ahead of use; the playground calls it when idle, so the first Python run takes about 20 ms instead of 220."
             },
             {
               "type": "code",
               "caption": "In a Web Worker",
               "lang": "javascript",
-              "code": "import { loadZipp } from './zipp.mjs'\nconst zipp = await loadZipp('./zipp-0.0.35-javascript-python.wasm')\nconst engine = new zipp.Engine()\nengine.initSource('print(sum(range(10)))', 'python')\nconsole.log(engine.takeOutput())   // 45\nengine.dispose()"
+              "code": "import { loadZipp } from './zipp.mjs'\nconst zipp = await loadZipp('./zipp-0.0.37-javascript-python.wasm')\nconst engine = new zipp.Engine()\nengine.initSource('print(sum(range(10)))', 'python')\nconsole.log(engine.takeOutput())   // 45\nengine.dispose()"
             },
             {
               "type": "p",
@@ -842,9 +850,248 @@
       ]
     },
     {
+      "slug": "php",
+      "title": "Zipp PHP: PHP 8.x on a Rust Register VM and WebAssembly",
+      "description": "ZIPP compiles PHP 8.x directly to register bytecode with Laravel, Slim and CakePHP parity, selective x86-64 JIT, HTTP Worker Mode and browser WebAssembly.",
+      "h1": "PHP 8.x on the Zipp register VM",
+      "breadcrumb": "PHP",
+      "lede": "Zipp compiles PHP 8.x templates, scripts and Composer frameworks straight to its shared register bytecode and runs them on the same VM as JavaScript, TypeScript, Python and Rust — with no external PHP binary, no PHP-to-JS transpilation, an HTTP/1.1 Worker Mode server, and a browser WebAssembly build.",
+      "keywords": [
+        "PHP in WebAssembly",
+        "PHP runtime in Rust",
+        "Laravel Slim CakePHP Rust VM",
+        "PHP Worker Mode HTTP server",
+        "Zipp PHP frontend"
+      ],
+      "datePublished": "2026-11-21",
+      "dateModified": "2026-11-21",
+      "priority": "0.8",
+      "sections": [
+        {
+          "heading": "How PHP reaches the VM",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Zipp's pure-Rust parser (`zipp-phpparse`, `#![forbid(unsafe_code)]`, zero dependencies) lexes and parses dual-mode HTML and PHP 8.x syntax into an AST. The frontend resolves namespaces and `use` imports, analyzes scopes, and lowers directly into Zipp's register bytecode, sharing the same frame stack, garbage collector and native JIT as JavaScript."
+            },
+            {
+              "type": "p",
+              "text": "PHP semantics live in a memoized and disk-cached runtime seed (`__zipp_php`): exact 64-bit integers (unboxed in `Value` for ±2^46, auto-promoting to `float` on overflow), binary-safe byte strings (`strlen(\"café\") === 5`, `mb_strlen(\"café\") === 4`), ordered-map arrays with O(1) sticky-`shared` copy-on-write and zero-copy `foreach`, `&$x` references, plain-object OOP instances, and lazily materialized Reflection, SPL, DateTime and Intl builtins."
+            },
+            {
+              "type": "code",
+              "caption": "Run PHP scripts and HTTP servers natively",
+              "lang": "shell",
+              "code": "zipp php app.php [args...]\nzipp app.php [args...]\n\n# Shared-nothing HTTP/1.1 SAPI server with in-process OPcache\nzipp php -S 127.0.0.1:8000 -t examples/php/backend examples/php/backend/index.php\n\n# Long-lived Worker Mode (boot once, serve requests on a warm VM)\nzipp php --worker -S 127.0.0.1:8000 -t examples/php/backend examples/php/backend/worker.php"
+            }
+          ]
+        },
+        {
+          "heading": "Language and framework coverage",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "The PHP frontend is tested byte-for-byte against native PHP 8.4.15 with Composer 2 (`vendor/autoload.php`) across real **Laravel 11** (2,512 vendor files), **Slim 4** (178 vendor files) and **CakePHP 5** (1,048 vendor files), in both CLI invocations and live HTTP/1.1 Worker Mode."
+            },
+            {
+              "type": "ul",
+              "items": [
+                "Dual-mode HTML templates: inline HTML outside `<?php ... ?>`, `<?= ... ?>`, alternative control syntax (`if (...): ... endif;`), heredoc/nowdoc, string interpolation and nested output buffering (`ob_start`..`ob_get_clean`).",
+                "Modern PHP 8.1–8.4 features: namespaces and group `use`, closures (`use ($a, &$b)`, `Closure::bind`), arrow functions, named and variadic arguments, first-class callables, `match`, destructuring, `goto` with `try`/`finally` unwind, generators (`yield`, `yield from`), classes/interfaces/traits, constructor property promotion, `readonly` and anonymous classes, typed class constants, PHP 8.4 parenthesis-less `new Foo()->bar()`, asymmetric visibility, property hooks, Unit and Backed `enum`s, late static binding, magic methods, attributes (`#[...]`) and full Reflection.",
+                "Backend standard library: `$_SERVER`, `$_GET`, `$_POST`, `$_COOKIE`, `$_FILES`, `$_REQUEST`, `$_ENV`, `$_SESSION`, `php://input`, `php://temp`, `header()`, `http_response_code()`, `setcookie()`, `session_*()`, JSON, PCRE (possessive quantifiers, recursion, `(*SKIP)(*F)`, branch reset groups and Unicode classes), `mb_*`, `ctype_*`, SPL iterators and containers, lightweight `intl`, crypto (`hash`, `hash_hmac`, OS-seeded `random_bytes`/`random_int`, `password_hash`/`password_verify`), `DateTime`/`DateTimeImmutable`, `PDO`/`mysqli` SQL bridges, streams and `spl_autoload_register`."
+              ]
+            }
+          ]
+        },
+        {
+          "heading": "Performance and Worker Mode",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Zipp lowers PHP hot paths onto its existing register VM and selective native x86-64 JIT without adding PHP-specific opcodes. Guarded JS-`Number` companion functions and pure-int OOP methods compile natively through Tier-A and Tier-C while generic 64-bit `BigInt` bodies stay on the zero-overhead interpreter, falling back with 100% parity on overflow. A persistent single-file disk OPcache pack (`ZPO2`) validates included `.php` files by `(mtime_nanos, file_len)` metadata checks with lazy blob decode."
+            },
+            {
+              "type": "table",
+              "caption": "Windows x86-64 release build vs local native PHP 8.4.15 (100% byte-for-byte parity; see docs/PHP.md)",
+              "head": [
+                "Workload",
+                "ZIPP",
+                "PHP 8.4.15",
+                "Comparison"
+              ],
+              "rows": [
+                [
+                  "`bench.php` total (compute, array & OOP)",
+                  "3.0 ms",
+                  "53.4 ms",
+                  "17.8× faster"
+                ],
+                [
+                  "Cold CLI `empty.php` (median of 7)",
+                  "13.5 ms",
+                  "45.5 ms",
+                  "3.37× faster"
+                ],
+                [
+                  "Cold CLI Slim 4.15 multi-route",
+                  "39.7 ms",
+                  "59.9 ms",
+                  "1.51× faster"
+                ],
+                [
+                  "Cold CLI CakePHP 5.4 multi-route",
+                  "67.0 ms",
+                  "96.2 ms",
+                  "1.44× faster"
+                ],
+                [
+                  "Cold CLI Laravel 11.51 multi-route",
+                  "67.6 ms",
+                  "79.7 ms",
+                  "1.18× faster"
+                ],
+                [
+                  "HTTP Worker Mode Slim 4.15 (8× concurrency)",
+                  "1,712 req/s",
+                  "355 req/s (`php -S`)",
+                  "2.67 ms/req seq"
+                ],
+                [
+                  "HTTP Worker Mode CakePHP 5.4 (8× concurrency)",
+                  "2,233 req/s",
+                  "356 req/s (`php -S`)",
+                  "3.32 ms/req seq"
+                ],
+                [
+                  "HTTP Worker Mode Laravel 11.51 (8× concurrency)",
+                  "1,409 req/s",
+                  "298 req/s (`php -S`)",
+                  "5.65 ms/req seq"
+                ]
+              ]
+            }
+          ]
+        },
+        {
+          "heading": "PHP in WebAssembly",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Published from v0.0.37 as `zipp-0.0.37-javascript-php.wasm` (6,038,525 bytes raw, 1,480,745 bytes after Brotli-11), the browser build compiles out native filesystem and process-environment access under `safe-sandbox` and replaces them with a caller-supplied virtual filesystem."
+            },
+            {
+              "type": "p",
+              "text": "Browser and Worker hosts drive PHP web applications through `PhpApp` (supporting both per-request SAPI dispatch and persistent Worker Mode) and attach external SQL databases such as XDB SQLite via composable `addAppBridge(\"sql\", bridge)`: `PDO` and `mysqli` route queries through host-owned `app.sql.*` capabilities while sharing the guest VM's instruction budget."
+            }
+          ]
+        }
+      ],
+      "related": [
+        {
+          "label": "Rust frontend",
+          "href": "/rust/"
+        },
+        {
+          "label": "WebAssembly runtime and module sizes",
+          "href": "/wasm/"
+        },
+        {
+          "label": "Embedding guide",
+          "href": "/embedding/"
+        },
+        {
+          "label": "docs/PHP.md in the repository",
+          "href": "https://github.com/f2i-com/zipp.org/blob/main/docs/PHP.md"
+        }
+      ]
+    },
+    {
+      "slug": "rust",
+      "title": "Zipp Rust: Rust Scripts, Cargo Backends and WASM on One VM",
+      "description": "ZIPP compiles Rust scripts, Cargo projects and Axum/SQLx backends directly to register bytecode with instant startup, #[test] support and browser WebAssembly.",
+      "h1": "Rust on the Zipp register VM",
+      "breadcrumb": "Rust",
+      "lede": "Zipp compiles Rust scripts, libraries and multi-file Cargo backend applications directly into its shared register bytecode and executes them on the same VM and native x86-64/ARM64 JIT as JavaScript, TypeScript, Python and PHP — with zero external `rustc` or `cargo` invocation and instant startup.",
+      "keywords": [
+        "Rust interpreter VM",
+        "run Rust scripts without rustc",
+        "Rust Axum SQLx WebAssembly",
+        "Zipp Rust frontend",
+        "polyglot Rust VM"
+      ],
+      "datePublished": "2026-11-21",
+      "dateModified": "2026-11-21",
+      "priority": "0.8",
+      "sections": [
+        {
+          "heading": "How Rust reaches the VM",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Zipp's pure-Rust parser (`zipp-rsparse`, `#![forbid(unsafe_code)]`, zero dependencies) parses Rust 2021/2024 source into an AST. The frontend discovers `Cargo.toml` and `src/lib.rs`, loads multi-file `mod foo;` and `#[path = \"...\"]` trees, resolves `use` and cross-module `pub use` re-exports, expands `macro_rules!` and built-in macros, filters `#[cfg(test)]`, and emits register bytecode directly."
+            },
+            {
+              "type": "code",
+              "caption": "Run Rust scripts, Cargo projects, tests and HTTP servers",
+              "lang": "shell",
+              "code": "zipp rs examples/rust/hello.rs [args...]\nzipp rs examples/rust/issue_tracker\n\n# Run sync and async #[test] functions\nzipp rs --test examples/rust/issue_tracker\n\n# Multi-threaded HTTP/1.1 worker server (with optional live reload)\nzipp rs --serve 127.0.0.1:8080 examples/rust/issue_tracker\nzipp rs --watch --serve 127.0.0.1:8080 examples/rust/issue_tracker"
+            }
+          ]
+        },
+        {
+          "heading": "Language and backend coverage",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "The frontend ships with a full multi-file Cargo web application ([`examples/rust/issue_tracker`](https://github.com/f2i-com/zipp.org/tree/main/examples/rust/issue_tracker)) exercising `Cargo.toml` metadata, `src/lib.rs` re-exports, `async fn` HTTP handlers, JWT authentication, salted password hashing, JSON persistence and sync/async `#[cfg(test)]` suites."
+            },
+            {
+              "type": "ul",
+              "items": [
+                "Core Rust language: `fn`, `async fn` / `async { ... }` / `.await` on Zipp's native Promise/microtask engine, structs, enums, `impl` and `trait` (default methods, `Self`, `&mut self` with `*self = ...`, custom `Iterator`, `From`/`TryFrom`), `#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]`, `#[serde(...)]` attributes, closures (`move`, mutable captures, `Box<dyn Fn>`), full pattern matching (guards, `@`, slices, `if let` chains, `let ... else`), `?` with automatic `From` conversion and declarative `macro_rules!`.",
+                "Macros: `println!`, `format!` (full `std::fmt` specifiers and inline `{var}`), `vec!`, `assert*!`, `panic!`, `matches!`, `json!`, `include_str!`, `include_bytes!`, `env!`, `tokio::join!`, `tokio::try_join!`, `tokio::select!`, `anyhow!`/`bail!`/`ensure!` and tracing log macros.",
+                "Backend ecosystem: `std::fs`, `std::io`, `std::path`, `std::env`, `std::process`, `std::time`, `std::net`, `std::sync` (`Arc`, `Mutex`, `RwLock`, `OnceLock`, `Atomic*`), `serde_json`, `regex`, `argon2`, `jsonwebtoken`, `uuid`, `time`/`Utc::now()`, `zipp::kv::Store`, `http::Router` and **Axum 0.7** routing, extractors, middleware and WebSockets plus **SQLx** bridged over `app.sql.*`."
+              ]
+            }
+          ]
+        },
+        {
+          "heading": "Native JIT and sandboxed WebAssembly",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "User Rust functions (`__rs_fn_*`) and integer `for i in a..b` / `a..=b` loops lower to unboxed Zipp register bytecode (`LoadInt`, `Add`, `Sub`, `Mul`, `Lt`, `Le`, `AddInt`, `Call`, `Return`) and compile natively on Zipp's x86-64 Tier-A and Tier-C JITs while the Rust runtime seed stays interpreted."
+            },
+            {
+              "type": "p",
+              "text": "In the browser, `zipp-0.0.37-javascript-rust.wasm` (5,954,532 bytes raw, 1,466,783 bytes after Brotli-11) compiles out host filesystem, process and TCP networking under `safe-sandbox`, substituting an in-memory binary-safe VFS overlay (`RustProgramConfig::vfs`) and Axum/SQLx worker-boot dispatch over host-owned `addAppBridge` capabilities."
+            }
+          ]
+        }
+      ],
+      "related": [
+        {
+          "label": "PHP 8.x frontend",
+          "href": "/php/"
+        },
+        {
+          "label": "WebAssembly runtime and module sizes",
+          "href": "/wasm/"
+        },
+        {
+          "label": "Embedding guide",
+          "href": "/embedding/"
+        },
+        {
+          "label": "docs/RUST.md in the repository",
+          "href": "https://github.com/f2i-com/zipp.org/blob/main/docs/RUST.md"
+        }
+      ]
+    },
+    {
       "slug": "wasm",
-      "title": "Zipp WebAssembly: JavaScript and Python Engine in the Browser",
-      "description": "Zipp compiles to WebAssembly as a persistent, interpreter-only sandbox for JavaScript and Python: module sizes, the Engine API, the Worker deadline model and limits.",
+      "title": "Zipp WebAssembly: Polyglot Sandbox Engine in the Browser",
+      "description": "Zipp compiles to WebAssembly as a persistent, interpreter-only sandbox for JS, TS, Python, PHP and Rust: sizes, Engine API, addAppBridge plugins and limits.",
       "h1": "The Zipp WebAssembly runtime",
       "breadcrumb": "WebAssembly",
       "lede": "`zipp-wasm` is the engine built for `wasm32-unknown-unknown`: a persistent VM a browser host keeps alive across re-entries, with no JIT, no `unsafe` code, default-deny host capabilities and hard resource limits. It powers the playground on this site and the Softn sandbox.",
@@ -856,7 +1103,7 @@
         "wasm-bindgen Rust engine"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-11-11",
+      "dateModified": "2026-11-21",
       "sections": [
         {
           "heading": "Why a JavaScript engine inside JavaScript",
@@ -876,7 +1123,7 @@
             },
             {
               "type": "table",
-              "caption": "Engine sizes in the v0.0.35 release assets, bindings included (Brotli-11 computed from each file)",
+              "caption": "Engine sizes in the v0.0.37 release assets, bindings included (Brotli-11 computed from each file)",
               "head": [
                 "Variant",
                 "Languages",
@@ -887,38 +1134,50 @@
                 [
                   "`javascript` (default)",
                   "JavaScript",
-                  "4,855,175",
-                  "1,254,950"
+                  "4,913,223",
+                  "1,268,242"
                 ],
                 [
                   "`javascript-lite`",
                   "JavaScript core without `Intl` and `Temporal`, built for size",
-                  "2,832,722",
-                  "778,494"
+                  "2,878,928",
+                  "788,538"
                 ],
                 [
                   "`javascript-typescript`",
                   "JavaScript + TypeScript and TSX",
-                  "5,192,500",
-                  "1,325,298"
+                  "5,250,935",
+                  "1,338,703"
+                ],
+                [
+                  "`javascript-php`",
+                  "JavaScript + PHP 8.x (`PhpApp` SAPI & SQL bridge)",
+                  "6,038,525",
+                  "1,480,745"
+                ],
+                [
+                  "`javascript-rust`",
+                  "JavaScript + Rust (Axum/SQLx worker-boot)",
+                  "5,954,532",
+                  "1,466,783"
                 ],
                 [
                   "`javascript-python-base`",
-                  "JavaScript + Python, torch as a package",
-                  "6,580,459",
-                  "1,645,970"
+                  "JavaScript + Python 3.13, torch as a package",
+                  "6,905,076",
+                  "1,702,286"
                 ],
                 [
                   "`torch-package`",
                   "The torch package for `javascript-python-base`",
                   "2,163,109",
-                  "403,192"
+                  "403,538"
                 ],
                 [
                   "`javascript-python`",
-                  "JavaScript + Python with torch built in",
-                  "8,617,556",
-                  "2,022,547"
+                  "JavaScript + Python 3.13 with torch built in",
+                  "8,942,154",
+                  "2,078,280"
                 ],
                 [
                   "QuickJS-NG v0.16.2 reactor, for scale",
@@ -930,7 +1189,7 @@
             },
             {
               "type": "p",
-              "text": "Each file is `zipp-<v>-<variant>.wasm` and carries the JavaScript bindings generated for its build, the glue that releases up to v0.0.25 shipped as a separate file: they add 54,670 bytes raw and 13,434 after Brotli to the JavaScript engine, and 12,522 to 14,411 bytes after Brotli to each of the other three (and 13,199 to `javascript-typescript`, new in v0.0.31). Without them, measured the way earlier releases' modules were, the JavaScript engine is 4,800,505 bytes raw and 1,241,516 after Brotli, ZIPP Lite 2,778,058 and 765,972, Python without torch 6,518,317 and 1,631,559, and the complete engine 8,555,419 and 2,008,217: within 0.1% of v0.0.33's on the wire, and the torch package 186 bytes less. Zipp's JavaScript engine is about 3.18× QuickJS-NG's raw and 3.01× on the wire as published (3.14× and 2.98× without its bindings), and ZIPP Lite 1.85× and 1.87× (1.82× and 1.84×). A page that never imports torch can serve `javascript-python-base` and skip the package; one that does fetches it on demand, and the pair costs slightly more than `javascript-python` because the package carries its own copy of the kernels' support code. A Python-only variant was tried and came out 85 bytes larger than the combined module, so it does not exist. The engine is compiled with `safe-sandbox`, `meter-only`, `wasm-no-fs-loader` and `wasm-single-agent`, and `overflow-checks` stay on in release."
+              "text": "Each file is `zipp-<v>-<variant>.wasm` and carries the JavaScript bindings generated for its build, the glue that releases up to v0.0.25 shipped as a separate file: in v0.0.37 they add 56,996 bytes raw and 13,438 after Brotli to the JavaScript engine (4,856,227 raw and 1,254,804 after Brotli without bindings). Zipp's JavaScript engine is about 3.21× QuickJS-NG's raw and 3.04× on the wire as published, and ZIPP Lite 1.88× and 1.89×. v0.0.37 adds dedicated `javascript-php` (1.48 MB on the wire) and `javascript-rust` (1.47 MB) modules alongside the existing JavaScript, Lite, TypeScript and Python variants. A page that never imports torch can serve `javascript-python-base` and skip the package; one that does fetches it on demand, and the pair costs slightly more than `javascript-python` because the package carries its own copy of the kernels' support code. A Python-only variant was tried and came out 85 bytes larger than the combined module, so it does not exist. Every module retains the audited 51-function host import surface (plus `zippTorchKernel` on Python builds) and is compiled with `safe-sandbox`, `meter-only`, `wasm-no-fs-loader` and `wasm-single-agent`, with `overflow-checks` left on in release."
             }
           ]
         },
@@ -941,15 +1200,15 @@
               "type": "code",
               "caption": "engine.worker.js",
               "lang": "javascript",
-              "code": "import { loadZipp } from './zipp.mjs'\nconst zipp = await loadZipp('./zipp-0.0.35-javascript.wasm')\nconsole.log(zipp.languages)  // [\"javascript\"] or [\"javascript\",\"python\"]\n\nconst engine = new zipp.Engine()\nengine.setInstructionBudget(200_000_000)\nengine.initScript('const xs = [3,1,2]; console.log(xs.sort())')\nconsole.log(engine.takeConsole())\nconsole.log(engine.evalInContext('xs.length'))  // \"3\"\nengine.dispose()"
+              "code": "import { loadZipp } from './zipp.mjs'\nconst zipp = await loadZipp('./zipp-0.0.37-javascript.wasm')\nconsole.log(zipp.languages)  // [\"javascript\"], [\"javascript\",\"php\"], [\"javascript\",\"rust\"], ...\n\nconst engine = new zipp.Engine()\nengine.setInstructionBudget(200_000_000)\nengine.initScript('const xs = [3,1,2]; console.log(xs.sort())')\nconsole.log(engine.takeConsole())\nconsole.log(engine.evalInContext('xs.length'))  // \"3\"\nengine.dispose()"
             },
             {
               "type": "p",
-              "text": "Beyond `initScript`, `initSource(source, language)` and `initPythonProject(files, entry, argv)`, the class exposes `callFunction`, `evalInContext` and `evalInContextRich`, batched global get and set by stable slot index, a content fingerprint of the globals so a host cannot miss a mutation made through a reference, `dispatchEvent` for a deliberately limited event facade with no DOM, and `resourceUsage` for what the guest has consumed. Python builds add `prewarmPython()`, which compiles the Python runtime before the first run, and `addPythonPackage(archive, kernels)`, through which `loadZipp({ engine, packages })` registers the torch package once per module instance."
+              "text": "Beyond `initScript`, `initSource(source, language)` and `initPythonProject(files, entry, argv)`, the class exposes `callFunction`, `evalInContext` and `evalInContextRich`, batched global get and set by stable slot index, a content fingerprint of the globals so a host cannot miss a mutation made through a reference, `dispatchEvent` for a deliberately limited event facade with no DOM, and `resourceUsage` for what the guest has consumed. Python builds add `prewarmPython()`, which compiles the Python runtime before the first run, and `addPythonPackage(archive, kernels)`, through which `loadZipp({ engine, packages })` registers the torch package once per module instance. PHP builds export `PhpApp` for SAPI and Worker Mode dispatch, and Rust builds support binary-safe VFS overlays and Axum/SQLx worker-boot."
             },
             {
               "type": "p",
-              "text": "Host communication has exactly two channels. Synchronous `__zippHostCall(kind, ...args)` takes strings and returns one string, and every capability name (`db.query`, `ls.getItem`, `nav.clipboardWrite` and so on) is denied per engine until the host grants it. Asynchronous requests queue up for the host to drain with `drainPendingHostCalls()` and answer with `resolveHostCallback(id, result)`. Installing a bridge object never grants authority by itself."
+              "text": "Host communication has exactly two channels. Synchronous `__zippHostCall(kind, ...args)` takes strings and returns one string, and every capability name (`db.query`, `ls.getItem`, `app.sql.query`, `nav.clipboardWrite` and so on) is denied per engine until the host grants it. Asynchronous requests queue up for the host to drain with `drainPendingHostCalls()` and answer with `resolveHostCallback(id, result)`. From v0.0.37, `addAppBridge(namespace, bridge)` composes multiple sandboxed plugin bridges (such as XDB SQLite on `app.sql.*`) without overwriting each other, while `hostStepsRemaining()` and `hostChargeSteps(n)` let plugins charge work against the guest VM's instruction budget without expanding the WASM import surface. Installing a bridge object never grants authority by itself."
             }
           ]
         },
@@ -1057,7 +1316,7 @@
             },
             {
               "type": "table",
-              "caption": "WebAssembly assets of a release (`<v>` is the version, 0.0.35 for the current one)",
+              "caption": "WebAssembly assets of a release (`<v>` is the version, 0.0.37 for the current one)",
               "head": [
                 "Asset",
                 "Contents"
@@ -1076,12 +1335,20 @@
                   "JavaScript and TypeScript (with TSX), the types dropped as the parser reads them (from v0.0.31)"
                 ],
                 [
+                  "`zipp-<v>-javascript-php.wasm`",
+                  "JavaScript and PHP 8.x, with `PhpApp` SAPI/Worker Mode and `PDO`/`mysqli` SQL bridge (from v0.0.37)"
+                ],
+                [
+                  "`zipp-<v>-javascript-rust.wasm`",
+                  "JavaScript and Rust, with binary VFS overlay and Axum/SQLx worker-boot (from v0.0.37)"
+                ],
+                [
                   "`zipp-<v>-javascript-python.wasm`",
-                  "JavaScript and Python, torch built in"
+                  "JavaScript and Python 3.13, torch built in"
                 ],
                 [
                   "`zipp-<v>-javascript-python-base.wasm`",
-                  "JavaScript and Python without torch"
+                  "JavaScript and Python 3.13 without torch"
                 ],
                 [
                   "`zipp-<v>-torch-package.wasm`",
@@ -1099,7 +1366,7 @@
             },
             {
               "type": "p",
-              "text": "Serve each engine Brotli-compressed, since the sizes above are what it costs on the wire, and check it against the release's `SHA256SUMS`. The release has each one ready as a `.wasm.br` (1,253,800 bytes for the JavaScript engine): send it with `Content-Encoding: br` and `Content-Type: application/wasm` and the browser decodes it. `zipp.mjs` 1.2.0, in the embed kit from v0.0.27 (and in v0.0.26's as republished), also loads a `.wasm.br` URL itself, decompressing it where the runtime can (Node, Firefox) or falling back to the plain `.wasm` beside it; the plain `.wasm` stays the default. Pin the torch package by hash exactly as you pin the engine: a package built from another engine source is refused by its ABI check, so take it from the same release as the engine. Up to v0.0.25, releases shipped zip archives instead, `zipp-wasm-<version>-web.zip` and its `-web-lite`, `-web-python-base`, `-web-python` and `-web-torch` siblings, each holding the wasm-bindgen glue and the module as two files to be served with matching cache keys, TypeScript declarations, `BUILD-INFO.txt`, `PROFILE.json` and its own `SHA256SUMS`."
+              "text": "Serve each engine Brotli-compressed, since the sizes above are what it costs on the wire, and check it against the release's `SHA256SUMS`. The release has each one ready as a `.wasm.br` (1,268,242 bytes for the JavaScript engine): send it with `Content-Encoding: br` and `Content-Type: application/wasm` and the browser decodes it. `zipp.mjs` 1.2.0+, in the embed kit from v0.0.27 (and 1.5.0 in v0.0.37), also loads a `.wasm.br` URL itself, decompressing it where the runtime can (Node, Firefox) or falling back to the plain `.wasm` beside it; the plain `.wasm` stays the default. Pin the torch package by hash exactly as you pin the engine: a package built from another engine source is refused by its ABI check, so take it from the same release as the engine. Up to v0.0.25, releases shipped zip archives instead, `zipp-wasm-<version>-web.zip` and its `-web-lite`, `-web-python-base`, `-web-python` and `-web-torch` siblings, each holding the wasm-bindgen glue and the module as two files to be served with matching cache keys, TypeScript declarations, `BUILD-INFO.txt`, `PROFILE.json` and its own `SHA256SUMS`."
             }
           ]
         },
@@ -1111,11 +1378,11 @@
               "type": "code",
               "caption": "Running a program in a sandbox with `zipp.mjs`",
               "lang": "javascript",
-              "code": "import { loadZipp } from \"./zipp.mjs\"\n\nconst zipp = await loadZipp(\"./zipp-0.0.35-javascript.wasm\")\nconst sandbox = await zipp.createSandbox({\n  limits: { instructions: 50_000_000, timeoutMs: 5000 },\n  permissions: {\n    storage: { initial: { theme: \"dark\" } },        // a private, in-memory localStorage\n    files: { \"notes.txt\": \"hello\" },                 // read with host.callSync(\"fs.read\", ...)\n    network: [\"https://api.example.com/\"],          // the only URLs its fetch() may reach\n  },\n  host: { \"clock.now\": () => Date.now() },          // answers host.call(\"clock.now\", ...)\n})\nconst { output } = await sandbox.run(source)       // throws a ZippSandboxError on failure\nawait sandbox.close()"
+              "code": "import { loadZipp } from \"./zipp.mjs\"\n\nconst zipp = await loadZipp(\"./zipp-0.0.37-javascript.wasm\")\nconst sandbox = await zipp.createSandbox({\n  limits: { instructions: 50_000_000, timeoutMs: 5000 },\n  permissions: {\n    storage: { initial: { theme: \"dark\" } },        // a private, in-memory localStorage\n    files: { \"notes.txt\": \"hello\" },                 // read with host.callSync(\"fs.read\", ...)\n    network: [\"https://api.example.com/\"],          // the only URLs its fetch() may reach\n  },\n  host: { \"clock.now\": () => Date.now() },          // answers host.call(\"clock.now\", ...)\n})\nconst { output } = await sandbox.run(source)       // throws a ZippSandboxError on failure\nawait sandbox.close()"
             },
             {
               "type": "p",
-              "text": "A sandbox is default-deny. It starts with no storage, no files, no network and no host functions: without a grant, `localStorage` and the file calls throw an `Error` whose message begins `SecurityError:`, `fetch` does not exist, and `host.call` answers `denied`. Each permission opens one door: `storage` a private in-memory `localStorage`; `files` a map of paths to text, read-only unless `writable`; `network` a `fetch` that reaches only the listed origins or URL prefixes, with no cookies or credentials and redirects refused unless allowed; `host` the named functions. `limits.instructions` is a step budget the engine enforces, and `limits.timeoutMs` bounds each `run` or `call`: by default every sandbox runs in its own Worker, which is terminated when that time runs out. A failure is a `ZippSandboxError` whose `category` is `guest`, `source`, `resource`, `timeout`, `host` or `usage`, with whatever the program printed before it. The [sandbox playground](/sandbox/playground/) runs the 0.0.35 JavaScript engine this way and lets you switch each permission and limit and see the result."
+              "text": "A sandbox is default-deny. It starts with no storage, no files, no network and no host functions: without a grant, `localStorage` and the file calls throw an `Error` whose message begins `SecurityError:`, `fetch` does not exist, and `host.call` answers `denied`. Each permission opens one door: `storage` a private in-memory `localStorage`; `files` a map of paths to text, read-only unless `writable`; `network` a `fetch` that reaches only the listed origins or URL prefixes, with no cookies or credentials and redirects refused unless allowed; `host` the named functions. `limits.instructions` is a step budget the engine enforces, and `limits.timeoutMs` bounds each `run` or `call`: by default every sandbox runs in its own Worker, which is terminated when that time runs out. A failure is a `ZippSandboxError` whose `category` is `guest`, `source`, `resource`, `timeout`, `host` or `usage`, with whatever the program printed before it. The [sandbox playground](/sandbox/playground/) runs the 0.0.37 JavaScript engine this way and lets you switch each permission and limit and see the result."
             },
             {
               "type": "p",
@@ -1136,6 +1403,14 @@
         {
           "label": "Python in the browser",
           "href": "/python/"
+        },
+        {
+          "label": "PHP 8.x frontend and PhpApp WASM",
+          "href": "/php/"
+        },
+        {
+          "label": "Rust frontend and WASM worker-boot",
+          "href": "/rust/"
         },
         {
           "label": "GPU compute from the browser",
@@ -1369,8 +1644,8 @@
     },
     {
       "slug": "test262",
-      "title": "Zipp Test262 Conformance: 96,228 JavaScript Tests",
-      "description": "How Zipp scores the pinned tc39/test262 corpus: 96,228 executions, zero skips, 96,227 passing unmodified and one documented expected failure, gated in CI.",
+      "title": "Zipp Test262 Conformance: 96,564 JavaScript Tests",
+      "description": "How Zipp scores the pinned tc39/test262 corpus: 96,564 executions, zero skips, 96,563 passing unmodified and one documented expected failure, gated in CI.",
       "h1": "JavaScript Test262 conformance",
       "breadcrumb": "Test262",
       "lede": "Test262 is the official ECMAScript conformance suite. Zipp runs the whole pinned corpus, unmodified, in both sloppy and strict mode, with a scorer that cannot raise the pass rate by skipping tests. This page explains exactly what the numbers mean, what the one expected failure is, and how the result is gated in CI.",
@@ -1382,14 +1657,14 @@
         "Rust JavaScript engine Test262"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-11-11",
+      "dateModified": "2026-11-21",
       "priority": "0.9",
       "extraStructuredData": [
         {
           "@context": "https://schema.org",
           "@type": "Dataset",
-          "name": "Zipp Test262 conformance results, tc39/test262 0b4e081",
-          "description": "Pass, fail and skip counts for the Zipp JavaScript engine against the unmodified tc39/test262 corpus at commit 0b4e0812022b18236b5276d2804948fdd9f71603, plus the ECMA-402 DateTimeFormat shard.",
+          "name": "Zipp Test262 conformance results, tc39/test262 2e58f87d83",
+          "description": "Pass, fail and skip counts for the Zipp JavaScript engine against the unmodified tc39/test262 corpus at commit 2e58f87d8350ad51224617a041c6e041d52f8444, plus the ECMA-402 DateTimeFormat shard.",
           "url": "https://www.zipp.org/test262/",
           "license": "https://www.apache.org/licenses/LICENSE-2.0",
           "creator": {
@@ -1397,7 +1672,7 @@
             "name": "f2i",
             "url": "https://f2i.com"
           },
-          "datePublished": "2026-10-17"
+          "datePublished": "2026-11-20"
         }
       ],
       "sections": [
@@ -1406,7 +1681,7 @@
           "blocks": [
             {
               "type": "table",
-              "caption": "Local run against the pinned corpus 0b4e081, unmodified",
+              "caption": "Local run against the pinned corpus 2e58f87d83, unmodified",
               "head": [
                 "Suite",
                 "Pass",
@@ -1417,17 +1692,17 @@
               "rows": [
                 [
                   "Core corpus, unmodified upstream",
-                  "**96,227**",
+                  "**96,563**",
                   "1",
                   "0",
-                  "96,228"
+                  "96,564"
                 ],
                 [
                   "`test/intl402/DateTimeFormat`, unmodified",
-                  "**490**",
+                  "**492**",
                   "0",
                   "0",
-                  "490"
+                  "492"
                 ]
               ]
             },
@@ -1437,7 +1712,7 @@
             },
             {
               "type": "p",
-              "text": "The corpus is tc39/test262 at commit `0b4e0812022b18236b5276d2804948fdd9f71603` (26 October 2026), walking `test/` including the `staging` directory and excluding the separate ECMA-402 suite under `test/intl402/`, which is opt-in. Nothing is excluded by feature flag: Temporal, decorators, iterator helpers, `ShadowRealm`, resizable buffers and every other feature in the pinned corpus are in scope."
+              "text": "The corpus is tc39/test262 at commit `2e58f87d8350ad51224617a041c6e041d52f8444` (11 November 2026), walking `test/` including the `staging` directory and excluding the separate ECMA-402 suite under `test/intl402/`, which is opt-in. Nothing is excluded by feature flag: Temporal, decorators, iterator helpers, `ShadowRealm`, resizable buffers and every other feature in the pinned corpus are in scope."
             }
           ]
         },
@@ -1446,7 +1721,7 @@
           "blocks": [
             {
               "type": "p",
-              "text": "96,228 is a count of executions, not files. Following the suite's own interpretation guide, a test that carries none of the `onlyStrict`, `noStrict`, `raw` or `module` flags runs twice, once as sloppy code and once with `\"use strict\";` prepended. `raw` and `module` tests run once; `onlyStrict` and `noStrict` run once each in their mode."
+              "text": "96,564 is a count of executions, not files. Following the suite's own interpretation guide, a test that carries none of the `onlyStrict`, `noStrict`, `raw` or `module` flags runs twice, once as sloppy code and once with `\"use strict\";` prepended. `raw` and `module` tests run once; `onlyStrict` and `noStrict` run once each in their mode."
             },
             {
               "type": "p",
@@ -1472,6 +1747,10 @@
             {
               "type": "p",
               "text": "The 26 October pin, `0b4e081`, is one commit later. Its tests expect a DataView's `byteLength` and `byteOffset` to read 0 once the view's buffer is detached or has shrunk beneath it, as a typed array's do (tc39/ecma262#3972, which has consensus). Zipp threw a `TypeError` there and failed 12 executions; `759c05fe` makes both read 0. Two detached-buffer tests were merged into one, so the corpus is two executions smaller."
+            },
+            {
+              "type": "p",
+              "text": "The 11 November pin, `2e58f87d83`, added 336 core executions and two DateTimeFormat executions. Before the move, 18 newly covered executions failed across three spec edges: allowing `eval` and `arguments` as `break`/`continue` labels in strict mode and class elements per `LabelIdentifier`, rejecting dangling `T`/`t` time designators in `Temporal.Duration` ISO strings (`P1DT`, `PT`), and marking generator-backed Iterator helpers completed on abrupt completion. All 18 are fixed with regression tests in `4fc42f3f`."
             }
           ]
         },
@@ -1504,7 +1783,7 @@
             },
             {
               "type": "p",
-              "text": "The release workflow calls this job at the exact tagged commit and will not publish without it. A green `main` at some other revision is not a release gate. The evidence artifact (`test262.json`, `failures.txt`, `datetimeformat.json` and `datetimeformat-failures.txt`) is retained for thirty days. The figures above are from a local run on this pin. For v0.0.35 the job passed on it at `cd86ccdb`, the engine source the release was then tagged on with only versions and notes changed (`384cb93a`), as it had for v0.0.33 and v0.0.34."
+              "text": "The release workflow calls this job at the exact tagged commit and will not publish without it. A green `main` at some other revision is not a release gate. The evidence artifact (`test262.json`, `failures.txt`, `datetimeformat.json` and `datetimeformat-failures.txt`) is retained for thirty days. The figures above are from the `2e58f87d83` pin; v0.0.37 (`a5c9ef93`) ran and passed both the 96,564-execution core corpus and the 492-execution DateTimeFormat shard in its release gate."
             }
           ]
         },
@@ -1587,6 +1866,11 @@
                   "date": "2026-10-27",
                   "title": "New pin: 96,227 of 96,228 unmodified, 490 DateTimeFormat",
                   "text": "Corpus 0b4e081, one commit later: a DataView's `byteLength` and `byteOffset` read 0 out of bounds (tc39/ecma262#3972); 12 failures before the move, fixed in `759c05fe`."
+                },
+                {
+                  "date": "2026-11-20",
+                  "title": "New pin: 96,563 of 96,564 unmodified, 492 DateTimeFormat",
+                  "text": "Corpus 2e58f87d83 (11 November): 18 newly covered failures across `LabelIdentifier` labels, dangling `Temporal.Duration` `T`/`t` designators and abrupt Iterator-helper completion, fixed in `4fc42f3f`."
                 }
               ]
             },
@@ -3160,7 +3444,7 @@
         "sandboxed scripting"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-11-11",
+      "dateModified": "2026-11-21",
       "sections": [
         {
           "heading": "The embedding model",
@@ -3173,7 +3457,7 @@
               "type": "code",
               "caption": "Cargo.toml",
               "lang": "toml",
-              "code": "[dependencies]\nzipp-vm = { git = \"https://github.com/f2i-com/zipp.org\", tag = \"v0.0.35\" }"
+              "code": "[dependencies]\nzipp-vm = { git = \"https://github.com/f2i-com/zipp.org\", tag = \"v0.0.37\" }"
             },
             {
               "type": "code",
@@ -3213,11 +3497,11 @@
               "type": "code",
               "caption": "host.js, inside a dedicated Worker",
               "lang": "javascript",
-              "code": "import { loadZipp } from './zipp.mjs'\nconst { Engine } = await loadZipp('./zipp-0.0.35-javascript.wasm')\n\nconst engine = new Engine()\nengine.setSyncHostCapabilities(['db.query', 'ls.getItem'])\nengine.setDbBridge(tenantScopedDb)\nengine.setLocalStorageBridge(tenantScopedStorage)\nengine.setInstructionBudget(500_000_000)\nengine.initScript(source)\n\n// Later entries, same globals:\nconst rendered = engine.callFunction('render', [{ user: 'ada' }])\nfor (const call of engine.drainPendingHostCalls()) {\n  engine.resolveHostCallback(call.id, await handle(call))\n}\nengine.pump()"
+              "code": "import { loadZipp } from './zipp.mjs'\nconst { Engine } = await loadZipp('./zipp-0.0.37-javascript.wasm')\n\nconst engine = new Engine()\nengine.setSyncHostCapabilities(['db.query', 'ls.getItem'])\nengine.setDbBridge(tenantScopedDb)\nengine.setLocalStorageBridge(tenantScopedStorage)\nengine.setInstructionBudget(500_000_000)\nengine.initScript(source)\n\n// Later entries, same globals:\nconst rendered = engine.callFunction('render', [{ user: 'ada' }])\nfor (const call of engine.drainPendingHostCalls()) {\n  engine.resolveHostCallback(call.id, await handle(call))\n}\nengine.pump()"
             },
             {
               "type": "p",
-              "text": "The Worker is the lifetime boundary: a deadline timer in the page calls `worker.terminate()` and creates a fresh one. `host-sdk/` in the repository is a reference adapter tested in real Chromium, Firefox and WebKit Workers, and the [WebAssembly page](/wasm/) lists every limit the module enforces."
+              "text": "The Worker is the lifetime boundary: a deadline timer in the page calls `worker.terminate()` and creates a fresh one. `host-sdk/` in the repository is a reference adapter tested in real Chromium, Firefox and WebKit Workers. From v0.0.37, `addAppBridge(namespace, bridge)` composes multiple external plugin bridges (such as XDB SQLite on `app.sql.*` for `PhpApp` and Rust SQLx apps) with shared step metering via `hostStepsRemaining()` and `hostChargeSteps(n)`, and the [WebAssembly page](/wasm/) lists every limit the module enforces."
             },
             {
               "type": "p",
@@ -3232,11 +3516,11 @@
               "type": "code",
               "caption": "zipp --help, abridged",
               "lang": "text",
-              "code": "zipp js  <file.js>            run a script (compat goal; --script-goal for pure Script)\nzipp mjs <file.mjs>           run a file as an ES module\nzipp py  <file.py | dir>      run a Python program or project\nzipp run [--lang=L] <file>    pick the frontend by flag, extension or shebang\nzipp sandbox <flags> <file>   supervised run with explicit limits\nzipp --version --json         build identity: source commit, dirty flag, rustc, jit"
+              "code": "zipp js  <file.js>            run a script (compat goal; --script-goal for pure Script)\nzipp mjs <file.mjs>           run a file as an ES module\nzipp py  <file.py | dir>      run a Python 3.13 program or project\nzipp php <file.php>           run a PHP 8.x script (or -S / --worker HTTP server)\nzipp rs  <file.rs | dir>      run a Rust script or Cargo project (--test, --serve, --watch)\nzipp run [--lang=L] <file>    pick the frontend by flag, extension or shebang\nzipp sandbox <flags> <file>   supervised run with explicit limits\nzipp --version --json         build identity: source commit, dirty flag, rustc, jit"
             },
             {
               "type": "p",
-              "text": "Frontend detection precedence is explicit selection, then a recognized extension (`.js`, `.cjs`, `.mjs`, `.py`, `.pyw`), then a recognized shebang, then a leading directive, then an error. Bare source never silently defaults to one language. There is no REPL."
+              "text": "Frontend detection precedence is explicit selection, then a recognized extension (`.js`, `.cjs`, `.mjs`, `.ts`, `.mts`, `.cts`, `.tsx`, `.py`, `.pyw`, `.php`, `.rs`), then a recognized shebang, then a leading directive, then an error. Bare source never silently defaults to one language. There is no REPL."
             }
           ]
         },
@@ -3262,9 +3546,9 @@
                   "text": "Run a stranger's JavaScript inside your JavaScript, as Softn does, with a Worker as the kill switch."
                 },
                 {
-                  "title": "Two languages, one host",
-                  "href": "/python/",
-                  "text": "Offer Python and JavaScript to the same users with one engine, one set of limits and one host-call surface."
+                  "title": "Five languages, one host",
+                  "href": "/php/",
+                  "text": "Run JavaScript, TypeScript, Python 3.13, PHP 8.x and Rust with one engine, one set of limits and one host-call surface."
                 }
               ]
             }
@@ -3305,7 +3589,7 @@
         "capability-based scripting"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-11-11",
+      "dateModified": "2026-11-21",
       "sections": [
         {
           "heading": "Three profiles",
@@ -3356,7 +3640,7 @@
           "blocks": [
             {
               "type": "p",
-              "text": "The [sandbox playground](/sandbox/playground/) runs JavaScript in a sandbox of the 0.0.35 WebAssembly loader, `zipp.mjs`, with a switch for each permission (storage, files, network, host functions) and each limit (steps and time). Run a program with a permission off to see the refusal, switch it on to see what the program gets, or run a loop that never ends and watch the limit stop it. To run the same sandbox in a page of your own, start from the [embed section of the home page](/#embed): an engine `.wasm`, `zipp.mjs` and a starter project."
+              "text": "The [sandbox playground](/sandbox/playground/) runs JavaScript in a sandbox of the 0.0.37 WebAssembly loader, `zipp.mjs`, with a switch for each permission (storage, files, network, host functions) and each limit (steps and time). Run a program with a permission off to see the refusal, switch it on to see what the program gets, or run a loop that never ends and watch the limit stop it. To run the same sandbox in a page of your own, start from the [embed section of the home page](/#embed): an engine `.wasm`, `zipp.mjs` and a starter project."
             }
           ]
         },
@@ -3471,7 +3755,7 @@
         "JavaScript engine written in Rust"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-10-29",
+      "dateModified": "2026-11-21",
       "sections": [
         {
           "heading": "At a glance",
@@ -3514,7 +3798,7 @@
                 ],
                 [
                   "Test262",
-                  "96,227 / 96,228 unmodified, one documented expected failure, on a pinned corpus",
+                  "96,563 / 96,564 unmodified, one documented expected failure, on a pinned corpus",
                   "High; QuickJS-NG publishes its own results",
                   "Publishes a conformance dashboard",
                   "Targets ES6 plus selected later features",
@@ -3522,15 +3806,15 @@
                 ],
                 [
                   "WebAssembly build",
-                  "Yes, 1.20 MB on the wire (JavaScript-only, bindings included; ZIPP Lite 0.72 MB)",
+                  "Yes, 1.27 MB on the wire (JavaScript-only, bindings included; ZIPP Lite 0.79 MB)",
                   "Yes, about 0.42 MB on the wire (QuickJS-NG reactor)",
                   "Yes",
                   "Yes (Hermes in the browser is a niche path)",
                   "No (V8 is the host, not a module)"
                 ],
                 [
-                  "Second language",
-                  "Python 3 frontend on the same VM",
+                  "Additional languages",
+                  "TypeScript/TSX, Python 3.13, PHP 8.x and Rust on the same VM",
                   "No",
                   "No",
                   "No",
@@ -3651,11 +3935,11 @@
     },
     {
       "slug": "releases",
-      "title": "Zipp Releases: v0.0.1 to v0.0.35, Downloads and Notes",
-      "description": "Every Zipp release from v0.0.1 on 30 August 2026 to v0.0.35 on 11 November 2026, with what changed, how releases are gated, and what each download contains.",
+      "title": "Zipp Releases: v0.0.1 to v0.0.37, Downloads and Notes",
+      "description": "Every Zipp release from v0.0.1 on 30 August 2026 to v0.0.37 on 20 November 2026, with what changed, how releases are gated, and what each download contains.",
       "h1": "Zipp releases",
       "breadcrumb": "Releases",
-      "lede": "Zipp publishes GitHub Releases only. Since v0.0.26 they are plain files: the native CLI for Windows x86-64, as a portable `.exe` and an `.msi` installer, and for Linux x86-64, arm64 and armv7, one `.wasm` file per WebAssembly engine (each also Brotli-compressed, as `.wasm.br`), and an embed kit; up to v0.0.25 they were x86-64 CLI archives for Windows and Linux and WebAssembly archives. Thirty-five tags shipped between 30 August and 11 November 2026. This page lists them, explains what a release has to pass, and links the notes.",
+      "lede": "Zipp publishes GitHub Releases only. Since v0.0.26 they are plain files: the native CLI for Windows x86-64, as a portable `.exe` and an `.msi` installer, and for Linux x86-64, arm64 and armv7, one `.wasm` file per WebAssembly engine (each also Brotli-compressed, as `.wasm.br`), and an embed kit; up to v0.0.25 they were x86-64 CLI archives for Windows and Linux and WebAssembly archives. Thirty-seven tags shipped between 30 August and 20 November 2026. This page lists them, explains what a release has to pass, and links the notes.",
       "keywords": [
         "Zipp releases",
         "Zipp download",
@@ -3664,29 +3948,30 @@
         "Zipp changelog"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-11-11",
+      "dateModified": "2026-11-21",
       "sections": [
         {
-          "heading": "Latest: v0.0.35, 11 November 2026",
+          "heading": "Latest: v0.0.37, 20 November 2026",
           "blocks": [
             {
               "type": "p",
-              "text": "A patch release with speed work, out the same day as v0.0.34's interpreter release. The experimental optimizing tier compiles a function that starts with a loop, with a fix contributed for issue #93; compiled loops that read and write globals are faster again; and frameless calls and object allocation do less work. The [benchmarks page](/benchmarks/) still shows v0.0.31's profile-guided capture; the [release notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.35.md) give v0.0.35's measurements against v0.0.34 and Node 24."
+              "text": "A major polyglot and performance release adding full **PHP 8.x** and **Rust** frontends and WebAssembly modules (`javascript-php` and `javascript-rust`), **Python 3.13** syntax and stdlib parity with new JIT fast paths, composable sandboxed plugin bridges (`addAppBridge`) with shared instruction metering, JS VM and Tier-C/Tier-O JIT speedups, and an updated Test262 pin (`2e58f87d83`, 96,563 / 96,564 unmodified). The [benchmarks page](/benchmarks/) still shows v0.0.31's profile-guided capture; [docs/releases/0.0.37.md](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.37.md) and [docs/releases/0.0.36.md](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.36.md) give the full notes for both releases."
             },
             {
               "type": "ul",
               "items": [
-                "New, from a contributor: the optimizing tier (`ZIPP_OPT=1`, off by default) compiles a function whose first instruction is a loop's head, through a preheader that merges the values the function is entered with and the values the loop carries back (codeandsolder's fix for #93; v0.0.34 had Tier O decline such functions). Under `ZIPP_OPT=1`, an integer loop at a function's start runs in 62 ms where the decline took 69, a floating-point one in 16 against 21, and a function that runs its loop once per call 2.4 times faster.",
-                "Faster, compiled code: the blocks that hand an operation back to the interpreter come after a function's code instead of behind each operation, so the success path falls through; v0.0.34 had given one to every compiled global access. With the JIT, `class-prototype-hot` takes 0.81× v0.0.34's time, `sparse-array` 0.85× and `nbody` 0.86×.",
-                "Faster, the interpreter: a small function run without a frame reads its captured variables through one fetch of its closure's list, and a number written to one skips the write barrier; allocating no longer reserves and probes 32 KB of stack in every function that makes an object. Interpreted, `upval_rw` takes 0.88× v0.0.34's time and is now ahead of `node --jitless`.",
-                "Over 90 benchmark programs v0.0.35 takes 0.984× v0.0.34's time with the JIT and 0.997× interpreted; it is ahead of Node 24 on 72 of the 89 programs Node runs, and of `node --jitless` on 71 interpreted.",
-                "v0.0.34 (11 November, not described here before): on the x86-64 command lines, interpreted loops and the calls they make run through a second, leaner form of the interpreter, whose instructions are small functions that jump from one to the next. Interpreted, it takes 0.83× v0.0.33's time over the 90 programs and is ahead of `node --jitless` on 71 of 89; a global deleted or given an accessor by code a running compiled loop called is no longer read as the plain variable it was; and Tier O no longer runs forever on a function that starts with a loop.",
-                "WebAssembly modules: the six of v0.0.33 and v0.0.34, the same size. As published, the JavaScript engine is 1.25 MB on the wire, ZIPP Lite 0.78 MB, the TypeScript engine 1.32 MB, Python without torch 1.65 MB and the complete engine 2.02 MB; the torch package 0.40 MB. Loader `zipp.mjs` 1.5.0, unchanged, and host SDK 1.4.0."
+                "New, PHP 8.x frontend, HTTP SAPI/Worker Mode and WASM (`zipp-0.0.37-javascript-php.wasm`): pure-Rust dual-mode HTML/PHP parser, PSR-4 autoloading, OOP/traits/enums/reflection, byte-for-byte Laravel 11 / Slim 4 / CakePHP 5 parity against PHP 8.4.15, selective x86-64 JIT, persistent `ZPO2` disk OPcache, and `PhpApp` with `PDO`/`mysqli` over host-owned `app.sql.*`.",
+                "New, Rust frontend, Axum/SQLx backend support and WASM (`zipp-0.0.37-javascript-rust.wasm`): pure-Rust parser, `Cargo.toml` + multi-file module discovery, `zipp rs --test` / `--serve` / `--watch`, Axum 0.7 routing/extractors/middleware/WebSockets, SQLx over `app.sql.*`, `serde`/`argon2`/`jsonwebtoken`/`uuid`, and binary-safe VFS overlay persistence.",
+                "Python 3.13 parity and JIT acceleration: `async`/`await`, `except*`, PEP 695 type parameters, `asyncio`/`fractions`/`numbers` stdlib modules, frame-less acyclic leaf calls (`py_leaf`), self-recursive x86-64 micro-JIT (`py_rec`), inline list/tuple/math JIT paths and fast generator stepping.",
+                "Composable sandboxed plugin bridges and shared metering: `addAppBridge(namespace, bridge)` in `zipp-wasm`, unified `HostCtx::steps_remaining`/`charge_steps`, and `hostStepsRemaining`/`hostChargeSteps` exports without expanding the audited 51-function WASM import surface.",
+                "JavaScript VM, parser, JIT and Test262: skip-body preparser, megamorphic property/index/call memos, 24/32-slot value slabs, minor-GC ephemeron/root delta paths, Tier-O `TaggedTruthy` `SmallBigInt` fix, and Test262 moved to `2e58f87d83` (96,563 / 96,564 core, 492 / 492 DateTimeFormat) with 18 newly covered failures fixed.",
+                "v0.0.36 (17 November, not described here before): fixed a minor-GC nursery bug where setup's unused object-literal batch could leave a live closure unrecorded; added ten more operations to the x86-64 loop runner (`new`, `super`, `in`, `instanceof`, `Object.keys`, `Array.isArray`, computed compound keys, `~x`), paged Unicode case mapping, and faster string/position parsing.",
+                "WebAssembly modules: eight modules in v0.0.37. As published on the wire (Brotli-11), `javascript` is 1.27 MB, ZIPP Lite 0.79 MB, `javascript-typescript` 1.34 MB, `javascript-php` 1.48 MB, `javascript-rust` 1.47 MB, `javascript-python-base` 1.70 MB, `javascript-python` 2.08 MB, and `torch-package` 0.40 MB. Loader `zipp.mjs` 1.5.0 and host SDK 1.4.0."
               ]
             },
             {
               "type": "table",
-              "caption": "v0.0.35 assets",
+              "caption": "v0.0.37 assets",
               "head": [
                 "Asset",
                 "Bytes",
@@ -3694,99 +3979,119 @@
               ],
               "rows": [
                 [
-                  "`zipp-0.0.35-windows-x86_64-portable.exe`",
-                  "26,045,952",
-                  "Native CLI for Windows x86-64, complete: JavaScript and TypeScript with the x86-64 JIT, Node programs, WebAssembly on Wasmtime, Python with its JIT tier, torch and the native GPU path; runs from anywhere"
+                  "`zipp-0.0.37-windows-x86_64-portable.exe`",
+                  "30,794,240",
+                  "Native CLI for Windows x86-64, complete: JavaScript/TypeScript with x86-64 JIT, Node programs, WebAssembly on Wasmtime, Python 3.13 with JIT and torch, PHP 8.x with HTTP Worker Mode, Rust with `--test`/`--serve`/`--watch`, and native GPU; runs from anywhere"
                 ],
                 [
-                  "`zipp-0.0.35-windows-x86_64-installer.msi`",
-                  "8,302,592",
+                  "`zipp-0.0.37-windows-x86_64-installer.msi`",
+                  "9,662,464",
                   "The same CLI as a per-user install into `%LOCALAPPDATA%\\Programs\\ZIPP` that adds `zipp` to the user's PATH; no administrator rights"
                 ],
                 [
-                  "`zipp-0.0.35-linux-x86_64`",
-                  "31,412,456",
+                  "`zipp-0.0.37-linux-x86_64`",
+                  "36,576,976",
                   "Native CLI for Linux x86-64, same contents; glibc 2.35 or later, `chmod +x` after downloading"
                 ],
                 [
-                  "`zipp-0.0.35-linux-arm64`",
-                  "24,727,960",
+                  "`zipp-0.0.37-linux-arm64`",
+                  "27,599,032",
                   "Native CLI for 64-bit Arm Linux"
                 ],
                 [
-                  "`zipp-0.0.35-linux-armv7`",
-                  "20,374,308",
+                  "`zipp-0.0.37-linux-armv7`",
+                  "23,960,636",
                   "Native CLI for 32-bit Arm Linux with hard float, interpreter only, WebAssembly on wasmi"
                 ],
                 [
-                  "`zipp-0.0.35-javascript.wasm`",
-                  "4,855,175",
+                  "`zipp-0.0.37-javascript.wasm`",
+                  "4,913,223",
                   "JavaScript engine, with `Intl` and `Temporal`, for pages, Workers, Node, Deno and Bun"
                 ],
                 [
-                  "`zipp-0.0.35-javascript-lite.wasm`",
-                  "2,832,722",
+                  "`zipp-0.0.37-javascript-lite.wasm`",
+                  "2,878,928",
                   "ZIPP Lite: the JavaScript core without `Intl` and `Temporal`, built for size"
                 ],
                 [
-                  "`zipp-0.0.35-javascript-typescript.wasm`",
-                  "5,192,500",
+                  "`zipp-0.0.37-javascript-typescript.wasm`",
+                  "5,250,935",
                   "The JavaScript engine with TypeScript and TSX; `zipp.mjs` 1.5.0 runs a TypeScript program in it"
                 ],
                 [
-                  "`zipp-0.0.35-javascript-python.wasm`",
-                  "8,617,556",
-                  "JavaScript + Python with torch built in"
+                  "`zipp-0.0.37-javascript-python.wasm`",
+                  "8,942,154",
+                  "JavaScript + Python 3.13 with torch built in"
                 ],
                 [
-                  "`zipp-0.0.35-javascript-python-base.wasm`",
-                  "6,580,459",
-                  "JavaScript + Python without torch"
+                  "`zipp-0.0.37-javascript-python-base.wasm`",
+                  "6,905,076",
+                  "JavaScript + Python 3.13 without torch"
                 ],
                 [
-                  "`zipp-0.0.35-torch-package.wasm`",
+                  "`zipp-0.0.37-javascript-php.wasm`",
+                  "6,038,525",
+                  "JavaScript + PHP 8.x, with `PhpApp` SAPI/Worker Mode and `PDO`/`mysqli` SQL bridge"
+                ],
+                [
+                  "`zipp-0.0.37-javascript-rust.wasm`",
+                  "5,954,532",
+                  "JavaScript + Rust, with binary VFS overlay and Axum/SQLx worker-boot"
+                ],
+                [
+                  "`zipp-0.0.37-torch-package.wasm`",
                   "2,163,109",
                   "The torch package, added to the `-javascript-python-base` engine when a program needs it"
                 ],
                 [
-                  "`zipp-0.0.35-javascript.wasm.br`",
-                  "1,253,800",
+                  "`zipp-0.0.37-javascript.wasm.br`",
+                  "1,268,242",
                   "The JavaScript engine compressed with Brotli: the same module at about a quarter of the size. Serve it with `Content-Encoding: br` and `Content-Type: application/wasm` and the browser decodes it, or let `zipp.mjs` 1.5.0 load it"
                 ],
                 [
-                  "`zipp-0.0.35-javascript-lite.wasm.br`",
-                  "778,494",
+                  "`zipp-0.0.37-javascript-lite.wasm.br`",
+                  "788,538",
                   "ZIPP Lite, Brotli-compressed"
                 ],
                 [
-                  "`zipp-0.0.35-javascript-typescript.wasm.br`",
-                  "1,324,793",
+                  "`zipp-0.0.37-javascript-typescript.wasm.br`",
+                  "1,338,703",
                   "The TypeScript engine, Brotli-compressed"
                 ],
                 [
-                  "`zipp-0.0.35-javascript-python.wasm.br`",
-                  "2,020,289",
-                  "JavaScript + Python with torch, Brotli-compressed"
+                  "`zipp-0.0.37-javascript-python.wasm.br`",
+                  "2,078,280",
+                  "JavaScript + Python 3.13 with torch, Brotli-compressed"
                 ],
                 [
-                  "`zipp-0.0.35-javascript-python-base.wasm.br`",
-                  "1,645,492",
-                  "JavaScript + Python without torch, Brotli-compressed"
+                  "`zipp-0.0.37-javascript-python-base.wasm.br`",
+                  "1,702,286",
+                  "JavaScript + Python 3.13 without torch, Brotli-compressed"
                 ],
                 [
-                  "`zipp-0.0.35-torch-package.wasm.br`",
-                  "403,192",
+                  "`zipp-0.0.37-javascript-php.wasm.br`",
+                  "1,480,745",
+                  "JavaScript + PHP 8.x, Brotli-compressed"
+                ],
+                [
+                  "`zipp-0.0.37-javascript-rust.wasm.br`",
+                  "1,466,783",
+                  "JavaScript + Rust, Brotli-compressed"
+                ],
+                [
+                  "`zipp-0.0.37-torch-package.wasm.br`",
+                  "403,538",
                   "The torch package, Brotli-compressed"
                 ],
                 [
-                  "`zipp-0.0.35-wasm-embed-kit.zip`",
-                  "219,173",
-                  "The loader `zipp.mjs` 1.5.0, the one file a page needs beside an engine, with its TypeScript types, the engine API types, the host SDK, the GPU lab, the docs and examples. It loads a `.wasm.br` too: decoded by the server, decompressed by the loader where the runtime can (Node, Firefox), or by falling back to the plain `.wasm` beside it"
+                  "`zipp-0.0.37-wasm-embed-kit.zip`",
+                  "220,134",
+                  "The loader `zipp.mjs` 1.5.0, the one file a page needs beside an engine, with its TypeScript types, the engine API types, the host SDK, the GPU lab, the docs and examples"
                 ],
                 [
                   "`SHA256SUMS`",
-                  "1,803",
-                  "Checksums for all 18 files above"
+                  "2,203",
+                  "Checksums for all 22 files above"
                 ]
               ]
             },
@@ -3798,7 +4103,7 @@
             },
             {
               "type": "p",
-              "text": "[Release notes and downloads on GitHub](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.35) · [docs/releases/0.0.35.md](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.35.md) · [v0.0.34 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.34.md) · [v0.0.33 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.33.md) · [v0.0.32 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.32.md) · [v0.0.30 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.30.md) · [v0.0.29 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.29.md) · [v0.0.28 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.28.md) · [v0.0.27 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.27.md) · [v0.0.26 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.26.md) · [v0.0.25 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.25.md) · [v0.0.24 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.24.md) · [v0.0.23 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.23.md)"
+              "text": "[Release notes and downloads on GitHub](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.37) · [docs/releases/0.0.37.md](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.37.md) · [v0.0.36 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.36.md) · [v0.0.35 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.35.md) · [v0.0.34 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.34.md) · [v0.0.33 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.33.md) · [v0.0.32 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.32.md) · [v0.0.30 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.30.md) · [v0.0.29 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.29.md) · [v0.0.28 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.28.md) · [v0.0.27 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.27.md) · [v0.0.26 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.26.md) · [v0.0.25 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.25.md) · [v0.0.24 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.24.md) · [v0.0.23 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.23.md)"
             }
           ]
         },
@@ -3809,7 +4114,7 @@
               "type": "code",
               "caption": "From a release download",
               "lang": "shell",
-              "code": "# Windows: the portable .exe runs from wherever you saved it\n.\\zipp-0.0.35-windows-x86_64-portable.exe js app.js\n# or install zipp-0.0.35-windows-x86_64-installer.msi, which adds zipp to\n# your PATH without administrator rights\nzipp js app.js\n\n# Linux x86-64 (zipp-0.0.35-linux-arm64 or -linux-armv7 on Arm), glibc 2.35+\ncurl -fL -o zipp https://github.com/f2i-com/zipp.org/releases/download/v0.0.35/zipp-0.0.35-linux-x86_64\nchmod +x zipp\n./zipp js app.js\n\n# WebAssembly, for a web page: the loader zipp.mjs from the embed kit, and one\n# engine (or its .wasm.br: the same engine, about a quarter of the size)\ncurl -fLO https://github.com/f2i-com/zipp.org/releases/download/v0.0.35/zipp-0.0.35-wasm-embed-kit.zip\nunzip -j zipp-0.0.35-wasm-embed-kit.zip zipp-0.0.35-wasm-embed-kit/zipp.mjs\ncurl -fLO https://github.com/f2i-com/zipp.org/releases/download/v0.0.35/zipp-0.0.35-javascript.wasm\n\n# From source, any platform with Rust 1.92\ngit clone https://github.com/f2i-com/zipp.org && cd zipp.org\ncargo build --locked --release\n./target/release/zipp --version --json"
+              "code": "# Windows: the portable .exe runs from wherever you saved it\n.\\zipp-0.0.37-windows-x86_64-portable.exe js app.js\n# or install zipp-0.0.37-windows-x86_64-installer.msi, which adds zipp to\n# your PATH without administrator rights\nzipp js app.js\n\n# Linux x86-64 (zipp-0.0.37-linux-arm64 or -linux-armv7 on Arm), glibc 2.35+\ncurl -fL -o zipp https://github.com/f2i-com/zipp.org/releases/download/v0.0.37/zipp-0.0.37-linux-x86_64\nchmod +x zipp\n./zipp js app.js\n\n# WebAssembly, for a web page: the loader zipp.mjs from the embed kit, and one\n# engine (or its .wasm.br: the same engine, about a quarter of the size)\ncurl -fLO https://github.com/f2i-com/zipp.org/releases/download/v0.0.37/zipp-0.0.37-wasm-embed-kit.zip\nunzip -j zipp-0.0.37-wasm-embed-kit.zip zipp-0.0.37-wasm-embed-kit/zipp.mjs\ncurl -fLO https://github.com/f2i-com/zipp.org/releases/download/v0.0.37/zipp-0.0.37-javascript.wasm\n\n# From source, any platform with Rust 1.92\ngit clone https://github.com/f2i-com/zipp.org && cd zipp.org\ncargo build --locked --release\n./target/release/zipp --version --json"
             },
             {
               "type": "p",
@@ -3826,7 +4131,7 @@
           "blocks": [
             {
               "type": "p",
-              "text": "Pushing a `vX.Y.Z` tag runs the release workflow. It refuses to publish unless the tag object matches the checkout; the root `Cargo.toml`, the WebAssembly crate and the landing page all carry the same version; and the reusable CI, the full security workflow (including the pinned Test262 corpus), the native build and the WebAssembly build all pass at that exact commit. A green `main` at some other revision is not a release gate. The job is retry-safe: it re-downloads existing assets, verifies `SHA256SUMS`, and checks that `BUILD-INFO.json` is not dirty and names the right commit before deciding to do nothing. A dispatched re-run may skip the two longest gate jobs - the native workspace suite and Test262 - only when the identical tree has been through them elsewhere; v0.0.19 was published that way, with both run locally on the tagged commit (308 test binaries, 2,453 tests; 95,680 of 95,680 corrected-core executions) and every other job in the workflow, and so was v0.0.20, whose JavaScript engine source had not changed since v0.0.19 passed them. From v0.0.21 the workflow also builds the torch package with the two engines it pairs with, and refuses to publish unless `python` plus the package prints exactly what `all` prints over the torch suites. From v0.0.22 it also builds ZIPP Lite. v0.0.24's first run lost four gate jobs to GitHub runner shutdowns, and those jobs were re-run at the same commit before it published. v0.0.27 was dispatched the same way: its tagged commit changes only versions and release notes from `05d2bd9b`, where the full security workflow, the native workspace suite and Test262 on 64-bit and 32-bit builds included, had passed. So was v0.0.28, after the CI and the full security workflow had passed on its tagged commit itself. So was v0.0.29: the full security workflow on its prep commit, `8cd844fd`, had failed one test, a heap-ceiling regression, whose fix and the heap and limit tests around it were run before `58c92a59` was tagged, and Test262 then passed on the published Windows binary, with its JIT and without. So was v0.0.30: the full security workflow passed at `ef3bea8a` once its benchmark lane stopped running the hour-long comparison of the profile-guided training corpus, which `tools/pgo.sh` still runs before every profile-guided build, and the tagged commit, `fd6b48a5`, changes only a landing test from it; and Test262 then passed on the published Windows binary, with its JIT and without. So was v0.0.31: CI and the full security workflow passed at `051577de` after its dependency audit had refused Wasmtime 44.0.3 for eight advisories, and the release run's own builds then found two faults no gate builds for, an extra parenthesis in the release smoke test's WebAssembly program and dead code on 32-bit Arm, fixed in `1a0098b0` and `85fb9d3e`, which change no x86-64 code; the tagged commit, `fcfb1934`, changes only the release notes from them. The release's arm64 build ran the pinned Test262 corpus in full, and it then passed on the published Windows and Linux x86-64 binaries, with their JIT and without. So was v0.0.32, after its gate refused the first commit tagged: the first release run, at `6112d701`, failed the pinned Test262 corpus on one test, strict and sloppy, a class's static initializer whose arrow reads the class's name through `eval`, which that release's own fix for arrows in class methods (`08f34f83`) had broken. The tag was moved to the fix, `e312cf40`, before anything was published, and the release run's CI and full security workflow, the corpus included, then passed at that commit, with the arm64 build running it in full. v0.0.33's gate caught a crash before the tag: the release build's dry run stopped on its arm64 build, where one Test262 test, `staging/sm/extensions/recursion.js`, overflowed the native stack instead of throwing a `RangeError`. The fix (`78097701`) bounds native re-entry by the stack the command line declares; CI, the full security workflow and the dry run then passed at that commit, and the release was tagged on it with only versions and notes changed (`cc75c2a3`). v0.0.34 was published twice: the build of 10 November was withdrawn within the hour and replaced by one with the optimizing tier's fix for #93 and without the 22% slowdown on a request loop that the first build's notes had reported. For v0.0.35 the release build's dry run, CI and the full security workflow, the corpus included, passed at `cd86ccdb`, and the release was tagged on it with only versions and notes changed (`384cb93a`)."
+              "text": "Pushing a `vX.Y.Z` tag runs the release workflow. It refuses to publish unless the tag object matches the checkout; the root `Cargo.toml`, the WebAssembly crate and the landing page all carry the same version; and the reusable CI, the full security workflow (including the pinned Test262 corpus), the native build and the WebAssembly build all pass at that exact commit. A green `main` at some other revision is not a release gate. The job is retry-safe: it re-downloads existing assets, verifies `SHA256SUMS`, and checks that `BUILD-INFO.json` is not dirty and names the right commit before deciding to do nothing. A dispatched re-run may skip the two longest gate jobs - the native workspace suite and Test262 - only when the identical tree has been through them elsewhere; v0.0.19 was published that way, with both run locally on the tagged commit (308 test binaries, 2,453 tests; 95,680 of 95,680 corrected-core executions) and every other job in the workflow, and so was v0.0.20, whose JavaScript engine source had not changed since v0.0.19 passed them. From v0.0.21 the workflow also builds the torch package with the two engines it pairs with, and refuses to publish unless `python` plus the package prints exactly what `all` prints over the torch suites. From v0.0.22 it also builds ZIPP Lite. v0.0.24's first run lost four gate jobs to GitHub runner shutdowns, and those jobs were re-run at the same commit before it published. v0.0.27 was dispatched the same way: its tagged commit changes only versions and release notes from `05d2bd9b`, where the full security workflow, the native workspace suite and Test262 on 64-bit and 32-bit builds included, had passed. So was v0.0.28, after the CI and the full security workflow had passed on its tagged commit itself. So was v0.0.29: the full security workflow on its prep commit, `8cd844fd`, had failed one test, a heap-ceiling regression, whose fix and the heap and limit tests around it were run before `58c92a59` was tagged, and Test262 then passed on the published Windows binary, with its JIT and without. So was v0.0.30: the full security workflow passed at `ef3bea8a` once its benchmark lane stopped running the hour-long comparison of the profile-guided training corpus, which `tools/pgo.sh` still runs before every profile-guided build, and the tagged commit, `fd6b48a5`, changes only a landing test from it; and Test262 then passed on the published Windows binary, with its JIT and without. So was v0.0.31: CI and the full security workflow passed at `051577de` after its dependency audit had refused Wasmtime 44.0.3 for eight advisories, and the release run's own builds then found two faults no gate builds for, an extra parenthesis in the release smoke test's WebAssembly program and dead code on 32-bit Arm, fixed in `1a0098b0` and `85fb9d3e`, which change no x86-64 code; the tagged commit, `fcfb1934`, changes only the release notes from them. The release's arm64 build ran the pinned Test262 corpus in full, and it then passed on the published Windows and Linux x86-64 binaries, with their JIT and without. So was v0.0.32, after its gate refused the first commit tagged: the first release run, at `6112d701`, failed the pinned Test262 corpus on one test, strict and sloppy, a class's static initializer whose arrow reads the class's name through `eval`, which that release's own fix for arrows in class methods (`08f34f83`) had broken. The tag was moved to the fix, `e312cf40`, before anything was published, and the release run's CI and full security workflow, the corpus included, then passed at that commit, with the arm64 build running it in full. v0.0.33's gate caught a crash before the tag: the release build's dry run stopped on its arm64 build, where one Test262 test, `staging/sm/extensions/recursion.js`, overflowed the native stack instead of throwing a `RangeError`. The fix (`78097701`) bounds native re-entry by the stack the command line declares; CI, the full security workflow and the dry run then passed at that commit, and the release was tagged on it with only versions and notes changed (`cc75c2a3`). v0.0.34 was published twice: the build of 10 November was withdrawn within the hour and replaced by one with the optimizing tier's fix for #93 and without the 22% slowdown on a request loop that the first build's notes had reported. For v0.0.35 the release build's dry run, CI and the full security workflow, the corpus included, passed at `cd86ccdb`, and the release was tagged on it with only versions and notes changed (`384cb93a`). v0.0.36 passed CI, security and Test262 after fixing the setup object-literal batch nursery bug and extending the loop runner (`475e6694`). For v0.0.37, the release workflow's cross-platform gates caught ARM/audit/JIT/Python/PHP edge cases (`3ce58871`, `84c2df00`) before `a5c9ef93` passed every gate — including the updated `2e58f87d83` Test262 corpus and the new `javascript-php` and `javascript-rust` WebAssembly builds — and published all 23 assets."
             }
           ]
         },
@@ -3842,6 +4147,16 @@
                 "Headline"
               ],
               "rows": [
+                [
+                  "[v0.0.37](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.37)",
+                  "2026-11-20",
+                  "PHP 8.x and Rust frontends and WebAssembly modules, Python 3.13 parity (`async`/`await`, `except*`, PEP 695) and JIT fast paths, composable `addAppBridge` plugins, JS VM/JIT speedups, and Test262 `2e58f87d83` (96,563 / 96,564)"
+                ],
+                [
+                  "[v0.0.36](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.36)",
+                  "2026-11-17",
+                  "Nursery fix for live closures in early object literals, ten more operations in the x86-64 loop runner, paged Unicode case mapping, and faster script loading"
+                ],
                 [
                   "[v0.0.35](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.35)",
                   "2026-11-11",
@@ -4047,11 +4362,11 @@
     },
     {
       "slug": "journey",
-      "title": "The Zipp Story: A JavaScript Engine in Rust in 167 Days",
-      "description": "How Zipp went from a typed toy language on 29 May 2026 to a Test262-conformant, JIT-compiled JavaScript and Python engine by 29 October 2026, mistakes included.",
+      "title": "The Zipp Story: A Polyglot Runtime in Rust in 177 Days",
+      "description": "How Zipp went from a typed toy language on 29 May 2026 to a Test262-conformant, JIT-compiled runtime for JS, Python, PHP and Rust in 177 days.",
       "h1": "The Zipp story",
       "breadcrumb": "The story",
-      "lede": "Zipp's repository has 3,268 commits over 167 days, written almost entirely by one person, and it narrates its own mistakes in commit subjects. This is that history in nine acts, with dates and hashes. The [journal](/journal/) has the day-by-day entries.",
+      "lede": "Zipp's repository has 3,331 commits over 177 days, written almost entirely by one person, and it narrates its own mistakes in commit subjects. This is that history in nine acts, with dates and hashes. The [journal](/journal/) has the day-by-day entries.",
       "keywords": [
         "building a JavaScript engine",
         "JavaScript engine in Rust history",
@@ -4060,7 +4375,7 @@
         "solo compiler project"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-11-11",
+      "dateModified": "2026-11-21",
       "schemaType": "Article",
       "sections": [
         {
@@ -4070,14 +4385,14 @@
               "type": "stats",
               "items": [
                 {
-                  "value": "3,268",
-                  "label": "Commits from 29 May to 11 November 2026",
-                  "note": "247 in May, 1,039 in June, 253 in July, 230 in August, 366 in September, 916 in October, 217 in November"
+                  "value": "3,331",
+                  "label": "Commits from 29 May to 21 November 2026",
+                  "note": "247 in May, 1,039 in June, 253 in July, 230 in August, 366 in September, 925 in October, 271 in November"
                 },
                 {
-                  "value": "35",
-                  "label": "Tagged releases in 74 days",
-                  "note": "v0.0.1 on 30 August to v0.0.35 on 11 November"
+                  "value": "37",
+                  "label": "Tagged releases in 83 days",
+                  "note": "v0.0.1 on 30 August to v0.0.37 on 20 November"
                 },
                 {
                   "value": "452,901",
@@ -4426,6 +4741,16 @@
                   "date": "2026-11-11",
                   "title": "A contributor's fix for Tier O, bail-outs out of the way, one fetch per leaf call; v0.0.35",
                   "text": "`041f2802`, `711775b1`, `ac4f4d73`, `85104a98`, `cd86ccdb`, `384cb93a`."
+                },
+                {
+                  "date": "2026-11-17",
+                  "title": "Setup's object-literal batch released before old-gen marking, ten more loop-runner ops, paged case mapping; v0.0.36",
+                  "text": "`1f409483`, `eb199535`, `30fec88c`, `b489efd3`, `475e6694`."
+                },
+                {
+                  "date": "2026-11-20",
+                  "title": "PHP 8.x and Rust frontends + WASM modules, Python 3.13 parity, composable plugin bridges, Test262 2e58f87d83; v0.0.37",
+                  "text": "`6c8cd8e4`, `d6d5cc6b`, `c3d74be0`, `755a33c7`, `4fc42f3f`, `2b24920f`, `8c14de6b`, `84c2df00`, `a5c9ef93`."
                 }
               ]
             }
@@ -5056,6 +5381,63 @@
     "searchPlaceholder": "nursery, Annex B, PGO, WebGPU…",
     "intro": [],
     "entries": [
+      {
+        "slug": "php-rust-python-3-13-and-v0-0-37",
+        "date": "2026-11-20",
+        "title": "PHP 8.x, Rust, Python 3.13, plugin bridges and v0.0.37",
+        "summary": "v0.0.37 turns Zipp into a five-language runtime on one register VM: PHP 8.x (Laravel/Slim/CakePHP parity, Worker Mode, PhpApp WASM), Rust (Cargo projects, #[test], Axum/SQLx, WASM), Python 3.13 parity + JIT fast paths, composable addAppBridge plugins, and Test262 2e58f87d83.",
+        "tags": [
+          "php",
+          "rust",
+          "python",
+          "wasm",
+          "release"
+        ],
+        "commits": [
+          "1f409483",
+          "6c8cd8e4",
+          "d6d5cc6b",
+          "c3d74be0",
+          "755a33c7",
+          "4fc42f3f",
+          "2b24920f",
+          "8c14de6b",
+          "84c2df00",
+          "a5c9ef93"
+        ],
+        "blocks": [
+          {
+            "type": "p",
+            "text": "Between 17 and 20 November, Zipp shipped two releases. First came [v0.0.36](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.36): `1f409483` fixed a subtle nursery bug where unused objects left in setup's pre-allocated object-literal batch were marked old without write-barrier records, and ten more operations stayed inside the x86-64 loop runner (`eb199535`, `30fec88c`)."
+          },
+          {
+            "type": "p",
+            "text": "Then [v0.0.37](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.37) landed the largest expansion of the polyglot core yet. `6c8cd8e4` and `d6d5cc6b` added a full PHP 8.x frontend (`zipp-phpparse`, Composer PSR-4, Laravel 11 / Slim 4 / CakePHP 5 parity against PHP 8.4.15, selective x86-64 JIT, persistent `ZPO2` disk OPcache, and HTTP/1.1 Worker Mode). `755a33c7` and `2b24920f` added a Rust frontend (`zipp-rsparse`, Cargo project discovery, sync/async `#[test]`, Axum 0.7 routing/extractors/WebSockets, SQLx over `app.sql.*`, and `--serve` / `--watch`). `c3d74be0` brought Python to 3.13 parity (`async`/`await`, `except*`, PEP 695 type parameters, `asyncio`/`fractions`/`numbers`) with `py_leaf` and `py_rec` JIT fast paths."
+          },
+          {
+            "type": "p",
+            "text": "In `zipp-wasm`, `8c14de6b` added `javascript-php` and `javascript-rust` release modules, `PhpApp` SAPI/Worker dispatch, binary-safe VFS overlays, and composable `addAppBridge(namespace, bridge)` plugins with shared step metering (`hostStepsRemaining` / `hostChargeSteps`) while keeping the audited 51-function WASM import surface unchanged. `4fc42f3f` bumped the Test262 pin to `2e58f87d83` (96,563 / 96,564 core, 492 / 492 DateTimeFormat) after fixing 18 newly covered failures, and `3ce58871` / `84c2df00` cleared the last cross-platform gate edges so `a5c9ef93` published all 23 release assets cleanly."
+          }
+        ],
+        "related": [
+          {
+            "label": "PHP 8.x frontend",
+            "href": "/php/"
+          },
+          {
+            "label": "Rust frontend",
+            "href": "/rust/"
+          },
+          {
+            "label": "Python 3.13 frontend",
+            "href": "/python/"
+          },
+          {
+            "label": "Releases",
+            "href": "/releases/"
+          }
+        ]
+      },
       {
         "slug": "resident-gpu-sessions-and-v0-0-19",
         "date": "2026-09-16",

@@ -15,6 +15,32 @@ export class Engine {
         wasm.__wbg_engine_free(ptr, 0);
     }
     /**
+     * Register a namespaced application bridge for `app.<namespace>.*` calls
+     * (and `app.<namespace>`), so independent plugins (for example `"sql"`,
+     * `"fs"`, `"kv"`) can coexist without replacing one another.
+     *
+     * `namespace` must be a single lowercase identifier segment matching the
+     * first segment of `app.<namespace>.*` (`[a-z][a-z0-9_-]*`). Like
+     * [`Self::set_app_bridge`], `bridge.call(kind, args)` receives the kind
+     * without the `app.` prefix (e.g. `"sql.query"`) and an array of string
+     * arguments, so the same plugin adapter works with both `setAppBridge` and
+     * `addAppBridge`. Registering a bridge grants no capabilities on its own;
+     * allow each operation explicitly through `setSyncHostCapabilities`.
+     * While `bridge.call` runs, the plugin may inspect and deduct from the
+     * VM's unified instruction budget via `hostStepsRemaining()` and
+     * `hostChargeSteps(n)`.
+     * @param {string} namespace
+     * @param {any} bridge
+     */
+    addAppBridge(namespace, bridge) {
+        const ptr0 = passStringToWasm0(namespace, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.engine_addAppBridge(this.__wbg_ptr, ptr0, len0, bridge);
+        if (ret[1]) {
+            throw takeFromExternrefTable0(ret[0]);
+        }
+    }
+    /**
      * Call the top-level function `name`. Microtasks are drained before this
      * returns, so promise callbacks the call scheduled have already run.
      * @param {string} name
@@ -728,6 +754,36 @@ export function accelGuestCall(name, args) {
 }
 
 /**
+ * Deduct `steps` work units from the active engine's unified instruction
+ * budget while a synchronous host bridge (`app.*`, `accel.run`, or a Python
+ * package bridge) is running. Throws the VM's budget-exhausted `RangeError`
+ * (and marks the VM's budget exhausted) if charging `steps` crosses the
+ * engine's finite ceiling.
+ * @param {number} steps
+ */
+export function hostChargeSteps(steps) {
+    const ret = wasm.hostChargeSteps(steps);
+    if (ret[1]) {
+        throw takeFromExternrefTable0(ret[0]);
+    }
+}
+
+/**
+ * Instructions remaining in the active engine's unified step budget
+ * (`Infinity` when unmetered, `0` when exhausted). Callable only while a
+ * synchronous host bridge (`app.*`, `accel.run`, or a Python package bridge)
+ * is executing.
+ * @returns {number}
+ */
+export function hostStepsRemaining() {
+    const ret = wasm.hostStepsRemaining();
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return ret[0];
+}
+
+/**
  * Running totals for this WASM instance, as JSON-shaped data:
  *
  * - `enginesCreated`, `enginesDisposed`, and `enginesLive` (the difference:
@@ -927,7 +983,7 @@ function __wbg_get_imports() {
             const ret = result;
             return ret;
         },
-        __wbg_isArray_02e2d96ea260062e: function() { return handleError(function (arg0) {
+        __wbg_isArray_4f81634b686ac9f1: function() { return handleError(function (arg0) {
             const ret = Array.isArray(arg0);
             return ret;
         }, arguments); },
@@ -935,7 +991,7 @@ function __wbg_get_imports() {
             const ret = ArrayBuffer.isView(arg0);
             return ret;
         },
-        __wbg_keys_ee5473a4e9a22715: function() { return handleError(function (arg0) {
+        __wbg_keys_33870080d56649c3: function() { return handleError(function (arg0) {
             const ret = Object.keys(arg0);
             return ret;
         }, arguments); },
@@ -955,7 +1011,7 @@ function __wbg_get_imports() {
             const ret = new Array();
             return ret;
         },
-        __wbg_new_cb892b1bc8c0474c: function() { return handleError(function (arg0) {
+        __wbg_new_8b924dcf7ae2263d: function() { return handleError(function (arg0) {
             const ret = new Float32Array(arg0);
             return ret;
         }, arguments); },

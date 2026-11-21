@@ -251,7 +251,7 @@ test('repository links on the site point at files and headings that exist on mai
 
 test('the home page keeps the site identity and links to the documentation without JavaScript', () => {
   const home = readFileSync(new URL('../index.html', import.meta.url), 'utf8')
-  assert.ok(home.includes('<title>ZIPP: Portable Polyglot Runtime for JavaScript and Python</title>'))
+  assert.ok(home.includes('<title>ZIPP: Portable Polyglot Runtime for JS, Python, PHP and Rust</title>'))
   assert.ok(home.includes('Zippy Interpreter for Polyglot Programming'), 'home spells out the name')
   assert.ok(new RegExp(`<link rel="canonical" href="${content.site.origin}/" ?/?>`).test(home))
   assert.ok(home.includes('"SoftwareApplication"') && home.includes('"WebSite"'))

@@ -21,17 +21,19 @@ const COMMITS_URL = `${GITHUB_URL}/commits/main`
 const DOC_LINKS = [
   { href: '/javascript-engine/', title: 'JavaScript engine', text: 'What Zipp is, the language it implements, and how to run it.' },
   { href: '/architecture/', title: 'JavaScript engine architecture', text: 'NaN-boxed values, the explicit-frame register VM, JIT tiers and the nursery GC.' },
-  { href: '/test262/', title: 'Test262 conformance', text: '96,228 executions of the pinned corpus, the one expected failure, and the CI gate.' },
+  { href: '/test262/', title: 'Test262 conformance', text: '96,564 executions of the pinned corpus, the one expected failure, and the CI gate.' },
   { href: '/benchmarks/', title: 'Zipp benchmarks', text: 'JIT against JIT, interpreter against interpreter, Python against CPython, with the raw data.' },
-  { href: '/python/', title: 'Python frontend', text: 'Python 3 compiled to the same register bytecode, natively or in the browser.' },
+  { href: '/python/', title: 'Python frontend', text: 'Python 3.13 compiled to the same register bytecode, natively or in the browser.' },
+  { href: '/php/', title: 'PHP 8.x frontend', text: 'PHP 8.x compiled to register bytecode, with Laravel/Slim/CakePHP parity, Worker Mode and WASM.' },
+  { href: '/rust/', title: 'Rust frontend', text: 'Rust scripts, multi-file Cargo projects, #[test], Axum/SQLx backends and browser WASM.' },
   { href: '/wasm/', title: 'WebAssembly runtime', text: 'The persistent, interpreter-only browser sandbox and every one of its limits.' },
   { href: '/webgpu/', title: 'GPU compute', text: 'Float32 graphs from Python and JavaScript on WebGPU, WebGL2 or WASM kernels.' },
   { href: '/embedding/', title: 'Embedding guide', text: 'The Rust embed API, the browser Engine class, and the CLI as a host.' },
   { href: '/sandbox/', title: 'Sandboxing untrusted code', text: 'Three execution profiles, their guarantees, and their non-guarantees.' },
   { href: SANDBOX_PLAYGROUND_URL, title: 'Sandbox playground', text: 'Run JavaScript in a default-deny sandbox, with a switch for every permission and limit.' },
   { href: '/comparisons/', title: 'Compared with QuickJS, Boa and V8', text: 'Where each engine is the better choice, stated fairly.' },
-  // A dated snapshot: the figures the /journey/ page itself states (tests/embed.test.mjs checks they agree).
-  { href: '/journey/', title: 'The Zipp story', text: '3,268 commits in 167 days, to 11 November 2026, told in nine acts with the mistakes left in.' },
+  // A dated snapshot: the figures the /journey/ page itself states (tests/site.test.mjs checks they agree).
+  { href: '/journey/', title: 'The Zipp story', text: '3,331 commits in 177 days, to 21 November 2026, told in nine acts with the mistakes left in.' },
   { href: '/journal/', title: 'Engineering journal', text: 'Dated entries with commit links, searchable, with an RSS feed.' },
 ]
 
@@ -478,7 +480,7 @@ const controls = [
 ]
 
 const pipeline = [
-  ['01', 'Source', 'JavaScript or Python'],
+  ['01', 'Source', 'JS, TS, Python, PHP, Rust'],
   ['02', 'Front end', 'One per language'],
   ['03', 'Bytecode', 'Register-based VM'],
   ['04', 'Hot loops', 'x86-64 OSR JIT'],
@@ -549,7 +551,7 @@ function Playground() {
 
   // This scratchpad loads the engine's internal packaging: the wasm-bindgen glue
   // and the module as two files in public/wasm, extracted from the release's
-  // zipp-0.0.35-javascript.wasm (`package.mjs extract`) and driven by
+  // zipp-0.0.37-javascript.wasm (`package.mjs extract`) and driven by
   // playground.worker.ts. Pages that embed ZIPP use the public path instead,
   // zipp.mjs plus that one .wasm, which the Embed section (EmbedSection.tsx)
   // shows and /sandbox/playground/ runs. tests/adventure.test.mjs exercises this
@@ -777,7 +779,7 @@ function Playground() {
           </div>
         </div>
       </div>
-      <p className="playground-build-note">Bundled engine: <a href={`${GITHUB_URL}/releases/tag/v0.0.35`} target="_blank" rel="noreferrer">ZIPP WASM v0.0.35</a>. Each run uses a disposable Worker with a host-enforced deadline. Repository updates do not swap the engine underneath your code.</p>
+      <p className="playground-build-note">Bundled engine: <a href={`${GITHUB_URL}/releases/tag/v0.0.37`} target="_blank" rel="noreferrer">ZIPP WASM v0.0.37</a>. Each run uses a disposable Worker with a host-enforced deadline. Repository updates do not swap the engine underneath your code.</p>
       <p className="playground-build-note">This scratchpad loads the engine’s internal two-file packaging. To put ZIPP in your own page, use <code>zipp.mjs</code> and one <code>.wasm</code>: see <a href="#embed">Embed ZIPP on your site</a>.</p>
     </section>
   )
@@ -891,7 +893,7 @@ function App() {
               ZIPP is a portable polyglot runtime: one Rust register-bytecode VM that languages compile to,
               so programs share one runtime, one sandbox and one set of embeddings, from the native CLI
               and Rust to WebAssembly in browsers, Node, Deno and Bun.
-              <strong> JavaScript (ES2025, 99.999% of Test262) and Python (an experimental subset, with torch) run on it today.</strong>
+              <strong> JavaScript (ES2025, 99.999% of Test262), TypeScript, Python 3.13 (with torch), PHP 8.x and Rust run on it today.</strong>
               {' '}The VM is built for more: <a href={LANGUAGES_URL} target="_blank" rel="noreferrer">how a language plugs in</a>.
             </p>
 
@@ -901,7 +903,7 @@ function App() {
             </div>
             <p className="hero-embed">
               <a href="#embed">Embed it in your page</a>: one <code>.wasm</code> engine and <code>zipp.mjs</code> from
-              the <a href={`${GITHUB_URL}/releases/tag/v0.0.35`} target="_blank" rel="noreferrer">v0.0.35 release</a>, nothing to build.
+              the <a href={`${GITHUB_URL}/releases/tag/v0.0.37`} target="_blank" rel="noreferrer">v0.0.37 release</a>, nothing to build.
             </p>
 
             <div className="hero-trust" aria-label="Zipp highlights">
@@ -1082,7 +1084,7 @@ function App() {
             <p>Build the native CLI with stable Rust, run trusted scripts and modules, then move to the embedding API when your host needs a live VM.</p>
             <div className="quickstart-links">
               <a className="text-link" href={EMBEDDING_URL}>Embedding docs<ArrowIcon /></a>
-              <ExternalLink className="text-link" href={`${GITHUB_URL}/releases/tag/v0.0.35`}>Or download the v0.0.35 CLI</ExternalLink>
+              <ExternalLink className="text-link" href={`${GITHUB_URL}/releases/tag/v0.0.37`}>Or download the v0.0.37 CLI</ExternalLink>
               <ExternalLink className="text-link" href={GITHUB_URL}>Browse the source</ExternalLink>
             </div>
           </div>
@@ -1139,7 +1141,7 @@ function App() {
       <footer className="site-footer section-wrap">
         <a className="brand" href="#top" aria-label="Back to top"><Brand /></a>
         <p>
-          Portable polyglot runtime · JavaScript + Python today · one VM · part of{' '}
+          Portable polyglot runtime · JS, TS, Python, PHP &amp; Rust · one VM · part of{' '}
           <a href={F2I_URL} target="_blank" rel="noreferrer">f2i.com</a>
         </p>
         <div>
