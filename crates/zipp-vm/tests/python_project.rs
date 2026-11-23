@@ -1117,3 +1117,181 @@ print("ok")
     .unwrap();
     assert_eq!(out, vec!["ok"]);
 }
+
+#[test]
+fn stdout_and_stderr_do_not_truncate_past_64_kib_in_embedder() {
+    // Non-streaming embedder host (`take_output` / `take_errput`): lines
+    // exceeding 64 KiB are preserved intact instead of being truncated by
+    // `inspect_line` with `...`.
+    let main = "import sys\nprint('a' * 70000)\nsys.stderr.write('b' * 70000 + '\\n')\n";
+    let (out, err) = big_stack(move || {
+        let mut compiled = compile_python_project("main", &[("main".to_owned(), main.to_owned())])?;
+        let state = compiled.state_mut();
+        state.set_limits(50_000_000, None);
+        state.run_init()?;
+        Ok::<_, String>((state.take_output(), state.take_errput()))
+    })
+    .unwrap();
+    assert_eq!(out, vec!["a".repeat(70_000)]);
+    assert_eq!(err, vec!["b".repeat(70_000)]);
+
+    // Streaming embedder host (`set_raw_output_sink`): exact bytes are emitted
+    // without appended newlines, including binary writes via `.buffer.write`.
+    let raw_main = "import sys\nprint('hello', end='')\nsys.stdout.write('world')\nsys.stderr.write('err')\nsys.stdout.buffer.write(b'\\x00\\xff')\n";
+    let (raw_out, raw_err) = big_stack(move || {
+        use std::sync::{Arc, Mutex};
+        use zipp_vm::embed::ConsoleStream;
+        let out_buf: Arc<Mutex<Vec<u8>>> = Arc::default();
+        let err_buf: Arc<Mutex<Vec<u8>>> = Arc::default();
+        let out_c = out_buf.clone();
+        let err_c = err_buf.clone();
+        let mut compiled =
+            compile_python_project("main", &[("main".to_owned(), raw_main.to_owned())])?;
+        let state = compiled.state_mut();
+        state.set_raw_output_sink(Box::new(move |stream, bytes| match stream {
+            ConsoleStream::Stdout => out_c.lock().unwrap().extend_from_slice(bytes),
+            ConsoleStream::Stderr => err_c.lock().unwrap().extend_from_slice(bytes),
+        }));
+        state.set_limits(50_000_000, None);
+        state.run_init()?;
+        let o = out_buf.lock().unwrap().clone();
+        let e = err_buf.lock().unwrap().clone();
+        Ok::<_, String>((o, e))
+    })
+    .unwrap();
+    assert_eq!(raw_out, b"helloworld\x00\xff");
+    assert_eq!(raw_err, b"err");
+}
+
+#[cfg(feature = "instrument")]
+#[test]
+fn metered_output_limit_fails_loudly_instead_of_truncating() {
+    use zipp_vm::embed::ConsoleStream;
+
+    // Non-streaming metered host: exceeding `output_limit` fails explicitly.
+    let err = big_stack(|| {
+        let mut compiled = compile_python_project(
+            "main",
+            &[("main".to_owned(), "print('a' * 2048)\n".to_owned())],
+        )?;
+        let state = compiled.state_mut();
+        state.set_limits(50_000_000, None);
+        state.set_output_limit(1024);
+        state.run_init()
+    })
+    .expect_err("non-streaming output past limit must fail");
+    assert!(
+        err.to_ascii_lowercase().contains("output"),
+        "expected output limit error, got: {err}"
+    );
+
+    // Streaming metered host (text and binary): exceeding `output_limit` fails
+    // before emitting the overflowing write.
+    for src in [
+        "import sys\nsys.stdout.write('a' * 2048)\n",
+        "import sys\nsys.stdout.buffer.write(b'x' * 2048)\n",
+    ] {
+        let src = src.to_owned();
+        let err = big_stack(move || {
+            let mut compiled = compile_python_project("main", &[("main".to_owned(), src)])?;
+            let state = compiled.state_mut();
+            state.set_raw_output_sink(Box::new(|_stream: ConsoleStream, _bytes: &[u8]| {}));
+            state.set_limits(50_000_000, None);
+            state.set_output_limit(1024);
+            state.run_init()
+        })
+        .expect_err("streaming output past limit must fail");
+        assert!(
+            err.to_ascii_lowercase().contains("output"),
+            "expected output limit error, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn str_slice_search_affix_truth_cache_and_textwrap_semantics() {
+    let main = r#"
+import re, textwrap, html.parser
+
+# ASCII slicing + bounded find/rfind/count/startswith/endswith edge cases
+s = "abcdef"
+assert s[1:4] == "bcd"
+assert s[-3:-1] == "de"
+assert s[4:2] == ""
+assert s[::2] == "ace"
+assert s[::-1] == "fedcba"
+assert [s.find("", 4, 2), s.rfind("", 4, 2), s.count("", 4, 2)] == [-1, -1, 0]
+assert [s.find("", 10), s.rfind("", 10), s.find("", 6), s.rfind("", 6)] == [-1, -1, 6, 6]
+assert [s.startswith("", 4, 2), s.endswith("", 4, 2), s.startswith("", 10), s.endswith("", 10)] == [False, False, False, False]
+assert s.find("cd", 1, 4) == 2
+assert s.find("cd", 1, 3) == -1
+assert s.rfind("cd", 1, 4) == 2
+assert s.rfind("cd", 1, 3) == -1
+assert s.count("a", 0, 1) == 1 and s.count("a", 1, 6) == 0
+assert "banana".count("na", 2, 6) == 2 and "banana".count("na", 2, 5) == 1
+assert s.startswith("bc", 1, 4) and not s.startswith("bcde", 1, 4)
+assert s.endswith("cd", 1, 4) and not s.endswith("abcd", 1, 4)
+assert s.startswith(("xy", "bc"), 1, 4) and s.endswith(("xy", "cd"), 1, 4)
+
+# Astral code-point indexing, slicing, find/rfind/count/startswith/endswith
+u = "a🦀b🦀c"
+assert len(u) == 5
+assert [u[0], u[1], u[2], u[3], u[4], u[-1], u[-2]] == ["a", "🦀", "b", "🦀", "c", "c", "🦀"]
+assert u[1:4] == "🦀b🦀"
+assert u[2:5] == "b🦀c"
+assert u.find("b", 1) == 2 and u.find("c", 2) == 4
+assert u.rfind("🦀") == 3 and u.rfind("🦀", 0, 3) == 1
+assert u.count("🦀", 1, 4) == 2 and u.count("🦀", 2, 4) == 1
+assert u.startswith("b🦀", 2, 4) and u.endswith("🦀c", 3, 5)
+
+# re.Pattern / re.Match direct fast paths (ASCII & astral)
+pat = re.compile(r"([a-z]+)=([0-9]+)(;?)")
+m = pat.match("🦀foo=42;bar=9", 1)
+assert bool(m) is True
+assert m.start() == 1 and m.end() == 8
+assert m.group() == "foo=42;" and m.group(1) == "foo"
+assert m.group(1, 2, 3) == ("foo", "42", ";")
+
+# Dynamic __bool__ / __len__ invalidates per-class truthiness cache
+class Box:
+    pass
+bx = Box()
+assert bool(bx) is True
+Box.__bool__ = lambda self: False
+assert bool(bx) is False
+del Box.__bool__
+assert bool(bx) is True
+Box.__len__ = lambda self: 0
+assert bool(bx) is False
+
+# textwrap full kwargs & TextWrapper (used by html2text default body_width=78)
+lines = textwrap.wrap(
+    "alpha superlongwordthatcannotbebroken beta gamma",
+    width=12,
+    break_long_words=False,
+    subsequent_indent="  ",
+)
+assert lines == ["alpha", "  superlongwordthatcannotbebroken", "  beta gamma"], lines
+tw = textwrap.TextWrapper(width=10, initial_indent="> ", subsequent_indent="  ")
+assert tw.fill("one two three four") == "> one two\n  three\n  four"
+
+# html.parser parses multi-tag document cleanly
+class Counter(html.parser.HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.tags = 0
+        self.text = []
+    def handle_starttag(self, tag, attrs):
+        self.tags += 1
+    def handle_data(self, data):
+        self.text.append(data)
+
+p = Counter()
+p.feed("<div>🦀<a href='x&amp;y'>hi &lt;world&gt;</a></div>" * 50)
+p.close()
+assert p.tags == 100
+assert "hi <world>" in "".join(p.text)
+print("ok")
+"#;
+    assert_eq!(run_project("main", &[("main", main)]).unwrap(), vec!["ok"]);
+}

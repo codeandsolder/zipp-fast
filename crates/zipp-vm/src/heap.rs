@@ -9570,6 +9570,89 @@ impl Heap {
         self.alloc_object_settled_thin(boxed, crate::shape::EMPTY)
     }
 
+    /// Allocate a `NewPlannedObject` empty shell backed by `plan`, reusing the
+    /// object pool and value slab whenever `thin_alloc` is active so planned
+    /// literals that cannot fuse into `FinalizeObject` (e.g. spreads or
+    /// computed properties) still avoid per-object `Box`/`Vec` mallocs.
+    #[cfg(not(feature = "safe-sandbox"))]
+    pub(crate) fn alloc_planned_object(&mut self, plan: crate::bytecode::StaticKeyPlan) -> u32 {
+        let n = plan.len();
+        if self.thin_alloc && static_key_plans_enabled() {
+            if let Some(sc) = val_slab_class(n) {
+                let mut shell = self.obj_pool.pop();
+                let owner = &mut self.val_slab[sc as usize];
+                let owner_addr = std::ptr::from_mut(&mut *owner).expose_provenance();
+                let mut reuse_base = None;
+                if let Some(b) = shell.as_deref_mut() {
+                    if let ValStore::Slab {
+                        base,
+                        owner_and_len,
+                    } = &b.vals
+                    {
+                        if *owner_and_len & !VAL_SLAB_OWNER_LEN_MASK == owner_addr {
+                            reuse_base = Some(*base);
+                            if self.oracle {
+                                self.shell_cell_stats[0] += 1;
+                            }
+                        } else {
+                            b.vals.strip_slab();
+                            if self.oracle {
+                                self.shell_cell_stats[1] += 1;
+                            }
+                        }
+                    }
+                }
+                let base = match reuse_base {
+                    Some(base) => base,
+                    None => self.val_slab[sc as usize].alloc_cell(val_slab_class_cap(sc)),
+                };
+                let vals = ValStore::Slab {
+                    base,
+                    owner_and_len: owner_addr,
+                };
+                let boxed = match shell {
+                    Some(mut b) => {
+                        self.obj_pool_pops += 1;
+                        if self.oracle {
+                            self.obj_pool_stats[1] += 1;
+                        }
+                        *b = ObjMap {
+                            keys: PropKeys::planned(plan),
+                            vals,
+                            ..ObjMap::new()
+                        };
+                        b
+                    }
+                    None => Box::new(ObjMap {
+                        keys: PropKeys::planned(plan),
+                        vals,
+                        ..ObjMap::new()
+                    }),
+                };
+                return self.alloc_object_settled_thin(boxed, crate::shape::EMPTY);
+            }
+        }
+        let boxed = match self.obj_pool.pop() {
+            Some(mut b) => {
+                self.obj_pool_pops += 1;
+                if self.oracle {
+                    self.obj_pool_stats[1] += 1;
+                }
+                b.vals.strip_slab();
+                *b = ObjMap::with_static_key_plan(plan);
+                b
+            }
+            None => Box::new(ObjMap::with_static_key_plan(plan)),
+        };
+        self.alloc(HeapObj::Object(boxed))
+    }
+
+    /// [`Heap::alloc_planned_object`] in the checked profile, which has no slab.
+    #[cfg(feature = "safe-sandbox")]
+    pub(crate) fn alloc_planned_object(&mut self, plan: crate::bytecode::StaticKeyPlan) -> u32 {
+        self.alloc(HeapObj::Object(Box::new(ObjMap::with_static_key_plan(plan))))
+    }
+
     /// [`Heap::alloc_ctor_object`] in the checked profile, which has no slab.
     #[cfg(feature = "safe-sandbox")]
     pub(crate) fn alloc_ctor_object(&mut self, hint: usize, class: Option<u32>) -> u32 {

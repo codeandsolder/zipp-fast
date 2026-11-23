@@ -1204,6 +1204,7 @@ impl<'p> Vm<'p> {
                     return lacks.then_some(m);
                 }
             }
+            return None;
         }
         let gb_name: &str = self.func(func_id as usize).string_constants[gb as usize].as_str();
         let (_, s, b) = self.py_table_entry(cls, ty.gb, "gb", gb_name)?;

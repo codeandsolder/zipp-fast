@@ -3282,6 +3282,16 @@ impl<'p> Vm<'p> {
                 .program
                 .global_names
                 .iter()
+                .position(|name| name == native::PY_WRITE_NAME);
+            if let Some(slot) = slot.filter(|&slot| slot < self.globals.len()) {
+                let wr = self.heap.alloc(HeapObj::Native(native::PY_WRITE));
+                self.globals[slot] = Value::heap(wr);
+                self.bump_global_gen(slot as u32);
+            }
+            let slot = self
+                .program
+                .global_names
+                .iter()
                 .position(|name| name == native::PY_PCT_NAME);
             if let Some(slot) = slot.filter(|&slot| slot < self.globals.len()) {
                 let pct = self.heap.alloc(HeapObj::Native(native::PY_PCT));

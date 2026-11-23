@@ -377,7 +377,7 @@ pub(crate) extern "win64" fn jit_make_closure(
         };
 
         // Lexical inheritance reads, all before the allocation commit.
-        let inherited_home = if this_reg.is_some() {
+        let inherited_home = if this_reg.is_some() && !vm.closure_home.is_empty() {
             vm.closure_home.get(&site.active).copied()
         } else {
             None
@@ -394,16 +394,22 @@ pub(crate) extern "win64" fn jit_make_closure(
             };
             if frame_nt != Value::UNDEFINED {
                 frame_nt
-            } else {
+            } else if !vm.closure_new_target.is_empty() {
                 vm.closure_new_target
                     .get(&site.active)
                     .copied()
                     .unwrap_or(Value::UNDEFINED)
+            } else {
+                Value::UNDEFINED
             }
         } else {
             Value::UNDEFINED
         };
-        let eval_scope = vm.closure_eval_scope.get(&site.active).copied();
+        let eval_scope = if vm.closure_eval_scope.is_empty() {
+            None
+        } else {
+            vm.closure_eval_scope.get(&site.active).copied()
+        };
 
         // B257: the three mirror lines are settled from the values in hand
         // (the heap falls back to the re-reading `alloc` when the thin fold

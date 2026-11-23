@@ -3135,9 +3135,7 @@ impl<'p> Vm<'p> {
                                 "InternalError: invalid static key plan".to_string(),
                             ));
                         }
-                        let v = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(
-                            ObjMap::with_static_key_plan(plan),
-                        ))));
+                        let v = Value::heap(self.heap.alloc_planned_object(plan));
                         self.realm_born(v.heap_index(), self.obj_proto);
                         self.set(base, dst, v);
                         ip += 1;

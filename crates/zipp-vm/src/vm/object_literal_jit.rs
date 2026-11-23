@@ -156,11 +156,7 @@ pub(crate) extern "win64" fn jit_new_planned_object(
             return crate::codegen::SELF_CALL_DEOPT;
         }
         vm.maybe_gc();
-        let idx = vm
-            .heap
-            .alloc(HeapObj::Object(Box::new(ObjMap::with_static_key_plan(
-                plan,
-            ))));
+        let idx = vm.heap.alloc_planned_object(plan);
         vm.realm_born(idx, vm.obj_proto);
         crate::heap::note_static_key_jit_object();
         Value::heap(idx).bits()

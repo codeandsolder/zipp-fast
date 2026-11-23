@@ -587,6 +587,31 @@
         if (c === T.dict || c === T.set || c === T.frozenset) return v.size !== 0;
         if (c === T.range) return rangeLength(v) !== 0n;
         if (c === T.complex) return v.re !== 0 || v.im !== 0;
+        if (v.isType !== true && c !== undefined) {
+            if (c.truthVer !== c.ver) {
+                const b = rt.lookupType(c, "__bool__");
+                if (b !== undefined) { c.truthKind = 2; c.truthFn = b; }
+                else {
+                    const l = rt.lookupType(c, "__len__");
+                    if (l !== undefined) { c.truthKind = 3; c.truthFn = l; }
+                    else { c.truthKind = 1; c.truthFn = undefined; }
+                }
+                c.truthVer = c.ver;
+            }
+            const tk = c.truthKind;
+            if (tk === 1) return true;
+            const fn = c.truthFn;
+            const fastSelf = fn !== null && typeof fn === "object" && (fn.cls === T.function || fn.cls === T.builtin_function_or_method) && fn.c1 !== undefined;
+            if (tk === 2) {
+                const r = fastSelf ? fn.c1(fn.unboxSelf === true && v.pyval !== undefined ? v.pyval : v) : call(descrGet(fn, v, c), [], null);
+                if (typeof r !== "boolean") fail(E.TypeError, "__bool__ should return bool, returned " + typeOf(r).name);
+                return r;
+            }
+            const n = fastSelf ? fn.c1(fn.unboxSelf === true && v.pyval !== undefined ? v.pyval : v) : call(descrGet(fn, v, c), [], null);
+            if (!isInt(n)) fail(E.TypeError, "'" + typeOf(n).name + "' object cannot be interpreted as an integer");
+            if (asInt(n) < 0n) fail(E.ValueError, "__len__() should return >= 0");
+            return asInt(n) !== 0n;
+        }
         const b = typeMethod(v, "__bool__");
         if (b !== undefined) {
             const r = call(descrGet(b, v, c), [], null);
@@ -1449,11 +1474,51 @@
         return STR_QUERY !== null ? STR_QUERY(s) : SURROGATE.test(s);
     }
     rt.hasSurrogate = hasSurrogate;
+    // Sparse sorted UTF-16 start indices of valid surrogate pairs for O(log K)
+    // code-point <-> UTF-16 offset conversion, cached for the last string
+    // scanned (shared across str indexing/slicing, str.find/startswith, and re).
+    const ASTRAL_PAIR = /[\ud800-\udbff][\udc00-\udfff]/g;
+    function buildAstralPairs(s) {
+        const pairs = [];
+        ASTRAL_PAIR.lastIndex = 0;
+        let m;
+        while ((m = ASTRAL_PAIR.exec(s)) !== null) pairs.push(m.index);
+        return pairs.length ? pairs : null;
+    }
+    function cpFromUtf16(pairs, u) {
+        let lo = 0, hi = pairs.length;
+        while (lo < hi) { const mid = (lo + hi) >>> 1; if (pairs[mid] < u) lo = mid + 1; else hi = mid; }
+        return u - lo;
+    }
+    function utf16FromCp(pairs, cp) {
+        let lo = 0, hi = pairs.length;
+        while (lo < hi) { const mid = (lo + hi) >>> 1; if (pairs[mid] - mid < cp) lo = mid + 1; else hi = mid; }
+        return cp + lo;
+    }
+    let infoS = "", infoPairs = null, infoLen = 0;
+    rt.infoLen = 0; rt.infoPairs = null;
+    function strInfo(s) {
+        if (s !== infoS) {
+            if (hasSurrogate(s)) {
+                infoPairs = buildAstralPairs(s);
+                infoLen = infoPairs !== null ? s.length - infoPairs.length : s.length;
+            } else {
+                infoPairs = null;
+                infoLen = s.length;
+            }
+            infoS = s;
+            rt.infoLen = infoLen;
+            rt.infoPairs = infoPairs;
+        }
+    }
+    rt.cpFromUtf16 = cpFromUtf16;
+    rt.utf16FromCp = utf16FromCp;
+    rt.strInfo = strInfo;
     // The length in code points.
     function strLen(s) {
         if (!hasSurrogate(s)) return s.length;
-        let n = 0; for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); if (c < 0xdc00 || c > 0xdfff) n++; }
-        return n;
+        strInfo(s);
+        return infoLen;
     }
     rt.strLen = strLen;
     function normIndex(i, length, what) {
@@ -1471,9 +1536,43 @@
     function isSlice(k) { return k !== null && typeof k === "object" && k.cls === T.slice; }
     function baseGetitem(o, k) {
         if (typeof o === "string") {
-            if (isSlice(k)) return sliceArray(codepoints(o), k).join("");
+            if (isSlice(k)) {
+                if (!hasSurrogate(o)) {
+                    const n = o.length;
+                    if (k.step === null) {
+                        let lo = k.start === null ? 0 : typeof k.start === "bigint" ? Number(k.start) : Number(rt.indexOf(k.start, "slice"));
+                        let hi = k.stop === null ? n : typeof k.stop === "bigint" ? Number(k.stop) : Number(rt.indexOf(k.stop, "slice"));
+                        if (lo < 0) { lo += n; if (lo < 0) lo = 0; } else if (lo > n) lo = n;
+                        if (hi < 0) { hi += n; if (hi < 0) hi = 0; } else if (hi > n) hi = n;
+                        return lo < hi ? o.slice(lo, hi) : "";
+                    }
+                    const [start, , step, count] = sliceIndices(k, n);
+                    if (count === 0) return "";
+                    if (step === 1) return o.slice(start, start + count);
+                    let out = "";
+                    for (let i = 0, j = start; i < count; i++, j += step) out += o[j];
+                    return out;
+                }
+                strInfo(o);
+                const [start, , step, count] = sliceIndices(k, infoLen);
+                if (count === 0) return "";
+                if (step === 1) {
+                    const u0 = infoPairs !== null ? utf16FromCp(infoPairs, start) : start;
+                    const u1 = infoPairs !== null ? utf16FromCp(infoPairs, start + count) : start + count;
+                    return o.slice(u0, u1);
+                }
+                return sliceArray(Array.from(o), k).join("");
+            }
             if (!hasSurrogate(o)) return o[normIndex(k, o.length, "string")];
-            const cps = Array.from(o); return cps[normIndex(k, cps.length, "string")];
+            strInfo(o);
+            const idx = normIndex(k, infoLen, "string");
+            const u = infoPairs !== null ? utf16FromCp(infoPairs, idx) : idx;
+            const c = o.charCodeAt(u);
+            if (c >= 0xd800 && c <= 0xdbff && u + 1 < o.length) {
+                const c2 = o.charCodeAt(u + 1);
+                if (c2 >= 0xdc00 && c2 <= 0xdfff) return o.slice(u, u + 2);
+            }
+            return o[u];
         }
         if (o.items !== undefined && (isInstance(o, T.list) || isInstance(o, T.tuple))) {
             const base = isInstance(o, T.list) ? T.list : T.tuple;

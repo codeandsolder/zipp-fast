@@ -2252,6 +2252,10 @@ pub struct Vm<'p> {
     /// of into the buffers above (a CLI that prints progress while a long
     /// program runs). `None` everywhere else.
     pub(crate) console_sink: Option<Box<dyn FnMut(ConsoleStream, &str)>>,
+    /// Raw byte output sink for frontends whose stdout/stderr carry unframed
+    /// bytes without trailing newlines or `inspect_line` truncation (for
+    /// example the native `zipp py` CLI). Empty slice signals an explicit flush.
+    pub(crate) raw_output_sink: Option<Box<dyn FnMut(ConsoleStream, &[u8])>>,
     /// Embedder host hook, backing the `HOST_CALL` native. `None` in every
     /// engine-internal path (`run`, `run_module_file`, the CLI, test262), so a
     /// stock build has no host surface at all; only `crate::embed` installs one.

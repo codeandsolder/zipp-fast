@@ -427,6 +427,45 @@ impl<'p> Vm<'p> {
         self.py_strm_fast_op(this, args, at, op.as_int())
     }
 
+    /// Parse optional `start`/`end` slice bounds in `args[2..]` for an ASCII
+    /// string of byte length `len`. Returns `None` to fall back to JS (non-int
+    /// bound), `Some(None)` for an empty/out-of-range window (`lo > hi`), or
+    /// `Some(Some((lo, hi)))` with `0 <= lo <= hi <= len`.
+    fn py_strm_bounds(&self, args: &[Value], len: usize) -> Option<Option<(usize, usize)>> {
+        let n = len as i128;
+        let lo = match args.get(2).copied() {
+            None => 0usize,
+            Some(v) if v == Value::NULL || v.is_undefined() => 0usize,
+            Some(v) => {
+                let i = self.bigint_i128(v)?;
+                if i < 0 {
+                    (i + n).max(0) as usize
+                } else if i > n {
+                    return Some(None);
+                } else {
+                    i as usize
+                }
+            }
+        };
+        let hi = match args.get(3).copied() {
+            None => len,
+            Some(v) if v == Value::NULL || v.is_undefined() => len,
+            Some(v) => {
+                let i = self.bigint_i128(v)?;
+                if i < 0 {
+                    (i + n).max(0) as usize
+                } else {
+                    i.min(n) as usize
+                }
+            }
+        };
+        if lo > hi {
+            Some(None)
+        } else {
+            Some(Some((lo, hi)))
+        }
+    }
+
     fn py_strm_fast_op(&mut self, this: Value, args: &[Value], at: usize, op: i32) -> Option<Value> {
         match (op, args.len()) {
             (12, 2) => return self.py_heap_op(this, args, true, at),
@@ -511,6 +550,23 @@ impl<'p> Vm<'p> {
                     let s = self.py_strm_bytes(s_idx);
                     let affix = self.py_strm_bytes(affix_idx);
                     (if op == 18 { s.starts_with(affix) } else { s.ends_with(affix) }, affix.len().min(s.len()))
+                };
+                self.charge_steps(i64::try_from(compared).unwrap_or(i64::MAX));
+                return Some(Value::bool(found));
+            }
+            (18, 3) | (18, 4) | (19, 3) | (19, 4) => {
+                if !ascii {
+                    return None;
+                }
+                let (affix_idx, _) = self.py_strm_flat(args[1])?;
+                let s_len = self.py_strm_bytes(s_idx).len();
+                let Some((lo, hi)) = self.py_strm_bounds(args, s_len)? else {
+                    return Some(Value::FALSE);
+                };
+                let (found, compared) = {
+                    let win = &self.py_strm_bytes(s_idx)[lo..hi];
+                    let affix = self.py_strm_bytes(affix_idx);
+                    (if op == 18 { win.starts_with(affix) } else { win.ends_with(affix) }, affix.len().min(win.len()))
                 };
                 self.charge_steps(i64::try_from(compared).unwrap_or(i64::MAX));
                 return Some(Value::bool(found));
@@ -703,7 +759,7 @@ impl<'p> Vm<'p> {
             (6, 2) => {
                 let (sub_idx, _) = self.py_strm_flat(args[1])?;
                 // The match position, as a count of code points before it.
-                let found = {
+                let (found, scanned) = {
                     let s = self.py_strm_bytes(s_idx);
                     let sub = self.py_strm_bytes(sub_idx);
                     let at = if sub.is_empty() {
@@ -715,12 +771,142 @@ impl<'p> Vm<'p> {
                     } else {
                         memchr::memmem::find(s, sub)
                     };
-                    at.map(|i| if ascii { i } else { s[..i].iter().filter(|&&b| b & 0xC0 != 0x80).count() })
+                    let scanned = at.map_or(s.len(), |i| i + sub.len());
+                    (at.map(|i| if ascii { i } else { s[..i].iter().filter(|&&b| b & 0xC0 != 0x80).count() }), scanned)
                 };
+                self.charge_steps(i64::try_from(scanned).unwrap_or(i64::MAX));
                 return Some(match found {
                     None => self.make_bigint(-1),
                     Some(cps) => self.make_bigint(cps as i128),
                 });
+            }
+            (6, 3) | (6, 4) => {
+                if !ascii {
+                    return None;
+                }
+                let (sub_idx, _) = self.py_strm_flat(args[1])?;
+                let s_len = self.py_strm_bytes(s_idx).len();
+                let Some((lo, hi)) = self.py_strm_bounds(args, s_len)? else {
+                    return Some(self.make_bigint(-1));
+                };
+                let (found, scanned) = {
+                    let win = &self.py_strm_bytes(s_idx)[lo..hi];
+                    let sub = self.py_strm_bytes(sub_idx);
+                    let at = if sub.is_empty() {
+                        Some(0)
+                    } else if sub.len() == 1 {
+                        memchr::memchr(sub[0], win)
+                    } else if sub.len() > win.len() {
+                        None
+                    } else {
+                        memchr::memmem::find(win, sub)
+                    };
+                    let scanned = at.map_or(win.len(), |i| i + sub.len());
+                    (at.map(|i| lo + i), scanned)
+                };
+                self.charge_steps(i64::try_from(scanned).unwrap_or(i64::MAX));
+                return Some(match found {
+                    None => self.make_bigint(-1),
+                    Some(pos) => self.make_bigint(pos as i128),
+                });
+            }
+            (22, 2) => {
+                let (sub_idx, _) = self.py_strm_flat(args[1])?;
+                let (found, scanned) = {
+                    let s = self.py_strm_bytes(s_idx);
+                    let sub = self.py_strm_bytes(sub_idx);
+                    let at = if sub.is_empty() {
+                        Some(s.len())
+                    } else if sub.len() == 1 {
+                        memchr::memrchr(sub[0], s)
+                    } else if sub.len() > s.len() {
+                        None
+                    } else {
+                        memchr::memmem::rfind(s, sub)
+                    };
+                    let scanned = at.map_or(s.len(), |i| s.len() - i);
+                    (at.map(|i| if ascii { i } else { s[..i].iter().filter(|&&b| b & 0xC0 != 0x80).count() }), scanned)
+                };
+                self.charge_steps(i64::try_from(scanned).unwrap_or(i64::MAX));
+                return Some(match found {
+                    None => self.make_bigint(-1),
+                    Some(cps) => self.make_bigint(cps as i128),
+                });
+            }
+            (22, 3) | (22, 4) => {
+                if !ascii {
+                    return None;
+                }
+                let (sub_idx, _) = self.py_strm_flat(args[1])?;
+                let s_len = self.py_strm_bytes(s_idx).len();
+                let Some((lo, hi)) = self.py_strm_bounds(args, s_len)? else {
+                    return Some(self.make_bigint(-1));
+                };
+                let (found, scanned) = {
+                    let win = &self.py_strm_bytes(s_idx)[lo..hi];
+                    let sub = self.py_strm_bytes(sub_idx);
+                    let at = if sub.is_empty() {
+                        Some(win.len())
+                    } else if sub.len() == 1 {
+                        memchr::memrchr(sub[0], win)
+                    } else if sub.len() > win.len() {
+                        None
+                    } else {
+                        memchr::memmem::rfind(win, sub)
+                    };
+                    let scanned = at.map_or(win.len(), |i| win.len() - i);
+                    (at.map(|i| lo + i), scanned)
+                };
+                self.charge_steps(i64::try_from(scanned).unwrap_or(i64::MAX));
+                return Some(match found {
+                    None => self.make_bigint(-1),
+                    Some(pos) => self.make_bigint(pos as i128),
+                });
+            }
+            (23, 2) => {
+                let (sub_idx, _) = self.py_strm_flat(args[1])?;
+                let (cnt, scanned) = {
+                    let s = self.py_strm_bytes(s_idx);
+                    let sub = self.py_strm_bytes(sub_idx);
+                    let c = if sub.is_empty() {
+                        if ascii { s.len() + 1 } else { s.iter().filter(|&&b| b & 0xC0 != 0x80).count() + 1 }
+                    } else if sub.len() == 1 {
+                        memchr::memchr_iter(sub[0], s).count()
+                    } else if sub.len() > s.len() {
+                        0
+                    } else {
+                        memchr::memmem::find_iter(s, sub).count()
+                    };
+                    (c, s.len())
+                };
+                self.charge_steps(i64::try_from(scanned).unwrap_or(i64::MAX));
+                return Some(self.make_bigint(cnt as i128));
+            }
+            (23, 3) | (23, 4) => {
+                if !ascii {
+                    return None;
+                }
+                let (sub_idx, _) = self.py_strm_flat(args[1])?;
+                let s_len = self.py_strm_bytes(s_idx).len();
+                let Some((lo, hi)) = self.py_strm_bounds(args, s_len)? else {
+                    return Some(self.make_bigint(0));
+                };
+                let (cnt, scanned) = {
+                    let win = &self.py_strm_bytes(s_idx)[lo..hi];
+                    let sub = self.py_strm_bytes(sub_idx);
+                    let c = if sub.is_empty() {
+                        win.len() + 1
+                    } else if sub.len() == 1 {
+                        memchr::memchr_iter(sub[0], win).count()
+                    } else if sub.len() > win.len() {
+                        0
+                    } else {
+                        memchr::memmem::find_iter(win, sub).count()
+                    };
+                    (c, win.len())
+                };
+                self.charge_steps(i64::try_from(scanned).unwrap_or(i64::MAX));
+                return Some(self.make_bigint(cnt as i128));
             }
             (7, 2) => {
                 let items = args[1];
@@ -1703,5 +1889,181 @@ impl<'p> Vm<'p> {
             self.regex_subject_units_put(text_val, u16s);
         }
         Ok(self.alloc_array_current_realm(out))
+    }
+
+    /// `__zipp_py_write(op, to_stderr, payload)`: direct Python stdout/stderr
+    /// emission that bypasses `inspect_line`'s 64 KiB truncation and preserves
+    /// exact bytes (no appended newline) whenever a streaming host installs a
+    /// raw output sink.
+    ///
+    /// - `op == 0`: write UTF-8 text to the raw sink if one is installed;
+    ///   returns `true` if handled, `false` if the host has no raw sink (so
+    ///   the runtime falls back to its line-buffered non-streaming path).
+    /// - `op == 1`: emit one untruncated line on the non-streaming console path
+    ///   (charged against `output_limit` when instrumented, never truncated at
+    ///   64 KiB with `"..."`).
+    /// - `op == 2`: write raw bytes (`Array`/`TypedArray` of `0..=255`) from
+    ///   `sys.stdout.buffer.write` / `sys.stderr.buffer.write` to the raw sink
+    ///   if one is installed; returns `true` if handled, `false` otherwise.
+    /// - `op == 3`: flush the raw sink for the stream (passing `&[]`); returns
+    ///   `true` if a raw sink is installed, `false` otherwise.
+    pub(crate) fn py_write(&mut self, args: &[Value]) -> Result<Value, Thrown> {
+        let arg = |i: usize| args.get(i).copied().unwrap_or(Value::UNDEFINED);
+        let op = arg(0).as_f64() as i32;
+        let to_stderr = self.truthy(arg(1));
+        let stream = if to_stderr {
+            crate::vm::ConsoleStream::Stderr
+        } else {
+            crate::vm::ConsoleStream::Stdout
+        };
+        match op {
+            0 => {
+                if self.raw_output_sink.is_none() {
+                    return Ok(Value::bool(false));
+                }
+                let payload = arg(2);
+                if payload.is_heap() && self.heap.is_str_like(payload.heap_index()) {
+                    let idx = payload.heap_index();
+                    self.heap.flatten(idx);
+                    let byte_len = match self.heap.get(idx) {
+                        HeapObj::Str(s) => s.as_bytes().len(),
+                        _ => 0,
+                    };
+                    #[cfg(feature = "instrument")]
+                    self.instrument_output_bytes(byte_len)
+                        .map_err(|msg| Thrown(msg.into()))?;
+                    if byte_len > 0 {
+                        if let (HeapObj::Str(s), Some(sink)) =
+                            (self.heap.get(idx), self.raw_output_sink.as_mut())
+                        {
+                            let text = s.as_str_lossy();
+                            sink(stream, text.as_bytes());
+                        }
+                    }
+                    return Ok(Value::bool(true));
+                }
+                let text = self.to_js_string(payload)?;
+                #[cfg(feature = "instrument")]
+                self.instrument_output_bytes(text.len())
+                    .map_err(|msg| Thrown(msg.into()))?;
+                if !text.is_empty() {
+                    if let Some(sink) = self.raw_output_sink.as_mut() {
+                        sink(stream, text.as_bytes());
+                    }
+                }
+                Ok(Value::bool(true))
+            }
+            1 => {
+                let payload = arg(2);
+                let line = if payload.is_heap() && self.heap.is_str_like(payload.heap_index()) {
+                    let idx = payload.heap_index();
+                    self.heap.flatten(idx);
+                    match self.heap.get(idx) {
+                        HeapObj::Str(s) => s.to_lossy_string(),
+                        _ => String::new(),
+                    }
+                } else {
+                    self.to_js_string(payload)?
+                };
+                #[cfg(feature = "instrument")]
+                self.instrument_output_line(&line)
+                    .map_err(|msg| Thrown(msg.into()))?;
+                self.push_console_line_raw(line, to_stderr);
+                Ok(Value::UNDEFINED)
+            }
+            2 => {
+                if self.raw_output_sink.is_none() {
+                    return Ok(Value::bool(false));
+                }
+                let payload = arg(2);
+                if !payload.is_heap() {
+                    return Err(Thrown("TypeError: expected bytes array".into()));
+                }
+                let idx = payload.heap_index();
+                enum Kind {
+                    Array(usize),
+                    Typed { buf: u32, off: usize, end: usize },
+                }
+                let kind = match self.heap.get(idx) {
+                    HeapObj::Array(items) => Kind::Array(items.len()),
+                    HeapObj::TypedArray {
+                        buffer,
+                        byte_offset,
+                        length,
+                        ..
+                    } => {
+                        let buf = *buffer;
+                        let off = *byte_offset;
+                        let len = *length;
+                        let end = off.saturating_add(len);
+                        match self.heap.get(buf) {
+                            HeapObj::ArrayBuffer { data, detached } if !*detached => {
+                                let clamped = end.min(data.len());
+                                let start = off.min(clamped);
+                                Kind::Typed {
+                                    buf,
+                                    off: start,
+                                    end: clamped,
+                                }
+                            }
+                            _ => return Err(Thrown("TypeError: detached buffer".into())),
+                        }
+                    }
+                    _ => return Err(Thrown("TypeError: expected bytes array".into())),
+                };
+                match kind {
+                    Kind::Array(n) => {
+                        #[cfg(feature = "instrument")]
+                        self.instrument_output_bytes(n)
+                            .map_err(|msg| Thrown(msg.into()))?;
+                        if n > 0 {
+                            let bytes = match self.heap.get(idx) {
+                                HeapObj::Array(items) => {
+                                    let mut out = Vec::with_capacity(items.len());
+                                    for &x in items {
+                                        out.push(x.as_f64() as u8);
+                                    }
+                                    out
+                                }
+                                _ => Vec::new(),
+                            };
+                            if !bytes.is_empty() {
+                                if let Some(sink) = self.raw_output_sink.as_mut() {
+                                    sink(stream, &bytes);
+                                }
+                            }
+                        }
+                    }
+                    Kind::Typed { buf, off, end } => {
+                        #[cfg(feature = "instrument")]
+                        self.instrument_output_bytes(end - off)
+                            .map_err(|msg| Thrown(msg.into()))?;
+                        if end > off {
+                            if let (
+                                HeapObj::ArrayBuffer { data, detached },
+                                Some(sink),
+                            ) = (self.heap.get(buf), self.raw_output_sink.as_mut())
+                            {
+                                if !*detached {
+                                    if let Some(slice) = data.get(off..end) {
+                                        sink(stream, slice);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(Value::bool(true))
+            }
+            3 => {
+                if let Some(sink) = self.raw_output_sink.as_mut() {
+                    sink(stream, &[]);
+                    Ok(Value::bool(true))
+                } else {
+                    Ok(Value::bool(false))
+                }
+            }
+            _ => Ok(Value::UNDEFINED),
+        }
     }
 }

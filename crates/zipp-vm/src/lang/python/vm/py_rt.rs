@@ -293,6 +293,7 @@ pub(crate) struct PyRt {
     pub(super) t_dict: Value,
     pub(super) t_set: Value,
     pub(super) t_str: Value,
+    pub(super) t_slice: Value,
     pub(super) t_module: Value,
     pub(super) ebase: Value,
     /// `R.ISTYPES`: the types of None, bool, int, float and str, and bytes.
@@ -309,6 +310,7 @@ pub(crate) struct PyRt {
     pub(super) seq_shape: u32,
     pub(super) inst_shape: u32,
     pub(super) exc_shape: u32,
+    pub(super) slice_shape: u32,
     /// A dict record's shape and its `map`, `size` slots.
     pub(super) dict_shape: u32,
     pub(super) dict_slots: [usize; 2],
@@ -448,6 +450,8 @@ pub(super) const EXC_KEYS: [&str; 10] = ["cls", "dict", "args", "cause", "contex
 pub(super) const INST_KEYS: [&str; 2] = ["cls", "dict"];
 /// A traceback frame entry's keys (`R.addframe`'s literal, `R.FRAMETMPL`).
 pub(super) const FRAME_KEYS: [&str; 4] = ["file", "line", "name", "fn"];
+/// A slice record's keys (`R.slice`'s literal, `R.SLICETMPL`).
+pub(super) const SLICE_KEYS: [&str; 4] = ["cls", "start", "stop", "step"];
 
 impl PyRt {
     fn new(r: Value) -> PyRt {
@@ -458,6 +462,7 @@ impl PyRt {
             t_dict: Value::UNDEFINED,
             t_set: Value::UNDEFINED,
             t_str: Value::UNDEFINED,
+            t_slice: Value::UNDEFINED,
             t_module: Value::UNDEFINED,
             ebase: Value::UNDEFINED,
             istypes: [Value::UNDEFINED; 6],
@@ -470,6 +475,7 @@ impl PyRt {
             seq_shape: crate::shape::DICT,
             inst_shape: crate::shape::DICT,
             exc_shape: crate::shape::DICT,
+            slice_shape: crate::shape::DICT,
             dict_shape: crate::shape::DICT,
             dict_slots: [1, 2],
             ty: None,
@@ -811,6 +817,7 @@ impl<'p> Vm<'p> {
         rt.t_dict = own(self, "TDICT");
         rt.t_set = own(self, "TSET");
         rt.t_str = own(self, "TSTR");
+        rt.t_slice = own(self, "TSLICE");
         rt.t_module = own(self, "TMODULE");
         rt.ebase = own(self, "EBASE");
         rt.builtins = own(self, "BUILTINS");
@@ -838,6 +845,8 @@ impl<'p> Vm<'p> {
         rt.seq_shape = self.py_template_shape(rt.seq_tmpl, &SEQ_KEYS);
         rt.inst_shape = self.py_template_shape(rt.inst_tmpl, &INST_KEYS);
         rt.exc_shape = self.py_template_shape(rt.exc_tmpl, &EXC_KEYS);
+        let slice_tmpl = own(self, "SLICETMPL");
+        rt.slice_shape = self.py_template_shape(slice_tmpl, &SLICE_KEYS);
         rt.dict_shape = self.py_template_shape(dict, &["cls", "map", "size"]);
         rt.files = own(self, "FILES");
         rt.exc_entries = own(self, "EXCENTRY");
@@ -852,7 +861,7 @@ impl<'p> Vm<'p> {
         }
         // The values above stay reachable through `pins` (held by `R`).
         let mut keep = vec![
-            rt.t_list, rt.t_tuple, rt.t_dict, rt.t_set, rt.t_str, rt.t_module, rt.ebase, rt.builtins, rt.excstack,
+            rt.t_list, rt.t_tuple, rt.t_dict, rt.t_set, rt.t_str, rt.t_slice, rt.t_module, rt.ebase, rt.builtins, rt.excstack,
             rt.ctors, rt.seq_tmpl, rt.exc_tmpl, rt.inst_tmpl, rt.files, rt.frame_tmpl, rt.exc_entries,
         ];
         keep.extend_from_slice(&rt.istypes);

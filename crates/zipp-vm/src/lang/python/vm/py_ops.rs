@@ -1810,28 +1810,88 @@ impl<'p> Vm<'p> {
         (t.bits() != istypes[5].bits()).then_some(true)
     }
 
-    /// `s[k]` for [`Instr::PyStrItem`].
+    /// `s[k]` for [`Instr::PyStrItem`]: ASCII single index or step-1 slice.
     fn py_str_item(&mut self, s: Value, k: Value) -> Option<Value> {
         if !s.is_heap() || !self.heap.is_str_like(s.heap_index()) {
             return None;
         }
-        let i = self.bigint_i128(k)?;
         let idx = s.heap_index();
         self.heap.flatten(idx);
-        let HeapObj::Str(st) = self.heap.get(idx) else {
-            return None;
+        let len = {
+            let HeapObj::Str(st) = self.heap.get(idx) else {
+                return None;
+            };
+            if !st.is_ascii() {
+                return None;
+            }
+            st.as_bytes().len()
         };
-        if !st.is_ascii() {
+        let n = len as i128;
+        if let Some(i) = self.bigint_i128(k) {
+            let at = if i < 0 { i + n } else { i };
+            if at < 0 || at >= n {
+                return None;
+            }
+            let HeapObj::Str(st) = self.heap.get(idx) else {
+                return None;
+            };
+            // A one-character ASCII str is the interned string at its byte.
+            return Some(Value::heap(st.as_bytes()[at as usize] as u32));
+        }
+        if !k.is_heap() {
             return None;
         }
-        let bytes = st.as_bytes();
-        let n = bytes.len() as i128;
-        let at = if i < 0 { i + n } else { i };
-        if at < 0 || at >= n {
+        let (t_slice, slice_shape) = {
+            let p = self.py_rt.as_deref()?;
+            if p.slice_shape == crate::shape::DICT {
+                return None;
+            }
+            (p.t_slice.bits(), p.slice_shape)
+        };
+        let (start_v, stop_v) = match self.heap.get(k.heap_index()) {
+            HeapObj::Object(m)
+                if !m.is_ctor
+                    && m.shape() == slice_shape
+                    && m.val_at(0).bits() == t_slice
+                    && m.val_at(3) == Value::NULL =>
+            {
+                (m.val_at(1), m.val_at(2))
+            }
+            _ => return None,
+        };
+        let lo = if start_v == Value::NULL {
+            0usize
+        } else {
+            let i = self.bigint_i128(start_v)?;
+            if i < 0 {
+                (i + n).max(0) as usize
+            } else {
+                i.min(n) as usize
+            }
+        };
+        let hi = if stop_v == Value::NULL {
+            len
+        } else {
+            let i = self.bigint_i128(stop_v)?;
+            if i < 0 {
+                (i + n).max(0) as usize
+            } else {
+                i.min(n) as usize
+            }
+        };
+        if lo >= hi {
+            return Some(Value::heap(crate::heap::INTERN_EMPTY));
+        }
+        let slice_len = hi - lo;
+        if slice_len > 65536 {
             return None;
         }
-        // A one-character ASCII str is the interned string at its byte.
-        Some(Value::heap(bytes[at as usize] as u32))
+        #[cfg(feature = "instrument")]
+        if self.instr_rec.is_some() && slice_len > 1024 {
+            return None;
+        }
+        self.charge_steps(slice_len as i64);
+        Some(self.ascii_slice_value(idx, lo..hi))
     }
 
     /// `len(s)` for [`Instr::PyStrLen`]: the code points of a str with no

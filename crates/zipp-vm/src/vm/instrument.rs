@@ -2144,6 +2144,25 @@ impl super::Vm<'_> {
         Ok(())
     }
 
+    /// Charge raw bytes emitted to a streaming output sink against the output
+    /// budget (without per-line framing overhead).
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
+    pub(crate) fn instrument_output_bytes(&mut self, bytes: usize) -> Tick {
+        let Some(rec) = rec_mut!(self) else {
+            return Ok(());
+        };
+        let Some(total) = rec.output_used.checked_add(bytes) else {
+            rec.output_exhausted = true;
+            return Err(rec.exhaust(ResourceExhaustion::Output));
+        };
+        if total > rec.output_limit {
+            rec.output_exhausted = true;
+            return Err(rec.exhaust(ResourceExhaustion::Output));
+        }
+        rec.output_used = total;
+        Ok(())
+    }
+
     /// The dispatch loop's hook, run once per instruction *before* it executes:
     /// completes the previous row, charges one step against the budget, polls
     /// the abort flag, and opens a row for `instr`.
