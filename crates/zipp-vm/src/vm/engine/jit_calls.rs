@@ -1327,9 +1327,10 @@ impl<'p> Vm<'p> {
     }
 
     /// A semantics-guarded `CallMethodComputed` fast path for native MEMORY
-    /// regions. The guard is deliberately narrower than `get_index`: only a
-    /// canonical numeric key selecting an own, present dense-Array element can
-    /// pass, and that element must currently be a plain user Func/Closure.
+    /// regions. Accepts only a present own data property holding a plain user
+    /// Func/Closure: either a canonical dense-Array element or a settled flat
+    /// string key on an ordinary object. Accessors, exotic receivers, prototype
+    /// properties and coercible keys use the interpreter's full semantics.
     /// Everything else returns before lookup/coercion/getter/prototype code can
     /// run, so the interpreter may replay the instruction safely.
     ///
@@ -1375,26 +1376,61 @@ impl<'p> Vm<'p> {
                 return SELF_CALL_DEOPT;
             }
         }
-        let Some(index) = array_index(key) else {
-            return SELF_CALL_DEOPT;
-        };
-        let arr_idx = recv.heap_index();
-
-        // Arguments objects use an Array backing representation but a mapped
-        // index aliases the activation's formal register. Descriptor-backed or
-        // sparse indices in arr_props are authoritative over the dense slot.
-        // Both checks are read-only and precede every observable action.
-        if self.arguments_objs.contains_key(&arr_idx)
-            || self.array_index_override(arr_idx, index).is_some()
-        {
-            return SELF_CALL_DEOPT;
-        }
-        let callee = match self.heap.get(arr_idx) {
-            HeapObj::Array(items) => match items.get(index).copied() {
-                Some(v) if !v.is_hole() => v,
+        let recv_idx = recv.heap_index();
+        let (callee, allow_frame_fallback) = if let Some(index) = array_index(key) {
+            // A mapped arguments index or an indexed descriptor overrides the
+            // backing Array. A hole may inherit from the prototype chain.
+            if self.arguments_objs.contains_key(&recv_idx)
+                || self.array_index_override(recv_idx, index).is_some()
+            {
+                return SELF_CALL_DEOPT;
+            }
+            let callee = match self.heap.get(recv_idx) {
+                HeapObj::Array(items) => match items.get(index).copied() {
+                    Some(v) if !v.is_hole() => v,
+                    _ => return SELF_CALL_DEOPT,
+                },
                 _ => return SELF_CALL_DEOPT,
-            },
-            _ => return SELF_CALL_DEOPT,
+            };
+            (callee, true)
+        } else if key.is_heap()
+            && !(recv_idx == self.global_this && self.global_this != 0)
+            && self.realm_global_objs.is_empty()
+            && !self.module_namespaces.contains_key(&recv_idx)
+            && !self.deferred_ns_state.contains_key(&recv_idx)
+        {
+            // As `get_index`'s borrowed own-data read: no key conversion,
+            // getter invocation or prototype lookup is allowed in this prefix.
+            // A rope must take the general path, which flattens it first.
+            let HeapObj::Str(s) = self.heap.get(key.heap_index()) else {
+                return SELF_CALL_DEOPT;
+            };
+            let b = s.as_bytes();
+            if b.starts_with(b"@@") {
+                return SELF_CALL_DEOPT;
+            }
+            let Ok(name) = std::str::from_utf8(b) else {
+                return SELF_CALL_DEOPT;
+            };
+            let HeapObj::Object(m) = self.heap.get(recv_idx) else {
+                return SELF_CALL_DEOPT;
+            };
+            let Some(i) = crate::vm::ic::own_pos_in(&self.own_slot_cache, m, name) else {
+                return SELF_CALL_DEOPT;
+            };
+            if m.attr_at(i).accessor {
+                return SELF_CALL_DEOPT;
+            }
+            let callee = m.val_at(i);
+            if callee.is_uninitialized() {
+                return SELF_CALL_DEOPT;
+            }
+            // A compiled object method that cannot enter a windowed body is
+            // cheaper to replay using the interpreter's frame setup. The
+            // existing dense-Array path retains its original frame fallback.
+            (callee, false)
+        } else {
+            return SELF_CALL_DEOPT;
         };
         let Some((fid, closure)) = self.ic_plain_fn(callee) else {
             return SELF_CALL_DEOPT;
@@ -1413,7 +1449,14 @@ impl<'p> Vm<'p> {
                 };
             }
         }
-        self.jit_frame_call(fid, closure, recv, base, arg_base, argc, ip, callee)
+        if allow_frame_fallback {
+            self.jit_frame_call(fid, closure, recv, base, arg_base, argc, ip, callee)
+        } else {
+            // `call_compiled_windowed` returns `None` only before executing
+            // any user code: replay the full computed method in its original
+            // interpreter arm, including the exact error/this semantics.
+            SELF_CALL_DEOPT
+        }
     }
 
     /// OrdinaryCallBindThis for a frame-free call of the plain function `fid`
