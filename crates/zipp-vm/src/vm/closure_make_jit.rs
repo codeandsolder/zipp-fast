@@ -112,14 +112,15 @@ impl Vm<'_> {
 /// activation closure. Read-only; `None` declines before any effect.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 fn resolve_upvalues(
-    vm: &Vm<'_>,
+    vm: &mut Vm<'_>,
     regs: *const u64,
     reg_count: usize,
     site: MakeSite,
     child: usize,
 ) -> Option<Vec<u32>> {
+    let n = vm.func(child).upvalues.len();
+    let mut cells = vm.heap.take_upval_buf(n);
     let sources = &vm.func(child).upvalues;
-    let mut cells = Vec::with_capacity(sources.len());
     for src in sources {
         let cell = match *src {
             UpvalSource::ParentLocal(reg) => {

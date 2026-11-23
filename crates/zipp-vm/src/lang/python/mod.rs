@@ -32,6 +32,8 @@ use crate::embed::ScriptState;
 mod frontend;
 #[cfg(feature = "python")]
 pub(super) use frontend::{compile, compile_project, prewarm, set_runtime_cache, set_runtime_memo};
+#[cfg(feature = "python")]
+pub(crate) use frontend::{bundled_source_of, compile_dynamic_module};
 
 /// What compiling Python says in a build without it.
 #[cfg(not(feature = "python"))]

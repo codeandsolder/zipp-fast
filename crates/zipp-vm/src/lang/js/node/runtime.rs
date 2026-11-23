@@ -79,6 +79,7 @@ impl<'p> Vm<'p> {
         if !ENABLED.load(Ordering::Relaxed) || self.node_installed {
             return Ok(());
         }
+        EXIT_CODE.store(0, Ordering::Relaxed);
         self.node_installed = true;
         // The bootstrap is JavaScript the JIT may compile: pin the register
         // file before it runs, as each entry pins it before native code can

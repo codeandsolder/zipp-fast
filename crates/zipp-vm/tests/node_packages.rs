@@ -178,3 +178,76 @@ import("node:zlib").then((z) => console.log("zlib", typeof z.default.gzipSync));
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn import_meta_resolve_and_esm_exit_code() {
+    let root = std::env::temp_dir().join(format!("zipp-meta-resolve-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let files = [
+        (
+            "node_modules/@scope/pkg/package.json",
+            r#"{ "name": "@scope/pkg", "type": "module", "exports": { ".": { "types": "./index.d.ts", "import": "./esm/main.mjs", "require": "./cjs/main.cjs" }, "./sub": "./esm/sub.mjs" } }"#,
+        ),
+        (
+            "node_modules/@scope/pkg/esm/main.mjs",
+            "export const fromScoped = import.meta.resolve('./sub.mjs');\n",
+        ),
+        (
+            "node_modules/@scope/pkg/esm/sub.mjs",
+            "export const ok = true;\n",
+        ),
+        (
+            "node_modules/plain/package.json",
+            r#"{ "name": "plain", "main": "lib/entry.js" }"#,
+        ),
+        ("node_modules/plain/lib/entry.js", "module.exports = 1;\n"),
+        ("local.mjs", "export const x = 1;\n"),
+        (
+            "probe.mjs",
+            r#"import { fromScoped } from "@scope/pkg";
+console.log(typeof import.meta.resolve, import.meta.resolve.name, import.meta.resolve.length);
+console.log(import.meta.resolve("node:fs"), import.meta.resolve("fs"), import.meta.resolve("path/posix"));
+const r = import.meta.resolve;
+console.log(r("@scope/pkg").endsWith("/node_modules/@scope/pkg/esm/main.mjs"));
+console.log(r("@scope/pkg/sub").endsWith("/node_modules/@scope/pkg/esm/sub.mjs"));
+console.log(r("plain").endsWith("/node_modules/plain/lib/entry.js"));
+console.log(r("./local.mjs").endsWith("/local.mjs"));
+console.log(r("./missing-rel.mjs").endsWith("/missing-rel.mjs"));
+console.log(fromScoped.endsWith("/node_modules/@scope/pkg/esm/sub.mjs"));
+try { r("no-such-pkg-xyz"); console.log("unexpected"); } catch (e) { console.log(e.name, e.code); }
+process.on("beforeExit", (c) => console.log("beforeExit", c));
+process.on("exit", (c) => console.log("exit", c));
+process.exitCode = 17;
+"#,
+        ),
+    ];
+    for (rel, text) in files {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, text).unwrap();
+    }
+    let module = root.join("probe.mjs");
+    zipp_vm::set_node_runtime(
+        true,
+        vec!["zipp".into(), module.to_string_lossy().into_owned()],
+    );
+    let out = zipp_vm::run_module_file(&module, None).expect("compiles");
+    assert_eq!(
+        lines(&out),
+        [
+            "function resolve 1",
+            "node:fs node:fs node:path/posix",
+            "true",
+            "true",
+            "true",
+            "true",
+            "true",
+            "true",
+            "Error ERR_MODULE_NOT_FOUND",
+            "beforeExit 17",
+            "exit 17",
+        ]
+    );
+    assert_eq!(zipp_vm::node_exit_code(), 17);
+    let _ = std::fs::remove_dir_all(&root);
+}

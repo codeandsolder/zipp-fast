@@ -3252,6 +3252,36 @@ impl<'p> Vm<'p> {
                 .program
                 .global_names
                 .iter()
+                .position(|name| name == native::PY_ZLIB_NAME);
+            if let Some(slot) = slot.filter(|&slot| slot < self.globals.len()) {
+                let zlib = self.heap.alloc(HeapObj::Native(native::PY_ZLIB));
+                self.globals[slot] = Value::heap(zlib);
+                self.bump_global_gen(slot as u32);
+            }
+            let slot = self
+                .program
+                .global_names
+                .iter()
+                .position(|name| name == native::PY_BYTES_DECODE_NAME);
+            if let Some(slot) = slot.filter(|&slot| slot < self.globals.len()) {
+                let dec = self.heap.alloc(HeapObj::Native(native::PY_BYTES_DECODE));
+                self.globals[slot] = Value::heap(dec);
+                self.bump_global_gen(slot as u32);
+            }
+            let slot = self
+                .program
+                .global_names
+                .iter()
+                .position(|name| name == native::PY_RE_FINDALL_NAME);
+            if let Some(slot) = slot.filter(|&slot| slot < self.globals.len()) {
+                let fa = self.heap.alloc(HeapObj::Native(native::PY_RE_FINDALL));
+                self.globals[slot] = Value::heap(fa);
+                self.bump_global_gen(slot as u32);
+            }
+            let slot = self
+                .program
+                .global_names
+                .iter()
                 .position(|name| name == native::PY_PCT_NAME);
             if let Some(slot) = slot.filter(|&slot| slot < self.globals.len()) {
                 let pct = self.heap.alloc(HeapObj::Native(native::PY_PCT));

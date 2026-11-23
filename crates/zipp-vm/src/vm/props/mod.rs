@@ -17,4 +17,4 @@ mod proxy_ops;
 
 pub(crate) use enumerate::{KeyValueFront, KEY_VALUE_FRONT_SLOTS};
 pub(crate) use proxy_ops::{TrapFront, TRAP_FRONT_SLOTS};
-pub(crate) use member::ClassLookup;
+pub(crate) use member::{ClassLookup, ClassMemberSlot, CLASS_MEMBER_CACHE_SLOTS};

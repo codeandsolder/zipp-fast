@@ -337,6 +337,8 @@ impl<'p> Vm<'p> {
         // properties assigned to them, e.g. assert.sameValue).
         if self.global_this == 0 {
             self.setup_globals();
+            #[cfg(feature = "node")]
+            self.install_node_runtime(false)?;
             self.hoist_functions();
             self.set_gc_floor();
         }
@@ -356,6 +358,14 @@ impl<'p> Vm<'p> {
             self.mark_promise_handled(bp);
         }
         self.run_event_loop();
+        #[cfg(feature = "node")]
+        {
+            let roots = [
+                r.as_ref().copied().unwrap_or(Value::UNDEFINED),
+                body.unwrap_or(Value::UNDEFINED),
+            ];
+            self.with_host_roots(&roots, Self::node_run_ended);
+        }
         if let Some(bp) = body {
             if bp.is_heap() {
                 let st = match self.heap.get(bp.heap_index()) {
@@ -2200,7 +2210,9 @@ impl<'p> Vm<'p> {
     #[inline]
     pub(crate) fn note_global_route_change(&mut self) {
         self.global_route_epoch = self.global_route_epoch.saturating_add(1);
-        self.jit_global_route_ok.clear();
+        if self.global_route_epoch == u32::MAX {
+            self.jit_global_route_ok.clear();
+        }
         // Native code already running validated its routes before this.
         self.jit_route_dirty = 1;
     }
@@ -2314,12 +2326,13 @@ impl<'p> Vm<'p> {
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn jit_globals_still_routable(&mut self, func_id: u32) -> bool {
         let epoch = self.global_route_epoch;
-        if let Some(&(seen, ok)) = self.jit_global_route_ok.get(&func_id) {
+        let idx = func_id as usize;
+        if let Some(&(seen, ok)) = self.jit_global_route_ok.get(idx) {
             if seen == epoch {
                 return ok;
             }
         }
-        let proto: *const crate::bytecode::FuncProto = self.func(func_id as usize);
+        let proto: *const crate::bytecode::FuncProto = self.func(idx);
         // SAFETY: program and leaked eval FuncProtos are immutable while running.
         let ok = unsafe { &*proto }.code.iter().all(|ins| match *ins {
             Instr::LoadGlobal { idx, .. } | Instr::LoadGlobalOrUndefined { idx, .. } => {
@@ -2332,7 +2345,10 @@ impl<'p> Vm<'p> {
             }
             _ => true,
         });
-        self.jit_global_route_ok.insert(func_id, (epoch, ok));
+        if self.jit_global_route_ok.len() <= idx {
+            self.jit_global_route_ok.resize(idx + 1, (0, false));
+        }
+        self.jit_global_route_ok[idx] = (epoch, ok);
         ok
     }
 

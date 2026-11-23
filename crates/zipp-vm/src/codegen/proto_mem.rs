@@ -11482,7 +11482,10 @@ pub(crate) fn emit_cross3_dyn_stub(
     heap: &HeapHelpers,
     refetch: Option<(usize, usize)>,
 ) {
-    use crate::codegen::{CROSS_DYN_ARROW, CROSS_DYN_OK, CROSS_DYN_STRICT, CROSS_DYN_WIDE_ZERO};
+    use crate::codegen::{
+        CROSS_DYN_ARROW, CROSS_DYN_EPOCH_OK, CROSS_DYN_NO_GLOBALS, CROSS_DYN_OK,
+        CROSS_DYN_ROUTE_SHIFT, CROSS_DYN_STRICT, CROSS_DYN_WIDE_ZERO,
+    };
     use crate::vm::host_api::{
         JIT_ACTIVATION_OFFSET, JIT_CALL_DEPTH_OFFSET, JIT_CROSS_TABLE_LEN_OFFSET,
         JIT_CROSS_TABLE_RAW_OFFSET, JIT_EVAL_SCOPE_NONEMPTY_OFFSET, JIT_FN_CALL_NATIVE_BITS_OFFSET,
@@ -11512,6 +11515,7 @@ pub(crate) fn emit_cross3_dyn_stub(
     let zero_done = ops.new_dynamic_label();
     let noroot = ops.new_dynamic_label();
     let slow_finish = ops.new_dynamic_label();
+    let dyn_route_ok = ops.new_dynamic_label();
 
     let fill_counter = crate::vm::crossstats::stats_enabled()
         .then(|| crate::vm::crossstats::fill_fast_counter_addr());
@@ -11567,8 +11571,6 @@ pub(crate) fn emit_cross3_dyn_stub(
         ; jne => fast_decline
         ; cmp DWORD [rdi + depth], crate::vm::native_call_cap() as i32
         ; jae => fast_decline
-        ; cmp DWORD [rdi + JIT_GLOBAL_ROUTE_EPOCH_OFFSET as i32], 0
-        ; jne => fast_decline
         ; cmp BYTE [rdi + JIT_GC_REQUESTED_OFFSET as i32], 0
         ; jne => fast_decline
         ; cmp BYTE [rdi + JIT_GC_STRESS_OFFSET as i32], 0
@@ -11580,6 +11582,16 @@ pub(crate) fn emit_cross3_dyn_stub(
         ; mov [rsp + 88], r8
         ; mov [rsp + 96], r11
         ; mov DWORD [rsp + 116], r10d
+        // Route-epoch guard against `dyn_flags` (already in r9d; eax is free here).
+        ; test r9d, CROSS_DYN_NO_GLOBALS as i32
+        ; jnz => dyn_route_ok
+        ; test r9d, CROSS_DYN_EPOCH_OK as i32
+        ; jz => decline_pop
+        ; mov eax, r9d
+        ; shr eax, CROSS_DYN_ROUTE_SHIFT as i8
+        ; cmp DWORD [rdi + JIT_GLOBAL_ROUTE_EPOCH_OFFSET as i32], eax
+        ; jne => decline_pop
+        ; => dyn_route_ok
         ; mov eax, DWORD [r11 + 28]
         ; mov DWORD [rsp + 108], eax
 

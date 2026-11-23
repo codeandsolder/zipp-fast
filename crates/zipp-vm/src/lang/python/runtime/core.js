@@ -203,7 +203,8 @@ var __zipp_py = (function () {
     defExc("FileNotFoundError", E.OSError); defExc("PermissionError", E.OSError); defExc("TimeoutError", E.OSError);
     defExc("FileExistsError", E.OSError); defExc("IsADirectoryError", E.OSError); defExc("NotADirectoryError", E.OSError);
     defExc("UnicodeError", E.ValueError); defExc("UnicodeDecodeError", E.UnicodeError); defExc("UnicodeEncodeError", E.UnicodeError);
-    defExc("IndentationError", E.SyntaxError); defExc("DeprecationWarning", E.Warning); defExc("UserWarning", E.Warning);
+    defExc("IndentationError", E.SyntaxError);
+    for (const w of ["DeprecationWarning", "PendingDeprecationWarning", "RuntimeWarning", "SyntaxWarning", "UserWarning", "FutureWarning", "ImportWarning", "UnicodeWarning", "BytesWarning", "EncodingWarning", "ResourceWarning"]) defExc(w, E.Warning);
     defExc("StopAsyncIteration"); defExc("JSONDecodeError", E.ValueError);
     defExc("BaseExceptionGroup", E.BaseException); defExc("ExceptionGroup", E.BaseExceptionGroup);
     E.ExceptionGroup.bases = [E.BaseExceptionGroup, E.Exception]; E.ExceptionGroup.mro = computeMro(E.ExceptionGroup);
@@ -2387,6 +2388,18 @@ var __zipp_py = (function () {
         return { cls: T.module, name: name, file: file || null, globals: new Map(), dict: null };
     }
     rt.newModule = newModule;
+    rt.constructors.set(T.module, (args, kw, cls) => {
+        const nameVal = args.length >= 1 ? args[0] : (kw && kw.has("name") ? kw.get("name") : undefined);
+        if (typeof nameVal !== "string") fail(E.TypeError, "module.__init__() argument 1 must be str");
+        const doc = args.length >= 2 ? args[1] : (kw && kw.has("doc") ? kw.get("doc") : null);
+        const m = { cls: cls || T.module, name: nameVal, file: null, globals: new Map(), dict: null };
+        m.globals.set("__name__", nameVal);
+        m.globals.set("__doc__", doc);
+        m.globals.set("__package__", null);
+        m.globals.set("__loader__", null);
+        m.globals.set("__spec__", null);
+        return m;
+    });
     rt.moduleAttr = function (m, name, missing) {
         const v = m.globals.get(name);
         if (v !== undefined) return v;
@@ -2451,9 +2464,18 @@ var __zipp_py = (function () {
         else {
             const b = builtinModules.get(name);
             if (b !== undefined) { m = typeof b === "function" ? b() : b; modules.set(name, m); }
-            else if (hasSubmodules(name)) { m = newModule(name, null); m.globals.set("__name__", name); m.globals.set("__path__", rt.list([name.replace(/\./g, "/")])); modules.set(name, m); }
-            else if (parent !== null && parent.submodules !== undefined && parent.submodules.has(leaf)) { m = parent.submodules.get(leaf); modules.set(name, m); }
-            else { const e = makeExc(E.ModuleNotFoundError, ["No module named '" + name + "'"]); e.dict.set("name", name); throw e; }
+            else {
+                let dynCode = undefined;
+                try { dynCode = __zipp_py_compile(name); } catch (e) { dynCode = undefined; }
+                if (dynCode !== undefined) {
+                    const dynInit = { code: dynCode, file: name.replace(/\./g, "/") + ".py" };
+                    inits.set(name, dynInit);
+                    m = runModule(name, dynInit, name === entryName ? "__main__" : name);
+                }
+                else if (hasSubmodules(name)) { m = newModule(name, null); m.globals.set("__name__", name); m.globals.set("__path__", rt.list([name.replace(/\./g, "/")])); modules.set(name, m); }
+                else if (parent !== null && parent.submodules !== undefined && parent.submodules.has(leaf)) { m = parent.submodules.get(leaf); modules.set(name, m); }
+                else { const e = makeExc(E.ModuleNotFoundError, ["No module named '" + name + "'"]); e.dict.set("name", name); throw e; }
+            }
         }
         if (parent !== null && parent.globals.get(leaf) === undefined) parent.globals.set(leaf, m);
         return m;
@@ -2475,6 +2497,7 @@ var __zipp_py = (function () {
         return bytes;
     };
     const vfsNorm = function (p) {
+        if (typeof p === "string" && p.length > 0 && p.charCodeAt(0) !== 47 && p.charCodeAt(0) !== 46 && p.charCodeAt(p.length - 1) !== 47 && p.indexOf("\\") < 0 && p.indexOf("//") < 0 && p.indexOf("/.") < 0) return p;
         p = String(p).replace(/\\/g, "/");
         const parts = [], segs = p.split("/");
         for (const s of segs) { if (s === "" || s === ".") continue; if (s === "..") { parts.pop(); continue; } parts.push(s); }
@@ -2603,6 +2626,8 @@ var __zipp_py = (function () {
         if (m !== null && typeof m === "object" && m.globals !== undefined && typeof m.name === "string") {
             const full = m.name + "." + name;
             if (initOf(full) !== undefined || builtinModules.has(full) || hasSubmodules(full)) return R.import(full, null);
+            try { return R.import(full, null); }
+            catch (e) { if (!isInstance(e, E.ModuleNotFoundError) || e.dict.get("name") !== full) throw e; }
         }
         const e = makeExc(E.ImportError, ["cannot import name '" + name + "' from '" + m.name + "'"]);
         e.dict.set("name", m.name);
@@ -2620,6 +2645,14 @@ var __zipp_py = (function () {
         return null;
     };
     rt.entryModule = function () { return modules.get(entryName) || null; };
+    rt.execModuleSource = function (mod, name, source, file) {
+        const code = __zipp_py_compile(name, source, file);
+        if (code === undefined) fail(E.ImportError, "cannot compile module " + name);
+        const g = mod.globals !== undefined ? mod.globals : mod.dict;
+        if (mod.cls === T.module && file) mod.file = file;
+        const fn = R.func(code, "<module>", "<module>", [], 0, 0, false, false, [], [], [], [], g, false, null, name);
+        fn.code();
+    };
 
     // ---- forward declarations filled by the other runtime files ------------------------------------------
     let str = null, repr = null;

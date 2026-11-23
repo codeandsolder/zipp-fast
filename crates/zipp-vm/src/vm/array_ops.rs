@@ -930,8 +930,8 @@ impl<'p> Vm<'p> {
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         let kernel_ok = this_arg.is_undefined() && species_target.is_none();
         let collect = matches!(mode, EachMode::Map | EachMode::Filter);
-        let mut out: Vec<Value> = if collect {
-            Vec::with_capacity(snapshot_len)
+        let mut out: Vec<Value> = if collect && snapshot_len > 0 {
+            self.heap.take_arr_buf(snapshot_len)
         } else {
             Vec::new()
         };
@@ -3859,10 +3859,12 @@ impl<'p> Vm<'p> {
                     };
                 let slice: Vec<Value> = if start < end {
                     if clean {
-                        match self.heap.get(idx) {
-                            HeapObj::Array(items) => items[start as usize..end as usize].to_vec(),
-                            _ => Vec::new(),
+                        let count = (end - start) as usize;
+                        let mut v = self.heap.take_arr_buf(count);
+                        if let HeapObj::Array(items) = self.heap.get(idx) {
+                            v.extend_from_slice(&items[start as usize..end as usize]);
                         }
+                        v
                     } else {
                         // Spec copy: HasProperty(k) (proto-aware, accessors fire)
                         // then Get; an ABSENT index stays absent in the result.

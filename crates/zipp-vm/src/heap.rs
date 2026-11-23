@@ -1404,13 +1404,15 @@ where
 
 /// Largest element-buffer CAPACITY the array pool retains: bounds both the
 /// per-entry memory and the waste when a pop's capacity exceeds the ask.
-#[cfg(not(feature = "safe-sandbox"))]
-const ARR_POOL_MAX_CAP: usize = 32;
+pub(crate) const ARR_POOL_MAX_CAP: usize = 32;
 
 /// Largest string byte-buffer CAPACITY the byte pool retains (see
 /// `Heap::byte_pool`).
+pub(crate) const BYTE_POOL_MAX_CAP: usize = 64;
+
+/// Largest closure upvalue-cell buffer CAPACITY the upvalue pool retains.
 #[cfg(not(feature = "safe-sandbox"))]
-const BYTE_POOL_MAX_CAP: usize = 64;
+const UPVAL_POOL_MAX_CAP: usize = 16;
 
 /// Retained-shell FLOOR for the recycle pool (~450 KiB of shells): the trim
 /// at each collection-done note keeps `max(2 * served, floor)` shells, so a
@@ -7814,6 +7816,12 @@ pub struct Heap {
     /// each free from the sweep to the trim).
     #[cfg(not(feature = "safe-sandbox"))]
     byte_pool_want: bool,
+    /// Recycled closure upvalue-cell buffers (capacity 1..=`UPVAL_POOL_MAX_CAP`),
+    /// avoiding per-closure `mi_malloc`/`mi_free` churn on closure-heavy workloads.
+    #[cfg(not(feature = "safe-sandbox"))]
+    upval_pool: Vec<Vec<u32>>,
+    #[cfg(not(feature = "safe-sandbox"))]
+    upval_pool_pops: usize,
     /// B220: recycled property-key buffers, the third member of the
     /// B194/B196b pool family. The sweep drains a dying DYNAMIC-keyed
     /// object's key Strings here and the `obj["prefix" + i] = v` append pops
@@ -8588,6 +8596,10 @@ impl Heap {
             #[cfg(not(feature = "safe-sandbox"))]
             byte_pool_want: false,
             #[cfg(not(feature = "safe-sandbox"))]
+            upval_pool: Vec::new(),
+            #[cfg(not(feature = "safe-sandbox"))]
+            upval_pool_pops: 0,
+            #[cfg(not(feature = "safe-sandbox"))]
             key_pool: Vec::new(),
             #[cfg(not(feature = "safe-sandbox"))]
             key_pool_stats: [0; 3],
@@ -8963,6 +8975,9 @@ impl Heap {
                 }
                 return v;
             }
+            if cap > 0 {
+                return Vec::with_capacity(cap.max(4));
+            }
         }
         Vec::with_capacity(cap)
     }
@@ -8971,7 +8986,6 @@ impl Heap {
     /// when the pool has one and `cap` fits its class (cleared here), fresh
     /// otherwise. Hand it to a `JsStr` constructor; a buffer that ends up
     /// unused goes back through `return_byte_buf`.
-    #[cfg_attr(not(feature = "python"), allow(dead_code))] // the Python str methods' producers
     #[inline]
     pub(crate) fn take_byte_buf(&mut self, cap: usize) -> Vec<u8> {
         #[cfg(not(feature = "safe-sandbox"))]
@@ -8984,6 +8998,31 @@ impl Heap {
                 }
                 return v;
             }
+            if cap > 0 {
+                return Vec::with_capacity(if cap <= 32 { 32 } else { BYTE_POOL_MAX_CAP });
+            }
+        }
+        Vec::with_capacity(cap)
+    }
+
+    /// An upvalue-cell buffer for a new capturing closure — recycled from
+    /// `upval_pool` when one is available and `cap <= UPVAL_POOL_MAX_CAP`.
+    #[inline]
+    pub(crate) fn take_upval_buf(&mut self, cap: usize) -> Vec<u32> {
+        if cap == 0 {
+            return Vec::new();
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
+        if cap <= UPVAL_POOL_MAX_CAP {
+            self.upval_pool_pops += 1;
+            if let Some(mut v) = self.upval_pool.pop() {
+                v.clear();
+                if v.capacity() < cap {
+                    v.reserve(cap);
+                }
+                return v;
+            }
+            return Vec::with_capacity(cap.max(4));
         }
         Vec::with_capacity(cap)
     }
@@ -11419,6 +11458,12 @@ impl Heap {
                             .map(|v| v.capacity() * std::mem::size_of::<Value>())
                             .sum::<usize>()
                         + vec_capacity_bytes(&self.arr_pool)
+                        + self
+                            .upval_pool
+                            .iter()
+                            .map(|v| v.capacity() * std::mem::size_of::<u32>())
+                            .sum::<usize>()
+                        + vec_capacity_bytes(&self.upval_pool)
                         + self.concat_memo.len() * std::mem::size_of::<ConcatMemoEntry>()
                         + {
                             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -11565,11 +11610,16 @@ impl Heap {
             | HeapObj::Boxed { .. } => true,
             HeapObj::Bound { args, .. } => args.capacity() == 0,
             HeapObj::Iterator { items, .. } => items.capacity() == 0,
+            HeapObj::Closure { upvalues, .. } => upvalues.capacity() == 0,
             _ => false,
         } {
             #[cfg(feature = "jit")]
             {
                 self.hot_mirror[idx as usize] = HotMirror::CLEAR;
+                if matches!(&self.objs[idx as usize], HeapObj::Closure { .. }) {
+                    self.this_mirror[idx as usize] = Value::UNDEFINED.bits();
+                    self.upvals_mirror[idx as usize] = 0;
+                }
             }
             if self.payload_accounting.get() {
                 let payload = self.resident_payload_charged[idx as usize].replace(0);
@@ -11758,7 +11808,12 @@ impl Heap {
                 // builds (`take_byte_buf`). Nothing else in a `JsStr` owns
                 // memory.
                 HeapObj::Str(js) => {
-                    self.byte_pool_want && pool && (1..=BYTE_POOL_MAX_CAP).contains(&js.byte_capacity())
+                    (self.byte_pool_want || self.byte_pool_asks != 0)
+                        && pool
+                        && (1..=BYTE_POOL_MAX_CAP).contains(&js.byte_capacity())
+                }
+                HeapObj::Closure { upvalues, .. } => {
+                    pool && (1..=UPVAL_POOL_MAX_CAP).contains(&upvalues.capacity())
                 }
                 _ => false,
             };
@@ -11768,6 +11823,7 @@ impl Heap {
                     #[cfg(feature = "python")]
                     HeapObj::PyAttrs { vals, .. } => self.arr_pool.push(vals),
                     HeapObj::Str(js) => self.byte_pool.push(js.into_byte_buf()),
+                    HeapObj::Closure { upvalues, .. } => self.upval_pool.push(upvalues),
                     _ => unreachable!("the pool test matched one of these"),
                 }
                 self.free_slot_tail(idx);
@@ -11983,6 +12039,13 @@ impl Heap {
             self.byte_pool_want = self.byte_pool_asks != 0;
             self.byte_pool_asks = 0;
             self.byte_pool.truncate(keep);
+            let keep = self
+                .upval_pool_pops
+                .saturating_mul(2)
+                .max(self.upval_pool.len() / 2)
+                .max(OBJ_POOL_FLOOR);
+            self.upval_pool_pops = 0;
+            self.upval_pool.truncate(keep);
             let keep = self
                 .arr_pool_pops
                 .saturating_mul(2)
@@ -12482,6 +12545,30 @@ impl Heap {
         self.alloc_str_settled(JsStr::new(s))
     }
 
+    /// Allocate a string from `&str`, reusing interned slots for empty / 1-byte
+    /// ASCII and `byte_pool` for small strings (`<= BYTE_POOL_MAX_CAP`).
+    #[inline]
+    pub(crate) fn alloc_str_copy(&mut self, s: &str) -> u32 {
+        let b = s.as_bytes();
+        match b.len() {
+            0 => return INTERN_EMPTY,
+            1 if b[0] < 128 => return b[0] as u32,
+            _ => {}
+        }
+        if b.len() <= BYTE_POOL_MAX_CAP {
+            let mut buf = self.take_byte_buf(b.len());
+            buf.extend_from_slice(b);
+            let js = if s.is_ascii() {
+                JsStr::from_ascii(buf)
+            } else {
+                // `s` is valid UTF-8, so `buf` is guaranteed valid UTF-8.
+                JsStr::new(String::from_utf8(buf).unwrap_or_else(|_| s.to_owned()))
+            };
+            return self.alloc_str_settled(js);
+        }
+        self.alloc_str_settled(JsStr::new(s.to_owned()))
+    }
+
     /// [`Heap::alloc`] of a string. A small one takes B257's slot-reuse path
     /// (`alloc_array_settled`'s): a `Str` owns no mirror line, so the cleared
     /// mirror `free_slot` left stands, and the slot is written without the
@@ -12490,7 +12577,7 @@ impl Heap {
     /// (whose `alloc` weighs every payload) and every non-default
     /// configuration go through `alloc` unchanged.
     #[inline]
-    fn alloc_str_settled(&mut self, js: JsStr) -> u32 {
+    pub(crate) fn alloc_str_settled(&mut self, js: JsStr) -> u32 {
         #[cfg(not(feature = "safe-sandbox"))]
         if self.thin_alloc
             && !self.payload_accounting.get()

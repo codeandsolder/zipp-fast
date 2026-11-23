@@ -8410,6 +8410,15 @@ fn jit_class_read_fill(vm: &mut Vm, obj: Value, key: &str, site_idx: u32, func: 
             nhops,
             hops,
         } if c == class && nhops as usize <= 5 => (Value::UNDEFINED.bits(), nhops, hops),
+        crate::vm::ic::Walked::ClassGetter { .. } => {
+            if recv_shape != crate::shape::DICT
+                && jit_acc_route_enabled()
+                && vm.jit_acc_route.len() < JIT_SHAPE_SLOT_MAX
+            {
+                vm.jit_acc_route.insert((site_idx, recv_shape));
+            }
+            return crate::codegen::PROP_VIA_IC;
+        }
         _ => return crate::codegen::PROP_VIA_IC,
     };
     let key_id = vm.prop_key_id(func, name);
@@ -10379,13 +10388,13 @@ pub(crate) extern "win64" fn jit_leaf_same_func_proto(
         // a stale or malformed heap Value before either table is indexed.
         return 0;
     }
-    // Root-program prototypes are immutable and directly indexable. Unified
-    // loader/eval fids can live outside this table; they deliberately miss here
-    // (the normal call remains authoritative) instead of using a panicking
-    // convenience lookup across generated-code FFI.
-    let Some(proto) = vm.main_func(fid as usize) else {
+    // Root-program and loader-installed ES module prototypes are immutable for
+    // the life of the VM and live in `vm.funcs`. Ordinary eval/dynamic fids
+    // still miss here so the normal call remains authoritative.
+    if !(vm.is_main_func(fid) || vm.loader_module_func(fid)) || (fid as usize) >= vm.funcs.len() {
         return 0;
-    };
+    }
+    let proto = vm.funcs[fid as usize];
     if proto.lexical_this || !proto.upvalues.is_empty() || proto.is_generator || proto.is_async {
         return 0;
     }

@@ -136,7 +136,7 @@
     chdir() { throw new Error("process.chdir() is not supported"); },
     exit(code) {
       if (code !== undefined) process.exitCode = code;
-      const c = process.exitCode === undefined ? 0 : +process.exitCode | 0;
+      const c = process.exitCode === undefined || process.exitCode === null ? 0 : +process.exitCode | 0;
       emit("exit", c);
       host.exit(c);
     },
@@ -182,10 +182,11 @@
   };
   defineProperty(process, Symbol.toStringTag, { value: "process", configurable: true });
   host.onExit(() => {
-    const c = process.exitCode === undefined ? 0 : +process.exitCode | 0;
-    emit("beforeExit", c);
-    emit("exit", c);
-    return process.exitCode === undefined ? 0 : +process.exitCode | 0;
+    const readCode = () =>
+      process.exitCode === undefined || process.exitCode === null ? 0 : +process.exitCode | 0;
+    emit("beforeExit", readCode());
+    emit("exit", readCode());
+    return readCode();
   });
   return { process };
 })

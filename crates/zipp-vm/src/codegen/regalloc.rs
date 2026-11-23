@@ -821,7 +821,10 @@ pub(crate) fn compile_region_regalloc(
         // plan_region `dead`). A `split_recv_lg` load/GetProp is not such an op:
         // it writes the boxed reference a guard exit replays (see region_int).
         if let Some(d) = writes_reg(&proto.code[ip]) {
-            if plan.dead.contains(&d) && !plan.split_recv_lg.contains(&ip) {
+            if plan.dead.contains(&d)
+                && !plan.split_recv_lg.contains(&ip)
+                && !plan.pinned_nullish_cmp.contains_key(&(ip + 1))
+            {
                 continue;
             }
         }
@@ -1132,6 +1135,34 @@ pub(crate) fn compile_region_regalloc(
                 emit_dcmp(&mut ops, &plan, dst, a, b, Cmp::Ge);
                 flag_cmp = Some((ip, dst, Cmp::Ge));
             }
+            Instr::LoadUndefined { dst } if plan.pinned_nullish_cmp.contains_key(&(ip + 1)) => {
+                if !plan.reg_home.contains_key(&dst) {
+                    dynasm!(ops
+                        ; mov rax, QWORD crate::value::Value::UNDEFINED.bits() as i64
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                }
+                flag_cmp = prev_flag;
+            }
+            Instr::LoadNull { dst } if plan.pinned_nullish_cmp.contains_key(&(ip + 1)) => {
+                if !plan.reg_home.contains_key(&dst) {
+                    dynasm!(ops
+                        ; mov rax, QWORD crate::value::Value::NULL.bits() as i64
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                }
+                flag_cmp = prev_flag;
+            }
+            Instr::Eq { dst, .. } | Instr::Ne { dst, .. }
+                if plan.pinned_nullish_cmp.contains_key(&ip) =>
+            {
+                let g = gh(&plan, dst);
+                if plan.pinned_nullish_cmp[&ip] {
+                    dynasm!(ops ; mov Rq(g), 1);
+                } else {
+                    dynasm!(ops ; xor Rq(g), Rq(g));
+                }
+            }
             Instr::Eq { dst, a, b } => emit_dcmp(&mut ops, &plan, dst, a, b, Cmp::Eq),
             Instr::Ne { dst, a, b } => emit_dcmp(&mut ops, &plan, dst, a, b, Cmp::Ne),
             Instr::Jump { target } => {
@@ -1284,12 +1315,27 @@ pub(crate) fn compile_region_regalloc(
                     // anything else (HOLE, bool, null/undefined, heap) → deopt.
                     dynasm!(ops ; mov rax, [rdx + rcx * 8]);
                     emit_box_to_home(&mut ops, d, deopt);
+                    dynasm!(ops ; jmp => done);
+                } else if ta_plan.pins[j].kind == 7 {
+                    // kind-7 Float32Array: 4-byte f32 widened to f64; canonicalise
+                    // any NaN so raw f32 payloads can never alias a NaN-box tag.
+                    dynasm!(ops
+                        ; movss xmm0, [rdx + rcx * 4]
+                        ; cvtss2sd Rx(d), xmm0
+                        ; ucomisd Rx(d), Rx(d)
+                        ; jnp => done
+                        ; mov rax, QWORD QNAN_BITS as i64
+                        ; movq Rx(d), rax
+                        ; jmp => done
+                    );
                 } else {
                     // kind-8 Float64Array: the element IS a raw f64.
-                    dynasm!(ops ; movsd Rx(d), [rdx + rcx * 8]);
+                    dynasm!(ops
+                        ; movsd Rx(d), [rdx + rcx * 8]
+                        ; jmp => done
+                    );
                 }
                 dynasm!(ops
-                    ; jmp => done
                     ; => deopt
                     ; mov DWORD [rsi], ip as i32      // resume AT this ip
                     ; jmp => flush_exit
@@ -1298,10 +1344,10 @@ pub(crate) fn compile_region_regalloc(
                 copy_clobber(&mut lc, d);
                 lc = None;
             }
-            // ── pinned-Float64Array element write ── x[i] = v → a direct movsd from
-            // the val xmm home. Same guards; an OOB store deopts (the interpreter
-            // does the spec coerce-then-silent-noop). `val` is already an f64 home,
-            // so the store is exact for every number (integers store their double).
+            // ── pinned-Float32Array/Float64Array element write ── x[i] = v → direct
+            // store from the val xmm home. Same guards; an OOB store deopts (the
+            // interpreter does the spec coerce-then-silent-noop). `val` is already
+            // an f64 home, so the store is exact for every number.
             Instr::SetIndex { key, val, .. } => {
                 let j = ta_plan.access[&ip] as usize;
                 let off = ta_base + 32 * j as i32;
@@ -1329,7 +1375,16 @@ pub(crate) fn compile_region_regalloc(
                     ; cmp rcx, [rsp + off + 16]
                     ; jae => deopt
                     ; mov rdx, [rsp + off + 8]
-                    ; movsd [rdx + rcx * 8], Rx(vx)   // home f64 → element
+                );
+                if ta_plan.pins[j].kind == 7 {
+                    dynasm!(ops
+                        ; cvtsd2ss xmm0, Rx(vx)
+                        ; movss [rdx + rcx * 4], xmm0
+                    );
+                } else {
+                    dynasm!(ops ; movsd [rdx + rcx * 8], Rx(vx)); // home f64 → element
+                }
+                dynasm!(ops
                     ; jmp => done
                     ; => deopt
                     ; mov DWORD [rsi], ip as i32

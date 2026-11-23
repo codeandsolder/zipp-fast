@@ -484,6 +484,152 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// `import.meta.resolve(specifier[, parent])`: resolves `specifier` using
+    /// the same ESM resolution rules as `import` and returns its URL string
+    /// (`node:<name>` for Node builtins, `file://...` for files and packages).
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
+    pub(crate) fn import_meta_resolve(
+        &mut self,
+        state: &[Value],
+        args: &[Value],
+    ) -> Result<Value, Thrown> {
+        use crate::vm::node::resolve::{
+            file_url_path, resolve_meta_specifier, MetaResolution, MetaResolveError,
+        };
+        let throw_coded = |vm: &mut Self, msg: String, code: &str| -> Thrown {
+            let err = vm.error_from_thrown(&msg);
+            if err.is_heap() {
+                let code_val = vm.with_host_roots(&[err], |vm| vm.alloc_str(code.to_string()));
+                let _ = vm.set_prop(err, "code", code_val, false);
+            }
+            vm.pending_throw = Some(err);
+            Thrown(msg)
+        };
+        self.require_external_code_enabled()?;
+        let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        let a1 = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+        let spec = self.to_js_string(a0)?;
+
+        // Determine the parent directory to resolve against.
+        let ns_idx = state.first().map(|v| v.as_f64() as u32).unwrap_or(0);
+        let own_path = self
+            .module_cache
+            .iter()
+            .find(|(_, v)| **v == Value::heap(ns_idx))
+            .map(|(p, _)| p.clone());
+        let base_dir: Option<std::path::PathBuf> = if a1 != Value::UNDEFINED {
+            let parent_str = self.to_js_string(a1)?;
+            let Some(mut p) = file_url_path(&parent_str) else {
+                return Err(throw_coded(
+                    self,
+                    format!("TypeError: Invalid base URL: {parent_str}"),
+                    "ERR_INVALID_URL",
+                ));
+            };
+            if let Some(root) = &self.module_root {
+                let rel = p.strip_prefix("/").unwrap_or(&p);
+                p = root.join(rel);
+                if !lexically_confined(root, &p) {
+                    return Err(throw_coded(
+                        self,
+                        format!("Error: Cannot find module '{spec}'"),
+                        "ERR_MODULE_NOT_FOUND",
+                    ));
+                }
+            }
+            let before_qh = parent_str.split(['?', '#']).next().unwrap_or("");
+            if before_qh.ends_with('/') {
+                Some(p)
+            } else {
+                Some(p.parent().unwrap_or(std::path::Path::new(".")).to_path_buf())
+            }
+        } else {
+            own_path
+                .as_deref()
+                .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+                .or_else(|| self.module_base_dir.clone())
+        };
+
+        let confined = self.module_root.is_some();
+        match resolve_meta_specifier(base_dir.as_deref(), &spec, confined) {
+            Ok(MetaResolution::Url(url)) => Ok(self.alloc_str(url)),
+            Ok(MetaResolution::Path(raw_path, suffix)) => {
+                let resolved = if let Some(root) = self.module_root.clone() {
+                    if !lexically_confined(&root, &raw_path) {
+                        return Err(throw_coded(
+                            self,
+                            format!("Error: Cannot find module '{spec}'"),
+                            "ERR_MODULE_NOT_FOUND",
+                        ));
+                    }
+                    let final_path = match std::fs::canonicalize(&raw_path) {
+                        Ok(c) if c.starts_with(&root) => c,
+                        Ok(_) => {
+                            return Err(throw_coded(
+                                self,
+                                format!("Error: Cannot find module '{spec}'"),
+                                "ERR_MODULE_NOT_FOUND",
+                            ));
+                        }
+                        Err(_) => crate::lang::ts::resolve_candidates(&raw_path)
+                            .into_iter()
+                            .filter(|p| lexically_confined(&root, p))
+                            .find_map(|p| {
+                                std::fs::canonicalize(p)
+                                    .ok()
+                                    .filter(|p| p.is_file() && p.starts_with(&root))
+                            })
+                            .or_else(|| lexical_module_path(&raw_path))
+                            .unwrap_or(raw_path),
+                    };
+                    let Ok(below) = final_path.strip_prefix(&root) else {
+                        return Err(throw_coded(
+                            self,
+                            format!("Error: Cannot find module '{spec}'"),
+                            "ERR_MODULE_NOT_FOUND",
+                        ));
+                    };
+                    file_url(&std::path::Path::new("/").join(below))
+                } else {
+                    let final_path = match std::fs::canonicalize(&raw_path) {
+                        Ok(c) => c,
+                        Err(_) => crate::lang::ts::resolve_candidates(&raw_path)
+                            .into_iter()
+                            .find_map(|p| std::fs::canonicalize(p).ok().filter(|p| p.is_file()))
+                            .unwrap_or_else(|| {
+                                let abs = std::path::absolute(&raw_path).unwrap_or(raw_path);
+                                lexical_module_path(&abs).unwrap_or(abs)
+                            }),
+                    };
+                    file_url(&final_path)
+                };
+                let url = if suffix.is_empty() {
+                    resolved
+                } else {
+                    format!("{resolved}{suffix}")
+                };
+                Ok(self.alloc_str(url))
+            }
+            Err(MetaResolveError::NotFound(msg)) => {
+                let from = own_path
+                    .as_deref()
+                    .filter(|_| !confined)
+                    .map(|p| format!(" imported from {}", p.display()))
+                    .unwrap_or_default();
+                Err(throw_coded(
+                    self,
+                    format!("Error: {msg}{from}"),
+                    "ERR_MODULE_NOT_FOUND",
+                ))
+            }
+            Err(MetaResolveError::UnsupportedScheme(msg)) => Err(throw_coded(
+                self,
+                format!("Error: {msg}"),
+                "ERR_UNSUPPORTED_ESM_URL_SCHEME",
+            )),
+        }
+    }
+
     /// `import_module` for a static request edge taken by the link in
     /// flight (InnerModuleEvaluation step 11): the same stack segment, so a
     /// dependency that reaches back into an ancestor lowers the requester's

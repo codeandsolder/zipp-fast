@@ -5,7 +5,14 @@ import os
 
 class PurePath:
     def __init__(self, *parts):
+        if len(parts) == 1 and type(parts[0]) is str:
+            p = parts[0]
+            if p and p != "." and "//" not in p and "/." not in p and not p.endswith("/") and not p.startswith("./"):
+                self._path = p
+                self._parts_cache = None
+                return
         self._path = _join(*parts)
+        self._parts_cache = None
 
     def __fspath__(self):
         return self._path
@@ -36,9 +43,14 @@ class PurePath:
 
     @property
     def parts(self):
+        cached = self._parts_cache
+        if cached is not None:
+            return cached
         p = self._path
         parts = [x for x in p.split("/") if x and x != "."]
-        return tuple((["/"] if p.startswith("/") else []) + parts)
+        res = tuple((["/"] if p.startswith("/") else []) + parts)
+        self._parts_cache = res
+        return res
 
     @property
     def name(self):
@@ -162,11 +174,11 @@ class Path(PurePath):
     def is_dir(self):
         return os.path.isdir(self._path)
 
-    def open(self, mode="r", encoding=None, errors=None, newline=None):
-        return open(self._path, mode, encoding=encoding)
+    def open(self, mode="r", buffering=-1, encoding=None, errors=None, newline=None):
+        return open(self._path, mode, buffering=buffering, encoding=encoding, errors=errors, newline=newline)
 
-    def read_text(self, encoding=None, errors=None):
-        with open(self._path, "r", encoding=encoding) as f:
+    def read_text(self, encoding=None, errors=None, newline=None):
+        with open(self._path, "r", encoding=encoding, errors=errors, newline=newline) as f:
             return f.read()
 
     def read_bytes(self):
@@ -174,7 +186,7 @@ class Path(PurePath):
             return f.read()
 
     def write_text(self, text, encoding=None, errors=None, newline=None):
-        with open(self._path, "w", encoding=encoding) as f:
+        with open(self._path, "w", encoding=encoding, errors=errors, newline=newline) as f:
             return f.write(text)
 
     def write_bytes(self, data):
@@ -343,6 +355,25 @@ def _dirs(base, files=False):
     return out
 
 
+def _compile_seg_matcher(seg):
+    if "?" not in seg and "[" not in seg:
+        star = seg.find("*")
+        if star < 0:
+            return lambda name: name == seg
+        if seg.find("*", star + 1) < 0:
+            pre = seg[:star]
+            suf = seg[star + 1:]
+            if not pre and not suf:
+                return lambda name: "/" not in name
+            if not pre:
+                return lambda name: name.endswith(suf) and "/" not in name
+            if not suf:
+                return lambda name: name.startswith(pre) and "/" not in name
+            min_len = len(pre) + len(suf)
+            return lambda name: len(name) >= min_len and name.startswith(pre) and name.endswith(suf) and "/" not in name
+    return lambda name: _fnmatch(name, seg)
+
+
 def _glob(root, pattern):
     segments = PurePath(pattern).parts
     if not segments:
@@ -356,6 +387,7 @@ def _glob(root, pattern):
     last = len(segments) - 1
     for i, seg in enumerate(segments):
         nxt, seen = [], set()
+        matcher = None if seg == "**" else _compile_seg_matcher(seg)
         for c in candidates:
             if not os.path.isdir(c):
                 continue
@@ -365,13 +397,26 @@ def _glob(root, pattern):
                 # trailing separator asks for directories.
                 matches = _dirs(c, files=i == last and not pattern.endswith("/"))
             else:
-                matches = [_child(c, name) for name in sorted(os.listdir(c)) if _fnmatch(name, seg)]
-            for m in matches:
-                if m not in seen:
-                    seen.add(m)
-                    nxt.append(m)
+                matches = [_child(c, name) for name in os.listdir(c) if matcher(name)]
+            if len(candidates) == 1:
+                nxt = matches
+            else:
+                for m in matches:
+                    if m not in seen:
+                        seen.add(m)
+                        nxt.append(m)
         candidates = nxt
     if pattern.endswith("/"):
         # A trailing separator selects directories only.
         candidates = [c for c in candidates if os.path.isdir(c)]
+    if len(segments) == 1 and segments[0] != "**" and not pattern.endswith("/"):
+        base_parts = root.parts
+        prefix = "" if root._path == "." else (root._path if root._path == "/" else root._path + "/")
+        plen = len(prefix)
+        out = []
+        for c in candidates:
+            p = Path(c)
+            p._parts_cache = base_parts + (c[plen:],)
+            out.append(p)
+        return out
     return [Path(c) for c in candidates]

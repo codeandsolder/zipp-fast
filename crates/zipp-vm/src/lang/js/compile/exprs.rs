@@ -2818,8 +2818,18 @@ impl<'a> FnCompiler<'a> {
                 Ok(dst)
             }
             Op::Void => {
-                // Evaluate the operand for side effects; the value is `undefined`.
-                let _ = self.expr(arg)?;
+                // Evaluate non-literal operands for side effects; pure literals
+                // like `void 0` have none, so skip emitting a dead constant load.
+                if !matches!(
+                    arg,
+                    ast::Expr::Num(_)
+                        | ast::Expr::Bool(_)
+                        | ast::Expr::Null
+                        | ast::Expr::Str(_)
+                        | ast::Expr::BigInt(_)
+                ) {
+                    let _ = self.expr(arg)?;
+                }
                 self.emit(Instr::LoadUndefined { dst });
                 Ok(dst)
             }

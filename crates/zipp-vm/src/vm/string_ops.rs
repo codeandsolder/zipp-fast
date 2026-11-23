@@ -446,7 +446,7 @@ impl<'p> Vm<'p> {
     /// just allocate `t`.
     fn alloc_recv_slice(&mut self, js: &crate::heap::JsStr, s: &str, t: &str) -> Value {
         if js.is_wellformed() {
-            return self.alloc_str(t.to_string());
+            return Value::heap(self.heap.alloc_str_copy(t));
         }
         let start = t.as_ptr() as usize - s.as_ptr() as usize;
         let exact = crate::heap::JsStr::from_wtf8(js.as_bytes()[start..start + t.len()].to_vec());
@@ -701,13 +701,40 @@ impl<'p> Vm<'p> {
                             "trimStart" => s.trim_start_matches(ws),
                             _ => s.trim_end_matches(ws),
                         };
-                        Some((t.len() != s.len()).then(|| t.to_string()))
+                        if t.len() == s.len() {
+                            Some(None)
+                        } else {
+                            let start = t.as_ptr() as usize - s.as_ptr() as usize;
+                            Some(Some((start, start + t.len(), js.is_ascii())))
+                        }
                     }
                     _ => None,
                 };
                 match trimmed {
                     Some(None) => return Ok(Some(Value::heap(idx))),
-                    Some(Some(t)) => return Ok(Some(self.alloc_str(t))),
+                    Some(Some((a, b, is_ascii))) => {
+                        if a == b {
+                            return Ok(Some(Value::heap(crate::heap::INTERN_EMPTY)));
+                        }
+                        if b - a == 1 {
+                            if let HeapObj::Str(js) = self.heap.get(idx) {
+                                let ch = js.as_bytes()[a];
+                                if ch < 128 {
+                                    return Ok(Some(Value::heap(ch as u32)));
+                                }
+                            }
+                        }
+                        let mut buf = self.heap.take_byte_buf(b - a);
+                        if let HeapObj::Str(js) = self.heap.get(idx) {
+                            buf.extend_from_slice(&js.as_bytes()[a..b]);
+                        }
+                        let js = if is_ascii {
+                            crate::heap::JsStr::from_ascii(buf)
+                        } else {
+                            crate::heap::JsStr::new(String::from_utf8(buf).unwrap_or_default())
+                        };
+                        return Ok(Some(Value::heap(self.heap.alloc_str_settled(js))));
+                    }
                     None => {}
                 }
             }
@@ -717,7 +744,7 @@ impl<'p> Vm<'p> {
             // general path does.
             "toUpperCase" | "toLowerCase" => {
                 let upper = name == "toUpperCase";
-                let mapped = match self.heap.get(idx) {
+                let ascii_len = match self.heap.get(idx) {
                     HeapObj::Str(js) if js.is_ascii() => {
                         let b = js.as_bytes();
                         let changes = if upper {
@@ -728,10 +755,34 @@ impl<'p> Vm<'p> {
                         if !changes {
                             return Ok(Some(Value::heap(idx)));
                         }
-                        let out = if upper { b.to_ascii_uppercase() } else { b.to_ascii_lowercase() };
-                        // ASCII is UTF-8.
-                        Some(String::from_utf8(out).unwrap_or_default())
+                        if b.len() == 1 {
+                            let ch = if upper {
+                                b[0].to_ascii_uppercase()
+                            } else {
+                                b[0].to_ascii_lowercase()
+                            };
+                            return Ok(Some(Value::heap(ch as u32)));
+                        }
+                        Some(b.len())
                     }
+                    _ => None,
+                };
+                if let Some(len) = ascii_len {
+                    self.preflight_guest_string_size(len)?;
+                    let mut buf = self.heap.take_byte_buf(len);
+                    if let HeapObj::Str(js) = self.heap.get(idx) {
+                        buf.extend_from_slice(js.as_bytes());
+                    }
+                    if upper {
+                        buf.make_ascii_uppercase();
+                    } else {
+                        buf.make_ascii_lowercase();
+                    }
+                    return Ok(Some(Value::heap(
+                        self.heap.alloc_str_settled(crate::heap::JsStr::from_ascii(buf)),
+                    )));
+                }
+                let mapped = match self.heap.get(idx) {
                     HeapObj::Str(js) if case_map_one_pass(js) => {
                         let s = js.as_str_wf();
                         Some(if upper {
@@ -852,11 +903,41 @@ impl<'p> Vm<'p> {
                 } else {
                     norm(self.to_integer_strict(args[1])?)
                 };
-                // Arg coercion (valueOf) is complete; borrow the receiver, slice,
-                // and DROP the borrow before alloc_js (which may GC). `idx` is the
-                // rooted receiver and stays valid across the coercion above.
+                // Arg coercion (valueOf) is complete; fast-path empty, whole,
+                // single-ASCII-char, and pooled-small-ASCII slices with zero
+                // mallocs before falling back to generic `slice_units`.
+                let (s, e) = (start as usize, end as usize);
+                if s >= e {
+                    return Ok(Some(Value::heap(crate::heap::INTERN_EMPTY)));
+                }
+                if s == 0 && e == len as usize {
+                    return Ok(Some(Value::heap(idx)));
+                }
+                let ascii_fast: Option<(usize, usize)> = match self.heap.get(idx) {
+                    HeapObj::Str(js) if js.is_ascii() => {
+                        let bytes = js.as_bytes();
+                        if e <= bytes.len() {
+                            if e - s == 1 {
+                                return Ok(Some(Value::heap(bytes[s] as u32)));
+                            }
+                            (e - s <= crate::heap::BYTE_POOL_MAX_CAP).then_some((s, e))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some((a, b)) = ascii_fast {
+                    let mut buf = self.heap.take_byte_buf(b - a);
+                    if let HeapObj::Str(js) = self.heap.get(idx) {
+                        buf.extend_from_slice(&js.as_bytes()[a..b]);
+                    }
+                    return Ok(Some(Value::heap(
+                        self.heap.alloc_str_settled(crate::heap::JsStr::from_ascii(buf)),
+                    )));
+                }
                 let out = match self.heap.get(idx) {
-                    HeapObj::Str(js) => js.slice_units(start as usize, end as usize),
+                    HeapObj::Str(js) => js.slice_units(s, e),
                     _ => return Ok(None),
                 };
                 return Ok(Some(Value::heap(self.heap.alloc_js(out))));
@@ -875,9 +956,42 @@ impl<'p> Vm<'p> {
                 } else {
                     self.to_integer_strict(args[1])?.clamp(0, len)
                 };
-                let (from, to) = if s0 <= e0 { (s0, e0) } else { (e0, s0) };
+                let (from, to) = if s0 <= e0 {
+                    (s0 as usize, e0 as usize)
+                } else {
+                    (e0 as usize, s0 as usize)
+                };
+                if from >= to {
+                    return Ok(Some(Value::heap(crate::heap::INTERN_EMPTY)));
+                }
+                if from == 0 && to == len as usize {
+                    return Ok(Some(Value::heap(idx)));
+                }
+                let ascii_fast: Option<(usize, usize)> = match self.heap.get(idx) {
+                    HeapObj::Str(js) if js.is_ascii() => {
+                        let bytes = js.as_bytes();
+                        if to <= bytes.len() {
+                            if to - from == 1 {
+                                return Ok(Some(Value::heap(bytes[from] as u32)));
+                            }
+                            (to - from <= crate::heap::BYTE_POOL_MAX_CAP).then_some((from, to))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some((a, b)) = ascii_fast {
+                    let mut buf = self.heap.take_byte_buf(b - a);
+                    if let HeapObj::Str(js) = self.heap.get(idx) {
+                        buf.extend_from_slice(&js.as_bytes()[a..b]);
+                    }
+                    return Ok(Some(Value::heap(
+                        self.heap.alloc_str_settled(crate::heap::JsStr::from_ascii(buf)),
+                    )));
+                }
                 let out = match self.heap.get(idx) {
-                    HeapObj::Str(js) => js.slice_units(from as usize, to as usize),
+                    HeapObj::Str(js) => js.slice_units(from, to),
                     _ => return Ok(None),
                 };
                 return Ok(Some(Value::heap(self.heap.alloc_js(out))));
@@ -1198,10 +1312,14 @@ impl<'p> Vm<'p> {
                     (Some(_), None) if lim != 0 => js_recv.units().min(lim),
                     _ => 1,
                 };
-                let mut parts: Vec<Value> = Vec::new();
-                parts
-                    .try_reserve_exact(count)
-                    .map_err(|_| Thrown::from_static("RangeError: Invalid array length"))?;
+                let mut parts: Vec<Value> = if count <= crate::heap::ARR_POOL_MAX_CAP {
+                    self.heap.take_arr_buf(count)
+                } else {
+                    let mut v = Vec::new();
+                    v.try_reserve_exact(count)
+                        .map_err(|_| Thrown::from_static("RangeError: Invalid array length"))?;
+                    v
+                };
                 // W9 static pretenure (docs/archive/NURSERY_DESIGN.md §4): split's parts and
                 // result array are the markdown/regex rows' retained "builder"
                 // output — measured to survive minors wholesale, so they
@@ -1241,11 +1359,25 @@ impl<'p> Vm<'p> {
                             }
                             // Byte ranges of the exact bytes.
                             Some((ranges, false)) => {
+                                let raw = js_recv.as_bytes();
                                 for &(a, b) in ranges {
-                                    let js = crate::heap::JsStr::from_wtf8(
-                                        js_recv.as_bytes()[a..b].to_vec(),
-                                    );
-                                    parts.push(Value::heap(self.heap.alloc_js(js)));
+                                    let len = b - a;
+                                    if len == 0 {
+                                        parts.push(Value::heap(crate::heap::INTERN_EMPTY));
+                                    } else if len == 1 && raw[a] < 128 {
+                                        parts.push(Value::heap(raw[a] as u32));
+                                    } else if !pretenure && a == 0 && b == raw.len() {
+                                        parts.push(Value::heap(idx));
+                                    } else {
+                                        let mut buf = self.heap.take_byte_buf(len);
+                                        buf.extend_from_slice(&raw[a..b]);
+                                        let js = if ascii {
+                                            crate::heap::JsStr::from_ascii(buf)
+                                        } else {
+                                            crate::heap::JsStr::from_wtf8(buf)
+                                        };
+                                        parts.push(Value::heap(self.heap.alloc_str_settled(js)));
+                                    }
                                 }
                             }
                             // Unit ranges: a bound between the halves of a pair
@@ -1260,7 +1392,7 @@ impl<'p> Vm<'p> {
                         parts
                     }
                 };
-                let arr = Value::heap(self.heap.alloc(HeapObj::Array(parts)));
+                let arr = Value::heap(self.heap.alloc_array_settled(parts));
                 if pretenure {
                     self.heap.pretenure_end();
                 }
@@ -2025,6 +2157,36 @@ impl<'p> Vm<'p> {
         #[cfg(not(feature = "instrument"))]
         let _ = bytes;
         Ok(())
+    }
+
+    /// Fast value-returning wrapper over `string_from_char_codes`: empty and
+    /// single-ASCII calls return pre-interned strings with zero allocation.
+    #[inline]
+    pub(crate) fn string_from_char_codes_val(
+        &mut self,
+        args: &[Value],
+    ) -> Result<Value, Thrown> {
+        if args.is_empty() {
+            self.preflight_native_iteration_work(0)?;
+            return Ok(Value::heap(crate::heap::INTERN_EMPTY));
+        }
+        if args.len() == 1 {
+            self.preflight_native_iteration_work(1)?;
+            let u = if args[0].is_int() {
+                args[0].as_int() as u16
+            } else {
+                crate::vm::helpers_num2::to_uint32(self.to_number_strict(args[0])?) as u16
+            };
+            if u < 128 {
+                return Ok(Value::heap(u as u32));
+            }
+            self.preflight_guest_string_size(3)?;
+            let mut out = Vec::with_capacity(3);
+            crate::heap::wtf8_push_cp(&mut out, u as u32);
+            return Ok(Value::heap(self.heap.alloc_js(crate::heap::JsStr::from_wtf8(out))));
+        }
+        let js = self.string_from_char_codes(args)?;
+        Ok(Value::heap(self.heap.alloc_js(js)))
     }
 
     /// `String.fromCharCode(...codes)`: each arg is ToUint16(ToNumber) — strict

@@ -172,18 +172,19 @@
         if (x !== null && typeof x === "object") {
             const c = x.cls;
             if (c === UnionType || c === GenericAlias || c === TypeVar || c === ParamSpec || c === TypeAliasType) return true;
-            if (c !== undefined && rt.typeOf(x).name === "_Alias") return true;
+            if (c !== undefined && (c.module === "typing" || rt.typeOf(x).name === "_Alias")) return true;
         }
         return false;
     };
     const unionArgs = (v) => v !== null && typeof v === "object" && v.cls === UnionType ? v.dict.get("__args__").items : [v];
-    const isTypingOnlyUnionArg = (x) => x !== null && typeof x === "object" && (x.cls === TypeVar || x.cls === ParamSpec || x.cls === TypeAliasType || (x.cls !== undefined && rt.typeOf(x).name === "_Alias"));
+    const isTypingOnlyUnionArg = (x) => x !== null && typeof x === "object" && (x.cls === TypeVar || x.cls === ParamSpec || x.cls === TypeAliasType || (x.cls !== undefined && (x.cls.module === "typing" || rt.typeOf(x).name === "_Alias")));
     const makeUnion = (a, b) => {
         if (!isUnionOperand(a) || !isUnionOperand(b)) return NOTIMPL;
         const args = []; for (const x of unionArgs(a).concat(unionArgs(b))) if (!args.includes(x)) args.push(x);
         const typingUnion = args.some(isTypingOnlyUnionArg);
         return { cls: UnionType, dict: new Map([["__args__", tuple(args)]]), typingUnion: typingUnion };
     };
+    rt.makeUnion = makeUnion;
     const gaName = (x) => {
         if (x === rt.ELLIPSIS) return "...";
         if (x === null) return "None";
@@ -1097,9 +1098,15 @@
         for (const ch of s) { let cp = ch.codePointAt(0); if (cp < 0x80) out.push(cp); else if (cp < 0x800) out.push(0xC0 | (cp >> 6), 0x80 | (cp & 63)); else if (cp < 0x10000) out.push(0xE0 | (cp >> 12), 0x80 | ((cp >> 6) & 63), 0x80 | (cp & 63)); else out.push(0xF0 | (cp >> 18), 0x80 | ((cp >> 12) & 63), 0x80 | ((cp >> 6) & 63), 0x80 | (cp & 63)); }
         return rt.bytes(out);
     };
+    let DECODE_NATIVE = null;
+    try { DECODE_NATIVE = typeof __zipp_py_decode === "function" ? __zipp_py_decode : null; } catch (e) { DECODE_NATIVE = null; }
     rt.decodeBytes = function (b, encoding, errors) {
-        const enc = String(encoding).toLowerCase().replace("-", "");
         const items = b.items;
+        if (DECODE_NATIVE !== null) {
+            const fast = DECODE_NATIVE(items, String(encoding), errors === undefined ? "strict" : String(errors));
+            if (fast !== undefined) return fast;
+        }
+        const enc = String(encoding).toLowerCase().replace("-", "");
         const mode = errors === undefined ? "strict" : String(errors);
         if (enc === "ascii") { let out = ""; for (let i = 0; i < items.length; i++) { const c = items[i]; if (c < 128) out += String.fromCharCode(c); else if (mode === "replace") out += "�"; else if (mode !== "ignore") fail(E.UnicodeDecodeError, "'ascii' codec can't decode byte 0x" + c.toString(16) + " in position " + i + ": ordinal not in range(128)"); } return out; }
         if (enc === "latin1" || enc === "latin_1" || enc === "iso88591") { let out = ""; for (let i = 0; i < items.length; i++) out += String.fromCharCode(items[i]); return out; }
@@ -1288,6 +1295,11 @@
         return true;
     }
     method(L, "__eq__", 2, (a) => a[1] !== null && typeof a[1] === "object" && isInstance(a[1], T.list) ? seqEq(a[0], a[1]) : NOTIMPL);
+    method(L, "__ne__", 2, (a) => a[1] !== null && typeof a[1] === "object" && isInstance(a[1], T.list) ? !seqEq(a[0], a[1]) : NOTIMPL);
+    method(L, "__lt__", 2, (a) => a[1] !== null && typeof a[1] === "object" && isInstance(a[1], T.list) ? cmp("lt", list(a[0].items), list(a[1].items)) : NOTIMPL);
+    method(L, "__le__", 2, (a) => a[1] !== null && typeof a[1] === "object" && isInstance(a[1], T.list) ? cmp("le", list(a[0].items), list(a[1].items)) : NOTIMPL);
+    method(L, "__gt__", 2, (a) => a[1] !== null && typeof a[1] === "object" && isInstance(a[1], T.list) ? cmp("gt", list(a[0].items), list(a[1].items)) : NOTIMPL);
+    method(L, "__ge__", 2, (a) => a[1] !== null && typeof a[1] === "object" && isInstance(a[1], T.list) ? cmp("ge", list(a[0].items), list(a[1].items)) : NOTIMPL);
     method(L, "__repr__", 1, (a) => rt.baseRepr(a[0]));
     L.dict.set("__hash__", null);
     function sortItems(items, key, reverse) {
@@ -1404,8 +1416,11 @@
     method(T.tuple, "__iter__", 1, (a) => rt.baseIter(a[0]));
     method(T.tuple, "__hash__", 1, (a) => rt.baseHash(a[0]));
     method(T.tuple, "__eq__", 2, (a) => a[1] !== null && typeof a[1] === "object" && isInstance(a[1], T.tuple) ? seqEq(a[0], a[1]) : NOTIMPL);
+    method(T.tuple, "__ne__", 2, (a) => a[1] !== null && typeof a[1] === "object" && isInstance(a[1], T.tuple) ? !seqEq(a[0], a[1]) : NOTIMPL);
     method(T.tuple, "__lt__", 2, (a) => a[1] !== null && typeof a[1] === "object" && isInstance(a[1], T.tuple) ? cmp("lt", tuple(a[0].items), tuple(a[1].items)) : NOTIMPL);
+    method(T.tuple, "__le__", 2, (a) => a[1] !== null && typeof a[1] === "object" && isInstance(a[1], T.tuple) ? cmp("le", tuple(a[0].items), tuple(a[1].items)) : NOTIMPL);
     method(T.tuple, "__gt__", 2, (a) => a[1] !== null && typeof a[1] === "object" && isInstance(a[1], T.tuple) ? cmp("gt", tuple(a[0].items), tuple(a[1].items)) : NOTIMPL);
+    method(T.tuple, "__ge__", 2, (a) => a[1] !== null && typeof a[1] === "object" && isInstance(a[1], T.tuple) ? cmp("ge", tuple(a[0].items), tuple(a[1].items)) : NOTIMPL);
     method(T.tuple, "__add__", 2, (a) => rt.baseBinop("add", a[0], a[1], false));
     method(T.tuple, "__mul__", 2, (a) => rt.baseBinop("mul", a[0], a[1], false));
     method(T.tuple, "__repr__", 1, (a) => rt.baseRepr(a[0]));
@@ -2048,58 +2063,274 @@
         if (path !== null && typeof path === "object" && path.cls !== T.bytes && rt.typeMethod(path, "__fspath__") !== undefined) path = rt.callMethod(path, "__fspath__", []);
         if (typeof path !== "string") fail(E.TypeError, "expected str, bytes or os.PathLike object, not " + typeOf(path).name);
         const mode = args[1] === undefined ? needStr(kwget(kw, "mode", "r")) : needStr(args[1]);
-        const binary = mode.includes("b"), plus = mode.includes("+");
+        const binary = mode.includes("b"), textFlag = mode.includes("t"), plus = mode.includes("+");
+        if (binary && textFlag) fail(E.ValueError, "can't have text and binary mode at once");
         const kind = mode.replace(/[bt+]/g, "");
         if (!["r", "w", "a", "x"].includes(kind)) fail(E.ValueError, "invalid mode: '" + mode + "'");
+        const encArg = args[3] !== undefined ? args[3] : kwget(kw, "encoding", null);
+        const errArg = args[4] !== undefined ? args[4] : kwget(kw, "errors", null);
+        const nlArg = args[5] !== undefined ? args[5] : kwget(kw, "newline", null);
+        if (binary) {
+            if (encArg !== null) fail(E.ValueError, "binary mode doesn't take an encoding argument");
+            if (errArg !== null) fail(E.ValueError, "binary mode doesn't take an errors argument");
+            if (nlArg !== null) fail(E.ValueError, "binary mode doesn't take a newline argument");
+        } else if (nlArg !== null && nlArg !== "" && nlArg !== "\n" && nlArg !== "\r" && nlArg !== "\r\n") {
+            fail(E.ValueError, "illegal newline value: " + repr(nlArg));
+        }
         const norm = rt.vfs.norm(path);
-        if (rt.vfs.isDir(norm) && !rt.vfs.has(norm)) fail(E.IsADirectoryError, "[Errno 21] Is a directory: '" + path + "'");
+        if (!rt.vfs.has(norm) && rt.vfs.isDir(norm)) fail(E.IsADirectoryError, "[Errno 21] Is a directory: '" + path + "'");
         let existing = rt.vfs.get(norm);
         if (kind === "r" && existing === undefined) fail(E.FileNotFoundError, "[Errno 2] No such file or directory: '" + path + "'");
         if (kind === "x" && existing !== undefined) fail(E.FileExistsError, "[Errno 17] File exists: '" + path + "'");
-        const buf = kind === "w" || kind === "x" || existing === undefined ? [] : rt.bytesFromU8(existing);
-        const s = { path: norm, buf: buf, pos: kind === "a" ? buf.length : 0, binary: binary, readable: kind === "r" || plus, writable: kind !== "r" || plus, closed: false, dirty: kind === "w" || kind === "x" || kind === "a" && existing === undefined, mode: mode };
+        const writable = kind !== "r" || plus;
+        const buf = !writable ? null : (kind === "w" || kind === "x" || existing === undefined ? [] : rt.bytesFromU8(existing));
+        const u8 = !writable ? existing : null;
+        const s = {
+            path: norm, buf: buf, u8: u8, pos: kind === "a" ? buf.length : 0,
+            binary: binary, readable: kind === "r" || plus, writable: writable,
+            closed: false, dirty: kind === "w" || kind === "x" || kind === "a" && existing === undefined,
+            mode: mode, encoding: encArg === null ? "utf-8" : needStr(encArg),
+            errors: errArg === null ? "strict" : needStr(errArg),
+            newline: binary ? null : nlArg, rawText: null, rawBasePos: 0, tpos: 0, seenNl: 0,
+        };
         if (s.dirty) flush(s);
         if (s.writable) openStates.add(s);
-        const enc = kwget(kw, "encoding", null);
-        s.encoding = enc === null ? "utf-8" : needStr(enc);
         return { cls: binary ? BinType : FileType, dict: new Map([["_f", s], ["name", path], ["mode", mode]]) };
     }
-    const textOf = (s, bytes) => rt.decodeBytes(rt.bytes(bytes), s.encoding);
-    const bytesOfText = (s, text) => rt.encodeStr(text, s.encoding, "strict").items;
-    const readAll = (s) => { const out = s.buf.slice(s.pos); s.pos = s.buf.length; return out; };
-    const readN = (s, n) => { const out = s.buf.slice(s.pos, s.pos + n); s.pos += out.length; return out; };
-    const readLine = (s) => { let end = s.buf.indexOf(10, s.pos); end = end < 0 ? s.buf.length : end + 1; const out = s.buf.slice(s.pos, end); s.pos = end; return out; };
+    const ensureBuf = (s) => { if (s.buf === null) s.buf = s.u8 === null ? [] : rt.bytesFromU8(s.u8); return s.buf; };
+    const byteLen = (s) => s.buf !== null ? s.buf.length : (s.u8 !== null ? s.u8.length : 0);
+    const bytesOfText = (s, text) => rt.encodeStr(text, s.encoding, s.errors).items;
+    const readAllBin = (s) => {
+        if (s.buf === null) { const out = rt.bytesFromU8(s.pos === 0 ? s.u8 : s.u8.subarray(s.pos)); s.pos = s.u8.length; return out; }
+        const out = s.buf.slice(s.pos); s.pos = s.buf.length; return out;
+    };
+    const readNBin = (s, n) => {
+        if (n === 0) return [];
+        if (s.buf === null) { const end = Math.min(s.u8.length, s.pos + n); const out = rt.bytesFromU8(s.u8.subarray(s.pos, end)); s.pos = end; return out; }
+        const out = s.buf.slice(s.pos, s.pos + n); s.pos += out.length; return out;
+    };
+    const readLineBin = (s, limit) => {
+        if (limit === 0) return [];
+        const src = s.buf !== null ? s.buf : s.u8;
+        const maxEnd = limit < 0 ? src.length : Math.min(src.length, s.pos + limit);
+        let end = src.indexOf(10, s.pos);
+        end = end < 0 || end >= maxEnd ? maxEnd : end + 1;
+        const out = s.buf !== null ? s.buf.slice(s.pos, end) : rt.bytesFromU8(s.u8.subarray(s.pos, end));
+        s.pos = end; return out;
+    };
+    const noteNl = (s, nl) => { s.seenNl |= nl === "\n" ? 1 : nl === "\r" ? 2 : 4; };
+    const ensureText = (s) => {
+        if (s.rawText === null) {
+            const src = s.buf !== null
+                ? (s.pos === 0 ? s.buf : s.buf.slice(s.pos))
+                : (s.pos === 0 ? s.u8 : s.u8.subarray(s.pos));
+            s.rawText = rt.decodeBytes({ items: src }, s.encoding, s.errors);
+            s.rawBasePos = s.pos;
+            s.tpos = 0;
+        }
+        return s.rawText;
+    };
+    const syncTextBytePos = (s) => {
+        if (s.rawText !== null && s.tpos > 0) {
+            s.pos = s.tpos >= s.rawText.length ? byteLen(s) : s.rawBasePos + bytesOfText(s, s.rawText.slice(0, s.tpos)).length;
+        }
+    };
+    const advanceCp = (str, start, count) => {
+        let p = start, len = str.length, k = 0;
+        while (k < count && p < len) {
+            const c = str.charCodeAt(p);
+            p += (c >= 0xd800 && c < 0xdc00 && p + 1 < len && (str.charCodeAt(p + 1) & 0xfc00) === 0xdc00) ? 2 : 1;
+            k++;
+        }
+        return p;
+    };
+    const readTextAll = (s) => {
+        const raw = ensureText(s);
+        const tail = s.tpos === 0 ? raw : raw.slice(s.tpos);
+        s.tpos = raw.length;
+        s.pos = byteLen(s);
+        if (s.newline === null) {
+            if (tail.indexOf("\r") !== -1) {
+                if (tail.indexOf("\r\n") !== -1) noteNl(s, "\r\n");
+                if (/\r(?!\n)/.test(tail)) noteNl(s, "\r");
+                if (/(^|[^\r])\n/.test(tail)) noteNl(s, "\n");
+                return tail.replace(/\r\n|\r/g, "\n");
+            }
+            if (tail.indexOf("\n") !== -1) noteNl(s, "\n");
+        }
+        return tail;
+    };
+    const readTextN = (s, n) => {
+        if (n === 0) return "";
+        const raw = ensureText(s);
+        let p = s.tpos, len = raw.length;
+        if (p >= len) return "";
+        if (s.newline === null) {
+            if (raw.indexOf("\r", p) === -1 && !rt.hasSurrogate(raw)) {
+                const end = Math.min(len, p + n);
+                const out = raw.slice(p, end);
+                if (out.indexOf("\n") !== -1) noteNl(s, "\n");
+                s.tpos = end;
+                return out;
+            }
+            let out = "", k = 0;
+            while (k < n && p < len) {
+                const c = raw.charCodeAt(p);
+                if (c === 13) {
+                    if (p + 1 < len && raw.charCodeAt(p + 1) === 10) { noteNl(s, "\r\n"); p += 2; }
+                    else { noteNl(s, "\r"); p += 1; }
+                    out += "\n"; k++;
+                } else if (c >= 0xd800 && c < 0xdc00 && p + 1 < len && (raw.charCodeAt(p + 1) & 0xfc00) === 0xdc00) {
+                    out += raw.slice(p, p + 2); p += 2; k++;
+                } else {
+                    if (c === 10) noteNl(s, "\n");
+                    out += raw[p++]; k++;
+                }
+            }
+            s.tpos = p;
+            return out;
+        }
+        const end = rt.hasSurrogate(raw) ? advanceCp(raw, p, n) : Math.min(len, p + n);
+        s.tpos = end;
+        return raw.slice(p, end);
+    };
+    const readTextLine = (s, limit) => {
+        if (limit === 0) return "";
+        const raw = ensureText(s);
+        const p = s.tpos, len = raw.length;
+        if (p >= len) return "";
+        if (s.newline === null) {
+            if (limit < 0) {
+                const cr = raw.indexOf("\r", p), lf = raw.indexOf("\n", p);
+                if (cr < 0 && lf < 0) { s.tpos = len; return raw.slice(p); }
+                if (cr < 0 || (lf >= 0 && lf < cr)) { noteNl(s, "\n"); s.tpos = lf + 1; return raw.slice(p, lf + 1); }
+                if (cr + 1 < len && raw.charCodeAt(cr + 1) === 10) { noteNl(s, "\r\n"); s.tpos = cr + 2; }
+                else { noteNl(s, "\r"); s.tpos = cr + 1; }
+                return raw.slice(p, cr) + "\n";
+            }
+            let cur = p, out = "", k = 0;
+            while (k < limit && cur < len) {
+                const c = raw.charCodeAt(cur);
+                if (c === 13) {
+                    if (cur + 1 < len && raw.charCodeAt(cur + 1) === 10) { noteNl(s, "\r\n"); cur += 2; }
+                    else { noteNl(s, "\r"); cur += 1; }
+                    out += "\n"; break;
+                }
+                if (c === 10) { noteNl(s, "\n"); out += "\n"; cur++; break; }
+                if (c >= 0xd800 && c < 0xdc00 && cur + 1 < len && (raw.charCodeAt(cur + 1) & 0xfc00) === 0xdc00) {
+                    out += raw.slice(cur, cur + 2); cur += 2; k++;
+                } else { out += raw[cur++]; k++; }
+            }
+            s.tpos = cur;
+            return out;
+        }
+        let end;
+        if (s.newline === "") {
+            const cr = raw.indexOf("\r", p), lf = raw.indexOf("\n", p);
+            if (cr >= 0 && (lf < 0 || cr < lf)) {
+                if (cr + 1 < len && raw.charCodeAt(cr + 1) === 10) { noteNl(s, "\r\n"); end = cr + 2; }
+                else { noteNl(s, "\r"); end = cr + 1; }
+            } else if (lf >= 0) { noteNl(s, "\n"); end = lf + 1; }
+            else end = len;
+        } else {
+            const idx = raw.indexOf(s.newline, p);
+            end = idx < 0 ? len : idx + s.newline.length;
+        }
+        if (limit >= 0) {
+            const capped = rt.hasSurrogate(raw) ? advanceCp(raw, p, limit) : Math.min(len, p + limit);
+            if (capped < end) end = capped;
+        }
+        s.tpos = end;
+        return raw.slice(p, end);
+    };
     for (const [type, binary] of [[FileType, false], [BinType, true]]) {
-        const wrap = (bytes, s) => binary ? rt.bytes(bytes) : textOf(s, bytes);
-        type.dict.set("read", builtin("read", 2, (a) => { const s = fstate(a[0]); if (!s.readable) fail(E.OSError, "not readable"); const n = a[1] === undefined || a[1] === null ? -1 : Number(needInt(a[1])); return wrap(n < 0 ? readAll(s) : readN(s, n), s); }, 1));
-        type.dict.set("readline", builtin("readline", 1, (a) => { const s = fstate(a[0]); return wrap(readLine(s), s); }));
-        type.dict.set("readlines", builtin("readlines", 1, (a) => { const s = fstate(a[0]); const out = []; while (s.pos < s.buf.length) out.push(wrap(readLine(s), s)); return list(out); }));
-        type.dict.set("__iter__", builtin("__iter__", 1, (a) => { const s = fstate(a[0]); return { cls: T.iterator, next: () => s.pos < s.buf.length ? wrap(readLine(s), s) : STOP }; }));
+        type.dict.set("read", builtin("read", 2, (a) => {
+            const s = fstate(a[0]); if (!s.readable) fail(E.OSError, "not readable");
+            const n = a[1] === undefined || a[1] === null ? -1 : Number(needInt(a[1]));
+            if (binary) return rt.bytes(n < 0 ? readAllBin(s) : readNBin(s, n));
+            return n < 0 ? readTextAll(s) : readTextN(s, n);
+        }, 1));
+        type.dict.set("readline", builtin("readline", 2, (a) => {
+            const s = fstate(a[0]); if (!s.readable) fail(E.OSError, "not readable");
+            const limit = a[1] === undefined || a[1] === null ? -1 : Number(needInt(a[1]));
+            return binary ? rt.bytes(readLineBin(s, limit)) : readTextLine(s, limit);
+        }, 1));
+        type.dict.set("readlines", builtin("readlines", 2, (a) => {
+            const s = fstate(a[0]); if (!s.readable) fail(E.OSError, "not readable");
+            const out = [];
+            if (binary) { while (s.pos < byteLen(s)) out.push(rt.bytes(readLineBin(s, -1))); }
+            else { const raw = ensureText(s); while (s.tpos < raw.length) out.push(readTextLine(s, -1)); }
+            return list(out);
+        }, 1));
+        type.dict.set("__iter__", builtin("__iter__", 1, (a) => {
+            const s = fstate(a[0]);
+            if (binary) return { cls: T.iterator, next: () => s.pos < byteLen(s) ? rt.bytes(readLineBin(s, -1)) : STOP };
+            return { cls: T.iterator, next: () => { const raw = ensureText(s); return s.tpos < raw.length ? readTextLine(s, -1) : STOP; } };
+        }));
         type.dict.set("write", builtin("write", 2, (a) => {
             const s = fstate(a[0]); if (!s.writable) fail(E.OSError, "not writable");
-            let bytes;
-            if (binary) { if (a[1] === null || typeof a[1] !== "object" || a[1].cls !== T.bytes) fail(E.TypeError, "a bytes-like object is required, not '" + typeOf(a[1]).name + "'"); bytes = a[1].items; }
-            else bytes = bytesOfText(s, needStr(a[1]));
+            let bytes, writtenLen;
+            if (binary) {
+                if (a[1] === null || typeof a[1] !== "object" || a[1].cls !== T.bytes) fail(E.TypeError, "a bytes-like object is required, not '" + typeOf(a[1]).name + "'");
+                bytes = a[1].items; writtenLen = bytes.length;
+            } else {
+                let text = needStr(a[1]);
+                writtenLen = rt.strLen(text);
+                syncTextBytePos(s);
+                if (s.newline === "\r" && text.indexOf("\n") !== -1) text = text.replace(/\n/g, "\r");
+                else if (s.newline === "\r\n" && text.indexOf("\n") !== -1) text = text.replace(/\n/g, "\r\n");
+                bytes = bytesOfText(s, text);
+            }
+            const buf = ensureBuf(s);
             if (s.pos + bytes.length > MAX_FILE) fileTooLarge();
             // Past the end a gap (after a seek) fills with zeros, then appends;
             // a large append at the end is one native concat.
-            while (s.buf.length < s.pos) s.buf.push(0);
-            if (s.pos === s.buf.length && bytes.length >= 4096 && bytes.length * 4 >= s.buf.length) s.buf = s.buf.concat(bytes);
-            else for (let i = 0; i < bytes.length; i++) { if (s.pos + i < s.buf.length) s.buf[s.pos + i] = bytes[i]; else s.buf.push(bytes[i]); }
-            s.pos += bytes.length; s.dirty = true;
-            return BigInt(binary ? bytes.length : a[1].length);
+            while (buf.length < s.pos) buf.push(0);
+            if (s.pos === buf.length && bytes.length >= 4096 && bytes.length * 4 >= buf.length) s.buf = buf.concat(bytes);
+            else for (let i = 0; i < bytes.length; i++) { if (s.pos + i < buf.length) buf[s.pos + i] = bytes[i]; else buf.push(bytes[i]); }
+            s.pos += bytes.length; s.dirty = true; s.rawText = null; s.tpos = 0;
+            return BigInt(writtenLen);
         }));
         type.dict.set("writelines", builtin("writelines", 2, (a) => { for (const line of drain(a[1])) rt.callMethod(a[0], "write", [line]); return null; }));
         type.dict.set("flush", builtin("flush", 1, (a) => { flush(fstate(a[0])); return null; }));
         type.dict.set("close", builtin("close", 1, (a) => { const s = a[0].dict.get("_f"); if (!s.closed) { flush(s); s.closed = true; openStates.delete(s); } return null; }));
-        type.dict.set("seek", builtin("seek", 3, (a) => { const s = fstate(a[0]); const off = Number(needInt(a[1])); const whence = a[2] === undefined ? 0 : Number(needInt(a[2])); s.pos = Math.max(0, whence === 0 ? off : whence === 1 ? s.pos + off : s.buf.length + off); return BigInt(s.pos); }, 2));
-        type.dict.set("tell", builtin("tell", 1, (a) => BigInt(fstate(a[0]).pos)));
-        type.dict.set("truncate", builtin("truncate", 2, (a) => { const s = fstate(a[0]); const n = a[1] === undefined || a[1] === null ? s.pos : Number(needInt(a[1])); if (n < 0) fail(E.OSError, "[Errno 22] Invalid argument"); if (n > MAX_FILE) fileTooLarge(); if (n < s.buf.length) s.buf.length = n; else while (s.buf.length < n) s.buf.push(0); s.dirty = true; return BigInt(n); }, 1));
+        type.dict.set("seek", builtin("seek", 3, (a) => {
+            const s = fstate(a[0]); const off = Number(needInt(a[1])); const whence = a[2] === undefined ? 0 : Number(needInt(a[2]));
+            if (!binary) syncTextBytePos(s);
+            s.pos = Math.max(0, whence === 0 ? off : whence === 1 ? s.pos + off : byteLen(s) + off);
+            if (!binary) {
+                if (s.rawText !== null && s.pos === s.rawBasePos) s.tpos = 0;
+                else { s.rawText = null; s.tpos = 0; }
+            }
+            return BigInt(s.pos);
+        }, 2));
+        type.dict.set("tell", builtin("tell", 1, (a) => {
+            const s = fstate(a[0]);
+            if (!binary) syncTextBytePos(s);
+            return BigInt(s.pos);
+        }));
+        type.dict.set("truncate", builtin("truncate", 2, (a) => { const s = fstate(a[0]); if (!binary) syncTextBytePos(s); const buf = ensureBuf(s); const n = a[1] === undefined || a[1] === null ? s.pos : Number(needInt(a[1])); if (n < 0) fail(E.OSError, "[Errno 22] Invalid argument"); if (n > MAX_FILE) fileTooLarge(); if (n < buf.length) buf.length = n; else while (buf.length < n) buf.push(0); s.dirty = true; s.rawText = null; s.tpos = 0; return BigInt(n); }, 1));
         type.dict.set("readable", builtin("readable", 1, (a) => fstate(a[0]).readable));
         type.dict.set("writable", builtin("writable", 1, (a) => fstate(a[0]).writable));
         type.dict.set("__enter__", builtin("__enter__", 1, (a) => a[0]));
         type.dict.set("__exit__", builtin("__exit__", 4, (a) => { rt.callMethod(a[0], "close", []); return false; }));
         type.dict.set("closed", { cls: T.property, fget: builtin("closed", 1, (a) => a[0].dict.get("_f").closed), fset: null, fdel: null, doc: null });
+        if (!binary) {
+            type.dict.set("encoding", { cls: T.property, fget: builtin("encoding", 1, (a) => a[0].dict.get("_f").encoding), fset: null, fdel: null, doc: null });
+            type.dict.set("errors", { cls: T.property, fget: builtin("errors", 1, (a) => a[0].dict.get("_f").errors), fset: null, fdel: null, doc: null });
+            type.dict.set("newlines", { cls: T.property, fget: builtin("newlines", 1, (a) => {
+                const m = a[0].dict.get("_f").seenNl;
+                if (m === 0) return null;
+                if (m === 1) return "\n";
+                if (m === 2) return "\r";
+                if (m === 4) return "\r\n";
+                const arr = [];
+                if (m & 1) arr.push("\n");
+                if (m & 2) arr.push("\r");
+                if (m & 4) arr.push("\r\n");
+                return tuple(arr);
+            }), fset: null, fdel: null, doc: null });
+        }
         type.dict.set("__repr__", builtin("__repr__", 1, (a) => "<" + (binary ? "_io.BufferedReader" : "_io.TextIOWrapper") + " name=" + repr(a[0].dict.get("name")) + " mode=" + repr(a[0].dict.get("mode")) + ">"));
     }
     rt.openFile = openFile;

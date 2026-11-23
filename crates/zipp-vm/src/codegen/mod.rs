@@ -1320,6 +1320,29 @@ pub(crate) const CROSS_DYN_SLOPPY: u32 = 1 << 3;
 /// Callee has `reg_count > 64` or an unanalyzed `uninit_mask` (`u64::MAX`);
 /// `cross3_dyn_stub` zeroes `[copy_n + 1 .. reg_count]` when reusing a window.
 pub(crate) const CROSS_DYN_WIDE_ZERO: u32 = 1 << 4;
+/// Callee executes zero direct global loads/stores, so its compiled body is
+/// unaffected by `global_route_epoch` changes.
+pub(crate) const CROSS_DYN_NO_GLOBALS: u32 = 1 << 5;
+/// Bits `CROSS_DYN_ROUTE_SHIFT..32` carry the `global_route_epoch` at which
+/// this callee's direct global accesses were validated.
+pub(crate) const CROSS_DYN_EPOCH_OK: u32 = 1 << 6;
+pub(crate) const CROSS_DYN_ROUTE_SHIFT: u32 = 7;
+pub(crate) const CROSS_DYN_MAX_EPOCH: u32 = (1 << (32 - CROSS_DYN_ROUTE_SHIFT)) - 1;
+pub(crate) const CROSS_DYN_ROUTE_BITS_MASK: u32 =
+    CROSS_DYN_NO_GLOBALS | CROSS_DYN_EPOCH_OK | (CROSS_DYN_MAX_EPOCH << CROSS_DYN_ROUTE_SHIFT);
+
+pub(crate) fn proto_has_direct_globals(code: &[Instr]) -> bool {
+    code.iter().any(|ins| {
+        matches!(
+            ins,
+            Instr::LoadGlobal { .. }
+                | Instr::LoadGlobalOrUndefined { .. }
+                | Instr::StoreGlobal { .. }
+                | Instr::StoreGlobalStrict { .. }
+                | Instr::StoreGlobalResolved { .. }
+        )
+    })
+}
 /// Sentinel slot stored in a 32-way shape-pair IC entry (`fill_shape_pair`)
 /// when the static property key is provably absent from this shape and from
 /// pristine `%Object.prototype%`. Bit 31 distinguishes it from real slot indices
@@ -4075,6 +4098,11 @@ pub struct Jit {
     /// whose bodies were evicted too often (they take Tier C from then on).
     opt_feedback: FxHashMap<u32, opt::OptFeedback>,
     opt_blacklist: rustc_hash::FxHashSet<u32>,
+    /// Functions whose compiled body baked direct global accesses from an
+    /// inlined callee (`method_plan` or Tier O), so `jit_globals_still_routable`
+    /// checking only the caller's own bytecode is insufficient to refresh their
+    /// cross-entry route epoch.
+    cross_no_refresh: rustc_hash::FxHashSet<u32>,
     /// The functions whose compiled body is Tier O's: Tier C's site
     /// feedback leaves them be (`take_tier_c_body`).
     opt_bodies: rustc_hash::FxHashSet<u32>,
@@ -4613,6 +4641,7 @@ impl Jit {
         self.cross_wide_uninit.clear();
         self.cross_needs_frame.clear();
         self.cross_lazy_ff.clear();
+        self.cross_no_refresh.clear();
         self.map_kernels.clear();
         self.reduce_kernels.clear();
         self.filter_kernels.clear();
@@ -4880,6 +4909,8 @@ impl Jit {
         markdown_inline: Option<MarkdownInlinePlan>,
         needs_frame: bool,
         lazy_ff: bool,
+        route_epoch: u32,
+        has_direct_globals: bool,
     ) {
         let i = func_id as usize;
         if self.cross_entries.len() <= i {
@@ -4966,19 +4997,27 @@ impl Jit {
             && reg_count <= 512
             && proto.param_count <= 62
             && (1 + proto.param_count as usize) <= reg_count as usize;
-        self.cross_table[i].dyn_flags = if dyn_ok {
-            CROSS_DYN_OK
-                | if wide_zero { CROSS_DYN_WIDE_ZERO } else { 0 }
-                | if proto.lexical_this {
-                    CROSS_DYN_ARROW
-                } else if proto.is_strict {
-                    CROSS_DYN_STRICT
-                } else {
-                    CROSS_DYN_SLOPPY
-                }
+        let route_bits = if !has_direct_globals {
+            CROSS_DYN_NO_GLOBALS
+        } else if route_epoch <= CROSS_DYN_MAX_EPOCH {
+            CROSS_DYN_EPOCH_OK | (route_epoch << CROSS_DYN_ROUTE_SHIFT)
         } else {
             0
         };
+        self.cross_table[i].dyn_flags = route_bits
+            | if dyn_ok {
+                CROSS_DYN_OK
+                    | if wide_zero { CROSS_DYN_WIDE_ZERO } else { 0 }
+                    | if proto.lexical_this {
+                        CROSS_DYN_ARROW
+                    } else if proto.is_strict {
+                        CROSS_DYN_STRICT
+                    } else {
+                        CROSS_DYN_SLOPPY
+                    }
+            } else {
+                0
+            };
         self.cross_table[i].uninit_mask = uninit_mask;
         self.cross_table[i].reg_count = reg_count;
         self.cross_table[i].param_count = proto.param_count;
@@ -4988,6 +5027,23 @@ impl Jit {
         if let Some(callers) = self.cross_pending.remove(&func_id) {
             for caller in callers {
                 self.evict_for_cross_retry(caller);
+            }
+        }
+    }
+
+    /// Update the validated `global_route_epoch` packed into `cross_table[func_id]`
+    /// after `jit_globals_still_routable` re-proves its direct global accesses at
+    /// a newer epoch, returning subsequent cross-calls to the native fast path.
+    #[inline]
+    pub fn refresh_cross_route_epoch(&mut self, func_id: u32, route_epoch: u32) {
+        if self.opt_bodies.contains(&func_id) || self.cross_no_refresh.contains(&func_id) {
+            return;
+        }
+        if let Some(rec) = self.cross_table.get_mut(func_id as usize) {
+            if (rec.dyn_flags & CROSS_DYN_NO_GLOBALS) == 0 && route_epoch <= CROSS_DYN_MAX_EPOCH {
+                rec.dyn_flags = (rec.dyn_flags & !CROSS_DYN_ROUTE_BITS_MASK)
+                    | CROSS_DYN_EPOCH_OK
+                    | (route_epoch << CROSS_DYN_ROUTE_SHIFT);
             }
         }
     }
@@ -5278,6 +5334,9 @@ impl Jit {
         opt_callees: &OptCallees,
         // Canonical VM-wide property key IDs indexed by `name_idx`.
         prop_key_ids: &[u32],
+        // The `Vm::global_route_epoch` at which this function's direct global
+        // accesses were validated.
+        route_epoch: u32,
     ) {
         if self.compiled.contains_key(&func_id) || self.blacklist.contains(&func_id) {
             return;
@@ -5387,7 +5446,22 @@ impl Jit {
                     return;
                 }
                 let mask = if needs_frame { u64::MAX } else { cross_uninit_mask(proto) };
-                self.set_cross_entry(func_id, proto, entry, mask, None, None, None, needs_frame, false);
+                let has_globals = proto_has_direct_globals(&proto.code)
+                    || !method_plan.is_empty()
+                    || !opt_callees.bodies.is_empty();
+                self.set_cross_entry(
+                    func_id,
+                    proto,
+                    entry,
+                    mask,
+                    None,
+                    None,
+                    None,
+                    needs_frame,
+                    false,
+                    route_epoch,
+                    has_globals,
+                );
                 return;
             }
         }
@@ -5557,6 +5631,13 @@ impl Jit {
                 } else {
                     (uninit_mask, wide_uninit_mask)
                 };
+                let has_globals =
+                    proto_has_direct_globals(&proto.code) || !method_plan.is_empty();
+                if method_plan.is_empty() {
+                    self.cross_no_refresh.remove(&func_id);
+                } else {
+                    self.cross_no_refresh.insert(func_id);
+                }
                 self.set_cross_entry(
                     func_id,
                     proto,
@@ -5567,6 +5648,8 @@ impl Jit {
                     markdown_inline,
                     needs_frame,
                     lazy_ff,
+                    route_epoch,
+                    has_globals,
                 );
                 return;
             }

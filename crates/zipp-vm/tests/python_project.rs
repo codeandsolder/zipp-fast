@@ -625,3 +625,495 @@ fn deferred_files_are_read_on_first_use() {
     assert_eq!(reads[..3], [1, 1, 0], "{reads:?}");
     assert!(reads[3] >= 1 && reads[4] >= 1, "{reads:?}");
 }
+
+#[test]
+fn text_mode_universal_newline_translation() {
+    let main = r#"
+from pathlib import Path
+import re
+
+p = Path("sample.txt")
+# Binary read is byte-exact.
+assert p.read_bytes() == b"first\r\nsecond\rthird\nfourth"
+with open("sample.txt", "rb") as f:
+    assert f.read() == b"first\r\nsecond\rthird\nfourth"
+
+# Default newline=None translates CRLF and CR to LF (Path.read_text and open).
+assert p.read_text() == "first\nsecond\nthird\nfourth"
+assert p.read_text(encoding="utf-8") == "first\nsecond\nthird\nfourth"
+assert p.read_text(newline="") == "first\r\nsecond\rthird\nfourth"
+assert re.findall(r"^[a-z]+$", p.read_text(), re.MULTILINE) == ["first", "second", "third", "fourth"]
+
+# All five newline modes match CPython for read(), list(f), readline(), read(n).
+cases = {
+    None: (
+        "first\nsecond\nthird\nfourth",
+        ["first\n", "second\n", "third\n", "fourth"],
+        ["first\n", "second", "\nthird\nfourth"],
+    ),
+    "": (
+        "first\r\nsecond\rthird\nfourth",
+        ["first\r\n", "second\r", "third\n", "fourth"],
+        ["first\r", "\nsecon", "d\rthird\nfourth"],
+    ),
+    "\n": (
+        "first\r\nsecond\rthird\nfourth",
+        ["first\r\n", "second\rthird\n", "fourth"],
+        ["first\r", "\nsecon", "d\rthird\nfourth"],
+    ),
+    "\r": (
+        "first\r\nsecond\rthird\nfourth",
+        ["first\r", "\nsecond\r", "third\nfourth"],
+        ["first\r", "\nsecon", "d\rthird\nfourth"],
+    ),
+    "\r\n": (
+        "first\r\nsecond\rthird\nfourth",
+        ["first\r\n", "second\rthird\nfourth"],
+        ["first\r", "\nsecon", "d\rthird\nfourth"],
+    ),
+}
+for nl, (exp_all, exp_lines, exp_chunks) in cases.items():
+    with open("sample.txt", "r", newline=nl) as f:
+        assert f.read() == exp_all, (nl, "all")
+    with open("sample.txt", "r", newline=nl) as f:
+        assert list(f) == exp_lines, (nl, "iter")
+    with open("sample.txt", "r", newline=nl) as f:
+        assert f.readlines() == exp_lines, (nl, "readlines")
+    with open("sample.txt", "r", newline=nl) as f:
+        got = [f.read(6), f.read(6), f.read()]
+        assert got == exp_chunks, (nl, "chunks", got, exp_chunks)
+
+# Writing with explicit newline translates LF.
+out_crlf = Path("out_crlf.txt")
+n = out_crlf.write_text("a\nb\n", newline="\r\n")
+assert n == 4
+assert out_crlf.read_bytes() == b"a\r\nb\r\n"
+assert out_crlf.read_text() == "a\nb\n"
+
+out_cr = Path("out_cr.txt")
+out_cr.write_text("a\nb\n", newline="\r")
+assert out_cr.read_bytes() == b"a\rb\r"
+assert out_cr.read_text() == "a\nb\n"
+
+# Invalid newline and binary mode errors.
+for bad in ["x", "\n\r"]:
+    try:
+        open("sample.txt", "r", newline=bad)
+        assert False
+    except ValueError:
+        pass
+try:
+    open("sample.txt", "rb", newline="\n")
+    assert False
+except ValueError:
+    pass
+
+print("ok")
+"#;
+    let files = vec![
+        (
+            "sample.txt".to_owned(),
+            b"first\r\nsecond\rthird\nfourth".to_vec(),
+        ),
+        ("main.py".to_owned(), main.as_bytes().to_vec()),
+    ];
+    let out = big_stack(move || {
+        let mut compiled = zipp_vm::frontend::compile_python_program(
+            "main",
+            &[("main".to_owned(), main.to_owned())],
+            &files,
+            &[],
+            false,
+        )?;
+        let state = compiled.state_mut();
+        state.set_limits(50_000_000, None);
+        state.run_init()?;
+        Ok::<_, String>(state.take_output())
+    })
+    .unwrap();
+    assert_eq!(out, vec!["ok"]);
+}
+
+#[test]
+fn zipfile_deflated_and_compresslevel_and_shutil() {
+    let main = r#"
+import zipfile, zlib, shutil, os, struct
+
+# Exact issue #104 repro.
+info = zipfile.ZipInfo("test.txt", (1980, 1, 1, 0, 0, 0))
+info.compress_type = zipfile.ZIP_DEFLATED
+with zipfile.ZipFile("probe.zip", "w") as z:
+    z.writestr(info, b"hello world" * 1000, compresslevel=9)
+
+with zipfile.ZipFile("probe.zip", "r") as z:
+    got = z.getinfo("test.txt")
+    assert got.compress_type == zipfile.ZIP_DEFLATED, got.compress_type
+    assert got.file_size == 11000
+    assert got.compress_size < 200, got.compress_size
+    assert got.date_time == (1980, 1, 1, 0, 0, 0)
+    assert z.read("test.txt") == b"hello world" * 1000
+    assert z.testzip() is None
+
+# Check raw ZIP header method field is 8 (DEFLATED), not 0 (STORED).
+raw_zip = open("probe.zip", "rb").read()
+assert raw_zip[:4] == b"PK\x03\x04"
+assert struct.unpack("<H", raw_zip[8:10])[0] == zipfile.ZIP_DEFLATED
+
+# ZipFile-level compression and compresslevel.
+with zipfile.ZipFile("all_deflated.zip", "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+    z.writestr("a.txt", "repeat " * 500)
+    z.writestr("b.txt", b"stored override", compress_type=zipfile.ZIP_STORED)
+
+with zipfile.ZipFile("all_deflated.zip", "r") as z:
+    ia = z.getinfo("a.txt")
+    ib = z.getinfo("b.txt")
+    assert ia.compress_type == zipfile.ZIP_DEFLATED and ia.compress_size < ia.file_size
+    assert ib.compress_type == zipfile.ZIP_STORED and ib.compress_size == ib.file_size
+    assert z.read("a.txt") == ("repeat " * 500).encode("utf-8")
+    assert z.read("b.txt") == b"stored override"
+
+# Unsupported compression methods must fail rather than silently storing.
+for bad_method in (zipfile.ZIP_BZIP2, zipfile.ZIP_LZMA):
+    try:
+        zipfile.ZipFile("bad.zip", "w", compression=bad_method)
+        assert False, f"expected rejection for {bad_method}"
+    except NotImplementedError:
+        pass
+
+# zlib roundtrip (zlib, raw deflate, gzip) and checksums.
+payload = b"The quick brown fox jumps over the lazy dog. " * 100
+for wb in (15, -15, 31):
+    comp = zlib.compress(payload, level=9, wbits=wb)
+    assert len(comp) < len(payload) // 5
+    assert zlib.decompress(comp, wbits=wb) == payload
+assert zlib.crc32(b"123456789") == 0xCBF43926
+assert zlib.adler32(b"Wikipedia") == 0x11E60398
+
+# shutil.copyfile
+shutil.copyfile("probe.zip", "probe_copy.zip")
+assert open("probe_copy.zip", "rb").read() == raw_zip
+
+print("ok")
+"#;
+    let out = big_stack(move || {
+        let mut compiled = zipp_vm::frontend::compile_python_program(
+            "main",
+            &[("main".to_owned(), main.to_owned())],
+            &[("main.py".to_owned(), main.as_bytes().to_vec())],
+            &[],
+            false,
+        )?;
+        let state = compiled.state_mut();
+        state.set_limits(50_000_000, None);
+        state.run_init()?;
+        Ok::<_, String>(state.take_output())
+    })
+    .unwrap();
+    assert_eq!(out, vec!["ok"]);
+}
+
+#[test]
+fn re_astral_offset_scaling_and_semantics() {
+    let main = r#"
+import re
+
+# Group spans, pos, endpos across astral characters.
+s = "a🦀b(🦀c)d"
+p = re.compile(r"\((.)(.)\)")
+m = p.search(s)
+assert m is not None
+assert m.span() == (3, 7), m.span()
+assert m.span(1) == (4, 5), m.span(1)
+assert m.span(2) == (5, 6), m.span(2)
+assert m.group(1) == "🦀" and m.group(2) == "c"
+assert p.match(s, 3).span() == (3, 7)
+assert p.match(s, 3, 7).span() == (3, 7)
+assert p.match(s, 3, 6) is None
+assert p.search(s, 4) is None
+
+# Lone surrogates do not shift code-point offsets.
+lone = "ab\ud800cd\udc00ef"
+m2 = re.compile(r"ef").search(lone)
+assert m2.span() == (6, 8), m2.span()
+
+# Issue #107 repro: 8000 positions with a trailing astral char must stay linear (fast).
+text = "a" * 8000 + "🦀"
+pat = re.compile(r"(?:b)?'(?:[^'\\\n\r\t]|\\(?:[nrt\\0'\"]|x[0-9A-Fa-f]{2}|u\{[0-9A-Fa-f_]+\}))'")
+count = sum(pat.match(text, i) is not None for i in range(len(text)))
+assert count == 0
+# Also match at the end after 8000 ASCII chars + astral char.
+text2 = "a" * 8000 + "🦀'x'"
+m3 = pat.match(text2, 8001)
+assert m3 is not None and m3.span() == (8001, 8004) and m3.group(0) == "'x'"
+print("ok")
+"#;
+    let out = big_stack(move || {
+        let mut compiled = zipp_vm::frontend::compile_python_program(
+            "main",
+            &[("main".to_owned(), main.to_owned())],
+            &[("main.py".to_owned(), main.as_bytes().to_vec())],
+            &[],
+            false,
+        )?;
+        let state = compiled.state_mut();
+        state.set_limits(50_000_000, None);
+        state.run_init()?;
+        Ok::<_, String>(state.take_output())
+    })
+    .unwrap();
+    assert_eq!(out, vec!["ok"]);
+}
+
+#[test]
+fn html_urllib_warnings_and_support_stdlib() {
+    let main = r#"
+import sys, warnings, html, html.entities, html.parser
+import urllib.parse, urllib.error, urllib.request
+import codecs, logging, copyreg, threading, binascii, base64, tempfile, keyword, re
+import collections, collections.abc, typing, contextlib
+
+# sys.version_info named tuple & comparisons
+assert sys.version_info.major == 3 and sys.version_info.minor >= 12
+assert sys.version_info >= (3, 12) and not (sys.version_info >= (3, 14))
+assert isinstance(sys.warnoptions, list)
+
+# warnings + catch_warnings
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    warnings.warn("hello warning", DeprecationWarning)
+assert len(caught) == 1 and caught[0].category is DeprecationWarning
+assert str(caught[0].message) == "hello warning"
+
+# html + html.entities + html.parser
+assert html.escape('<a href="x">&</a>') == '&lt;a href=&quot;x&quot;&gt;&amp;&lt;/a&gt;'
+assert html.unescape('&lt;a&gt; &mdash; &#65; &#x42;') == '<a> \u2014 A B'
+assert html.entities.name2codepoint["mdash"] == 0x2014
+assert html.entities.html5["amp;"] == "&"
+
+events = []
+class Collector(html.parser.HTMLParser):
+    def handle_starttag(self, tag, attrs):
+        events.append(("start", tag, attrs))
+    def handle_endtag(self, tag):
+        events.append(("end", tag))
+    def handle_data(self, data):
+        events.append(("data", data))
+
+p = Collector()
+p.feed('<p class="lead">Hi &amp; <b>bye</b></p>')
+p.close()
+assert events[0] == ("start", "p", [("class", "lead")]), events
+assert ("data", "Hi & ") in events and ("start", "b", []) in events and ("data", "bye") in events
+
+# urllib.parse
+u = urllib.parse.urlparse("https://example.com:8080/a/b?x=1&y=two#frag")
+assert u.scheme == "https" and u.hostname == "example.com" and u.port == 8080
+assert u.path == "/a/b" and u.fragment == "frag"
+assert urllib.parse.parse_qs(u.query) == {"x": ["1"], "y": ["two"]}
+assert urllib.parse.urljoin("https://example.com/a/b", "../c") == "https://example.com/c"
+assert urllib.parse.unquote(urllib.parse.quote("a b/c")) == "a b/c"
+assert issubclass(urllib.error.HTTPError, urllib.error.URLError)
+
+# collections.abc, UserDict, typing, keyword
+assert isinstance("abc", collections.abc.Hashable)
+assert not isinstance([], collections.abc.Hashable)
+assert isinstance({}, collections.abc.Mapping)
+assert isinstance("abc", typing.Sized)
+ud = collections.UserDict(a=1)
+ud["b"] = 2
+assert len(ud) == 2 and ud["a"] == 1 and ud["b"] == 2
+assert keyword.iskeyword("def") and not keyword.iskeyword("not_a_kw")
+
+# bytes regexes & Python 3.11+ atomic/possessive syntax
+bp = re.compile(b"charset=([a-z0-9-]+)", re.I)
+bm = bp.search(b"Content-Type: text/html; CHARSET=utf-8;")
+assert bm is not None and bm.group(1) == b"utf-8" and bm.span(1) == (33, 38)
+assert re.findall(b"[a-z]+", b"ab 12 cd") == [b"ab", b"cd"]
+assert re.sub(b"a+", b"X", b"baaac") == b"bXc"
+ap = re.compile(r"(?>\r\n|[\n\r])([a-f0-9]{1,6}+)")
+am = ap.search("\r\nff00")
+assert am is not None and am.group(1) == "ff00"
+
+# base64, binascii, codecs, tempfile, threading
+enc = base64.b64encode(b"zipp!")
+assert base64.b64decode(enc) == b"zipp!"
+assert binascii.unhexlify(binascii.hexlify(b"\xde\xad")) == b"\xde\xad"
+assert codecs.lookup("utf-8").name == "utf-8"
+lock = threading.RLock()
+with lock:
+    with lock:
+        pass
+with tempfile.TemporaryDirectory() as td:
+    assert isinstance(td, str) and len(td) > 0
+print("ok")
+"#;
+    let out = big_stack(move || {
+        let mut compiled = zipp_vm::frontend::compile_python_program(
+            "main",
+            &[("main".to_owned(), main.to_owned())],
+            &[("main.py".to_owned(), main.as_bytes().to_vec())],
+            &[],
+            false,
+        )?;
+        let state = compiled.state_mut();
+        state.set_limits(50_000_000, None);
+        state.run_init()?;
+        Ok::<_, String>(state.take_output())
+    })
+    .unwrap();
+    assert_eq!(out, vec!["ok"]);
+}
+
+#[test]
+fn tomllib_shlex_datetime_unittest_mock_importlib_util() {
+    let main = r#"
+import importlib
+
+# Dynamic import of all 6 modules from Issue #103 without static import statements first.
+for name in ("tomllib", "shlex", "datetime", "unittest", "unittest.mock", "importlib.util"):
+    m = importlib.import_module(name)
+    assert m is not None, name
+
+tomllib = importlib.import_module("tomllib")
+shlex = importlib.import_module("shlex")
+datetime = importlib.import_module("datetime")
+unittest = importlib.import_module("unittest")
+mock = importlib.import_module("unittest.mock")
+iu = importlib.import_module("importlib.util")
+
+# tomllib: tables, dotted keys, array of tables, dates, inline tables, error handling.
+doc = tomllib.loads('''
+title = "Policy"
+[pkg]
+name = "demo"
+ports = [80, 443]
+meta.owner = "ci"
+[[items]]
+id = 1
+when = 2026-11-23T12:30:00Z
+[[items]]
+id = 2
+opts = { fast = true, ratio = 0.5 }
+''')
+assert doc["title"] == "Policy"
+assert doc["pkg"]["meta"]["owner"] == "ci"
+assert doc["items"][0]["when"] == datetime.datetime(2026, 11, 23, 12, 30, 0, tzinfo=datetime.timezone.utc)
+assert doc["items"][1]["opts"] == {"fast": True, "ratio": 0.5}
+try:
+    tomllib.loads("broken = [1, 2")
+    assert False
+except tomllib.TOMLDecodeError:
+    pass
+
+# shlex
+assert shlex.split("cmd --arg 'two words' \"three\\nfour\"") == ["cmd", "--arg", "two words", "three\\nfour"]
+assert shlex.quote("simple") == "simple"
+assert shlex.quote("a'b c") == "'a'\"'\"'b c'"
+assert shlex.join(["git", "commit", "-m", "hi there"]) == "git commit -m 'hi there'"
+
+# datetime
+d = datetime.date(2026, 5, 1)
+t = datetime.time(14, 30, 0)
+dt = datetime.datetime.combine(d, t, tzinfo=datetime.timezone.utc)
+assert dt.isoformat() == "2026-05-01T14:30:00+00:00"
+parsed = datetime.datetime.fromisoformat("2026-05-01T16:30:00+02:00")
+assert parsed == dt
+assert (dt + datetime.timedelta(days=2, hours=1)).day == 3
+assert datetime.datetime.strptime("2026-05-01 09:15", "%Y-%m-%d %H:%M").minute == 15
+
+# unittest + unittest.mock.patch.object
+class Service:
+    def fetch(self, key):
+        return f"real:{key}"
+
+class PolicyTest(unittest.TestCase):
+    def test_mock_patch_object(self):
+        svc = Service()
+        with mock.patch.object(svc, "fetch", return_value="mocked") as m:
+            self.assertEqual(svc.fetch("abc"), "mocked")
+            m.assert_called_once_with("abc")
+        self.assertEqual(svc.fetch("abc"), "real:abc")
+
+    def test_raises_and_subtest(self):
+        with self.assertRaisesRegex(ValueError, "bad"):
+            raise ValueError("bad input")
+        for x in (2, 4, 6):
+            with self.subTest(x=x):
+                self.assertEqual(x % 2, 0)
+
+suite = unittest.defaultTestLoader.loadTestsFromTestCase(PolicyTest)
+res = unittest.TestResult()
+suite.run(res)
+assert res.wasSuccessful() and res.testsRun == 2, (res.failures, res.errors)
+
+# importlib.util.spec_from_file_location loading a VFS file
+spec = iu.spec_from_file_location("policy_mod", "scripts/policy_mod.py")
+assert spec is not None and spec.loader is not None
+mod = iu.module_from_spec(spec)
+spec.loader.exec_module(mod)
+assert mod.ANSWER == 42 and mod.greet("zipp") == "hello zipp"
+print("ok")
+"#;
+    let helper = "ANSWER = 42\ndef greet(who):\n    return f'hello {who}'\n";
+    let out = big_stack(move || {
+        let mut compiled = zipp_vm::frontend::compile_python_program(
+            "main",
+            &[("main".to_owned(), main.to_owned())],
+            &[
+                ("main.py".to_owned(), main.as_bytes().to_vec()),
+                ("scripts/policy_mod.py".to_owned(), helper.as_bytes().to_vec()),
+            ],
+            &[],
+            false,
+        )?;
+        let state = compiled.state_mut();
+        state.set_limits(50_000_000, None);
+        state.run_init()?;
+        Ok::<_, String>(state.take_output())
+    })
+    .unwrap();
+    assert_eq!(out, vec!["ok"]);
+}
+
+#[test]
+fn re_findall_fastpath_and_pathlib_glob() {
+    let main = r#"
+import re
+from pathlib import Path
+
+# 0 groups, 1 group, 2+ groups, optional unmatched groups, empty matches, astral, pos/endpos.
+assert re.compile(r"\d+").findall("a1b22c333") == ["1", "22", "333"]
+assert re.compile(r"\[([^\]]+)\]").findall("[foo] [bar]") == ["foo", "bar"]
+assert re.compile(r"(a)(b)?").findall("a ab") == [("a", ""), ("a", "b")]
+assert re.compile(r"a*").findall("aba") == ["a", "", "a", ""]
+assert re.compile(r"🦀(\w+)").findall("🦀one 🦀two") == ["one", "two"]
+p = re.compile(r"\w+")
+assert p.findall("one two three", 4, 7) == ["two"]
+
+# pathlib glob / rglob + read_text
+docs = sorted(Path("docs").rglob("*.md"))
+assert [d.name for d in docs] == ["a.md", "b.md"]
+assert [d.read_text(encoding="utf-8") for d in docs] == ["hello\n", "world\n"]
+print("ok")
+"#;
+    let out = big_stack(move || {
+        let mut compiled = zipp_vm::frontend::compile_python_program(
+            "main",
+            &[("main".to_owned(), main.to_owned())],
+            &[
+                ("main.py".to_owned(), main.as_bytes().to_vec()),
+                ("docs/a.md".to_owned(), b"hello\r\n".to_vec()),
+                ("docs/sub/b.md".to_owned(), b"world\r\n".to_vec()),
+                ("docs/sub/skip.txt".to_owned(), b"ignore".to_vec()),
+            ],
+            &[],
+            false,
+        )?;
+        let state = compiled.state_mut();
+        state.set_limits(50_000_000, None);
+        state.run_init()?;
+        Ok::<_, String>(state.take_output())
+    })
+    .unwrap();
+    assert_eq!(out, vec!["ok"]);
+}
