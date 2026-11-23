@@ -309,10 +309,7 @@ with zipfile.ZipFile("deflated.zip", "a") as z:
     z.writestr("stored.txt", "plain")
 with zipfile.ZipFile("deflated.zip") as z:
     print("deflated kept", [(i.filename, i.compress_type) for i in z.infolist()], z.read("stored.txt"))
-    try:
-        z.read("packed.txt")
-    except NotImplementedError:
-        print("deflate unreadable")
+    print("deflated read", z.read("packed.txt"))
 with open("deflated.zip", "rb") as f:
     blob = f.read()
 with open("original.zip", "rb") as f:
@@ -335,7 +332,7 @@ print("deflated bytes kept", blob[:directory] == original[:directory])
             "x refused ['first.txt', 'second.txt']",
             "created ['n'] b'y'",
             "deflated kept [('packed.txt', 8), ('stored.txt', 0)] b'plain'",
-            "deflate unreadable",
+            "deflated read b'hello hello hello hello'",
             "deflated bytes kept True",
         ]
     );
