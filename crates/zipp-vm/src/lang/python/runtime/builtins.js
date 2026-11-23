@@ -849,40 +849,86 @@
         if (count < 0) return rt.checkedText(s.split(from).join(to));
         let out = "", rest = s, n = 0; while (n < count) { const i = rest.indexOf(from); if (i < 0) break; out += rest.slice(0, i) + to; rest = rest.slice(i + from.length); n++; } return rt.checkedText(out + rest);
     }, 3);
-    // start/end of find/index/count, clamped like a slice; null when the
-    // start lies past the end (then even an empty needle is not found).
-    function searchRange(a, s) {
-        const noBounds = (a[2] === undefined || a[2] === null) && (a[3] === undefined || a[3] === null);
-        if (noBounds) return { hay: s, start: 0, cps: null };
-        const cps = codepoints(s);
-        let start = a[2] === undefined || a[2] === null ? 0 : Number(rt.indexOf(a[2])), end = a[3] === undefined || a[3] === null ? cps.length : Number(rt.indexOf(a[3]));
-        if (start < 0) start = Math.max(0, start + cps.length); if (end < 0) end = Math.max(0, end + cps.length); end = Math.min(end, cps.length);
-        if (start > cps.length) return null;
-        return { hay: cps.slice(start, Math.max(start, end)).join(""), start: start, cps: cps };
+    // Parse optional [start, end] code-point bounds onto UTF-16 [u0, u1],
+    // without splitting `s` into a codepoint array. Returns null when start > end.
+    function strBounds(a, s) {
+        const hasBounds = (a[2] !== undefined && a[2] !== null) || (a[3] !== undefined && a[3] !== null);
+        let n, pairs = null;
+        if (rt.hasSurrogate(s)) { rt.strInfo(s); n = rt.infoLen; pairs = rt.infoPairs; }
+        else n = s.length;
+        if (!hasBounds) return { lo: 0, hi: n, u0: 0, u1: s.length, pairs: pairs };
+        let lo = a[2] === undefined || a[2] === null ? 0 : typeof a[2] === "bigint" ? Number(a[2]) : Number(rt.indexOf(a[2]));
+        let hi = a[3] === undefined || a[3] === null ? n : typeof a[3] === "bigint" ? Number(a[3]) : Number(rt.indexOf(a[3]));
+        if (lo < 0) lo = Math.max(0, lo + n);
+        if (hi < 0) hi = Math.max(0, hi + n);
+        if (hi > n) hi = n;
+        if (lo > hi) return null;
+        const u0 = pairs !== null ? rt.utf16FromCp(pairs, lo) : lo;
+        const u1 = hi === n ? s.length : (pairs !== null ? rt.utf16FromCp(pairs, hi) : hi);
+        return { lo: lo, hi: hi, u0: u0, u1: u1, pairs: pairs };
     }
     function findImpl(a, rev, raise) {
         const s = strSelf(a), sub = needStr(a[1]);
-        const r = searchRange(a, s);
-        const i = r === null ? -1 : rev ? r.hay.lastIndexOf(sub) : r.hay.indexOf(sub);
+        const b = strBounds(a, s);
+        if (b === null) { if (raise) fail(E.ValueError, "substring not found"); return -1n; }
+        if (sub.length === 0) return BigInt(rev ? b.hi : b.lo);
+        if (b.u0 + sub.length > b.u1) { if (raise) fail(E.ValueError, "substring not found"); return -1n; }
+        let i;
+        if (b.pairs !== null && rt.hasSurrogate(sub)) {
+            const hay = b.u0 === 0 && b.u1 === s.length ? s : s.slice(b.u0, b.u1);
+            const rel = rev ? hay.lastIndexOf(sub) : hay.indexOf(sub);
+            i = rel < 0 ? -1 : b.u0 + rel;
+        } else if (rev) {
+            i = s.lastIndexOf(sub, b.u1 - sub.length);
+            if (i < b.u0) i = -1;
+        } else {
+            i = s.indexOf(sub, b.u0);
+            if (i < 0 || i + sub.length > b.u1) i = -1;
+        }
         if (i < 0) { if (raise) fail(E.ValueError, "substring not found"); return -1n; }
-        return BigInt(r.start + (rt.hasSurrogate(r.hay) ? rt.strLen(r.hay.slice(0, i)) : i));
+        return BigInt(b.pairs !== null ? rt.cpFromUtf16(b.pairs, i) : i);
     }
     method(S, "find", 4, (a) => findImpl(a, false, false), 2);
     method(S, "rfind", 4, (a) => findImpl(a, true, false), 2);
     method(S, "index", 4, (a) => findImpl(a, false, true), 2);
     method(S, "rindex", 4, (a) => findImpl(a, true, true), 2);
-    method(S, "count", 4, (a) => { const s = strSelf(a), sub = needStr(a[1]); const r = searchRange(a, s); if (r === null) return 0n; if (sub === "") return BigInt(rt.strLen(r.hay) + 1); return BigInt(r.hay.split(sub).length - 1); }, 2);
-    function affix(a, end) {
-        let s = strSelf(a); const p = a[1];
-        // start/end bound the text like a slice (code points); a window that
-        // ends before it starts matches nothing, not even "".
-        if ((a[2] !== undefined && a[2] !== null) || (a[3] !== undefined && a[3] !== null)) {
-            const cps = codepoints(s), n = cps.length;
-            let lo = a[2] === undefined || a[2] === null ? 0 : Number(rt.indexOf(a[2])), hi = a[3] === undefined || a[3] === null ? n : Number(rt.indexOf(a[3]));
-            if (lo < 0) lo = Math.max(0, lo + n); if (hi < 0) hi = Math.max(0, hi + n); hi = Math.min(hi, n);
-            s = hi < lo ? null : cps.slice(lo, hi).join("");
+    method(S, "count", 4, (a) => {
+        const s = strSelf(a), sub = needStr(a[1]);
+        const b = strBounds(a, s);
+        if (b === null) return 0n;
+        if (sub.length === 0) return BigInt(b.hi - b.lo + 1);
+        let c = 0, p = b.u0;
+        const lim = b.u1 - sub.length;
+        while (p <= lim) {
+            const k = s.indexOf(sub, p);
+            if (k < 0 || k > lim) break;
+            c++; p = k + sub.length;
         }
-        const test = (x) => { const q = needStr(x); return s !== null && (end ? s.endsWith(q) : s.startsWith(q)); };
+        return BigInt(c);
+    }, 2);
+    function affix(a, end) {
+        const s = strSelf(a), p = a[1];
+        const b = strBounds(a, s);
+        const test = (x) => {
+            const q = needStr(x);
+            if (b === null) return false;
+            if (b.pairs !== null && rt.hasSurrogate(q)) {
+                const sub = b.u0 === 0 && b.u1 === s.length ? s : s.slice(b.u0, b.u1);
+                if (q.length > sub.length) return false;
+                if (end) {
+                    if (!sub.endsWith(q)) return false;
+                    const at = sub.length - q.length;
+                    if (at > 0 && sub.charCodeAt(at - 1) >= 0xd800 && sub.charCodeAt(at - 1) <= 0xdbff && sub.charCodeAt(at) >= 0xdc00 && sub.charCodeAt(at) <= 0xdfff) return false;
+                    return true;
+                }
+                if (!sub.startsWith(q)) return false;
+                const after = q.length;
+                if (after > 0 && after < sub.length && sub.charCodeAt(after - 1) >= 0xd800 && sub.charCodeAt(after - 1) <= 0xdbff && sub.charCodeAt(after) >= 0xdc00 && sub.charCodeAt(after) <= 0xdfff) return false;
+                return true;
+            }
+            if (b.u0 + q.length > b.u1) return false;
+            return end ? s.endsWith(q, b.u1) : s.startsWith(q, b.u0);
+        };
         if (p !== null && typeof p === "object" && p.cls === T.tuple) return p.items.some(test);
         return test(p);
     }
@@ -956,18 +1002,23 @@
             const LT = list([]);
             const install = (b, n, op) => {
                 b.strop = op; b.ltmpl = LT; b.ttype = T.tuple;
-                // A one-argument builtin with no entry yet: the one
+                // A positional builtin with no entry yet: the one
                 // `builtinFast` would give it.
-                b["j" + n] = b["c" + n] !== undefined ? b["c" + n] : n === 1 ? function (a) { return this.code([a]); } : function (a, c) { return this.code([a, c]); };
+                b["j" + n] = b["c" + n] !== undefined ? b["c" + n] : n === 1 ? function (a) { return this.code([a]); } : n === 2 ? function (a, c) { return this.code([a, c]); } : n === 3 ? function (a, c, d) { return this.code([a, c, d]); } : function (a, c, d, e) { return this.code([a, c, d, e]); };
                 b["c" + n] = STRM;
             };
             const native = (name, n, op) => install(S.dict.get(name), n, op);
             rt.nativeEntry = install;
             native("strip", 2, 1); native("lstrip", 2, 2); native("rstrip", 2, 3);
             native("strip", 1, 1); native("lstrip", 1, 2); native("rstrip", 1, 3);
-            native("split", 1, 4); native("split", 2, 4); native("replace", 3, 5); native("find", 2, 6);
+            native("split", 1, 4); native("split", 2, 4); native("replace", 3, 5);
+            native("find", 2, 6); native("find", 3, 6); native("find", 4, 6);
+            native("rfind", 2, 22); native("rfind", 3, 22); native("rfind", 4, 22);
+            native("count", 2, 23); native("count", 3, 23); native("count", 4, 23);
             native("join", 2, 7); native("lower", 1, 8); native("upper", 1, 9);
-            native("startswith", 2, 18); native("endswith", 2, 19); native("capitalize", 1, 21);
+            native("startswith", 2, 18); native("startswith", 3, 18); native("startswith", 4, 18);
+            native("endswith", 2, 19); native("endswith", 3, 19); native("endswith", 4, 19);
+            native("capitalize", 1, 21);
         }
         // An f-string's parts (strs, and ints left as ints: `"" + 5n` is
         // "5", as `str(5)`) are joined by `R.FJOIN.c<n>(...parts)`, a call
@@ -1842,25 +1893,73 @@
     }
 
     // ---- builtin functions ---------------------------------------------------------------------------------------------------
+    let PY_WRITE_NATIVE = null;
+    try { PY_WRITE_NATIVE = typeof __zipp_py_write === "function" ? __zipp_py_write : null; } catch (e) { PY_WRITE_NATIVE = null; }
+    const emitOutLine = (toErr, line) => {
+        if (PY_WRITE_NATIVE !== null) { PY_WRITE_NATIVE(1, toErr, line); return; }
+        if (toErr) console.error(line); else console.log(line);
+    };
     defkw("print", (a) => {
         const kw = kwOf(a, ["sep", "end", "file", "flush"]);
-        const sep = kwget(kw, "sep", null), end = kwget(kw, "end", null), file = kwget(kw, "file", null);
+        const sep = kwget(kw, "sep", null), end = kwget(kw, "end", null), file = kwget(kw, "file", null), flush = kwget(kw, "flush", false);
+        let target = file;
+        if (target === null) {
+            const sm = rt.modules.get("sys");
+            if (sm !== undefined) {
+                const so = sm.globals.get("stdout");
+                if (so !== undefined) {
+                    if (so === null) return null;
+                    target = so;
+                }
+            }
+        }
         const text = a.map(str).join(sep === null ? " " : needStr(sep, "sep")) + (end === null ? "\n" : needStr(end, "end"));
-        rt.writeOut(text, file);
+        rt.writeOut(text, target);
+        if (truth(flush)) {
+            if (target === null || target === undefined || ((target.isStdout === true || target.isStderr === true) && !(target.dict && target.dict.has("flush")))) {
+                rt.flushStream(target !== null && target !== undefined && target.isStderr === true);
+            } else {
+                call(rt.getattr(target, "flush"), [], null);
+            }
+        }
         return null;
     });
-    // Console output is line-buffered by the engine; keep partial lines until a newline.
+    // Native CLI hosts install a raw output sink so stdout/stderr preserve exact
+    // bytes with no appended newline and no 64 KiB inspect_line truncation.
+    // Non-streaming hosts (WASM, embedder tests) remain line-buffered while still
+    // bypassing inspect_line's 64 KiB truncation via PY_WRITE op 1.
     let outBuf = "", errBuf = "";
     rt.writeOut = function (text, file) {
-        const toErr = file !== null && file !== undefined && file.isStderr === true;
-        if (toErr) { errBuf += text; const i = errBuf.lastIndexOf("\n"); if (i >= 0) { console.error(errBuf.slice(0, i)); errBuf = errBuf.slice(i + 1); } return; }
-        // Any other file object (open(), io.StringIO, a user class) takes the text through its write().
-        if (file !== null && file !== undefined && file.isStdout !== true) { call(rt.getattr(file, "write"), [text], null); return; }
+        const hasCustomWrite = file !== null && file !== undefined && file.dict && file.dict.has("write");
+        const toErr = !hasCustomWrite && file !== null && file !== undefined && file.isStderr === true;
+        if (!toErr && file !== null && file !== undefined && (file.isStdout !== true || hasCustomWrite)) {
+            call(rt.getattr(file, "write"), [text], null);
+            return;
+        }
+        if (PY_WRITE_NATIVE !== null && PY_WRITE_NATIVE(0, toErr, text)) return;
+        if (toErr) {
+            errBuf += text;
+            const i = errBuf.lastIndexOf("\n");
+            if (i >= 0) { emitOutLine(true, errBuf.slice(0, i)); errBuf = errBuf.slice(i + 1); }
+            return;
+        }
         outBuf += text;
         const i = outBuf.lastIndexOf("\n");
-        if (i >= 0) { console.log(outBuf.slice(0, i)); outBuf = outBuf.slice(i + 1); }
+        if (i >= 0) { emitOutLine(false, outBuf.slice(0, i)); outBuf = outBuf.slice(i + 1); }
     };
-    rt.flushOut = function () { if (outBuf.length) { console.log(outBuf); outBuf = ""; } if (errBuf.length) { console.error(errBuf); errBuf = ""; } };
+    rt.writeBytesOut = function (bytesObj, isErr) {
+        const items = bytesObj.items;
+        if (PY_WRITE_NATIVE !== null && PY_WRITE_NATIVE(2, isErr, items)) return;
+        rt.writeOut(rt.decodeBytes(bytesObj, "utf-8", "replace"), isErr ? { isStderr: true } : null);
+    };
+    rt.flushStream = function (isErr) {
+        if (PY_WRITE_NATIVE !== null) PY_WRITE_NATIVE(3, isErr);
+    };
+    rt.flushOut = function () {
+        if (PY_WRITE_NATIVE !== null) { PY_WRITE_NATIVE(3, false); PY_WRITE_NATIVE(3, true); }
+        if (outBuf.length) { emitOutLine(false, outBuf); outBuf = ""; }
+        if (errBuf.length) { emitOutLine(true, errBuf); errBuf = ""; }
+    };
     def("len", 1, (a) => len(a[0]));
     def("repr", 1, (a) => repr(a[0]));
     // One escape per code point: an astral character is \U0001xxxx, not a surrogate pair.
@@ -2676,7 +2775,6 @@
     // Python function on a user class, `gb` for a builtin method of a
     // dict-less builtin container or str. A builtin that unboxes its
     // receiver is bound by `getattr` instead when the receiver is boxed.
-    const GB_TYPES = new Set([T.list, T.tuple, T.dict, T.set, T.frozenset, T.str]);
     R.mfind = function (obj, name, argc) {
         let t;
         if (obj !== null && typeof obj === "object") {
@@ -2699,7 +2797,8 @@
                     }
                     if (!(attr.unboxSelf === true && obj !== null && typeof obj === "object" && obj.pyval !== undefined)) {
                         const n = argc + 1, arity = attr.arity;
-                        if (GB_TYPES.has(t) && (arity < 0 ? n >= attr.minArity : n <= arity && n >= attr.minArity)) {
+                        const noDict = obj === null || typeof obj !== "object" || obj.dict === undefined;
+                        if (noDict && t.userClass !== true && (arity < 0 ? n >= attr.minArity : n <= arity && n >= attr.minArity)) {
                             t.gb[name + "#" + argc] = attr; rt.noteFlagged(t);
                         }
                         R.mself = true;
@@ -2826,13 +2925,14 @@
 (function (R) {
     "use strict";
     const rt = R.__rt, T = rt.T;
-    R.TLIST = T.list; R.TTUPLE = T.tuple; R.TRANGE = T.range; R.TDICT = T.dict; R.TSET = T.set;
+    R.TLIST = T.list; R.TTUPLE = T.tuple; R.TRANGE = T.range; R.TDICT = T.dict; R.TSET = T.set; R.TSLICE = T.slice;
     // The two classes whose instances' `__class__` is not their `cls` as
     // `getattr` answers it (a module's globals, a super proxy's MRO).
     R.TMODULE = T.module; R.TSUPER = T.super;
     // The emitter's native list and tuple displays (`PySeq`) copy this
     // record, which `sequence` made and nothing else ever sees.
     R.SEQTMPL = rt.list([]);
+    R.SLICETMPL = R.slice(null, null, null);
     // The `Number` intrinsic, for the emitter's guarded int-to-index conversions.
     R.Number = Number;
     // The text limit an inline str concatenation is checked against.

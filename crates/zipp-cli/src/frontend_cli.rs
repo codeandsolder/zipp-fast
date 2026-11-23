@@ -648,10 +648,15 @@ fn execute(mut compiled: zipp_vm::frontend::CompiledSource, gpu: bool) -> Result
     let state = compiled.state_mut();
     stream_console(state);
     if python {
+        stream_python_output(state);
         install_gpu(state, gpu);
         enable_python_jit(state);
     }
     let outcome = state.run_init();
+    if python {
+        let _ = io::stdout().flush();
+        let _ = io::stderr().flush();
+    }
     #[cfg(feature = "census")]
     state.record_census();
     // A program read from standard input has no project folder to write to.
@@ -869,6 +874,32 @@ fn stream_console(state: &mut ScriptState) {
         let _ = match stream {
             ConsoleStream::Stdout => writeln!(io::stdout().lock(), "{line}"),
             ConsoleStream::Stderr => writeln!(io::stderr().lock(), "{line}"),
+        };
+    }));
+}
+
+/// Stream Python stdout/stderr directly as raw bytes so `print(..., end="")`,
+/// `sys.stdout.write`, `sys.stdout.buffer.write`, and large documents (>64 KiB)
+/// preserve exact bytes without appended newlines or `inspect_line` truncation.
+fn stream_python_output(state: &mut ScriptState) {
+    state.set_raw_output_sink(Box::new(|stream, bytes| {
+        let _ = match stream {
+            ConsoleStream::Stdout => {
+                let mut out = io::stdout().lock();
+                if bytes.is_empty() {
+                    out.flush()
+                } else {
+                    out.write_all(bytes)
+                }
+            }
+            ConsoleStream::Stderr => {
+                let mut err = io::stderr().lock();
+                if bytes.is_empty() {
+                    err.flush()
+                } else {
+                    err.write_all(bytes)
+                }
+            }
         };
     }));
 }
@@ -1453,9 +1484,12 @@ fn run_project(
     drop(files);
     let state = compiled.state_mut();
     stream_console(state);
+    stream_python_output(state);
     install_gpu(state, gpu);
     enable_python_jit(state);
     let outcome = state.run_init();
+    let _ = io::stdout().flush();
+    let _ = io::stderr().flush();
     #[cfg(feature = "census")]
     state.record_census();
     // Files the program wrote go back to disk, inside the root only. The

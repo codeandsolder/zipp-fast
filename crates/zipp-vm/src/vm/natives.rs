@@ -5558,6 +5558,8 @@ impl<'p> Vm<'p> {
             #[cfg(feature = "python")]
             PY_RE_FINDALL => self.py_re_findall(args)?,
             #[cfg(feature = "python")]
+            PY_WRITE => self.py_write(args)?,
+            #[cfg(feature = "python")]
             PY_STR => self.py_str_has_surrogate(a0),
             #[cfg(feature = "python")]
             PY_ORD => self.py_ord(args)?,

@@ -753,6 +753,15 @@ impl ScriptState {
         self.with_vm(|vm| vm.console_sink = Some(sink));
     }
 
+    /// Deliver unframed raw stdout/stderr bytes directly to `sink` (used by
+    /// command-line Python runs so `print(..., end="")`, `sys.stdout.write`,
+    /// `sys.stdout.buffer.write`, and output longer than 64 KiB preserve exact
+    /// bytes without added newlines or `inspect_line` truncation). An empty
+    /// slice indicates an explicit flush request.
+    pub fn set_raw_output_sink(&mut self, sink: Box<dyn FnMut(ConsoleStream, &[u8])>) {
+        self.with_vm(|vm| vm.raw_output_sink = Some(sink));
+    }
+
     /// Take the `console.log`/`info`/`debug` lines produced so far, clearing the
     /// buffer. Un-drained output accumulates for the VM's lifetime, so a
     /// long-lived embedder should drain (or discard) periodically.

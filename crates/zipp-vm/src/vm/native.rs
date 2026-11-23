@@ -554,6 +554,11 @@ pub const PY_BYTES_DECODE_NAME: &str = "__zipp_py_decode";
 pub const PY_RE_FINDALL: u16 = 1978;
 #[cfg_attr(not(feature = "python"), allow(dead_code))]
 pub const PY_RE_FINDALL_NAME: &str = "__zipp_py_re_findall";
+/// Native raw/untruncated Python stdout/stderr write & flush (`vm::py_str`).
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_WRITE: u16 = 1979;
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_WRITE_NAME: &str = "__zipp_py_write";
 
 // ── decorator context closures (proposal-decorators) ────────────────────────
 // Each is a `HeapObj::NativeClosure`, not a bare `Native`: they close over the
@@ -2000,6 +2005,8 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         PY_BYTES_DECODE => ("", 3),
         #[cfg(feature = "python")]
         PY_RE_FINDALL => ("", 4),
+        #[cfg(feature = "python")]
+        PY_WRITE => ("", 3),
         U8_TO_HEX => ("toHex", 0),
         U8_SET_FROM_HEX => ("setFromHex", 1),
         U8_FROM_HEX => ("fromHex", 1),

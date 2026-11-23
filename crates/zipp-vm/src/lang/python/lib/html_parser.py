@@ -39,6 +39,9 @@ endendtag = re.compile(r">")
 endtagfind = re.compile(r"</\s*([a-zA-Z][-.a-zA-Z0-9:_]*)\s*>")
 
 
+_amp_end_re = re.compile(r"[\s;]")
+
+
 class HTMLParser(_markupbase.ParserBase):
     CDATA_CONTENT_ELEMENTS = ("script", "style")
 
@@ -82,7 +85,7 @@ class HTMLParser(_markupbase.ParserBase):
                 j = rawdata.find("<", i)
                 if j < 0:
                     amppos = rawdata.rfind("&", max(i, n - 34))
-                    if amppos >= 0 and not re.compile(r"[\s;]").search(rawdata, amppos):
+                    if amppos >= 0 and not _amp_end_re.search(rawdata, amppos):
                         break
                     j = n
             else:
@@ -101,17 +104,16 @@ class HTMLParser(_markupbase.ParserBase):
             i = self.updatepos(i, j)
             if i == n:
                 break
-            startswith = rawdata.startswith
-            if startswith("<", i):
+            if rawdata.startswith("<", i):
                 if starttagopen.match(rawdata, i):
                     k = self.parse_starttag(i)
-                elif startswith("</", i):
+                elif rawdata.startswith("</", i):
                     k = self.parse_endtag(i)
-                elif startswith("<!--", i):
+                elif rawdata.startswith("<!--", i):
                     k = self.parse_comment(i)
-                elif startswith("<?", i):
+                elif rawdata.startswith("<?", i):
                     k = self.parse_pi(i)
-                elif startswith("<!", i):
+                elif rawdata.startswith("<!", i):
                     k = self.parse_html_declaration(i)
                 elif (i + 1) < n:
                     self.handle_data("<")
@@ -133,13 +135,13 @@ class HTMLParser(_markupbase.ParserBase):
                     else:
                         self.handle_data(rawdata[i:k])
                 i = self.updatepos(i, k)
-            elif startswith("&#", i):
+            elif rawdata.startswith("&#", i):
                 match = charref.match(rawdata, i)
                 if match:
                     name = match.group()[2:-1]
                     self.handle_charref(name)
                     k = match.end()
-                    if not startswith(";", k - 1):
+                    if not rawdata.startswith(";", k - 1):
                         k = k - 1
                     i = self.updatepos(i, k)
                     continue
@@ -148,13 +150,13 @@ class HTMLParser(_markupbase.ParserBase):
                         self.handle_data(rawdata[i:i + 2])
                         i = self.updatepos(i, i + 2)
                     break
-            elif startswith("&", i):
+            elif rawdata.startswith("&", i):
                 match = entityref.match(rawdata, i)
                 if match:
                     name = match.group(1)
                     self.handle_entityref(name)
                     k = match.end()
-                    if not startswith(";", k - 1):
+                    if not rawdata.startswith(";", k - 1):
                         k = k - 1
                     i = self.updatepos(i, k)
                     continue

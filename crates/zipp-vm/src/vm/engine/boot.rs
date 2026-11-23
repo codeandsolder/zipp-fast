@@ -422,6 +422,7 @@ impl<'p> Vm<'p> {
             errput: Vec::new(),
             console_order: Vec::new(),
             console_sink: None,
+            raw_output_sink: None,
             host: None,
             host_ctx: None,
             start_mono_ms: crate::vm::clock::now_mono_ms(),

@@ -1390,7 +1390,28 @@
         g.set("platform", "zipp"); g.set("maxsize", 9223372036854775807n); g.set("byteorder", "little");
         g.set("path", list([])); g.set("modules", rt.namespaceView(rt.modules)); g.set("executable", "zipp");
         g.set("warnoptions", list([]));
-        const stream = (isErr) => { const t = pyClass(isErr ? "stderr" : "stdout", "sys", { write: (a) => { rt.writeOut(needStr(a[1]), isErr ? { isStderr: true } : null); return BigInt(a[1].length); }, flush: () => null }); const o = { cls: t, dict: new Map(), isStdout: !isErr, isStderr: isErr, write: true }; return o; };
+        const stream = (isErr) => {
+            const bt = pyClass("BufferedWriter", "io", {
+                write: (a) => {
+                    const b = a[1];
+                    if (b === null || typeof b !== "object" || (b.cls !== T.bytes && b.cls !== T.bytearray && b.cls !== T.memoryview)) {
+                        fail(E.TypeError, "a bytes-like object is required, not '" + typeOf(b).name + "'");
+                    }
+                    rt.writeBytesOut(b, isErr);
+                    return BigInt(b.items.length);
+                },
+                flush: () => { rt.flushStream(isErr); return null; },
+            });
+            const bufObj = { cls: bt, dict: new Map() };
+            const t = pyClass(isErr ? "stderr" : "stdout", "sys", {
+                write: (a) => { const s = needStr(a[1]); rt.writeOut(s, isErr ? { isStderr: true } : null); return len(s); },
+                writelines: (a) => { for (const line of drain(a[1])) rt.callMethod(a[0], "write", [line]); return null; },
+                flush: () => { rt.flushStream(isErr); return null; },
+                isatty: () => false,
+            });
+            const o = { cls: t, dict: new Map([["encoding", "utf-8"], ["errors", "strict"], ["buffer", bufObj]]), isStdout: !isErr, isStderr: isErr, write: true };
+            return o;
+        };
         g.set("stdout", stream(false)); g.set("stderr", stream(true)); g.set("stdin", null);
         fn(g, "exit", 1, (a) => { throw rt.makeExc(E.SystemExit, a.length ? [a[0]] : []); }, 0);
         fn(g, "getrecursionlimit", 0, () => 1000n);
@@ -1728,10 +1749,138 @@
         fn(g, "capwords", 1, (a) => needStr(a[0]).split(rt.WS_RUN).filter((x) => x).map((w) => w[0].toUpperCase() + w.slice(1).toLowerCase()).join(" "));
     });
     mod("textwrap", (g) => {
+        const TW_KW = ["width", "initial_indent", "subsequent_indent", "expand_tabs", "replace_whitespace", "fix_sentence_endings", "break_long_words", "drop_whitespace", "break_on_hyphens", "tabsize", "max_lines", "placeholder"];
+        function expandTabsStr(s, tabsize) {
+            if (s.indexOf("\t") < 0) return s;
+            let out = "", col = 0;
+            for (let i = 0; i < s.length; i++) {
+                const ch = s[i];
+                if (ch === "\t") { const pad = tabsize > 0 ? tabsize - (col % tabsize) : 0; out += " ".repeat(pad); col += pad; }
+                else { out += ch; col = (ch === "\n" || ch === "\r") ? 0 : col + 1; }
+            }
+            return out;
+        }
+        function wrapText(text, opts) {
+            const width = opts.width;
+            if (width <= 0) fail(E.ValueError, "invalid width " + width + " (must be > 0)");
+            let s = text;
+            if (opts.expand_tabs) s = expandTabsStr(s, opts.tabsize);
+            if (opts.replace_whitespace) s = s.replace(/[\t\n\x0b\x0c\r]/g, " ");
+            if (s === "") return [];
+            const rawChunks = s.split(/(\s+)/);
+            const chunks = [];
+            for (let i = 0; i < rawChunks.length; i++) {
+                const c = rawChunks[i];
+                if (!c.length) continue;
+                if (opts.break_on_hyphens && c.indexOf("-") >= 0 && !/^\s+$/.test(c)) {
+                    const parts = c.split(/(?<=-)(?=[^\s-])/);
+                    for (let j = 0; j < parts.length; j++) if (parts[j].length) chunks.push(parts[j]);
+                } else {
+                    chunks.push(c);
+                }
+            }
+            chunks.reverse();
+            const lines = [];
+            const maxLines = opts.max_lines;
+            const placeholder = opts.placeholder;
+            while (chunks.length) {
+                const curLine = [];
+                let curLen = 0;
+                const indent = lines.length ? opts.subsequent_indent : opts.initial_indent;
+                const avail = width - indent.length;
+                if (opts.drop_whitespace && /^\s+$/.test(chunks[chunks.length - 1]) && lines.length) chunks.pop();
+                while (chunks.length) {
+                    const top = chunks[chunks.length - 1];
+                    const l = top.length;
+                    if (curLen + l <= avail) { curLine.push(chunks.pop()); curLen += l; }
+                    else break;
+                }
+                if (chunks.length && chunks[chunks.length - 1].length > avail) {
+                    const top = chunks[chunks.length - 1];
+                    const spaceLeft = avail - curLen;
+                    if (opts.break_long_words && spaceLeft > 0) {
+                        curLine.push(top.slice(0, spaceLeft));
+                        chunks[chunks.length - 1] = top.slice(spaceLeft);
+                    } else if (!curLine.length) {
+                        if (opts.break_long_words && avail > 0) {
+                            curLine.push(top.slice(0, avail));
+                            chunks[chunks.length - 1] = top.slice(avail);
+                        } else {
+                            curLine.push(chunks.pop());
+                        }
+                    }
+                }
+                if (opts.drop_whitespace && curLine.length && /^\s+$/.test(curLine[curLine.length - 1])) curLine.pop();
+                if (curLine.length) {
+                    if (maxLines === null || lines.length + 1 < maxLines || (!chunks.length || (opts.drop_whitespace && chunks.length === 1 && /^\s+$/.test(chunks[0]))) && curLen <= avail) {
+                        lines.push(indent + curLine.join(""));
+                    } else {
+                        while (curLine.length) {
+                            if (!/^\s+$/.test(curLine[curLine.length - 1]) && curLen + placeholder.length <= avail) {
+                                curLine.push(placeholder);
+                                lines.push(indent + curLine.join(""));
+                                break;
+                            }
+                            curLen -= curLine.pop().length;
+                        }
+                        if (!curLine.length) lines.push(indent + placeholder.trimStart());
+                        break;
+                    }
+                }
+            }
+            return lines;
+        }
+        function optsFrom(a, kw, startIdx) {
+            const w = a[startIdx] !== undefined ? Number(needInt(a[startIdx])) : Number(needInt(kwget(kw, "width", 70n)));
+            const ml = kwget(kw, "max_lines", null);
+            return {
+                width: w,
+                initial_indent: needStr(kwget(kw, "initial_indent", "")),
+                subsequent_indent: needStr(kwget(kw, "subsequent_indent", "")),
+                expand_tabs: truth(kwget(kw, "expand_tabs", true)),
+                replace_whitespace: truth(kwget(kw, "replace_whitespace", true)),
+                fix_sentence_endings: truth(kwget(kw, "fix_sentence_endings", false)),
+                break_long_words: truth(kwget(kw, "break_long_words", true)),
+                drop_whitespace: truth(kwget(kw, "drop_whitespace", true)),
+                break_on_hyphens: truth(kwget(kw, "break_on_hyphens", true)),
+                tabsize: Number(needInt(kwget(kw, "tabsize", 8n))),
+                max_lines: ml === null ? null : Number(needInt(ml)),
+                placeholder: needStr(kwget(kw, "placeholder", " [...]")),
+            };
+        }
+        const TextWrapper = pyClass("TextWrapper", "textwrap", {
+            __init__: (a) => {
+                const kw = kwOf(a, TW_KW);
+                const opts = optsFrom(a, kw, 1);
+                for (const k of TW_KW) a[0].dict.set(k, k === "width" || k === "tabsize" ? BigInt(opts[k]) : k === "max_lines" ? (opts[k] === null ? null : BigInt(opts[k])) : opts[k]);
+                return null;
+            },
+            wrap: (a) => {
+                const d = a[0].dict;
+                const ml = d.get("max_lines");
+                return list(wrapText(needStr(a[1]), {
+                    width: Number(needInt(d.get("width"))),
+                    initial_indent: needStr(d.get("initial_indent")),
+                    subsequent_indent: needStr(d.get("subsequent_indent")),
+                    expand_tabs: truth(d.get("expand_tabs")),
+                    replace_whitespace: truth(d.get("replace_whitespace")),
+                    fix_sentence_endings: truth(d.get("fix_sentence_endings")),
+                    break_long_words: truth(d.get("break_long_words")),
+                    drop_whitespace: truth(d.get("drop_whitespace")),
+                    break_on_hyphens: truth(d.get("break_on_hyphens")),
+                    tabsize: Number(needInt(d.get("tabsize"))),
+                    max_lines: ml === null ? null : Number(needInt(ml)),
+                    placeholder: needStr(d.get("placeholder")),
+                }));
+            },
+            fill: (a) => call(TextWrapper.dict.get("wrap"), [a[0], a[1]], null).items.join("\n"),
+        });
+        TextWrapper.dict.get("__init__").kwnames = true;
+        g.set("TextWrapper", TextWrapper);
         fn(g, "dedent", 1, (a) => { const lines = needStr(a[0]).split("\n"); let margin = null; for (const l of lines) { if (!l.trim()) continue; const m = /^[ \t]*/.exec(l)[0]; margin = margin === null ? m : m.startsWith(margin) ? margin : margin.startsWith(m) ? m : ""; } return lines.map((l) => l.trim() ? l.slice(margin.length) : l.trim()).join("\n"); });
         fn(g, "indent", 2, (a) => needStr(a[0]).split("\n").map((l) => l.trim() ? a[1] + l : l).join("\n"));
-        fnkw(g, "wrap", (a) => { const kw = kwOf(a, ["width"]); const width = Number(a[1] !== undefined ? needInt(a[1]) : kwget(kw, "width", 70n)); const words = needStr(a[0]).split(/\s+/).filter((x) => x); const out = []; let cur = ""; for (const w of words) { if (cur.length + w.length + (cur ? 1 : 0) > width && cur) { out.push(cur); cur = w; } else cur = cur ? cur + " " + w : w; } if (cur) out.push(cur); return list(out); });
-        fnkw(g, "fill", (a) => { const kw = kwOf(a, ["width"]); const width = Number(a[1] !== undefined ? needInt(a[1]) : kwget(kw, "width", 70n)); return call(rt.modules.get("textwrap").globals.get("wrap"), [a[0], BigInt(width)], null).items.join("\n"); });
+        fnkw(g, "wrap", (a) => { const kw = kwOf(a, TW_KW); return list(wrapText(needStr(a[0]), optsFrom(a, kw, 1))); });
+        fnkw(g, "fill", (a) => { const kw = kwOf(a, TW_KW); return wrapText(needStr(a[0]), optsFrom(a, kw, 1)).join("\n"); });
         // CPython collapses the text first with `" ".join(text.strip().split())`.
         fn(g, "shorten", 2, (a) => { const s = needStr(a[0]).split(rt.WS_RUN).filter((x) => x).join(" "); const w = Number(needInt(a[1])); return s.length <= w ? s : s.slice(0, Math.max(0, w - 6)).replace(/\s+\S*$/, "") + " [...]"; });
     });
@@ -3242,52 +3391,10 @@
             if (stack.length) fail(error, "missing ), unterminated subpattern at position " + p.length);
             return { source: out, flags: flags, ignoreCase: baseI, groups: groups, names: names };
         }
-        // Code-point offsets over a string's UTF-16 ones (the same when the
-        // string has no surrogate pairs). A sparse sorted array of valid
-        // surrogate-pair UTF-16 start indices converts in both directions via
-        // O(log K) binary search, avoiding O(N^2) prefix scans even when a
-        // single astral character sits at the end of a long string.
-        const ASTRAL_PAIR = /[\ud800-\udbff][\udc00-\udfff]/g;
-        function buildAstralPairs(s) {
-            const pairs = [];
-            ASTRAL_PAIR.lastIndex = 0;
-            let m;
-            while ((m = ASTRAL_PAIR.exec(s)) !== null) pairs.push(m.index);
-            return pairs.length ? pairs : null;
-        }
-        function cpFromUtf16(pairs, u) {
-            let lo = 0, hi = pairs.length;
-            while (lo < hi) {
-                const mid = (lo + hi) >>> 1;
-                if (pairs[mid] < u) lo = mid + 1; else hi = mid;
-            }
-            return u - lo;
-        }
-        function utf16FromCp(pairs, cp) {
-            let lo = 0, hi = pairs.length;
-            while (lo < hi) {
-                const mid = (lo + hi) >>> 1;
-                if (pairs[mid] - mid < cp) lo = mid + 1; else hi = mid;
-            }
-            return cp + lo;
-        }
+        // Share `types.js`'s cached surrogate-pair index so str and re calls
+        // alternating on the same string index it once.
+        const cpFromUtf16 = rt.cpFromUtf16, utf16FromCp = rt.utf16FromCp, strInfo = rt.strInfo;
         const cpIndex = (M, off) => M.pairs !== null ? cpFromUtf16(M.pairs, off) : off;
-        // Cached surrogate-pair index and code-point length for the last string
-        // scanned: a loop matching one string at successive positions indexes
-        // it once, not per call.
-        let infoS = "", infoPairs = null, infoLen = 0;
-        function strInfo(s) {
-            if (s !== infoS) {
-                if (rt.hasSurrogate(s)) {
-                    infoPairs = buildAstralPairs(s);
-                    infoLen = infoPairs !== null ? s.length - infoPairs.length : s.length;
-                } else {
-                    infoPairs = null;
-                    infoLen = s.length;
-                }
-                infoS = s;
-            }
-        }
         function groupIdx(M, gi) {
             if (gi === undefined) return 0;
             if (typeof gi === "string") { const k = M.p.names.get(gi); if (k === undefined) fail(E.IndexError, "no such group"); return k; }
@@ -3381,7 +3488,6 @@
             span: (a) => tuple(span(a[0], a[1]).map(BigInt)),
             expand: (a) => { const M = a[0]; return wrapVal(M.p, expand(M, needSubject(M.p, a[1]))); },
             __getitem__: (a) => groupText(a[0], a[1]),
-            __bool__: () => true,
             __repr__: (a) => { const [s0, e0] = span(a[0], undefined); return "<re.Match object; span=(" + s0 + ", " + e0 + "), match=" + repr(wrapVal(a[0].p, a[0].m[0])) + ">"; },
         });
         const cgRe = { cls: T.classmethod, func: builtin("__class_getitem__", 2, (a) => rt.makeGenericAlias(a[0], a[1])) };
@@ -3395,12 +3501,14 @@
         prop(Match, "lastgroup", (M) => { const k = lastIndex(M); for (const [name, gi] of M.p.names) if (gi === k && k) return name; return null; });
         prop(Match, "regs", (M) => tuple(M.m.map((x, k) => tuple(span(M, BigInt(k)).map(BigInt)))));
         // t: the text the pattern ran on (the string cut at endpos).
-        const mk = (m, s, p, pos, endpos, pairs, t, raw) => ({ cls: Match, dict: new Map(), m: m, s: s, raw: raw !== undefined ? raw : s, t: t, p: p, pos: pos, endpos: endpos, pairs: pairs });
+        // Dict-less like CPython's re.Match: avoids allocating a Map per match
+        // and lets PyMethod cache Match methods directly in `gb`.
+        const mk = (m, s, p, pos, endpos, pairs, t, raw) => ({ cls: Match, m: m, s: s, raw: raw !== undefined ? raw : s, t: t, p: p, pos: pos, endpos: endpos, pairs: pairs });
         // pos/endpos (code points) -> the string to scan (cut at endpos, as
         // if it ended there) and the UTF-16 start.
         function window(s, a, kw) {
             strInfo(s);
-            const n = infoLen, pairs = infoPairs;
+            const n = rt.infoLen, pairs = rt.infoPairs;
             let pos = a[2] !== undefined ? a[2] : kwget(kw, "pos", 0n), end = a[3] !== undefined ? a[3] : kwget(kw, "endpos", null);
             pos = Number(needInt(pos)); end = end === null ? n : Number(needInt(end));
             if (pos < 0) pos = 0; if (pos > n) pos = n; if (end > n) end = n; if (end < 0) end = 0;
@@ -3434,7 +3542,7 @@
                 const P = a[0];
                 if (a.length <= 3 && !(a[a.length - 1] instanceof Map)) {
                     const s = needSubject(P, a[1]); strInfo(s);
-                    const n = infoLen, pairs = infoPairs;
+                    const n = rt.infoLen, pairs = rt.infoPairs;
                     let pos = a.length === 3 ? Number(needInt(a[2])) : 0;
                     if (pos < 0) pos = 0; if (pos > n) pos = n;
                     const u0 = pairs !== null ? utf16FromCp(pairs, pos) : pos;
@@ -3447,7 +3555,7 @@
                 const P = a[0];
                 if (a.length <= 3 && !(a[a.length - 1] instanceof Map)) {
                     const s = needSubject(P, a[1]); strInfo(s);
-                    const n = infoLen, pairs = infoPairs;
+                    const n = rt.infoLen, pairs = rt.infoPairs;
                     let pos = a.length === 3 ? Number(needInt(a[2])) : 0;
                     if (pos < 0) pos = 0; if (pos > n) pos = n;
                     const u0 = pairs !== null ? utf16FromCp(pairs, pos) : pos;
@@ -3510,6 +3618,55 @@
         });
         Pattern.dict.set("__class_getitem__", cgRe);
         for (const name of ["search", "match", "fullmatch", "findall", "finditer", "sub", "subn", "split"]) Pattern.dict.get(name).kwnames = true;
+        {
+            const patRun = (P, re, raw, posArg, hasPos) => {
+                if (typeof raw !== "string" || P.isBytes || (hasPos && typeof posArg !== "bigint")) return undefined;
+                if (!rt.hasSurrogate(raw)) {
+                    const n = raw.length;
+                    let pos = hasPos ? Number(posArg) : 0;
+                    if (pos < 0) pos = 0; else if (pos > n) pos = n;
+                    re.lastIndex = pos;
+                    const m = re.exec(raw);
+                    return m === null ? null : mk(m, raw, P, pos, n, null, raw, raw);
+                }
+                strInfo(raw);
+                const n = rt.infoLen, pairs = rt.infoPairs;
+                let pos = hasPos ? Number(posArg) : 0;
+                if (pos < 0) pos = 0; else if (pos > n) pos = n;
+                const u0 = pairs !== null ? utf16FromCp(pairs, pos) : pos;
+                re.lastIndex = u0;
+                const m = re.exec(raw);
+                return m === null ? null : mk(m, raw, P, pos, n, pairs, raw, raw);
+            };
+            const pSearch = Pattern.dict.get("search"), pMatch = Pattern.dict.get("match"), pSub = Pattern.dict.get("sub");
+            pSearch.c2 = function (P, s) { const r = patRun(P, P.re, s, 0n, false); return r !== undefined ? r : this.code([P, s]); };
+            pSearch.c3 = function (P, s, pos) { const r = patRun(P, P.re, s, pos, true); return r !== undefined ? r : this.code([P, s, pos]); };
+            pMatch.c2 = function (P, s) { const r = patRun(P, sticky(P), s, 0n, false); return r !== undefined ? r : this.code([P, s]); };
+            pMatch.c3 = function (P, s, pos) { const r = patRun(P, sticky(P), s, pos, true); return r !== undefined ? r : this.code([P, s, pos]); };
+            pSub.c3 = function (P, repl, s) { return subImpl(P, repl, s, 0, false); };
+            pSub.c4 = function (P, repl, s, count) { return subImpl(P, repl, s, Number(needInt(count)), false); };
+            const mStart = Match.dict.get("start"), mEnd = Match.dict.get("end"), mGroup = Match.dict.get("group");
+            mStart.c1 = function (M) { const m = M.m; return BigInt(M.pairs !== null ? cpFromUtf16(M.pairs, m.index) : m.index); };
+            mEnd.c1 = function (M) { const m = M.m; const u = m.index + m[0].length; return BigInt(M.pairs !== null ? cpFromUtf16(M.pairs, u) : u); };
+            mGroup.c1 = function (M) { return M.p.isBytes ? latin1ToBytes(M.m[0]) : M.m[0]; };
+            mGroup.c2 = function (M, gi) {
+                if (typeof gi === "bigint") {
+                    const k = Number(gi);
+                    if (k >= 0 && k <= M.p.ngroups) { const v = M.m[k]; return v === undefined ? null : (M.p.isBytes ? latin1ToBytes(v) : v); }
+                }
+                return this.code([M, gi]);
+            };
+            mGroup.c4 = function (M, g1, g2, g3) {
+                if (typeof g1 === "bigint" && typeof g2 === "bigint" && typeof g3 === "bigint" && !M.p.isBytes) {
+                    const ng = M.p.ngroups, k1 = Number(g1), k2 = Number(g2), k3 = Number(g3);
+                    if (k1 >= 0 && k1 <= ng && k2 >= 0 && k2 <= ng && k3 >= 0 && k3 <= ng) {
+                        const m = M.m;
+                        return tuple([m[k1] === undefined ? null : m[k1], m[k2] === undefined ? null : m[k2], m[k3] === undefined ? null : m[k3]]);
+                    }
+                }
+                return this.code([M, g1, g2, g3]);
+            };
+        }
         prop(Pattern, "pattern", (P) => P.src);
         prop(Pattern, "flags", (P) => P.flagsOut);
         prop(Pattern, "groups", (P) => BigInt(P.ngroups));
@@ -3528,7 +3685,7 @@
             }
             const literal = replStr !== null && !replStr.includes("\\");
             let pairs = null, n0 = 0;
-            if (!literal) { strInfo(s); pairs = infoPairs; n0 = infoLen; }
+            if (!literal) { strInfo(s); pairs = rt.infoPairs; n0 = rt.infoLen; }
             while (pos <= s.length) {
                 if ((m = execAt(re, s, pos)) === null) break;
                 pos = re.lastIndex;
@@ -3574,7 +3731,7 @@
             let re;
             try { re = new RegExp(t.source, (t.ignoreCase ? "i" : "") + "gu"); } catch (e) { fail(error, "bad pattern: " + (e && e.message)); }
             const flagsOut = isB ? (flags & ~32n) : (t.flags & 256n ? t.flags : t.flags | 32n);
-            const p = { cls: Pattern, dict: new Map(), re: re, src: srcVal, isBytes: isB, flagsOut: flagsOut, ngroups: t.groups, names: t.names, sticky: null, dsticky: null, full: null };
+            const p = { cls: Pattern, re: re, src: srcVal, isBytes: isB, flagsOut: flagsOut, ngroups: t.groups, names: t.names, sticky: null, dsticky: null, full: null };
             if (cache.size > 512) cache.clear();
             cache.set(key, p); return p;
         }

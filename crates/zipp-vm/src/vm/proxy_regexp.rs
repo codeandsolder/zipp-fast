@@ -10,9 +10,9 @@ use crate::value::Value;
 /// Exact main-realm function identities used by RegExp protocol-collapse
 /// proofs. Child realms intentionally allocate distinct Native objects with
 /// the same ids, so checking `HeapObj::Native(id)` alone is unsound.
-pub(crate) const REGEXP_PROTOCOL_INTRINSIC_COUNT: usize = 14;
-const REGEXP_PROTOCOL_SPECIES: usize = 13;
-const REGEXP_PROTOCOL_PROTO_SLOTS: [(&str, bool, u16); 13] = [
+pub(crate) const REGEXP_PROTOCOL_INTRINSIC_COUNT: usize = 15;
+const REGEXP_PROTOCOL_SPECIES: usize = 14;
+const REGEXP_PROTOCOL_PROTO_SLOTS: [(&str, bool, u16); 14] = [
     ("exec", false, native::REGEXP_EXEC),
     ("flags", true, native::REGEXP_GET_FLAGS),
     ("hasIndices", true, native::REGEXP_GET_HASINDICES),
@@ -26,6 +26,7 @@ const REGEXP_PROTOCOL_PROTO_SLOTS: [(&str, bool, u16); 13] = [
     ("@@match", false, native::REGEXP_SYM_MATCH),
     ("@@matchAll", false, native::REGEXP_SYM_MATCHALL),
     ("@@replace", false, native::REGEXP_SYM_REPLACE),
+    ("@@split", false, native::REGEXP_SYM_SPLIT),
 ];
 
 #[inline]
@@ -44,6 +45,7 @@ const fn regexp_protocol_intrinsic_index(native_id: u16) -> Option<usize> {
         native::REGEXP_SYM_MATCH => Some(10),
         native::REGEXP_SYM_MATCHALL => Some(11),
         native::REGEXP_SYM_REPLACE => Some(12),
+        native::REGEXP_SYM_SPLIT => Some(13),
         native::SPECIES_GET => Some(REGEXP_PROTOCOL_SPECIES),
         _ => None,
     }
