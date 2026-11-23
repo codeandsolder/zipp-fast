@@ -1379,4 +1379,329 @@ impl<'p> Vm<'p> {
         }
         None
     }
+
+    /// `__zipp_py_decode(items_or_u8, encoding, errors)`: fast native decode
+    /// for UTF-8, ASCII, and Latin-1 byte buffers (`Uint8Array` zero-copy or
+    /// `Array` of byte numbers). Returns `undefined` on invalid bytes or
+    /// uncommon options so the runtime fallback raises the exact Python error.
+    pub(crate) fn py_bytes_decode(&mut self, args: &[Value]) -> Result<Value, Thrown> {
+        let arg = |i: usize| args.get(i).copied().unwrap_or(Value::UNDEFINED);
+        let src = arg(0);
+        if !src.is_heap() {
+            return Ok(Value::UNDEFINED);
+        }
+        // Encoding & error mode: fast-path common exact ASCII spellings with zero allocation.
+        let enc_kind: u8 = {
+            if !arg(1).is_heap() || !self.heap.is_str_like(arg(1).heap_index()) {
+                return Ok(Value::UNDEFINED);
+            }
+            let eidx = arg(1).heap_index();
+            self.heap.flatten(eidx);
+            let HeapObj::Str(es) = self.heap.get(eidx) else {
+                return Ok(Value::UNDEFINED);
+            };
+            match es.as_bytes() {
+                b"utf-8" | b"UTF-8" | b"utf8" | b"UTF8" | b"utf_8" => 0,
+                b"ascii" | b"ASCII" => 1,
+                b"latin-1" | b"latin1" | b"latin_1" | b"iso-8859-1" | b"ISO-8859-1" => 2,
+                other => {
+                    let Ok(s) = std::str::from_utf8(other) else {
+                        return Ok(Value::UNDEFINED);
+                    };
+                    match s.to_ascii_lowercase().replace(['-', '_'], "").as_str() {
+                        "utf8" => 0,
+                        "ascii" => 1,
+                        "latin1" | "iso88591" => 2,
+                        _ => return Ok(Value::UNDEFINED),
+                    }
+                }
+            }
+        };
+        let err_kind: u8 = if arg(2) == Value::UNDEFINED {
+            0
+        } else {
+            if !arg(2).is_heap() || !self.heap.is_str_like(arg(2).heap_index()) {
+                return Ok(Value::UNDEFINED);
+            }
+            let midx = arg(2).heap_index();
+            self.heap.flatten(midx);
+            let HeapObj::Str(ms) = self.heap.get(midx) else {
+                return Ok(Value::UNDEFINED);
+            };
+            match ms.as_bytes() {
+                b"strict" => 0,
+                b"replace" => 1,
+                _ => return Ok(Value::UNDEFINED),
+            }
+        };
+        let owned: Vec<u8>;
+        let slice: &[u8] = match self.heap.get(src.heap_index()) {
+            HeapObj::TypedArray {
+                buffer,
+                kind,
+                byte_offset,
+                length,
+            } if *kind == 1 => {
+                let off = *byte_offset;
+                let len = *length;
+                match self.heap.get(*buffer) {
+                    HeapObj::ArrayBuffer { data, detached } if !*detached => {
+                        match data.get(off..off + len) {
+                            Some(s) => s,
+                            None => return Ok(Value::UNDEFINED),
+                        }
+                    }
+                    _ => return Ok(Value::UNDEFINED),
+                }
+            }
+            HeapObj::Array(items) => {
+                owned = items.iter().map(|v| v.as_f64() as u8).collect();
+                &owned
+            }
+            _ => return Ok(Value::UNDEFINED),
+        };
+        let decoded: String = match (enc_kind, err_kind) {
+            (0, 0) => match std::str::from_utf8(slice) {
+                Ok(s) => s.to_owned(),
+                Err(_) => return Ok(Value::UNDEFINED),
+            },
+            (0, 1) => String::from_utf8_lossy(slice).into_owned(),
+            (1, 0) => {
+                if slice.is_ascii() {
+                    match std::str::from_utf8(slice) {
+                        Ok(s) => s.to_owned(),
+                        Err(_) => return Ok(Value::UNDEFINED),
+                    }
+                } else {
+                    return Ok(Value::UNDEFINED);
+                }
+            }
+            (2, _) => {
+                if slice.is_ascii() {
+                    match std::str::from_utf8(slice) {
+                        Ok(s) => s.to_owned(),
+                        Err(_) => return Ok(Value::UNDEFINED),
+                    }
+                } else {
+                    let mut out = String::with_capacity(slice.len() + slice.len() / 4);
+                    for &b in slice {
+                        out.push(b as char);
+                    }
+                    out
+                }
+            }
+            _ => return Ok(Value::UNDEFINED),
+        };
+        Ok(self.alloc_str(decoded))
+    }
+
+    /// `__zipp_py_re_findall(js_re, text, start_u16, tuple_tmpl)`: native
+    /// `re.Pattern.findall` directly over `regress`, returning a JS `Array` of
+    /// matched strings (0 or 1 capture group) or Python tuples (>=2 groups),
+    /// or `undefined` to fall back to the JS scanner.
+    pub(crate) fn py_re_findall(&mut self, args: &[Value]) -> Result<Value, Thrown> {
+        let arg = |i: usize| args.get(i).copied().unwrap_or(Value::UNDEFINED);
+        let re_val = arg(0);
+        let text_val = arg(1);
+        let start_val = arg(2);
+        let tuple_tmpl = arg(3);
+        if !re_val.is_heap() || !text_val.is_heap() || !self.heap.is_str_like(text_val.heap_index())
+        {
+            return Ok(Value::UNDEFINED);
+        }
+        let re_idx = re_val.heap_index();
+        let unicode = match self.heap.get(re_idx) {
+            HeapObj::RegExp(r) => r.flags.contains('u') || r.flags.contains('v'),
+            _ => return Ok(Value::UNDEFINED),
+        };
+        let s_idx = text_val.heap_index();
+        self.heap.flatten(s_idx);
+        let start = if start_val.is_number() && start_val.as_f64() >= 0.0 {
+            start_val.as_f64() as usize
+        } else {
+            0
+        };
+        let _gc = self.gc_lock_guard();
+        let (is_ascii, ascii_units) = match self.heap.get(s_idx) {
+            HeapObj::Str(js) => (js.is_ascii(), js.as_bytes().len()),
+            _ => return Ok(Value::UNDEFINED),
+        };
+        let mut u16s: Vec<u16> = Vec::new();
+        #[cfg(feature = "safe-sandbox")]
+        let mut u16s_res = None;
+        let matches: Vec<regress::Match> = if is_ascii {
+            if start > ascii_units {
+                return Ok(self.alloc_array_current_realm(Vec::new()));
+            }
+            self.ensure_regexp_ascii_twin_deferred(re_idx, ascii_units);
+            #[cfg(feature = "safe-sandbox")]
+            {
+                let (limits, output_bytes) = self.instrument_regex_collection_limits();
+                let subj = match self.heap.get(s_idx) {
+                    HeapObj::Str(js) => js.as_str_wf(),
+                    _ => "",
+                };
+                let regex = match self.heap.get(re_idx) {
+                    HeapObj::RegExp(r) => match r.ascii_twin.get() {
+                        Some(Some(twin)) => Some(&**twin),
+                        _ => Some(&*r.regex),
+                    },
+                    _ => None,
+                };
+                let (collected, mut usage) = match regex {
+                    Some(regex) => {
+                        let mut iter = regex.find_from_ascii_with_limits(subj, start, limits);
+                        let c = iter.try_collect_with_memory_limit(usize::MAX, output_bytes);
+                        (c, iter.match_usage())
+                    }
+                    None => (Ok(Vec::new()), regress::MatchUsage::UNMETERED),
+                };
+                if let Err(err) = &collected {
+                    usage.exhaustion.get_or_insert(*err);
+                }
+                self.instrument_regex_usage(usage)
+                    .map_err(|m| Thrown(m.into()))?;
+                collected.unwrap_or_default()
+            }
+            #[cfg(not(feature = "safe-sandbox"))]
+            {
+                let subj = match self.heap.get(s_idx) {
+                    HeapObj::Str(js) => js.as_str_wf(),
+                    _ => "",
+                };
+                match self.heap.get(re_idx) {
+                    HeapObj::RegExp(r) => {
+                        let regex = match r.ascii_twin.get() {
+                            Some(Some(twin)) => &**twin,
+                            _ => &*r.regex,
+                        };
+                        regex.find_from_ascii(subj, start).collect()
+                    }
+                    _ => Vec::new(),
+                }
+            }
+        } else {
+            #[cfg(feature = "safe-sandbox")]
+            {
+                let (units, res) = self.regex_subject_units_take(text_val)?;
+                u16s = units;
+                u16s_res = Some(res);
+            }
+            #[cfg(not(feature = "safe-sandbox"))]
+            {
+                u16s = self.regex_subject_units_take(text_val);
+            }
+            if start > u16s.len() {
+                #[cfg(feature = "safe-sandbox")]
+                self.regex_subject_units_put(text_val, u16s, u16s_res);
+                #[cfg(not(feature = "safe-sandbox"))]
+                self.regex_subject_units_put(text_val, u16s);
+                return Ok(self.alloc_array_current_realm(Vec::new()));
+            }
+            #[cfg(feature = "safe-sandbox")]
+            {
+                let (limits, output_bytes) = self.instrument_regex_collection_limits();
+                let (collected, mut usage) = match self.heap.get(re_idx) {
+                    HeapObj::RegExp(r) => {
+                        let regex = &r.core.regex;
+                        if unicode {
+                            let mut iter = regex.find_from_utf16_with_limits(&u16s, start, limits);
+                            let c = iter.try_collect_with_memory_limit(usize::MAX, output_bytes);
+                            (c, iter.match_usage())
+                        } else {
+                            let mut iter = regex.find_from_ucs2_with_limits(&u16s, start, limits);
+                            let c = iter.try_collect_with_memory_limit(usize::MAX, output_bytes);
+                            (c, iter.match_usage())
+                        }
+                    }
+                    _ => (Ok(Vec::new()), regress::MatchUsage::UNMETERED),
+                };
+                if let Err(err) = &collected {
+                    usage.exhaustion.get_or_insert(*err);
+                }
+                self.instrument_regex_usage(usage)
+                    .map_err(|m| Thrown(m.into()))?;
+                collected.unwrap_or_default()
+            }
+            #[cfg(not(feature = "safe-sandbox"))]
+            {
+                match self.heap.get(re_idx) {
+                    HeapObj::RegExp(r) => {
+                        let regex = &r.core.regex;
+                        if unicode {
+                            regex.find_from_utf16(&u16s, start).collect()
+                        } else {
+                            regex.find_from_ucs2(&u16s, start).collect()
+                        }
+                    }
+                    _ => Vec::new(),
+                }
+            }
+        };
+
+        self.preflight_native_iteration_work(matches.len() as u64 + 1)?;
+        if matches.is_empty() {
+            return Ok(self.alloc_array_current_realm(Vec::new()));
+        }
+        let ngroups = matches[0].captures.len();
+        let empty = self.alloc_str(String::new());
+        let mut out: Vec<Value> = Vec::with_capacity(matches.len());
+        if ngroups == 0 {
+            for m in matches {
+                let r = m.range();
+                let v = if is_ascii {
+                    self.ascii_slice_value(s_idx, r)
+                } else {
+                    self.units_value(&u16s[r])
+                };
+                out.push(v);
+            }
+        } else if ngroups == 1 {
+            for m in matches {
+                let v = match m.captures[0].clone() {
+                    Some(r) => {
+                        if is_ascii {
+                            self.ascii_slice_value(s_idx, r)
+                        } else {
+                            self.units_value(&u16s[r])
+                        }
+                    }
+                    None => empty,
+                };
+                out.push(v);
+            }
+        } else {
+            let Some((tmpl_map, items_slot)) = self.py_json_template(tuple_tmpl, &["cls", "items"])
+            else {
+                return Ok(Value::UNDEFINED);
+            };
+            for m in matches {
+                let mut tup_items = Vec::with_capacity(ngroups);
+                for cap in &m.captures {
+                    let v = match cap {
+                        Some(r) => {
+                            if is_ascii {
+                                self.ascii_slice_value(s_idx, r.clone())
+                            } else {
+                                self.units_value(&u16s[r.clone()])
+                            }
+                        }
+                        None => empty,
+                    };
+                    tup_items.push(v);
+                }
+                let arr = self.alloc_array_current_realm(tup_items);
+                let mut obj = tmpl_map.clone();
+                obj.set_val_at(items_slot, arr);
+                out.push(self.alloc_object_current_realm(obj));
+            }
+        }
+        if !is_ascii {
+            #[cfg(feature = "safe-sandbox")]
+            self.regex_subject_units_put(text_val, u16s, u16s_res);
+            #[cfg(not(feature = "safe-sandbox"))]
+            self.regex_subject_units_put(text_val, u16s);
+        }
+        Ok(self.alloc_array_current_realm(out))
+    }
 }

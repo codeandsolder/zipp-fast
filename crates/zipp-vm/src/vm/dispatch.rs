@@ -6736,9 +6736,8 @@ impl<'p> Vm<'p> {
             S::StringFromCharCode => {
                 // ToUint16(ToNumber(v)) per arg, in argument order;
                 // adjacent (high, low) surrogate halves combine into
-                // the astral scalar â€” see `string_from_char_codes`.
-                let js = self.string_from_char_codes(&args)?;
-                Value::heap(self.heap.alloc_js(js))
+                // the astral scalar — see `string_from_char_codes`.
+                self.string_from_char_codes_val(&args)?
             }
             S::ObjectAssign => self.object_assign(&args)?,
             S::ObjectFromEntries => self.object_from_entries(a0)?,
@@ -7213,8 +7212,9 @@ impl<'p> Vm<'p> {
         this_reg: Option<u16>,
     ) -> Value {
         let cur_closure = self.frames[frame_idx].closure;
+        let n = self.func(func_id as usize).upvalues.len();
+        let mut cells = self.heap.take_upval_buf(n);
         let sources = &self.func(func_id as usize).upvalues;
-        let mut cells = Vec::with_capacity(sources.len());
         for src in sources {
             let cell = match *src {
                 UpvalSource::ParentLocal(reg) => self.get(base, reg).heap_index(),

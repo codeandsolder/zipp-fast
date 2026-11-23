@@ -438,6 +438,13 @@ struct Helpers {
 /// other path: `legacy/fast_memory.py` → `legacy.fast_memory`,
 /// `pkg/__init__.py` → `pkg`, `main.py` → `main`.
 #[cfg(feature = "python")]
+fn is_py_identifier(segment: &str) -> bool {
+    let mut chars = segment.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+#[cfg(feature = "python")]
 fn module_name_of_path(path: &str) -> Option<String> {
     let stem = path.strip_suffix(".py")?;
     let stem = stem.strip_suffix("/__init__").unwrap_or(stem);
@@ -445,12 +452,107 @@ fn module_name_of_path(path: &str) -> Option<String> {
         return None;
     }
     let name = stem.replace('/', ".");
-    let valid = name.split('.').all(|segment| {
-        let mut chars = segment.chars();
-        matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
-            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-    });
+    let valid = name.split('.').all(is_py_identifier);
     valid.then_some(name)
+}
+
+/// Resolve an `initPythonProject` entry and build its module map from bare
+/// module entries plus VFS files. Any valid explicit script path in `vfs`
+/// (even beneath a non-identifier directory such as `fixtures/with-hyphen/verify.py`
+/// or with a non-identifier filename such as `my-script.py`) executes directly,
+/// with its parent directory's sibling `.py` files importable like `sys.path[0]`.
+#[cfg(feature = "python")]
+fn resolve_python_project_entry(
+    entry: &str,
+    bare_modules: Vec<(String, String)>,
+    vfs: &[(String, Vec<u8>)],
+) -> Result<(String, Option<String>, Vec<(String, String)>), String> {
+    let entry_norm = entry.trim_start_matches("./");
+    let valid_entry_path = !entry_norm.is_empty()
+        && !entry_norm.starts_with('/')
+        && !entry_norm.split('/').any(|s| s == "..");
+    let matched_vfs = if valid_entry_path {
+        vfs.iter()
+            .position(|(p, _)| p == entry)
+            .or_else(|| vfs.iter().position(|(p, _)| p.trim_start_matches("./") == entry_norm))
+    } else {
+        None
+    };
+
+    let mut modules: Vec<(String, String)> = Vec::with_capacity(bare_modules.len() + vfs.len());
+    let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Bare module entries (`{ main: "..." }`) keep their exact names.
+    for (name, src) in bare_modules {
+        if taken.insert(name.clone()) {
+            modules.push((name, src));
+        }
+    }
+
+    let (entry_mod, entry_file) = if let Some(entry_idx) = matched_vfs {
+        let (entry_path, entry_bytes) = &vfs[entry_idx];
+        let entry_source = std::str::from_utf8(entry_bytes)
+            .map_err(|_| format!("Python project: entry file {entry_path:?} is not UTF-8 text"))?
+            .to_owned();
+        let entry_file_norm = entry_path.trim_start_matches("./").to_owned();
+        let mod_name = match module_name_of_path(&entry_file_norm) {
+            Some(name) if !taken.contains(&name) => name,
+            _ => {
+                let mut candidate = "__main__".to_owned();
+                while taken.contains(&candidate) {
+                    candidate.push('_');
+                }
+                candidate
+            }
+        };
+        taken.insert(mod_name.clone());
+        modules.push((mod_name.clone(), entry_source));
+
+        // Sibling `.py` modules in the entry script's folder (`sys.path[0]`).
+        if let Some((dir, _)) = entry_file_norm.rsplit_once('/') {
+            let prefix = format!("{dir}/");
+            for (idx, (path, bytes)) in vfs.iter().enumerate() {
+                if idx == entry_idx {
+                    continue;
+                }
+                let norm = path.trim_start_matches("./");
+                if let Some(rest) = norm.strip_prefix(&prefix) {
+                    if let Some(sib_mod) = module_name_of_path(rest) {
+                        if !taken.contains(&sib_mod) {
+                            if let Ok(src) = std::str::from_utf8(bytes) {
+                                taken.insert(sib_mod.clone());
+                                modules.push((sib_mod, src.to_owned()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        (mod_name, Some(entry_file_norm))
+    } else {
+        (
+            module_name_of_path(entry_norm).unwrap_or_else(|| entry.to_owned()),
+            None,
+        )
+    };
+
+    // Root-relative importable `.py` modules across the project.
+    for (idx, (path, bytes)) in vfs.iter().enumerate() {
+        if matched_vfs == Some(idx) {
+            continue;
+        }
+        let norm = path.trim_start_matches("./");
+        if let Some(mod_name) = module_name_of_path(norm) {
+            if !taken.contains(&mod_name) {
+                if let Ok(src) = std::str::from_utf8(bytes) {
+                    taken.insert(mod_name.clone());
+                    modules.push((mod_name, src.to_owned()));
+                }
+            }
+        }
+    }
+
+    Ok((entry_mod, entry_file, modules))
 }
 
 /// A host value rendered as an argument string.
@@ -1046,18 +1148,16 @@ impl Engine {
                 ));
             }
         };
-        let mut modules = Vec::with_capacity(files.len());
-        let mut vfs = Vec::with_capacity(files.len());
+        let mut bare_modules: Vec<(String, String)> = Vec::new();
+        let mut vfs: Vec<(String, Vec<u8>)> = Vec::with_capacity(files.len());
         let mut total = 0usize;
         for (name, contents) in files {
             let bytes: Vec<u8> = match contents {
                 HostValue::String(source) => {
                     total = total.saturating_add(source.len());
-                    if let Some(module) = module_name_of_path(&name) {
-                        modules.push((module, source.clone()));
-                    } else if !name.contains('/') && !name.contains('.') {
-                        // The original form: a bare module name.
-                        modules.push((name.clone(), source.clone()));
+                    if is_py_identifier(&name) {
+                        // The original form: a bare module name (`{ main: "..." }`).
+                        bare_modules.push((name, source));
                         continue;
                     }
                     source.into_bytes()
@@ -1096,12 +1196,29 @@ impl Engine {
             };
             vfs.push((name, bytes));
         }
-        let entry = module_name_of_path(entry).unwrap_or_else(|| entry.to_owned());
+        let (entry_mod, entry_file, modules) = resolve_python_project_entry(entry, bare_modules, &vfs)
+            .map_err(|e| {
+                self.note_error_kind("usage");
+                JsValue::from_str(&e)
+            })?;
         self.initialize(zipp_vm::frontend::LanguageId::Python, total, move || {
             // Hosted: the embedder drains `takeHostRequests` and answers
             // through `pythonCall("__zipp_py_deliver", ...)`.
-            zipp_vm::frontend::compile_python_program(&entry, &modules, &vfs, &argv, true)
-                .map(|compiled| compiled.into_state())
+            let compiled = match entry_file.as_deref() {
+                Some(file) => {
+                    let refs: Vec<(String, &str)> = modules
+                        .iter()
+                        .map(|(n, s)| (n.clone(), s.as_str()))
+                        .collect();
+                    zipp_vm::frontend::compile_python_script(
+                        &entry_mod, file, &refs, &vfs, &argv, true,
+                    )
+                }
+                None => {
+                    zipp_vm::frontend::compile_python_program(&entry_mod, &modules, &vfs, &argv, true)
+                }
+            };
+            compiled.map(|compiled| compiled.into_state())
         })
     }
 
@@ -5359,5 +5476,80 @@ mod tests {
         });
         assert!(super::ACTIVE_HOST_CTX.with(|c| c.get()).is_none());
         assert_eq!(ctx.remaining, 0);
+    }
+
+    #[cfg(feature = "python")]
+    #[test]
+    fn python_project_executes_entry_under_non_identifier_path() {
+        let vfs = vec![
+            (
+                "fixtures/with-hyphen/verify.py".to_owned(),
+                b"import sys, helper\nprint(42, __name__, __file__, sys.argv[0], helper.TAG)\n"
+                    .to_vec(),
+            ),
+            (
+                "fixtures/with-hyphen/helper.py".to_owned(),
+                b"TAG = 'sib'\n".to_vec(),
+            ),
+        ];
+        let (entry_mod, entry_file, modules) = super::resolve_python_project_entry(
+            "fixtures/with-hyphen/verify.py",
+            Vec::new(),
+            &vfs,
+        )
+        .expect("resolves non-identifier entry path");
+        assert_eq!(entry_mod, "__main__");
+        assert_eq!(
+            entry_file.as_deref(),
+            Some("fixtures/with-hyphen/verify.py")
+        );
+        let refs: Vec<(String, &str)> = modules
+            .iter()
+            .map(|(n, s)| (n.clone(), s.as_str()))
+            .collect();
+        let mut compiled = zipp_vm::frontend::compile_python_script(
+            &entry_mod,
+            entry_file.as_deref().unwrap(),
+            &refs,
+            &vfs,
+            &[],
+            true,
+        )
+        .expect("compiles non-identifier entry script");
+        compiled.state_mut().run_init().expect("runs entry script");
+        assert_eq!(
+            compiled.state_mut().take_output(),
+            vec!["42 __main__ fixtures/with-hyphen/verify.py fixtures/with-hyphen/verify.py sib"]
+        );
+
+        // Single-file exact issue #106 reproduction.
+        let vfs_min = vec![(
+            "fixtures/with-hyphen/verify.py".to_owned(),
+            b"print(42)\n".to_vec(),
+        )];
+        let (m, ef, mods) = super::resolve_python_project_entry(
+            "fixtures/with-hyphen/verify.py",
+            Vec::new(),
+            &vfs_min,
+        )
+        .expect("resolves minimal repro");
+        let refs_min: Vec<(String, &str)> = mods
+            .iter()
+            .map(|(n, s)| (n.clone(), s.as_str()))
+            .collect();
+        let mut compiled_min = zipp_vm::frontend::compile_python_script(
+            &m,
+            ef.as_deref().unwrap(),
+            &refs_min,
+            &vfs_min,
+            &[],
+            true,
+        )
+        .expect("compiles minimal repro");
+        compiled_min
+            .state_mut()
+            .run_init()
+            .expect("runs minimal repro");
+        assert_eq!(compiled_min.state_mut().take_output(), vec!["42"]);
     }
 }

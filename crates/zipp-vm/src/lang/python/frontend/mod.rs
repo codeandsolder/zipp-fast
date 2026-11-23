@@ -876,6 +876,88 @@ fn compile_lazy(lazy: &PyLazy, k: usize, base: u32) -> R<std::sync::Arc<[crate::
     Ok(functions)
 }
 
+/// Look up any bundled or installed-package module source by dotted name,
+/// for dynamic imports (`importlib.import_module`) not visible statically.
+pub(crate) fn bundled_source_of(name: &str) -> Option<(String, String)> {
+    let lib = library();
+    let m = lib.into_iter().find(|m| m.name == name)?;
+    let file = format!("{}.py", m.name.replace('.', "/"));
+    Some((file, m.source.to_owned()))
+}
+
+/// Compile an arbitrary Python module source on demand (used for dynamic
+/// `importlib.import_module` of bundled modules and `importlib.util.spec_from_file_location`).
+pub(crate) fn compile_dynamic_module(
+    lazy: &PyLazy,
+    name: &str,
+    file: &str,
+    source: &str,
+    base: u32,
+) -> R<Vec<crate::bytecode::FuncProto>> {
+    use crate::bytecode::FuncProto;
+    let _phase = prof::enter(Phase::PyFrontend);
+    let bump = ast::Bump::new();
+    let suite = parse_module(file, source, &bump)?;
+    let text: &str = source.strip_prefix('\u{feff}').unwrap_or(source);
+    let suite = nesting::check(suite, file, text)?;
+    let table = symtable::analyse(&suite, name).map_err(|e| format!("{file}: {e}"))?;
+    let lines = emitter::line_starts(text);
+    // Include both the project's known module names and all bundled library
+    // names so `from pkg import submod` resolves submodules accurately.
+    let lib = library();
+    let mut mod_set: BTreeSet<&str> = lazy.names.iter().map(String::as_str).collect();
+    let mut mod_vec: Vec<&str> = lazy.names.iter().map(String::as_str).collect();
+    for m in &lib {
+        if mod_set.insert(m.name) {
+            mod_vec.push(m.name);
+        }
+    }
+    if mod_set.insert(name) {
+        mod_vec.push(name);
+    }
+    let project = Project {
+        modules: mod_set,
+        module_names: mod_vec,
+        entry: &lazy.entry,
+    };
+    let mut fragment = crate::compile_only("", false)?;
+    fragment.functions.clear();
+    let fragment = RefCell::new(fragment);
+    let unit = Unit {
+        file,
+        source: text,
+        module_index: 0,
+        lines: &lines,
+    };
+    emit_module(
+        name,
+        unit,
+        &suite,
+        &table,
+        &project,
+        &fragment,
+        lazy.rt_slot,
+        lazy.line_slot,
+    )?;
+    let fragment = fragment.into_inner();
+    relocatable(name, &fragment, lazy.rt_slot, lazy.line_slot)?;
+    let mut functions: Vec<FuncProto> = fragment.functions.into_iter().collect();
+    if (base as usize).saturating_add(functions.len()) > MAX_FUNCTIONS {
+        return Err(format!(
+            "Python: importing {name}: function count limit exceeded"
+        ));
+    }
+    for f in &mut functions {
+        for ins in &mut f.code {
+            if let Instr::MakeFunc { func_id, .. } = ins {
+                *func_id = func_id.wrapping_add(base);
+            }
+        }
+        f.fused = Default::default();
+    }
+    Ok(functions)
+}
+
 /// Whether a module compiled for installation (`compile_lazy`) is code that
 /// only `MakeFunc` ids tie to its place in the program: the relocation
 /// `compile_lazy` does. Anything else carrying a function, class or global

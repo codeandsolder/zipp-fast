@@ -449,6 +449,7 @@ impl<'p> Vm<'p> {
                 &class_read,
                 &crate::codegen::OptCallees::default(),
                 &prop_key_ids,
+                self.global_route_epoch,
             );
         }
         // The direct global routes the body was compiled with, as

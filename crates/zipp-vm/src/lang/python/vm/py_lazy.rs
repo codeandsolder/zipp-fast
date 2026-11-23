@@ -21,55 +21,104 @@
 use super::*;
 
 impl<'p> Vm<'p> {
-    pub(super) fn py_compile_module(&mut self, name: Value) -> Result<Value, Thrown> {
+    pub(super) fn py_compile_module(&mut self, args: &[Value]) -> Result<Value, Thrown> {
         let program: &'p crate::bytecode::Program = self.program;
         let Some(lazy) = program.python_lazy.as_deref() else {
             return Err(Thrown::from_static("ImportError: no library modules to compile"));
         };
-        let name = self.to_js_string(name)?;
-        let Some(k) = lazy.modules.iter().position(|m| m.name == name) else {
-            return Err(Thrown(format!("ImportError: no library module named '{name}'")));
-        };
-        let module = &lazy.modules[k];
+        let name_val = args.first().copied().unwrap_or(Value::UNDEFINED);
+        let name = self.to_js_string(name_val)?;
         let base = (self.main_func_count + self.eval_funcs.len()) as u32;
-        // What compiling the module reserves (bytecode, constants, the
-        // compiler's own tables) is in the allocator's figure and is nothing
-        // a collection could answer, like the program compiled before its
-        // first statement ran. Importing a package compiles tens of megabytes
-        // this way, and each 16 MiB of it asked for a collection that freed
-        // nothing: six in a program that ran one before. Measured here and
-        // left out of the step. (The checked profile's step belongs to its
-        // heap ceiling and is not touched.)
-        #[cfg(not(feature = "safe-sandbox"))]
-        let footprint_before = self.heap.footprint_mark();
-        let (first, functions) = match module.installed.get() {
-            Some(installed) => installed,
-            None => {
-                let functions = (lazy.compile)(lazy, k, base).map_err(Thrown)?;
-                if functions.is_empty() {
-                    return Err(Thrown(format!("ImportError: {name}: no code")));
-                }
-                module.installed.get_or_init(|| (base, functions))
+
+        // 2+ arg form: `__zipp_py_compile(name, source, filename)` compiles
+        // arbitrary Python source (for `importlib.util.spec_from_file_location`).
+        if args.len() >= 2 && args[1] != Value::UNDEFINED {
+            let source = self.to_js_string(args[1])?;
+            let file = if args.len() >= 3 && args[2] != Value::UNDEFINED {
+                self.to_js_string(args[2])?
+            } else {
+                format!("{}.py", name.replace('.', "/"))
+            };
+            let functions =
+                crate::lang::python::compile_dynamic_module(lazy, &name, &file, &source, base)
+                    .map_err(Thrown)?;
+            if functions.is_empty() {
+                return Err(Thrown(format!("ImportError: {name}: no code")));
             }
+            let count = functions.len() as u32;
+            let mut installed_refs = Vec::with_capacity(functions.len());
+            for f in functions {
+                let node = self.eval_arena.funcs.push(self.eval_func_tail, f);
+                self.eval_func_tail = Some(node);
+                installed_refs.push(&node.value);
+            }
+            for r in installed_refs {
+                self.install_func(r);
+            }
+            self.module_func_ranges.push((base, base + count, u32::MAX));
+            let top = base + count - 1;
+            let code = Value::heap(self.heap.alloc(HeapObj::Func(top)));
+            self.realm_tag_new(code.heap_index());
+            return Ok(code);
+        }
+
+        // 1-arg form: first check statically registered lazy library modules.
+        if let Some(k) = lazy.modules.iter().position(|m| m.name == name) {
+            let module = &lazy.modules[k];
+            #[cfg(not(feature = "safe-sandbox"))]
+            let footprint_before = self.heap.footprint_mark();
+            let (first, functions) = match module.installed.get() {
+                Some(installed) => installed,
+                None => {
+                    let functions = (lazy.compile)(lazy, k, base).map_err(Thrown)?;
+                    if functions.is_empty() {
+                        return Err(Thrown(format!("ImportError: {name}: no code")));
+                    }
+                    module.installed.get_or_init(|| (base, functions))
+                }
+            };
+            // Installed once per program: the runtime keeps the code object.
+            if *first != base {
+                return Err(Thrown(format!("ImportError: {name} is already installed")));
+            }
+            for f in functions.iter() {
+                self.install_func(f);
+            }
+            #[cfg(not(feature = "safe-sandbox"))]
+            self.heap.exclude_footprint_since(footprint_before);
+            self.module_func_ranges
+                .push((base, base + functions.len() as u32, u32::MAX));
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            self.jit.python_functions_installed(base as usize, functions);
+            let top = base + functions.len() as u32 - 1;
+            let code = Value::heap(self.heap.alloc(HeapObj::Func(top)));
+            self.realm_tag_new(code.heap_index());
+            return Ok(code);
+        }
+
+        // Dynamic fallback: allow `importlib.import_module(...)` to load any
+        // bundled library module even if it was not statically imported.
+        let Some((file, source)) = crate::lang::python::bundled_source_of(&name) else {
+            return Ok(Value::UNDEFINED);
         };
-        // Installed once per program: the runtime keeps the code object.
-        if *first != base {
-            return Err(Thrown(format!("ImportError: {name} is already installed")));
+        let functions =
+            crate::lang::python::compile_dynamic_module(lazy, &name, &file, &source, base)
+                .map_err(Thrown)?;
+        if functions.is_empty() {
+            return Ok(Value::UNDEFINED);
         }
-        for f in functions.iter() {
-            self.install_func(f);
+        let count = functions.len() as u32;
+        let mut installed_refs = Vec::with_capacity(functions.len());
+        for f in functions {
+            let node = self.eval_arena.funcs.push(self.eval_func_tail, f);
+            self.eval_func_tail = Some(node);
+            installed_refs.push(&node.value);
         }
-        #[cfg(not(feature = "safe-sandbox"))]
-        self.heap.exclude_footprint_since(footprint_before);
-        // Immutable code at stable addresses, exactly as a loader-installed
-        // ES module's: its exact id range makes it eligible for the inline
-        // caches and native tiers the program's own functions get. (No module
-        // namespace: Python code has no `import.meta` or `import()`.)
-        self.module_func_ranges.push((base, base + functions.len() as u32, u32::MAX));
-        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-        self.jit.python_functions_installed(base as usize, functions);
-        // The top level is the module's last function (`emit_module`).
-        let top = base + functions.len() as u32 - 1;
+        for r in installed_refs {
+            self.install_func(r);
+        }
+        self.module_func_ranges.push((base, base + count, u32::MAX));
+        let top = base + count - 1;
         let code = Value::heap(self.heap.alloc(HeapObj::Func(top)));
         self.realm_tag_new(code.heap_index());
         Ok(code)

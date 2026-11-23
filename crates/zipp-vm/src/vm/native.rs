@@ -190,6 +190,10 @@ pub const WASM_LAZY_GET: u16 = 2122;
 /// Its setter: an assignment before the first read.
 #[cfg(feature = "webassembly")]
 pub const WASM_LAZY_SET: u16 = 2123;
+/// `import.meta.resolve(specifier[, parent])` (a `NativeClosure` over the
+/// module's namespace heap index).
+#[cfg(not(feature = "wasm-no-fs-loader"))]
+pub const IMPORT_META_RESOLVE: u16 = 2124;
 pub const FR_REGISTER: u16 = 298;
 pub const FR_UNREGISTER: u16 = 299;
 // Built-in iterator methods.
@@ -535,6 +539,21 @@ pub const PY_TABLE_NAME: &str = "__zipp_py_table";
 pub const PY_BIND: u16 = 1975;
 #[cfg_attr(not(feature = "python"), allow(dead_code))]
 pub const PY_BIND_NAME: &str = "__zipp_py_bind";
+/// The Python runtime's native DEFLATE/zlib/gzip + checksums (`vm::py_zlib`).
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_ZLIB: u16 = 1976;
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_ZLIB_NAME: &str = "__zipp_py_zlib";
+/// Native fast-path UTF-8/ASCII/Latin-1 bytes->str decoding (`vm::py_str`).
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_BYTES_DECODE: u16 = 1977;
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_BYTES_DECODE_NAME: &str = "__zipp_py_decode";
+/// Native fast-path `re.Pattern.findall` (`vm::py_str`).
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_RE_FINDALL: u16 = 1978;
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub const PY_RE_FINDALL_NAME: &str = "__zipp_py_re_findall";
 
 // ── decorator context closures (proposal-decorators) ────────────────────────
 // Each is a `HeapObj::NativeClosure`, not a bare `Native`: they close over the
@@ -1975,6 +1994,12 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         PY_TABLE => ("", 3),
         #[cfg(feature = "python")]
         PY_BIND => ("", 3),
+        #[cfg(feature = "python")]
+        PY_ZLIB => ("", 2),
+        #[cfg(feature = "python")]
+        PY_BYTES_DECODE => ("", 3),
+        #[cfg(feature = "python")]
+        PY_RE_FINDALL => ("", 4),
         U8_TO_HEX => ("toHex", 0),
         U8_SET_FROM_HEX => ("setFromHex", 1),
         U8_FROM_HEX => ("fromHex", 1),

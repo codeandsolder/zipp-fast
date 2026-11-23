@@ -409,9 +409,10 @@ fn hoistable_pins(
             Instr::LoadInt { .. }
             | Instr::LoadConst { .. }
             | Instr::Move { .. }
-            // B192: a completion-reg store of the canonical UNDEFINED bits —
+            // B192: a completion-reg store of the canonical UNDEFINED/NULL bits —
             // pure, no user code, no allocation, no GC.
             | Instr::LoadUndefined { .. }
+            | Instr::LoadNull { .. }
             | Instr::LoadGlobal { .. }
             | Instr::StoreGlobal { .. }
             | Instr::StoreGlobalStrict { .. }
@@ -520,7 +521,10 @@ fn hoistable_pins(
                     | Instr::StoreGlobalStrict { idx, .. }
                     | Instr::StoreGlobalResolved { idx, .. } if idx == g)
             }),
-            TaPinSrc::Reg(r) => !code[s..=e].iter().any(|i| writes_reg(i) == Some(r)),
+            TaPinSrc::Reg(r) => !code[s..=e].iter().any(|i| {
+                writes_reg(i) == Some(r)
+                    || matches!(*i, Instr::LoadUndefined { dst } | Instr::LoadNull { dst } if dst == r)
+            }),
         };
         if stable {
             out.insert(j as u8);
@@ -1061,7 +1065,7 @@ fn plan_region_cold_inner(
             // in JS, and previously demoted to the boxed memory path in full.
             match code[ip] {
                 Instr::GetIndex { .. } => {
-                    if (!admit_bitwise && k == 8)
+                    if (!admit_bitwise && (k == 7 || k == 8))
                         || (admit_bitwise
                             && (int_ta_load_kind(k).is_some() || k == ARR_INT_PIN_KIND))
                     {
@@ -1069,10 +1073,10 @@ fn plan_region_cold_inner(
                     }
                 }
                 Instr::SetIndex { .. } => {
-                    // This widening is deliberately read-only. Direct narrow
-                    // stores need per-dtype wrap/clamp emission; only the landed
-                    // Int32 and Float64 store arms qualify here.
-                    if (!admit_bitwise && k == 8) || (admit_bitwise && k == 5) {
+                    // This widening is deliberately read-only for narrow int
+                    // dtypes (which need per-dtype wrap/clamp emission); only
+                    // Int32, Float32, and Float64 store arms qualify here.
+                    if (!admit_bitwise && (k == 7 || k == 8)) || (admit_bitwise && k == 5) {
                         return true;
                     }
                     // A dense all-Int Array's in-place Int store on the int path
@@ -1242,6 +1246,17 @@ fn plan_region_cold_inner(
     // capability limit. It is now `MULTI_SPLIT_BUDGET`, sized to the four
     // recycled receivers of the parse-large-js mix loop (`kinds`, `ends`,
     // `starts`, `src`). `ZIPP_NO_MULTI_SPLIT=1` puts it back to one.
+    let jump_targets = region_jump_targets(code, s, e);
+    // Registers read anywhere OUTSIDE `[s, e]` in the enclosing function. Used
+    // by `pinned_nullish_cmp`, the DV flag-fusion veto, and the dead-code /
+    // home-sharing passes below (same conservative set, computed once).
+    let read_outside: FxHashSet<u16> = code
+        .iter()
+        .enumerate()
+        .filter(|(ip, _)| *ip < s || *ip > e)
+        .flat_map(|(_, instr)| instr_uses(instr))
+        .collect();
+    let mut pinned_nullish_cmp: FxHashMap<usize, bool> = FxHashMap::default();
     let mut split_recvs: FxHashSet<u16> = FxHashSet::default();
     let non_dv_split_budget = if crate::codegen::multi_split_enabled() {
         MULTI_SPLIT_BUDGET
@@ -1287,20 +1302,96 @@ fn plan_region_cold_inner(
             // the whole region to the memory path, which handles it).
             let mut def_n: FxHashMap<u16, u32> = FxHashMap::default();
             let mut def_lg: FxHashSet<u16> = FxHashSet::default();
+            let reg_def = |instr: &Instr| {
+                writes_reg(instr).or_else(|| match *instr {
+                    Instr::LoadUndefined { dst } | Instr::LoadNull { dst } => Some(dst),
+                    _ => None,
+                })
+            };
             for (off, instr) in code[s..=e].iter().enumerate() {
                 if cold.contains(&(s + off)) {
                     continue;
                 }
-                if let Some(d) = writes_reg(instr) {
+                if let Some(d) = reg_def(instr) {
                     *def_n.entry(d).or_insert(0) += 1;
                     if matches!(instr, Instr::LoadGlobal { .. }) {
                         def_lg.insert(d);
                     }
                 }
             }
+            if !admit_bitwise {
+                let pre_hoist = hoistable_pins(proto, s, e, ta_plan, cold);
+                if !pre_hoist.is_empty() {
+                    let mut use_n: FxHashMap<u16, u32> = FxHashMap::default();
+                    for (off, instr) in code[s..=e].iter().enumerate() {
+                        if cold.contains(&(s + off)) {
+                            continue;
+                        }
+                        for u in instr_uses(instr) {
+                            *use_n.entry(u).or_insert(0) += 1;
+                        }
+                    }
+                    for (off, instr) in code[s..=e].iter().enumerate() {
+                        let ip = s + off;
+                        if ip == s
+                            || cold.contains(&ip)
+                            || cold.contains(&(ip - 1))
+                            || jump_targets.contains(&ip)
+                        {
+                            continue;
+                        }
+                        let (a, b, is_ne) = match *instr {
+                            Instr::Eq { a, b, .. } => (a, b, false),
+                            Instr::Ne { a, b, .. } => (a, b, true),
+                            _ => continue,
+                        };
+                        let u = match code[ip - 1] {
+                            Instr::LoadUndefined { dst } | Instr::LoadNull { dst } => dst,
+                            _ => continue,
+                        };
+                        let r = if a == u && b != u {
+                            b
+                        } else if b == u && a != u {
+                            a
+                        } else {
+                            continue;
+                        };
+                        let is_hoisted_param_pin = recv.contains(&r)
+                            && def_n.get(&r).is_none()
+                            && ta_plan.pins.iter().enumerate().any(|(j, pin)| {
+                                pre_hoist.contains(&(j as u8)) && pin.src == TaPinSrc::Reg(r)
+                            });
+                        let u_single_use = def_n.get(&u) == Some(&1) && use_n.get(&u) == Some(&1);
+                        let u_dead_after = !u_single_use && ip + 1 <= e && !read_outside.contains(&u) && {
+                            let mut visited: FxHashSet<usize> = FxHashSet::default();
+                            let mut work = vec![ip + 1];
+                            let mut succs = Vec::new();
+                            let mut dead = true;
+                            while let Some(cur) = work.pop() {
+                                if cur < s || cur > e || !visited.insert(cur) {
+                                    continue;
+                                }
+                                if cold.contains(&cur) || instr_uses(&code[cur]).contains(&u) {
+                                    dead = false;
+                                    break;
+                                }
+                                if reg_def(&code[cur]) == Some(u) {
+                                    continue;
+                                }
+                                region_succs(code, s, e, cur, &mut succs);
+                                work.extend(succs.iter().copied());
+                            }
+                            dead
+                        };
+                        if is_hoisted_param_pin && !recv.contains(&u) && (u_single_use || u_dead_after) {
+                            pinned_nullish_cmp.insert(ip, is_ne);
+                        }
+                    }
+                }
+            }
             let mut used_elsewhere: FxHashSet<u16> = FxHashSet::default();
             for (off, instr) in code[s..=e].iter().enumerate() {
-                if cold.contains(&(s + off)) {
+                if cold.contains(&(s + off)) || pinned_nullish_cmp.contains_key(&(s + off)) {
                     continue;
                 }
                 // The receiver use AT a pinned access is exempt (read via the pin,
@@ -1769,17 +1860,6 @@ fn plan_region_cold_inner(
             }
         }
     }
-    let jump_targets = region_jump_targets(code, s, e);
-    // Registers read anywhere OUTSIDE `[s, e]` in the enclosing function. Used
-    // by the DV flag-fusion veto here, and by the dead-code / home-sharing
-    // passes below (same conservative set, computed once).
-    let read_outside: FxHashSet<u16> = code
-        .iter()
-        .enumerate()
-        .filter(|(ip, _)| *ip < s || *ip > e)
-        .flat_map(|(_, instr)| instr_uses(instr))
-        .collect();
-
     // ── DV endian-flag fusion ── see `RegionPlan::dv_flag_elide`. The bytecode
     // for `dv.getUint32(o, le === 1)` writes the Eq straight into the arg
     // window, and the compiler then RECYCLES that window register as a numeric
@@ -2251,10 +2331,12 @@ fn plan_region_cold_inner(
         };
         // Record operand first-occurrences (uses) BEFORE the def, so a reg used
         // and defined by the same op counts the use first (live-in).
-        for u in numeric_uses(s + off, instr).into_iter().filter(|&u| fused_flag_reg(s + off) != Some(u)) {
-            first_seen.entry(u).or_insert(false); // first occurrence is a use ⇒ live-in
-            if !ty.contains_key(&u) {
-                // Type not yet known; tentatively untyped — refined when defined.
+        if !pinned_nullish_cmp.contains_key(&(s + off)) {
+            for u in numeric_uses(s + off, instr).into_iter().filter(|&u| fused_flag_reg(s + off) != Some(u)) {
+                first_seen.entry(u).or_insert(false); // first occurrence is a use ⇒ live-in
+                if !ty.contains_key(&u) {
+                    // Type not yet known; tentatively untyped — refined when defined.
+                }
             }
         }
         // A TA-receiver reg is NOT typed/homed (sourced via the pin); skip its def.
@@ -2393,7 +2475,7 @@ fn plan_region_cold_inner(
     // TA-receiver regs are intentionally untyped (sourced via the pin) — skip them.
     let mut ro_live_in: Vec<u16> = Vec::new();
     for (off, instr) in code[s..=e].iter().enumerate() {
-        if cold.contains(&(s + off)) {
+        if cold.contains(&(s + off)) || pinned_nullish_cmp.contains_key(&(s + off)) {
             continue;
         }
         for u in numeric_uses(s + off, instr).into_iter().filter(|&u| fused_flag_reg(s + off) != Some(u)) {
@@ -2408,7 +2490,7 @@ fn plan_region_cold_inner(
     }
     if !ro_live_in.is_empty() {
         for (off, instr) in code[s..=e].iter().enumerate() {
-            if cold.contains(&(s + off)) {
+            if cold.contains(&(s + off)) || pinned_nullish_cmp.contains_key(&(s + off)) {
                 continue;
             }
             // B98: on the DOUBLE path, an `Add` operand counts as a numeric-required
@@ -2522,7 +2604,7 @@ fn plan_region_cold_inner(
 
     // Validate operand type requirements now that types are known.
     for (off, instr) in code[s..=e].iter().enumerate() {
-        if cold.contains(&(s + off)) {
+        if cold.contains(&(s + off)) || pinned_nullish_cmp.contains_key(&(s + off)) {
             continue;
         }
         match *instr {
@@ -4462,6 +4544,7 @@ fn plan_region_cold_inner(
         strict_entry_globs,
         box_regs,
         undef_dead,
+        pinned_nullish_cmp,
         getprop_ips,
         ty_splits,
     }))

@@ -941,6 +941,23 @@ pub(crate) struct MatchallFastSlots {
     ctor_slot: u32,
 }
 
+/// Cached `RegExp.prototype` intrinsic slot indices for `replace`/`exec`/`split`/`flags`
+/// fast-ok gates. Stored in a `Cell` on `Vm` so `&self` gates can populate and hit
+/// without scanning `RegExp.prototype`'s `ObjMap` by string key on every call.
+/// Re-checks `proto_version`, `proto_shape` (non-DICT), slot `accessor` bit, value
+/// identity, and pinned native version on every call, so any prototype mutation or
+/// in-place slot overwrite falls back conservatively to the full gate.
+#[derive(Clone, Copy)]
+pub(crate) struct RegexpProtoFastSlots {
+    proto_version: u32,
+    proto_shape: u32,
+    exec: (u32, u32, u32),
+    replace_sym: (u32, u32, u32),
+    split_sym: (u32, u32, u32),
+    flags: (u32, u32, u32),
+    flag_accessors: [(u32, u32, u32); 8],
+}
+
 /// `ZIPP_NO_FASTOK_MEMO=1` makes `regexp_matchall_fast_ok_cached` run the
 /// original nine-probe gate on every call, bypassing the slot memo entirely —
 /// the rollback switch and one side of a one-binary A/B (`tools/bench.py
@@ -1492,6 +1509,79 @@ impl<'p> Vm<'p> {
         })
     }
 
+    #[inline]
+    fn regexp_slot_still_pinned(
+        &self,
+        m: &ObjMap,
+        accessor: bool,
+        (slot, idx, ver): (u32, u32, u32),
+    ) -> bool {
+        let s = slot as usize;
+        s < m.vals_len()
+            && !m.is_hole(s)
+            && m.attr_at(s).accessor == accessor
+            && m.val_at(s).is_heap()
+            && m.val_at(s).heap_index() == idx
+            && self.heap.version_of(idx) == ver
+    }
+
+    #[inline]
+    fn regexp_proto_fast_slots_get(&self, m: &ObjMap) -> Option<RegexpProtoFastSlots> {
+        let sh = m.shape();
+        if sh == crate::shape::DICT {
+            return None;
+        }
+        let pver = self.heap.version_of(self.regexp_proto);
+        if let Some(c) = self.regexp_proto_fast_slots.get() {
+            if c.proto_version == pver && c.proto_shape == sh {
+                return Some(c);
+            }
+        }
+        self.regexp_proto_fast_slots_fill(m, pver, sh)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn regexp_proto_fast_slots_fill(
+        &self,
+        m: &ObjMap,
+        proto_version: u32,
+        proto_shape: u32,
+    ) -> Option<RegexpProtoFastSlots> {
+        let pin = |key: &str, accessor: bool, id: u16| {
+            let i = m.pos(key)?;
+            let v = m.val_at(i);
+            (m.attr_at(i).accessor == accessor && self.regexp_protocol_value_is_intrinsic(v, id))
+                .then(|| {
+                    (
+                        i as u32,
+                        v.heap_index(),
+                        self.heap.version_of(v.heap_index()),
+                    )
+                })
+        };
+        let exec = pin("exec", false, native::REGEXP_EXEC)?;
+        let replace_sym = pin("@@replace", false, native::REGEXP_SYM_REPLACE)?;
+        let split_sym = pin("@@split", false, native::REGEXP_SYM_SPLIT)?;
+        let flags = pin("flags", true, native::REGEXP_GET_FLAGS)?;
+        let mut flag_accessors = [(0, 0, 0); 8];
+        for (out, &(name, native_id)) in flag_accessors.iter_mut().zip(Self::FLAG_ACCESSORS.iter())
+        {
+            *out = pin(name, true, native_id)?;
+        }
+        let slots = RegexpProtoFastSlots {
+            proto_version,
+            proto_shape,
+            exec,
+            replace_sym,
+            split_sym,
+            flags,
+            flag_accessors,
+        };
+        self.regexp_proto_fast_slots.set(Some(slots));
+        Some(slots)
+    }
+
     /// True when `String.prototype.replace`'s internal regex fast path is
     /// UNOBSERVABLE for instance `re`: its [[Prototype]] is exactly
     /// %RegExp.prototype%, it has no own exec/flags/@@replace overrides, and
@@ -1513,18 +1603,6 @@ impl<'p> Vm<'p> {
                     .any(|(name, _)| m.pos(name).is_some())
         }) {
             return false;
-        }
-        match self.heap.get(self.regexp_proto) {
-            HeapObj::Object(m) => {
-                let intrinsic =
-                    |k: &str, id: u16| self.regexp_proto_slot_is_intrinsic(m, k, false, id);
-                if !(intrinsic("exec", native::REGEXP_EXEC)
-                    && intrinsic("@@replace", native::REGEXP_SYM_REPLACE))
-                {
-                    return false;
-                }
-            }
-            _ => return false,
         }
         // The fast path starts matching at 0 and does not write `lastIndex`
         // back, which is only unobservable for a NON-sticky pattern whose
@@ -1557,17 +1635,30 @@ impl<'p> Vm<'p> {
         if global && !self.regexp_last_index_writable(re) {
             return false;
         }
-        // `@@replace` reads `flags`; the intrinsic flags getter in turn reads
-        // all eight flag accessors. Prove every live accessor's exact Native id
-        // (not merely "some native": swapping e.g. the `global` and `unicode`
-        // getters is observable). This is allocation-free, so a direct-call
-        // decline remains a pure prefix.
+        // `@@replace` reads `flags`, `exec`, and `@@replace`; the intrinsic flags
+        // getter reads all eight flag accessors. Check the slot-indexed memo first
+        // to avoid 11 string-key lookups on `%RegExp.prototype%` per call.
         match self.heap.get(self.regexp_proto) {
             HeapObj::Object(m) => {
+                if let Some(c) = self.regexp_proto_fast_slots_get(m) {
+                    if self.regexp_slot_still_pinned(m, false, c.exec)
+                        && self.regexp_slot_still_pinned(m, false, c.replace_sym)
+                        && self.regexp_slot_still_pinned(m, true, c.flags)
+                        && c.flag_accessors
+                            .iter()
+                            .all(|&g| self.regexp_slot_still_pinned(m, true, g))
+                    {
+                        return true;
+                    }
+                }
+                let intrinsic =
+                    |k: &str, id: u16| self.regexp_proto_slot_is_intrinsic(m, k, false, id);
                 let accessor = |name: &str, want: u16| {
                     self.regexp_proto_slot_is_intrinsic(m, name, true, want)
                 };
-                accessor("flags", native::REGEXP_GET_FLAGS)
+                intrinsic("exec", native::REGEXP_EXEC)
+                    && intrinsic("@@replace", native::REGEXP_SYM_REPLACE)
+                    && accessor("flags", native::REGEXP_GET_FLAGS)
                     && Self::FLAG_ACCESSORS
                         .iter()
                         .all(|(name, want)| accessor(name, *want))
@@ -1603,6 +1694,11 @@ impl<'p> Vm<'p> {
         }
         match self.heap.get(self.regexp_proto) {
             HeapObj::Object(m) => {
+                if let Some(c) = self.regexp_proto_fast_slots_get(m) {
+                    if self.regexp_slot_still_pinned(m, false, c.split_sym) {
+                        return true;
+                    }
+                }
                 self.regexp_proto_slot_is_intrinsic(m, "@@split", false, native::REGEXP_SYM_SPLIT)
             }
             _ => false,
@@ -2559,6 +2655,25 @@ impl<'p> Vm<'p> {
         if let Some(v) = self.regexp_match_global_fast(re, input)? {
             return Ok(v);
         }
+        // Non-global pristine RegExp fast path: avoids invoking the `flags`
+        // getter (allocating a flags string + Rust String) and `exec` lookup
+        // when `input` is already a string and `%RegExp.prototype%` is pristine.
+        #[cfg(not(feature = "safe-sandbox"))]
+        if regexp_match_fast_enabled()
+            && input.is_heap()
+            && matches!(
+                self.heap.get(input.heap_index()),
+                HeapObj::Str(_) | HeapObj::Cons { .. }
+            )
+            && matches!(
+                self.heap.get(re),
+                HeapObj::RegExp(r) if !r.core.flags.as_bytes().contains(&b'g')
+            )
+            && self.regexp_exec_fast_ok(re)
+            && self.regexp_pristine_flag_accessors_ok(re, Value::heap(re))
+        {
+            return self.regexp_exec(re, input);
+        }
         let rx = Value::heap(re);
         let flags_v = self.get_prop(rx, "flags")?;
         #[cfg(feature = "safe-sandbox")]
@@ -2740,10 +2855,15 @@ impl<'p> Vm<'p> {
         let result = match last {
             None => Value::NULL,
             Some(m) => {
-                let mut elems: Vec<Value> = Vec::new();
-                elems.try_reserve_exact(ranges.len()).map_err(|_| {
-                    Thrown::from_static("RangeError: RegExp match-result allocation failed")
-                })?;
+                let mut elems: Vec<Value> = if ranges.len() <= crate::heap::ARR_POOL_MAX_CAP {
+                    self.heap.take_arr_buf(ranges.len())
+                } else {
+                    let mut v = Vec::new();
+                    v.try_reserve_exact(ranges.len()).map_err(|_| {
+                        Thrown::from_static("RangeError: RegExp match-result allocation failed")
+                    })?;
+                    v
+                };
                 for r in ranges {
                     elems.push(mk(self, r));
                 }
@@ -2759,7 +2879,7 @@ impl<'p> Vm<'p> {
                     is_ascii,
                     &mk,
                 );
-                Value::heap(self.heap.alloc(HeapObj::Array(elems)))
+                Value::heap(self.heap.alloc_array_settled(elems))
             }
         };
         if !is_ascii {
@@ -2866,7 +2986,16 @@ impl<'p> Vm<'p> {
                 vm.units_value(&u16s[r])
             }
         };
-        let mut a: Vec<Value> = Vec::new();
+        let est = if size == 0 {
+            usize::from(found.is_empty())
+        } else {
+            (found.len().saturating_add(1)).min(lim as usize)
+        };
+        let mut a: Vec<Value> = if est <= crate::heap::ARR_POOL_MAX_CAP {
+            self.heap.take_arr_buf(est)
+        } else {
+            Vec::with_capacity(est.min(4096))
+        };
         // The last successful exec: the match the loop stopped at when `limit`
         // ends it, else the last one (every match from `q < size` is tried).
         let mut last = found.len().checked_sub(1);
@@ -2916,7 +3045,7 @@ impl<'p> Vm<'p> {
         if !is_ascii {
             self.regex_subject_units_put(input, u16s);
         }
-        Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(a)))))
+        Ok(Some(Value::heap(self.heap.alloc_array_settled(a))))
     }
 
     /// RegExp.prototype[Symbol.split] core (simplified — no capture groups in the
@@ -3810,7 +3939,7 @@ impl<'p> Vm<'p> {
         F: Fn(&mut Self, std::ops::Range<usize>) -> Value,
     {
         let whole = mk(self, mstart..mend);
-        let mut elems = Vec::with_capacity(1 + m.captures.len());
+        let mut elems = self.heap.take_arr_buf(1 + m.captures.len());
         elems.push(whole);
         for cap in &m.captures {
             let v = match cap {
@@ -4310,19 +4439,39 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        let (bytes, subject_ascii): (Vec<u8>, bool) = match self.heap.get(s_idx) {
-            HeapObj::Str(js) => (
-                js.as_bytes()[r].to_vec(),
-                js.is_ascii() && ascii_slice_fast(),
-            ),
-            _ => (Vec::new(), false),
+        if r.start == r.end {
+            return Value::heap(crate::heap::INTERN_EMPTY);
+        }
+        let (whole, one_ascii, subject_ascii, len) = match self.heap.get(s_idx) {
+            HeapObj::Str(js) => {
+                let b = js.as_bytes();
+                let sl = &b[r.clone()];
+                let whole = r.start == 0 && r.end == b.len();
+                let one = if sl.len() == 1 && sl[0] < 128 {
+                    Some(sl[0])
+                } else {
+                    None
+                };
+                (whole, one, js.is_ascii() && ascii_slice_fast(), sl.len())
+            }
+            _ => return Value::heap(crate::heap::INTERN_EMPTY),
         };
+        if whole {
+            return Value::heap(s_idx);
+        }
+        if let Some(ch) = one_ascii {
+            return Value::heap(ch as u32);
+        }
+        let mut bytes = self.heap.take_byte_buf(len);
+        if let HeapObj::Str(js) = self.heap.get(s_idx) {
+            bytes.extend_from_slice(&js.as_bytes()[r]);
+        }
         let js = if subject_ascii {
             crate::heap::JsStr::from_ascii(bytes)
         } else {
             crate::heap::JsStr::from_wtf8(bytes)
         };
-        Value::heap(self.heap.alloc_js(js))
+        Value::heap(self.heap.alloc_str_settled(js))
     }
 
     /// `Set(R, "lastIndex", v, true)` on a real RegExp. Fast path writes the
@@ -4414,6 +4563,15 @@ impl<'p> Vm<'p> {
             HeapObj::Object(m) => m,
             _ => return false,
         };
+        if let Some(c) = self.regexp_proto_fast_slots_get(proto) {
+            if self.regexp_slot_still_pinned(proto, true, c.flags)
+                && c.flag_accessors
+                    .iter()
+                    .all(|&g| self.regexp_slot_still_pinned(proto, true, g))
+            {
+                return true;
+            }
+        }
         let flags_ok =
             self.regexp_proto_slot_is_intrinsic(proto, "flags", true, native::REGEXP_GET_FLAGS);
         flags_ok
@@ -4499,6 +4657,11 @@ impl<'p> Vm<'p> {
         }
         match self.heap.get(self.regexp_proto) {
             HeapObj::Object(m) => {
+                if let Some(c) = self.regexp_proto_fast_slots_get(m) {
+                    if self.regexp_slot_still_pinned(m, false, c.exec) {
+                        return true;
+                    }
+                }
                 self.regexp_proto_slot_is_intrinsic(m, "exec", false, native::REGEXP_EXEC)
             }
             _ => false,
@@ -4765,7 +4928,7 @@ impl<'p> Vm<'p> {
     /// drops it, and only a subject of `REGEX_SUBJECT_UNITS_KEPT` units or
     /// fewer is kept at all.
     #[cfg(feature = "safe-sandbox")]
-    fn regex_subject_units_take(
+    pub(crate) fn regex_subject_units_take(
         &mut self,
         subject: Value,
     ) -> Result<(Vec<u16>, super::instrument::RegexTransientReservation), Thrown> {
@@ -4787,7 +4950,7 @@ impl<'p> Vm<'p> {
     /// Keep a buffer taken by the checked `regex_subject_units_take`, with
     /// its charge, for the next exec over the same flat string.
     #[cfg(feature = "safe-sandbox")]
-    fn regex_subject_units_put(
+    pub(crate) fn regex_subject_units_put(
         &mut self,
         subject: Value,
         units: Vec<u16>,
@@ -4812,7 +4975,7 @@ impl<'p> Vm<'p> {
     }
 
     #[cfg(not(feature = "safe-sandbox"))]
-    fn regex_subject_units_take(&mut self, subject: Value) -> Vec<u16> {
+    pub(super) fn regex_subject_units_take(&mut self, subject: Value) -> Vec<u16> {
         if subject.is_heap() {
             let idx = subject.heap_index();
             self.heap.flatten(idx);
@@ -4834,7 +4997,7 @@ impl<'p> Vm<'p> {
     /// memory outside the metered heap, and an instrumented VM's incremental
     /// accounting must not undercount between calls.
     #[cfg(not(feature = "safe-sandbox"))]
-    fn regex_subject_units_put(&mut self, subject: Value, units: Vec<u16>) {
+    pub(crate) fn regex_subject_units_put(&mut self, subject: Value, units: Vec<u16>) {
         #[cfg(feature = "instrument")]
         if self.instr_rec.is_some() {
             return;
@@ -6735,7 +6898,7 @@ impl<'p> Vm<'p> {
                     m.range(),
                 )?;
                 #[cfg(not(feature = "safe-sandbox"))]
-                let whole = self.alloc_str(subject[m.range()].to_string());
+                let whole = Value::heap(self.heap.alloc_str_copy(&subject[m.range()]));
                 let mut argv = Vec::new();
                 let argv_len = m
                     .captures
@@ -6763,7 +6926,7 @@ impl<'p> Vm<'p> {
                             }
                             #[cfg(not(feature = "safe-sandbox"))]
                             {
-                                self.alloc_str(subject[r.clone()].to_string())
+                                Value::heap(self.heap.alloc_str_copy(&subject[r.clone()]))
                             }
                         }
                         None => Value::UNDEFINED,

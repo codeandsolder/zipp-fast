@@ -268,6 +268,10 @@ pub(crate) struct RegionPlan {
     /// scan (`int_unadmitted_ips`) and the planner enforce that no other op
     /// defines them and every completion `Move` source is Num-typed.
     pub(crate) undef_dead: FxHashSet<u16>,
+    /// DOUBLE-path `Eq`/`Ne` ips comparing an entry-hoisted invariant pinned
+    /// receiver against an immediately preceding single-use `LoadUndefined` /
+    /// `LoadNull`. Maps `cmp_ip -> bool` (`false` for `Eq`, `true` for `Ne`).
+    pub(crate) pinned_nullish_cmp: FxHashMap<usize, bool>,
     /// W28 TYPE-AWARE LIVE-RANGE SPLITTING — a VM register the bytecode
     /// compiler recycled ACROSS A TYPE BOUNDARY: a `VTy::Bool` compare result
     /// over one range and a `VTy::Num` value over a disjoint one. Before this

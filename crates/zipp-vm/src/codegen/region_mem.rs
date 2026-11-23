@@ -6094,11 +6094,19 @@ fn emit_cross3_invoke(
             ; mov [rsp + iv.c3 + 56], r11
         );
     }
+    let route_ok = ops.new_dynamic_label();
     dynasm!(ops
         ; cmp DWORD [rcx + 8], iv.mask_gen as i32
         ; jne => fb
-        ; cmp DWORD [rdi + JIT_GLOBAL_ROUTE_EPOCH_OFFSET as i32], 0
+        ; mov r11d, DWORD [rcx + 12]
+        ; test r11d, crate::codegen::CROSS_DYN_NO_GLOBALS as i32
+        ; jnz => route_ok
+        ; test r11d, crate::codegen::CROSS_DYN_EPOCH_OK as i32
+        ; jz => fb
+        ; shr r11d, crate::codegen::CROSS_DYN_ROUTE_SHIFT as i8
+        ; cmp DWORD [rdi + JIT_GLOBAL_ROUTE_EPOCH_OFFSET as i32], r11d
         ; jne => fb
+        ; => route_ok
         ; cmp BYTE [rdi + JIT_GC_REQUESTED_OFFSET as i32], 0
         ; jne => fb
         ; cmp BYTE [rdi + JIT_GC_STRESS_OFFSET as i32], 0

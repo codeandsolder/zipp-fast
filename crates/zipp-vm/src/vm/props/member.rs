@@ -37,6 +37,35 @@ fn native_has_name_length_uncached(id: u16) -> bool {
         || native::static_name_length(id).is_some()
 }
 
+pub(crate) const CLASS_MEMBER_CACHE_SLOTS: usize = 1024;
+
+#[derive(Clone, Copy)]
+pub(crate) struct ClassMemberSlot {
+    pub(crate) class: u32,
+    pub(crate) proto_epoch: u32,
+    pub(crate) gc_epoch: u32,
+    pub(crate) len: u16,
+    pub(crate) kind: u8, // 0 = empty, 1 = Miss, 2 = Method, 3 = Accessor
+    pub(crate) w0: u64,
+    pub(crate) w1: u64,
+    pub(crate) v0: u64,
+    pub(crate) v1: u64,
+}
+
+impl ClassMemberSlot {
+    pub(crate) const EMPTY: Self = Self {
+        class: 0,
+        proto_epoch: 0,
+        gc_epoch: 0,
+        len: 0,
+        kind: 0,
+        w0: 0,
+        w1: 0,
+        v0: 0,
+        v1: 0,
+    };
+}
+
 /// The RegExp flag character a per-flag accessor name reports, if the name is
 /// one of the eight. Lets a `re.global`-style read be answered from the flag
 /// string in place, with no allocation and no prototype walk.
@@ -1027,16 +1056,61 @@ impl<'p> Vm<'p> {
     /// level that no longer qualifies hands the lookup to the live object.
     /// Private names never live on a prototype, so they always read the tables.
     #[inline]
+    pub(crate) fn invalidate_class_member_cache(&mut self) {
+        let next = self.class_member_gc_epoch.wrapping_add(1);
+        if next == 0 {
+            for slot in self.class_member_cache.iter() {
+                slot.set(ClassMemberSlot::EMPTY);
+            }
+            self.class_member_gc_epoch = 1;
+        } else {
+            self.class_member_gc_epoch = next;
+        }
+    }
+
+    #[inline]
     pub(crate) fn class_member_lookup(&self, inst: u32, class: u32, key: &str) -> ClassLookup {
-        let public = key.as_bytes().first() != Some(&b'#');
+        let b = key.as_bytes();
+        let public = b.first() != Some(&b'#');
+        let cache_key = if public && b.len() <= 16 {
+            let (w0, w1) = crate::vm::ic::key_words(b);
+            let slot_idx = ((class.wrapping_mul(0x9E37_79B1)
+                ^ (w0 as u32).wrapping_mul(0x85EB_CA77)
+                ^ ((w0 >> 32) as u32).wrapping_mul(0xC2B2_AE35)
+                ^ (b.len() as u32)) as usize)
+                & (CLASS_MEMBER_CACHE_SLOTS - 1);
+            let e = self.class_member_cache[slot_idx].get();
+            if e.kind != 0
+                && e.gc_epoch == self.class_member_gc_epoch
+                && e.proto_epoch == self.class_proto_epoch
+                && e.class == class
+                && e.len == b.len() as u16
+                && e.w0 == w0
+                && e.w1 == w1
+            {
+                return match e.kind {
+                    1 => ClassLookup::Miss,
+                    2 => ClassLookup::Method(Value::from_bits(e.v0)),
+                    _ => ClassLookup::Accessor {
+                        getter: Value::from_bits(e.v0),
+                        setter: Value::from_bits(e.v1),
+                    },
+                };
+            }
+            Some((slot_idx, w0, w1))
+        } else {
+            None
+        };
         let mut cur = Some(class);
         let mut first = true;
+        let mut cacheable = cache_key.is_some();
         while let Some(cidx) = cur {
             let HeapObj::Class(c) = self.heap.get(cidx) else {
                 break;
             };
             if public {
                 if first && c.reproto_instances {
+                    cacheable = false;
                     if let Some(p) = self.proto_of.get_copied(inst) {
                         return ClassLookup::Live(p);
                     }
@@ -1071,6 +1145,21 @@ impl<'p> Vm<'p> {
             }
             first = false;
             if let Some((_, v)) = c.methods.iter().find(|(k, _)| k == key) {
+                if cacheable {
+                    if let Some((slot_idx, w0, w1)) = cache_key {
+                        self.class_member_cache[slot_idx].set(ClassMemberSlot {
+                            class,
+                            proto_epoch: self.class_proto_epoch,
+                            gc_epoch: self.class_member_gc_epoch,
+                            len: b.len() as u16,
+                            kind: 2,
+                            w0,
+                            w1,
+                            v0: v.bits(),
+                            v1: 0,
+                        });
+                    }
+                }
                 return ClassLookup::Method(*v);
             }
             let getter = c.getters.iter().find(|(k, _)| k == key).map(|(_, v)| *v);
@@ -1082,12 +1171,44 @@ impl<'p> Vm<'p> {
                 None
             };
             if getter.is_some() || setter.is_some() {
+                let g = getter.unwrap_or(Value::UNDEFINED);
+                let s = setter.unwrap_or(Value::UNDEFINED);
+                if cacheable {
+                    if let Some((slot_idx, w0, w1)) = cache_key {
+                        self.class_member_cache[slot_idx].set(ClassMemberSlot {
+                            class,
+                            proto_epoch: self.class_proto_epoch,
+                            gc_epoch: self.class_member_gc_epoch,
+                            len: b.len() as u16,
+                            kind: 3,
+                            w0,
+                            w1,
+                            v0: g.bits(),
+                            v1: s.bits(),
+                        });
+                    }
+                }
                 return ClassLookup::Accessor {
-                    getter: getter.unwrap_or(Value::UNDEFINED),
-                    setter: setter.unwrap_or(Value::UNDEFINED),
+                    getter: g,
+                    setter: s,
                 };
             }
             cur = c.parent;
+        }
+        if cacheable {
+            if let Some((slot_idx, w0, w1)) = cache_key {
+                self.class_member_cache[slot_idx].set(ClassMemberSlot {
+                    class,
+                    proto_epoch: self.class_proto_epoch,
+                    gc_epoch: self.class_member_gc_epoch,
+                    len: b.len() as u16,
+                    kind: 1,
+                    w0,
+                    w1,
+                    v0: 0,
+                    v1: 0,
+                });
+            }
         }
         ClassLookup::Miss
     }

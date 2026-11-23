@@ -2079,6 +2079,12 @@ pub struct Vm<'p> {
     /// tables — the interpreter's `Class*` IC ways and the JIT's class
     /// method/accessor inline arms — bakes it and misses once it moves.
     pub(crate) class_proto_epoch: u32,
+    /// Bumped on every GC sweep that frees or recycles heap slots so
+    /// `class_member_cache` never hands out a reclaimed heap index.
+    pub(crate) class_member_gc_epoch: u32,
+    /// Direct-mapped cache over `Vm::class_member_lookup` for clean class chains
+    /// and public keys <= 16 bytes, keyed by `(class, proto_epoch, gc_epoch, key)`.
+    pub(crate) class_member_cache: Box<[std::cell::Cell<props::ClassMemberSlot>]>,
     /// Q7 method/accessor-inline receiver recording: per `(func_id<<32)|ip`
     /// CallMethod/GetProp/SetProp site that resolved a Class method/getter/setter,
     /// the ≤8 distinct receiver Value-bits seen at IC-fill time (warmup). The JIT
@@ -2878,7 +2884,7 @@ pub struct Vm<'p> {
     /// which its direct global accesses were last VALIDATED, and the verdict. Keeps a
     /// hot function that survived a global delete from re-scanning its whole body on
     /// every call. Only ever touched while `global_route_epoch != 0`.
-    jit_global_route_ok: rustc_hash::FxHashMap<u32, (u32, bool)>,
+    jit_global_route_ok: Vec<(u32, bool)>,
     /// One u32 GENERATION per global slot, bumped by every NON-BYTECODE Rust
     /// write to `globals` (`Vm::bump_global_gen`). A spliced leaf call whose
     /// callee register provably holds slot g's value guards `global_gens[g]`
@@ -3689,6 +3695,9 @@ pub struct Vm<'p> {
     /// pristine (and whenever last proven NOT pristine); validated per call
     /// by version compares, re-resolved by the full gate on any mismatch.
     matchall_fast_slots: Option<proxy_regexp::MatchallFastSlots>,
+    /// Cached `%RegExp.prototype%` intrinsic slot guards for `replace`/`exec`/
+    /// `split`/`flags` fast paths (`Cell` so `&self` predicates can populate it).
+    regexp_proto_fast_slots: std::cell::Cell<Option<proxy_regexp::RegexpProtoFastSlots>>,
     /// `$262.createRealm()` realm registry. `realms[r]` maps a MAIN-realm intrinsic
     /// prototype heap index to realm `r`'s corresponding prototype (realm 0 = the
     /// main realm, an empty map). `obj_realm` tags a heap index (a realm's
@@ -4508,6 +4517,9 @@ pub(crate) mod py_table;
 #[cfg(feature = "python")]
 #[path = "../lang/python/vm/py_tensor.rs"]
 mod py_tensor;
+#[cfg(feature = "python")]
+#[path = "../lang/python/vm/py_zlib.rs"]
+mod py_zlib;
 pub(crate) use prof::dump as prof_stats;
 pub(crate) use temporal::tzdb_version;
 pub(crate) mod decorators;

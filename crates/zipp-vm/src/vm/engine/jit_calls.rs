@@ -478,11 +478,14 @@ impl<'p> Vm<'p> {
         // direct global routes can be invalidated by `delete` / defineProperty
         // on globalThis (Tier C never records a self-binding, so that check is
         // structurally unnecessary — asserted at install).
-        if self.global_route_epoch != 0 && !self.jit_globals_still_routable(fid) {
-            crate::vm::helpers_misc::crossstats::decline(
-                crate::vm::helpers_misc::crossstats::DECL_ROUTABLE,
-            );
-            return SELF_CALL_DEOPT;
+        if self.global_route_epoch != 0 {
+            if !self.jit_globals_still_routable(fid) {
+                crate::vm::helpers_misc::crossstats::decline(
+                    crate::vm::helpers_misc::crossstats::DECL_ROUTABLE,
+                );
+                return SELF_CALL_DEOPT;
+            }
+            self.jit.refresh_cross_route_epoch(fid, self.global_route_epoch);
         }
         // GC safe point — the frame-transition parity point. The route this
         // path replaces ran `maybe_gc` in `dispatch_body` on EVERY call's frame

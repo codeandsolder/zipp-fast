@@ -532,7 +532,7 @@ fn run_module(path: &Path) -> Result<crate::Outcome, String> {
     let host = crate::compile::compile_main_program(&crate::front::parse_auto("")?, "")?;
     let mut vm = crate::vm::Vm::new(&host);
     vm.set_module_base_dir(path.parent().map(|p| p.to_path_buf()));
-    let result = vm.run().and_then(|_| vm.run_module_entry(path));
+    let result = vm.run_module_entry(path);
     if !matches!(&result, Err(thrown) if thrown.0.contains("top-level await is not supported")) {
         vm.report_unhandled_errors();
     }

@@ -1162,13 +1162,15 @@ pub fn run_module_file(
     let host = compile::compile_main_program(&host_ast, &host_src)?;
     let mut vm = vm::Vm::new(&host);
     vm.set_module_base_dir(base_dir);
-    if let Err(thrown) = vm.run() {
-        vm.report_unhandled_errors();
-        return Ok(Outcome {
-            output: std::mem::take(&mut vm.output),
-            errput: std::mem::take(&mut vm.errput),
-            error: Some(thrown.0),
-        });
+    if harness_path.is_some() {
+        if let Err(thrown) = vm.run() {
+            vm.report_unhandled_errors();
+            return Ok(Outcome {
+                output: std::mem::take(&mut vm.output),
+                errput: std::mem::take(&mut vm.errput),
+                error: Some(thrown.0),
+            });
+        }
     }
     let entry_result = vm.run_module_entry(path);
     if !matches!(&entry_result, Err(thrown) if thrown.0.contains("top-level await is not supported")) {

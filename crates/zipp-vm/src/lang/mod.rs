@@ -18,7 +18,7 @@ use std::str::FromStr;
 
 mod js;
 mod php;
-mod python;
+pub(crate) mod python;
 mod rust;
 pub(crate) mod ts;
 

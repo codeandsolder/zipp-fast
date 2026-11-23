@@ -1312,6 +1312,9 @@ impl<'p> Vm<'p> {
                         }
                     }
                 }
+                if matches!(kind, 0 | 1 | 2) {
+                    self.class_proto_epoch = self.class_proto_epoch.wrapping_add(1);
+                }
                 if let Some(stored) = stored_member {
                     // The store is committed and the mutable ClassData
                     // borrow is over; the barrier is infallible and no
@@ -1984,6 +1987,15 @@ impl<'p> Vm<'p> {
                                 if let Some(url) = self.module_url(k) {
                                     let url = self.alloc_str(url);
                                     meta.set("url", url);
+                                    let resolve = Value::heap(self.heap.alloc(
+                                        HeapObj::NativeClosure {
+                                            id: native::IMPORT_META_RESOLVE,
+                                            state: vec![Value::num(k as f64)],
+                                            name: "resolve",
+                                            length: 1,
+                                        },
+                                    ));
+                                    meta.set("resolve", resolve);
                                 }
                                 let m = self.heap.alloc(HeapObj::Object(Box::new(meta)));
                                 self.proto_of.insert(m, Value::NULL);
@@ -4508,7 +4520,7 @@ impl<'p> Vm<'p> {
                     }
                     opt_callees.class_epoch = self.mi_class_epoch;
                     for fid in crate::codegen::opt_plan_callee_ids(&cross_plan, &class_read, &opt_callees.getters) {
-                        if self.is_main_func(fid) {
+                        if self.is_main_func(fid) || self.loader_module_func(fid) {
                             let callee: &'p crate::bytecode::FuncProto = self.func(fid as usize);
                             if callee.code.len() <= 64
                                 && !callee.is_generator
@@ -4584,6 +4596,7 @@ impl<'p> Vm<'p> {
                     &class_read,
                     &opt_callees,
                     &prop_key_ids,
+                    self.global_route_epoch,
                 );
             }
         }

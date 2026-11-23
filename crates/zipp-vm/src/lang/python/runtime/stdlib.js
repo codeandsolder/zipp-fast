@@ -1380,9 +1380,16 @@
     });
     mod("sys", (g) => {
         g.set("argv", list([rt.entryModule() ? rt.entryModule().file || "main.py" : "main.py"].concat(rt.argv)));
-        g.set("version", "3.12.0 (zipp)"); g.set("version_info", tuple([3n, 12n, 0n, "final", 0n]));
+        const VersionInfo = rt.newType("version_info", [T.tuple], new Map(), "sys");
+        const viFields = ["major", "minor", "micro", "releaselevel", "serial"];
+        for (let i = 0; i < viFields.length; i++) VersionInfo.dict.set(viFields[i], { cls: T.property, fget: builtin(viFields[i], 1, (a) => a[0].items[i]), fset: null, fdel: null, doc: null });
+        VersionInfo.dict.set("__repr__", builtin("__repr__", 1, (a) => "sys.version_info(major=" + a[0].items[0] + ", minor=" + a[0].items[1] + ", micro=" + a[0].items[2] + ", releaselevel=" + repr(a[0].items[3]) + ", serial=" + a[0].items[4] + ")"));
+        const versionInfo = { cls: VersionInfo, items: [3n, 12n, 0n, "final", 0n], dict: new Map() };
+        g.set("version", "3.12.0 (zipp)"); g.set("version_info", versionInfo);
+        g.set("hexversion", 0x030c00f0n);
         g.set("platform", "zipp"); g.set("maxsize", 9223372036854775807n); g.set("byteorder", "little");
-        g.set("path", list([])); g.set("modules", dict()); g.set("executable", "zipp");
+        g.set("path", list([])); g.set("modules", rt.namespaceView(rt.modules)); g.set("executable", "zipp");
+        g.set("warnoptions", list([]));
         const stream = (isErr) => { const t = pyClass(isErr ? "stderr" : "stdout", "sys", { write: (a) => { rt.writeOut(needStr(a[1]), isErr ? { isStderr: true } : null); return BigInt(a[1].length); }, flush: () => null }); const o = { cls: t, dict: new Map(), isStdout: !isErr, isStderr: isErr, write: true }; return o; };
         g.set("stdout", stream(false)); g.set("stderr", stream(true)); g.set("stdin", null);
         fn(g, "exit", 1, (a) => { throw rt.makeExc(E.SystemExit, a.length ? [a[0]] : []); }, 0);
@@ -1394,7 +1401,18 @@
         fn(g, "exception", 0, () => rt.currentExc());
         g.set("stdlib_module_names", rt.call(rt.builtins.get("frozenset"), [list(rt.stdlibModuleNames())], null));
         fn(g, "getdefaultencoding", 0, () => "utf-8");
+        fn(g, "getfilesystemencoding", 0, () => "utf-8");
+        g.set("implementation", { cls: pyClass("SimpleNamespace", "types", {}), dict: new Map([["name", "zipp"], ["version", versionInfo], ["hexversion", 0x030c00f0n], ["cache_tag", null]]) });
         g.set("float_info", pyClass("float_info", "sys", {}) && (() => { const o = { cls: pyClass("float_info", "sys", {}), dict: new Map([["max", Number.MAX_VALUE], ["min", 2.2250738585072014e-308], ["epsilon", Number.EPSILON], ["dig", 15n], ["mant_dig", 53n]]) }; return o; })());
+    });
+    mod("keyword", (g) => {
+        const kw = ["False", "None", "True", "and", "as", "assert", "async", "await", "break", "class", "continue", "def", "del", "elif", "else", "except", "finally", "for", "from", "global", "if", "import", "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise", "return", "try", "while", "with", "yield"];
+        const soft = ["_", "case", "match", "type"];
+        const kwSet = new Set(kw), softSet = new Set(soft);
+        g.set("kwlist", list(kw.slice()));
+        g.set("softkwlist", list(soft.slice()));
+        fn(g, "iskeyword", 1, (a) => typeof a[0] === "string" && kwSet.has(a[0]));
+        fn(g, "issoftkeyword", 1, (a) => typeof a[0] === "string" && softSet.has(a[0]));
     });
     mod("os", (g, m) => {
         const path = rt.newModule("os.path", null);
@@ -1919,12 +1937,191 @@
     });
     mod("typing", (g) => {
         // Generic aliases print like CPython's: typing.Dict[str, int].
+        const ABCMeta = R.import("abc", null).globals.get("ABCMeta");
         const typeName = (x) => isType(x) ? (x.module === "builtins" ? x.name : x.module + "." + x.qualname) : x === null ? "None" : repr(x);
+        const rootInitSub = { cls: T.classmethod, func: builtin("__init_subclass__", -1, () => null) };
+        rootInitSub.func.kwnames = true;
+        const _Final = rt.newType("_Final", [], new Map([["__init_subclass__", rootInitSub]]), "typing");
+        const _SpecialForm = rt.newType("_SpecialForm", [_Final], new Map([
+            ["__init_subclass__", rootInitSub],
+            ["__init__", builtin("__init__", -1, (a) => {
+                const kw = a[a.length - 1] instanceof Map ? a.pop() : null;
+                const f = a[1];
+                a[0].dict.set("_getitem", f);
+                a[0].dict.set("_name", f && f.name ? f.name : (kw && kw.has("name") ? kw.get("name") : "SpecialForm"));
+                a[0].dict.set("__doc__", f && f.doc !== undefined ? f.doc : null);
+                return null;
+            })],
+            ["__getitem__", builtin("__getitem__", 2, (a) => {
+                const fn = a[0].dict.get("_getitem");
+                if (fn !== undefined && fn !== null) return call(fn, [a[0], a[1]], null);
+                return { cls: _GenericAlias, dict: new Map([["__origin__", a[0]], ["__args__", a[1] !== null && typeof a[1] === "object" && a[1].cls === T.tuple ? a[1] : tuple([a[1]])], ["_name", a[0].dict.get("_name") || a[0].dict.get("name") || ""]]) };
+            })],
+            ["__repr__", builtin("__repr__", 1, (a) => "typing." + (a[0].dict.get("_name") || a[0].dict.get("name") || "SpecialForm"))],
+            ["__or__", builtin("__or__", 2, (a) => rt.makeUnion(a[0], a[1]))],
+            ["__ror__", builtin("__ror__", 2, (a) => rt.makeUnion(a[1], a[0]))],
+            ["__call__", builtin("__call__", -1, (a) => a[1] === undefined ? null : a[1])],
+        ]), "typing");
+        _SpecialForm.dict.get("__init__").kwnames = true;
+        const _BaseGenericAlias = rt.newType("_BaseGenericAlias", [_Final], new Map([
+            ["__init_subclass__", rootInitSub],
+            ["__init__", builtin("__init__", -1, (a) => {
+                const kw = a[a.length - 1] instanceof Map ? a.pop() : null;
+                const origin = a[1];
+                a[0].dict.set("__origin__", origin);
+                a[0].dict.set("_inst", kw && kw.has("inst") ? kw.get("inst") : true);
+                a[0].dict.set("_name", kw && kw.has("name") ? kw.get("name") : (origin && origin.name ? origin.name : null));
+                return null;
+            })],
+            ["__mro_entries__", builtin("__mro_entries__", 2, (a) => { const o = a[0].dict.get("__origin__"); return isType(o) ? tuple([o]) : tuple([rt.Generic]); })],
+            ["__instancecheck__", builtin("__instancecheck__", 2, (a) => { const o = a[0].dict.get("__origin__"); if (isType(o)) return rt.isinstanceCheck(a[1], o); fail(E.TypeError, "Subscripted generics cannot be used with class and instance checks"); })],
+            ["__subclasscheck__", builtin("__subclasscheck__", 2, (a) => { const o = a[0].dict.get("__origin__"); if (isType(o)) return rt.call(rt.builtins.get("issubclass"), [a[1], o], null); fail(E.TypeError, "Subscripted generics cannot be used with class and instance checks"); })],
+            ["__or__", builtin("__or__", 2, (a) => rt.makeUnion(a[0], a[1]))],
+            ["__ror__", builtin("__ror__", 2, (a) => rt.makeUnion(a[1], a[0]))],
+            ["__call__", builtin("__call__", -1, (a) => { const kw = a[a.length - 1] instanceof Map ? a.pop() : null; const o = a[0].dict.get("__origin__"); return o && isType(o) ? call(o, a.slice(1), kw) : (a[1] === undefined ? null : a[1]); })],
+        ]), "typing");
+        _BaseGenericAlias.dict.get("__init__").kwnames = true;
+        _BaseGenericAlias.dict.get("__call__").kwnames = true;
+        const _GenericAlias = rt.newType("_GenericAlias", [_BaseGenericAlias], new Map([
+            ["__init_subclass__", rootInitSub],
+            ["__init__", builtin("__init__", -1, (a) => {
+                const kw = a[a.length - 1] instanceof Map ? a.pop() : null;
+                const origin = a[1], args = a[2];
+                a[0].dict.set("__origin__", origin);
+                a[0].dict.set("__args__", args !== null && typeof args === "object" && args.cls === T.tuple ? args : tuple(args === undefined ? [] : [args]));
+                a[0].dict.set("__parameters__", tuple([]));
+                a[0].dict.set("_inst", kw && kw.has("inst") ? kw.get("inst") : true);
+                a[0].dict.set("_name", kw && kw.has("name") ? kw.get("name") : (origin && origin.name ? origin.name : null));
+                return null;
+            })],
+            ["copy_with", builtin("copy_with", 2, (a) => ({ cls: a[0].cls, dict: new Map([["__origin__", a[0].dict.get("__origin__")], ["__args__", a[1] !== null && typeof a[1] === "object" && a[1].cls === T.tuple ? a[1] : tuple([a[1]])], ["__parameters__", tuple([])], ["_name", a[0].dict.get("_name")]]) }))],
+            ["__getitem__", builtin("__getitem__", 2, (a) => ({ cls: a[0].cls, dict: new Map([["__origin__", a[0].dict.get("__origin__")], ["__args__", a[1] !== null && typeof a[1] === "object" && a[1].cls === T.tuple ? a[1] : tuple([a[1]])], ["__parameters__", tuple([])], ["_name", a[0].dict.get("_name")]]) }))],
+            ["__repr__", builtin("__repr__", 1, (a) => { const n = a[0].dict.get("_name") || typeName(a[0].dict.get("__origin__")); const args = a[0].dict.get("__args__"); return "typing." + n + (args === undefined || args.items.length === 0 ? "" : "[" + args.items.map(typeName).join(", ") + "]"); })],
+        ]), "typing");
+        _GenericAlias.dict.get("__init__").kwnames = true;
+        const _SpecialGenericAlias = rt.newType("_SpecialGenericAlias", [_BaseGenericAlias], new Map([
+            ["__init_subclass__", rootInitSub],
+            ["__init__", builtin("__init__", -1, (a) => {
+                const kw = a[a.length - 1] instanceof Map ? a.pop() : null;
+                a[0].dict.set("__origin__", a[1]);
+                a[0].dict.set("_nparams", a[2] === undefined ? 0n : a[2]);
+                a[0].dict.set("_name", kw && kw.has("name") ? kw.get("name") : (a[1] && a[1].name ? a[1].name : ""));
+                a[0].dict.set("__args__", tuple([]));
+                return null;
+            })],
+            ["__getitem__", builtin("__getitem__", 2, (a) => ({ cls: _GenericAlias, dict: new Map([["__origin__", a[0].dict.get("__origin__")], ["__args__", a[1] !== null && typeof a[1] === "object" && a[1].cls === T.tuple ? a[1] : tuple([a[1]])], ["__parameters__", tuple([])], ["_name", a[0].dict.get("_name")]]) }))],
+            ["copy_with", builtin("copy_with", 2, (a) => ({ cls: _GenericAlias, dict: new Map([["__origin__", a[0].dict.get("__origin__")], ["__args__", a[1] !== null && typeof a[1] === "object" && a[1].cls === T.tuple ? a[1] : tuple([a[1]])], ["__parameters__", tuple([])], ["_name", a[0].dict.get("_name")]]) }))],
+            ["__repr__", builtin("__repr__", 1, (a) => "typing." + (a[0].dict.get("_name") || ""))],
+        ]), "typing");
+        _SpecialGenericAlias.dict.get("__init__").kwnames = true;
+        const _ConcatenateGenericAlias = rt.newType("_ConcatenateGenericAlias", [_GenericAlias], new Map([["__init_subclass__", rootInitSub]]), "typing");
+        const _AnnotatedAlias = rt.newType("_AnnotatedAlias", [_GenericAlias], new Map([["__init_subclass__", rootInitSub]]), "typing");
+        const _UnionGenericAlias = rt.newType("_UnionGenericAlias", [_GenericAlias], new Map([["__init_subclass__", rootInitSub]]), "typing");
+        const ForwardRef = rt.newType("ForwardRef", [_Final], new Map([
+            ["__slots__", tuple(["__forward_arg__", "__forward_code__", "__forward_evaluated__", "__forward_value__", "__forward_is_argument__", "__forward_is_class__", "__forward_module__"])],
+            ["__init_subclass__", rootInitSub],
+            ["__init__", builtin("__init__", -1, (a) => {
+                const kw = a[a.length - 1] instanceof Map ? a.pop() : null;
+                a[0].dict.set("__forward_arg__", needStr(a[1]));
+                a[0].dict.set("__forward_is_argument__", kw && kw.has("is_argument") ? truth(kw.get("is_argument")) : true);
+                a[0].dict.set("__forward_is_class__", kw && kw.has("is_class") ? truth(kw.get("is_class")) : false);
+                a[0].dict.set("__forward_module__", kw && kw.has("module") ? kw.get("module") : null);
+                a[0].dict.set("__forward_evaluated__", false);
+                a[0].dict.set("__forward_value__", null);
+                return null;
+            })],
+            ["__repr__", builtin("__repr__", 1, (a) => "ForwardRef(" + repr(a[0].dict.get("__forward_arg__")) + ")")],
+        ]), "typing");
+        ForwardRef.dict.get("__init__").kwnames = true;
+        const NewType = rt.newType("NewType", [], new Map([
+            ["__init__", builtin("__init__", 3, (a) => { a[0].dict.set("__name__", needStr(a[1])); a[0].dict.set("__supertype__", a[2]); return null; })],
+            ["__call__", builtin("__call__", 2, (a) => a[1])],
+            ["__or__", builtin("__or__", 2, (a) => rt.makeUnion(a[0], a[1]))],
+            ["__ror__", builtin("__ror__", 2, (a) => rt.makeUnion(a[1], a[0]))],
+            ["__repr__", builtin("__repr__", 1, (a) => "typing." + a[0].dict.get("__name__"))],
+        ]), "typing");
+        const ParamSpecArgs = rt.newType("ParamSpecArgs", [], new Map([["__init__", builtin("__init__", 2, (a) => { a[0].dict.set("__origin__", a[1]); return null; })]]), "typing");
+        const ParamSpecKwargs = rt.newType("ParamSpecKwargs", [], new Map([["__init__", builtin("__init__", 2, (a) => { a[0].dict.set("__origin__", a[1]); return null; })]]), "typing");
+        const EXCLUDED_ATTRIBUTES = ["__abstractmethods__", "__annotations__", "__weakref__", "_is_protocol", "_is_runtime_protocol", "__dict__", "__args__", "__slots__", "_get_protocol_attrs", "__next_in_mro__", "__parameters__", "__origin__", "__orig_bases__", "__extra__", "__tree_hash__", "__doc__", "__subclasshook__", "__init__", "__new__", "__module__", "_MutableMapping__marker", "_gorg"];
+        const excludedSet = new Set(EXCLUDED_ATTRIBUTES);
+        const getProtoMembers = (cls) => {
+            const out = new Set();
+            for (const c of cls.mro) {
+                if (c === rt.ObjectType || c === rt.Generic || c === Protocol) continue;
+                for (const k of c.dict.keys()) { if (!excludedSet.has(k) && !k.startsWith("__")) out.add(k); }
+                const ann = c.dict.get("__annotations__");
+                if (ann !== undefined && ann !== null && isInstance(ann, T.dict)) {
+                    for (const [k] of rt.dictEntryList(ann)) { if (typeof k === "string" && !excludedSet.has(k) && !k.startsWith("__")) out.add(k); }
+                }
+            }
+            return out;
+        };
+        const _ProtocolMeta = rt.newType("_ProtocolMeta", [ABCMeta], new Map(), "typing");
+        _ProtocolMeta.dict.set("__new__", { cls: T.staticmethod, func: builtin("__new__", -1, (a) => {
+            const kw = a[a.length - 1] instanceof Map ? a.pop() : null;
+            const cls = rt.makeClass(a[0], a[1], a[2], a[3], kw);
+            cls.isABC = true;
+            cls._abc_registry = new Set();
+            const directProto = cls.bases.some((b) => b === Protocol);
+            cls.dict.set("_is_protocol", directProto);
+            cls.dict.set("_is_runtime_protocol", false);
+            return cls;
+        }) });
+        _ProtocolMeta.dict.get("__new__").func.kwnames = true;
+        _ProtocolMeta.dict.set("__instancecheck__", builtin("__instancecheck__", 2, (a) => {
+            const cls = a[0], inst = a[1];
+            if (rt.isSubclass(typeOf(inst), cls)) return true;
+            if (cls.dict.get("_is_protocol") && cls.dict.get("_is_runtime_protocol")) {
+                for (const m of getProtoMembers(cls)) {
+                    if (rt.getattr(inst, m, rt.MISSING_ATTR) === rt.MISSING_ATTR) return false;
+                }
+                return true;
+            }
+            return false;
+        }));
+        _ProtocolMeta.dict.set("__subclasscheck__", builtin("__subclasscheck__", 2, (a) => {
+            const cls = a[0], sub = a[1];
+            if (!isType(sub)) fail(E.TypeError, "issubclass() arg 1 must be a class");
+            if (rt.isSubclass(sub, cls)) return true;
+            if (cls.dict.get("_is_protocol") && cls.dict.get("_is_runtime_protocol")) {
+                for (const m of getProtoMembers(cls)) {
+                    if (rt.lookupType(sub, m) === undefined) return false;
+                }
+                return true;
+            }
+            return false;
+        }));
+        const Protocol = rt.newType("Protocol", [rt.Generic], new Map([
+            ["__class_getitem__", { cls: T.classmethod, func: builtin("__class_getitem__", 2, (a) => rt.makeGenericAlias(a[0], a[1])) }],
+            ["_is_protocol", true],
+            ["_is_runtime_protocol", false],
+        ]), "typing");
+        Protocol.cls = _ProtocolMeta;
+        Protocol.isABC = true;
+        Protocol._abc_registry = new Set();
         const any = pyClass("_Alias", "typing", {
-            __getitem__: (a) => ({ cls: a[0].cls, dict: new Map([["name", a[0].dict.get("name")], ["args", a[1] !== null && typeof a[1] === "object" && a[1].cls === T.tuple ? a[1].items : [a[1]]]]) }),
+            __getitem__: (a) => ({ cls: a[0].cls, dict: new Map([["name", a[0].dict.get("name")], ["__origin__", a[0].dict.get("__origin__")], ["args", a[1] !== null && typeof a[1] === "object" && a[1].cls === T.tuple ? a[1].items : [a[1]]]]) }),
+            __mro_entries__: (a) => { const o = a[0].dict.get("__origin__"); return isType(o) ? tuple([o]) : tuple([rt.Generic]); },
+            __instancecheck__: (a) => { const o = a[0].dict.get("__origin__"); if (isType(o) && a[0].dict.get("args") === undefined) return rt.isinstanceCheck(a[1], o); fail(E.TypeError, "Subscripted generics cannot be used with class and instance checks"); },
+            __subclasscheck__: (a) => { const o = a[0].dict.get("__origin__"); if (isType(o) && a[0].dict.get("args") === undefined) return rt.call(rt.builtins.get("issubclass"), [a[1], o], null); fail(E.TypeError, "Subscripted generics cannot be used with class and instance checks"); },
             __repr__: (a) => { const args = a[0].dict.get("args"); return "typing." + a[0].dict.get("name") + (args === undefined ? "" : "[" + args.map(typeName).join(", ") + "]"); },
             __call__: (a) => a[1] === undefined ? null : a[1], __or__: (a) => a[0], __ror__: (a) => a[0] });
-        for (const n of ["Any", "List", "Dict", "Set", "FrozenSet", "Tuple", "Optional", "Union", "Callable", "Iterable", "Iterator", "Generator", "Sequence", "Mapping", "MutableMapping", "Type", "TypeVar", "Generic", "Protocol", "ClassVar", "Final", "Literal", "NoReturn", "Hashable", "Sized", "Collection", "Awaitable", "Coroutine", "AsyncIterator", "Deque", "DefaultDict", "OrderedDict", "Counter", "ChainMap", "Text", "IO", "TextIO", "BinaryIO", "Pattern", "Match", "SupportsInt", "SupportsFloat", "Annotated", "Self", "TypeAlias", "ParamSpec", "Concatenate", "TypeGuard", "Never", "LiteralString", "Required", "NotRequired", "Unpack", "TypedDict", "NamedTuple"]) { const o = { cls: any, dict: new Map([["name", n]]) }; g.set(n, o); }
+        const colMod = R.import("collections", null);
+        const colAbc = colMod.globals.get("abc").globals;
+        const ORIGINS = new Map([
+            ["List", T.list], ["Dict", T.dict], ["Set", T.set], ["FrozenSet", T.frozenset], ["Tuple", T.tuple],
+            ["Deque", colMod.globals.get("deque")], ["DefaultDict", colMod.globals.get("defaultdict")],
+            ["OrderedDict", colMod.globals.get("OrderedDict")], ["Counter", colMod.globals.get("Counter")],
+            ["ChainMap", colMod.globals.get("ChainMap")], ["AbstractSet", colAbc.get("Set")],
+        ]);
+        for (const n of ["Iterable", "Iterator", "Generator", "Sequence", "MutableSequence", "Mapping", "MutableMapping", "MutableSet", "Callable", "Hashable", "Sized", "Collection", "Container", "Awaitable", "Coroutine", "AsyncIterator", "AsyncIterable", "KeysView", "ValuesView", "ItemsView", "Reversible", "ByteString"]) ORIGINS.set(n, colAbc.get(n));
+        for (const n of ["Any", "List", "Dict", "Set", "FrozenSet", "Tuple", "Optional", "Union", "Callable", "Iterable", "Iterator", "Generator", "Sequence", "Mapping", "MutableMapping", "Type", "ClassVar", "Final", "Literal", "NoReturn", "Hashable", "Sized", "Collection", "Awaitable", "Coroutine", "AsyncIterator", "AsyncIterable", "Deque", "DefaultDict", "OrderedDict", "Counter", "ChainMap", "Text", "IO", "TextIO", "BinaryIO", "Pattern", "Match", "SupportsInt", "SupportsFloat", "SupportsComplex", "SupportsBytes", "SupportsIndex", "SupportsAbs", "SupportsRound", "Annotated", "Self", "TypeAlias", "Concatenate", "TypeGuard", "TypeIs", "TypeForm", "Never", "LiteralString", "Required", "NotRequired", "ReadOnly", "NoExtraItems", "Doc", "AnyStr", "ContextManager", "Container", "MutableSequence", "MutableSet", "AbstractSet", "KeysView", "ValuesView", "ItemsView", "Reversible", "ByteString"]) {
+            const origin = ORIGINS.get(n);
+            const m = new Map([["name", n]]);
+            if (origin !== undefined) m.set("__origin__", origin);
+            const o = { cls: any, dict: m };
+            g.set(n, o);
+        }
         g.set("TYPE_CHECKING", false);
         g.set("TypeVar", rt.TypeVar);
         g.set("ParamSpec", rt.ParamSpec);
@@ -1933,8 +2130,61 @@
         g.set("Generic", rt.Generic);
         g.set("NoDefault", rt.NoDefault);
         g.set("Unpack", rt.Unpack);
-        fn(g, "cast", 2, (a) => a[1]); fn(g, "overload", 1, (a) => a[0]); fn(g, "final", 1, (a) => a[0]); fn(g, "no_type_check", 1, (a) => a[0]);
-        fn(g, "get_type_hints", -1, () => dict()); fn(g, "runtime_checkable", 1, (a) => a[0]);
+        g.set("Protocol", Protocol);
+        g.set("_ProtocolMeta", _ProtocolMeta);
+        g.set("_Final", _Final);
+        g.set("_SpecialForm", _SpecialForm);
+        g.set("_BaseGenericAlias", _BaseGenericAlias);
+        g.set("_GenericAlias", _GenericAlias);
+        g.set("_SpecialGenericAlias", _SpecialGenericAlias);
+        g.set("_ConcatenateGenericAlias", _ConcatenateGenericAlias);
+        g.set("_AnnotatedAlias", _AnnotatedAlias);
+        g.set("_UnionGenericAlias", _UnionGenericAlias);
+        g.set("ForwardRef", ForwardRef);
+        g.set("NewType", NewType);
+        g.set("ParamSpecArgs", ParamSpecArgs);
+        g.set("ParamSpecKwargs", ParamSpecKwargs);
+        g.set("EXCLUDED_ATTRIBUTES", tuple(EXCLUDED_ATTRIBUTES));
+        g.set("_prohibited", tuple(["__new__", "__init__", "__slots__", "__getnewargs__", "_fields", "_field_defaults", "_make", "_replace", "_asdict", "_source"]));
+        g.set("_ASSERT_NEVER_REPR_MAX_LENGTH", 100n);
+        fn(g, "cast", 2, (a) => a[1]);
+        fn(g, "overload", 1, (a) => a[0]);
+        fn(g, "_overload_dummy", -1, () => fail(E.NotImplementedError, "You should not call an overloaded function."));
+        fn(g, "get_overloads", 1, () => list([]));
+        fn(g, "clear_overloads", 0, () => null);
+        fn(g, "final", 1, (a) => a[0]);
+        fn(g, "override", 1, (a) => a[0]);
+        fn(g, "no_type_check", 1, (a) => a[0]);
+        fn(g, "disjoint_base", 1, (a) => a[0]);
+        fn(g, "dataclass_transform", -1, () => builtin("dataclass_transform", 1, (b) => b[0]));
+        g.get("dataclass_transform").kwnames = true;
+        fn(g, "assert_type", 2, (a) => a[0]);
+        fn(g, "assert_never", 1, (a) => fail(E.AssertionError, "Expected code to be unreachable, but got: " + repr(a[0])));
+        fn(g, "reveal_type", 1, (a) => a[0]);
+        fn(g, "get_type_hints", -1, () => dict());
+        fn(g, "runtime_checkable", 1, (a) => { const c = a[0]; if (isType(c)) c.dict.set("_is_runtime_protocol", true); return c; });
+        fn(g, "is_protocol", 1, (a) => isType(a[0]) && Boolean(a[0].dict.get("_is_protocol")));
+        fn(g, "get_protocol_members", 1, (a) => { const s = rt.set(T.frozenset); if (isType(a[0])) for (const m of getProtoMembers(a[0])) rt.setAdd(s, m); return s; });
+        fn(g, "get_origin", 1, (a) => { const t = a[0]; if (t === null || typeof t !== "object") return null; if (t.cls === rt.UnionType) return rt.UnionType; if (t.dict && t.dict.has("__origin__")) return t.dict.get("__origin__"); return null; });
+        fn(g, "get_args", 1, (a) => { const t = a[0]; if (t !== null && typeof t === "object" && t.dict && t.dict.has("__args__")) { const v = t.dict.get("__args__"); return v && v.cls === T.tuple ? v : tuple(Array.isArray(v) ? v : [v]); } return tuple([]); });
+        fn(g, "_type_check", -1, (a) => a[0]);
+        g.get("_type_check").kwnames = true;
+        fn(g, "_type_repr", 1, (a) => typeName(a[0]));
+        fn(g, "_type_convert", -1, (a) => a[0]);
+        g.get("_type_convert").kwnames = true;
+        fn(g, "_tp_cache", -1, (a) => (a.length === 1 && typeof a[0] === "object" && a[0] !== null && (a[0].cls === T.function || a[0].cls === T.builtin_function_or_method)) ? a[0] : builtin("_tp_cache", 1, (b) => b[0]));
+        g.get("_tp_cache").kwnames = true;
+        fn(g, "_eval_type", -1, (a) => a[0]);
+        g.get("_eval_type").kwnames = true;
+        fn(g, "evaluate_forward_ref", -1, (a) => a[0]);
+        g.get("evaluate_forward_ref").kwnames = true;
+        fn(g, "_collect_parameters", 1, () => tuple([]));
+        fn(g, "_collect_type_vars", 1, () => tuple([]));
+        fn(g, "_deduplicate", 1, (a) => list(drain(a[0])));
+        fn(g, "_is_param_expr", 1, () => false);
+        fn(g, "_check_generic", -1, () => null);
+        fn(g, "_get_defaults", 1, () => dict());
+        fn(g, "_generic_class_getitem", 2, (a) => rt.makeGenericAlias(a[0], a[1]));
         // typing.NamedTuple: the functional form is collections.namedtuple;
         // a subclass turns its annotations into fields (class attributes
         // with the same names are the defaults) and keeps its own methods.
@@ -1964,11 +2214,14 @@
         NT.dict.get("__new__").func.kwnames = true;
         g.set("NamedTuple", NT);
         // typing.TypedDict subclasses construct plain dicts.
+        const _TypedDictMeta = rt.newType("_TypedDictMeta", [rt.TypeType], new Map(), "typing");
         const TD = rt.newType("TypedDict", [], new Map(), "typing");
+        TD.cls = _TypedDictMeta;
         TD.dict.set("__new__", { cls: T.staticmethod, func: builtin("__new__", -1, (a) => { const kwm = a[a.length - 1] instanceof Map ? a.pop() : null; const d = a[1] !== undefined ? rt.dictCopy(rt.asDict(a[1])) : dict(); if (kwm) for (const [k, v] of kwm) dictSet(d, k, v); return d; }) });
         TD.dict.get("__new__").func.kwnames = true;
+        g.set("_TypedDictMeta", _TypedDictMeta);
         g.set("TypedDict", TD);
-        for (const n of ["Protocol", "Literal", "ClassVar", "Final", "Annotated", "Self", "Never", "NoReturn", "TypeAlias", "Concatenate", "ParamSpec", "TypeVarTuple", "Unpack", "Required", "NotRequired", "LiteralString", "AnyStr", "Text", "Hashable", "Sized", "Awaitable", "Coroutine", "AsyncIterator", "AsyncIterable", "ContextManager", "Deque", "DefaultDict", "OrderedDict", "Counter", "ChainMap", "Collection", "Container", "MutableSequence", "MutableSet", "AbstractSet", "KeysView", "ValuesView", "ItemsView", "Reversible", "SupportsInt", "SupportsFloat", "SupportsIndex", "SupportsAbs", "SupportsRound", "ByteString", "Pattern", "Match", "IO", "TextIO", "BinaryIO"]) if (!g.has(n)) g.set(n, { cls: any, dict: new Map([["name", n]]) });
+        fn(g, "is_typeddict", 1, (a) => isType(a[0]) && a[0].cls === _TypedDictMeta);
     });
     mod("__future__", (g) => { for (const n of ["annotations", "division", "print_function", "absolute_import", "unicode_literals", "generators", "nested_scopes", "with_statement", "generator_stop", "barry_as_FLUFL"]) g.set(n, null); });
     mod("builtins", (g) => { for (const [k, v] of rt.builtins) g.set(k, v); });
@@ -2261,9 +2514,24 @@
         g.set("algorithms_guaranteed", g.get("algorithms_available"));
     });
     mod("importlib", (g) => {
-        fn(g, "import_module", 2, (a) => R.import(needStr(a[0]), null), 1);
+        fn(g, "import_module", 2, (a) => {
+            let name = needStr(a[0]);
+            if (name.startsWith(".")) {
+                const pkg = a[1] === undefined || a[1] === null ? null : needStr(a[1]);
+                if (!pkg) fail(E.TypeError, "the 'package' argument is required to perform a relative import for '" + name + "'");
+                let level = 0;
+                while (level < name.length && name[level] === ".") level++;
+                const rest = name.slice(level);
+                const bits = pkg.split(".");
+                if (level - 1 > bits.length) fail(E.ImportError, "attempted relative import beyond top-level package");
+                const base = bits.slice(0, bits.length - (level - 1));
+                name = rest ? (base.length ? base.join(".") + "." + rest : rest) : base.join(".");
+            }
+            return R.import(name, null);
+        }, 1);
         fn(g, "reload", 1, (a) => a[0]);
         fn(g, "invalidate_caches", 0, () => null);
+        fn(g, "_exec_source", 4, (a) => { rt.execModuleSource(a[0], needStr(a[1]), needStr(a[2]), needStr(a[3])); return null; });
     });
     mod("platform", (g) => {
         fn(g, "platform", 0, () => "Zipp-" + rt.version);
@@ -2346,6 +2614,22 @@
         Stack.dict.set("close", builtin("close", 1, (a) => { const left = unwind(a[0], null); if (left !== null) throw left; return null; }));
         Stack.dict.set("pop_all", builtin("pop_all", 1, (a) => { const s = { cls: Stack, dict: new Map(), exits: a[0].exits }; a[0].exits = []; return s; }));
         g.set("ExitStack", Stack);
+        const ABCMeta = R.import("abc", null).globals.get("ABCMeta");
+        const cgCm = { cls: T.classmethod, func: builtin("__class_getitem__", 2, (a) => rt.makeGenericAlias(a[0], a[1])) };
+        const ACM = rt.newType("AbstractContextManager", [], new Map([
+            ["__enter__", builtin("__enter__", 1, (a) => a[0])],
+            ["__exit__", builtin("__exit__", 4, () => null)],
+            ["__class_getitem__", cgCm],
+            ["__subclasshook__", { cls: T.classmethod, func: builtin("__subclasshook__", 2, (a) => a[0] === ACM && rt.lookupType(a[1], "__enter__") !== undefined && rt.lookupType(a[1], "__exit__") !== undefined ? true : NOTIMPL) }],
+        ]), "contextlib");
+        ACM.cls = ABCMeta; ACM.isABC = true; ACM._abc_registry = new Set();
+        const AACM = rt.newType("AbstractAsyncContextManager", [], new Map([
+            ["__class_getitem__", cgCm],
+            ["__subclasshook__", { cls: T.classmethod, func: builtin("__subclasshook__", 2, (a) => a[0] === AACM && rt.lookupType(a[1], "__aenter__") !== undefined && rt.lookupType(a[1], "__aexit__") !== undefined ? true : NOTIMPL) }],
+        ]), "contextlib");
+        AACM.cls = ABCMeta; AACM.isABC = true; AACM._abc_registry = new Set();
+        g.set("AbstractContextManager", ACM);
+        g.set("AbstractAsyncContextManager", AACM);
     });
     mod("functools", (g) => {
         fn(g, "reduce", 3, (a) => { const it = iter(a[1]); let acc; if (a.length === 3) acc = a[2]; else { acc = fornext(it); if (acc === STOP) fail(E.TypeError, "reduce() of empty iterable with no initial value"); } for (;;) { const v = fornext(it); if (v === STOP) return acc; acc = call(a[0], [acc, v], null); } }, 2);
@@ -2576,7 +2860,171 @@
             __repr__: (a) => "ChainMap(" + rt.amap(a[0].dict.get("maps").items, repr).join(", ") + ")", __getitem__: (a) => { for (const m of a[0].dict.get("maps").items) { const v = dictGet(m, a[1]); if (v !== undefined) return v; } throw rt.makeExc(E.KeyError, [a[1]]); }, get: (a) => { for (const m of a[0].dict.get("maps").items) { const v = dictGet(m, a[1]); if (v !== undefined) return v; } return a[2] === undefined ? null : a[2]; }, __contains__: (a) => a[0].dict.get("maps").items.some((m) => rt.dictHas(m, a[1])) });
         g.set("ChainMap", ChainMap);
         g.set("abc", rt.newModule("collections.abc", null));
-        for (const n of ["Iterable", "Iterator", "Mapping", "MutableMapping", "Sequence", "MutableSequence", "Set", "MutableSet", "Callable", "Hashable", "Sized", "Container", "Collection", "Generator"]) g.get("abc").globals.set(n, rt.newType(n, [], new Map(), "collections.abc"));
+        const ABCMeta = R.import("abc", null).globals.get("ABCMeta");
+        const abcG = g.get("abc").globals;
+        const hasMethods = (sub, names) => {
+            for (const m of names) {
+                const v = rt.lookupType(sub, m);
+                if (v === undefined || v === null) return NOTIMPL;
+            }
+            return true;
+        };
+        const makeAbc = (name, bases, methods) => {
+            const cls = rt.newType(name, bases, new Map(), "collections.abc");
+            cls.cls = ABCMeta;
+            cls.isABC = true;
+            cls._abc_registry = new Set();
+            cls.dict.set("__class_getitem__", cgCol);
+            if (methods !== null) {
+                cls.dict.set("__subclasshook__", { cls: T.classmethod, func: builtin("__subclasshook__", 2, (a) => a[0] === cls ? hasMethods(a[1], methods) : NOTIMPL) });
+            }
+            abcG.set(name, cls);
+            return cls;
+        };
+        const Hashable = makeAbc("Hashable", [], ["__hash__"]);
+        const Awaitable = makeAbc("Awaitable", [], ["__await__"]);
+        const Coroutine = makeAbc("Coroutine", [Awaitable], ["send", "throw", "close", "__await__"]);
+        const AsyncIterable = makeAbc("AsyncIterable", [], ["__aiter__"]);
+        const AsyncIterator = makeAbc("AsyncIterator", [AsyncIterable], ["__anext__", "__aiter__"]);
+        const AsyncGenerator = makeAbc("AsyncGenerator", [AsyncIterator], ["__aiter__", "__anext__", "asend", "athrow", "aclose"]);
+        const Iterable = makeAbc("Iterable", [], ["__iter__"]);
+        const Iterator = makeAbc("Iterator", [Iterable], ["__iter__", "__next__"]);
+        const Reversible = makeAbc("Reversible", [Iterable], ["__reversed__", "__iter__"]);
+        const Generator = makeAbc("Generator", [Iterator], ["__iter__", "__next__", "send", "throw", "close"]);
+        const Sized = makeAbc("Sized", [], ["__len__"]);
+        const Container = makeAbc("Container", [], ["__contains__"]);
+        const Collection = makeAbc("Collection", [Sized, Iterable, Container], ["__len__", "__iter__", "__contains__"]);
+        const Callable = makeAbc("Callable", [], ["__call__"]);
+        const SetAbc = makeAbc("Set", [Collection], null);
+        const MutableSet = makeAbc("MutableSet", [SetAbc], null);
+        const Mapping = makeAbc("Mapping", [Collection], null);
+        Mapping.dict.set("get", builtin("get", 3, (a) => { try { return getitem(a[0], a[1]); } catch (e) { if (e && e.cls && rt.isSubclass(e.cls, E.KeyError)) return a[2] === undefined ? null : a[2]; throw e; } }, 2));
+        Mapping.dict.set("__contains__", builtin("__contains__", 2, (a) => { try { getitem(a[0], a[1]); return true; } catch (e) { if (e && e.cls && rt.isSubclass(e.cls, E.KeyError)) return false; throw e; } }));
+        Mapping.dict.set("keys", builtin("keys", 1, (a) => list(drain(a[0]))));
+        Mapping.dict.set("items", builtin("items", 1, (a) => list(drain(a[0]).map((k) => tuple([k, getitem(a[0], k)])))));
+        Mapping.dict.set("values", builtin("values", 1, (a) => list(drain(a[0]).map((k) => getitem(a[0], k)))));
+        Mapping.dict.set("__eq__", builtin("__eq__", 2, (a) => { if (!rt.call(rt.builtins.get("isinstance"), [a[1], Mapping], null)) return NOTIMPL; return eq(dictFromPairs(drain(a[0]).map((k) => [k, getitem(a[0], k)])), dictFromPairs(drain(a[1]).map((k) => [k, getitem(a[1], k)]))); }));
+        Mapping.dict.set("__ne__", builtin("__ne__", 2, (a) => { const r = call(Mapping.dict.get("__eq__"), a, null); return r === NOTIMPL ? NOTIMPL : !truth(r); }));
+        const dictFromPairs = (pairs) => { const d = dict(); for (const [k, v] of pairs) dictSet(d, k, v); return d; };
+        const MutableMapping = makeAbc("MutableMapping", [Mapping], null);
+        const MappingView = makeAbc("MappingView", [Sized], null);
+        const KeysView = makeAbc("KeysView", [MappingView, SetAbc], null);
+        const ItemsView = makeAbc("ItemsView", [MappingView, SetAbc], null);
+        const ValuesView = makeAbc("ValuesView", [MappingView, Collection], null);
+        const Sequence = makeAbc("Sequence", [Reversible, Collection], null);
+        Sequence.dict.set("__contains__", builtin("__contains__", 2, (a) => { for (const x of drain(a[0])) if (eq(x, a[1])) return true; return false; }));
+        Sequence.dict.set("__reversed__", builtin("__reversed__", 1, (a) => iter(list(drain(a[0]).reverse()))));
+        Sequence.dict.set("index", builtin("index", 4, (a) => { const items = drain(a[0]); let i = a[2] !== undefined ? Number(needInt(a[2])) : 0; if (i < 0) i = Math.max(0, items.length + i); let stop = a[3] !== undefined ? Number(needInt(a[3])) : items.length; if (stop < 0) stop = Math.max(0, items.length + stop); for (; i < stop && i < items.length; i++) if (eq(items[i], a[1])) return BigInt(i); fail(E.ValueError, repr(a[1]) + " is not in sequence"); }, 2));
+        Sequence.dict.set("count", builtin("count", 2, (a) => { let c = 0n; for (const x of drain(a[0])) if (eq(x, a[1])) c++; return c; }));
+        const MutableSequence = makeAbc("MutableSequence", [Sequence], null);
+        const ByteString = makeAbc("ByteString", [Sequence], null);
+        const Buffer = makeAbc("Buffer", [], ["__buffer__"]);
+        // Register concrete builtins with their corresponding ABCs.
+        Callable._abc_registry.add(T.function);
+        Callable._abc_registry.add(T.builtin_function_or_method);
+        Callable._abc_registry.add(T.method);
+        Callable._abc_registry.add(rt.TypeType);
+        Iterable._abc_registry.add(T.str);
+        Iterable._abc_registry.add(T.bytes);
+        Iterable._abc_registry.add(T.range);
+        Iterator._abc_registry.add(T.iterator);
+        Iterator._abc_registry.add(T.list_iterator);
+        Iterator._abc_registry.add(T.generator);
+        Generator._abc_registry.add(T.generator);
+        Coroutine._abc_registry.add(T.coroutine);
+        AsyncGenerator._abc_registry.add(T.async_generator);
+        MutableMapping._abc_registry.add(T.dict);
+        MutableSequence._abc_registry.add(T.list);
+        Sequence._abc_registry.add(T.tuple);
+        Sequence._abc_registry.add(T.str);
+        Sequence._abc_registry.add(T.bytes);
+        Sequence._abc_registry.add(T.range);
+        ByteString._abc_registry.add(T.bytes);
+        SetAbc._abc_registry.add(T.frozenset);
+        MutableSet._abc_registry.add(T.set);
+        KeysView._abc_registry.add(T.dict_keys);
+        ItemsView._abc_registry.add(T.dict_items);
+        ValuesView._abc_registry.add(T.dict_values);
+        const UserDict = rt.newType("UserDict", [MutableMapping], new Map([
+            ["__init__", (() => {
+                const f = builtin("__init__", -1, (a) => {
+                    const kw = a[a.length - 1] instanceof Map ? a.pop() : null;
+                    const d = dict();
+                    a[0].dict.set("data", d);
+                    if (a[1] !== undefined && a[1] !== null) call(rt.getattr(a[0], "update"), [a[1]], null);
+                    if (kw && kw.size) call(rt.getattr(a[0], "update"), [], kw);
+                    return null;
+                });
+                f.kwnames = true;
+                return f;
+            })()],
+            ["__len__", builtin("__len__", 1, (a) => len(a[0].dict.get("data")))],
+            ["__getitem__", builtin("__getitem__", 2, (a) => {
+                const d = a[0].dict.get("data");
+                if (rt.dictHas(d, a[1])) return dictGet(d, a[1]);
+                const miss = rt.lookupType(typeOf(a[0]), "__missing__");
+                if (miss !== undefined) return call(descrGet(miss, a[0], typeOf(a[0])), [a[1]], null);
+                throw rt.makeExc(E.KeyError, [a[1]]);
+            })],
+            ["__setitem__", builtin("__setitem__", 3, (a) => { rt.setitem(a[0].dict.get("data"), a[1], a[2]); return null; })],
+            ["__delitem__", builtin("__delitem__", 2, (a) => { rt.delitem(a[0].dict.get("data"), a[1]); return null; })],
+            ["__iter__", builtin("__iter__", 1, (a) => iter(a[0].dict.get("data")))],
+            ["__contains__", builtin("__contains__", 2, (a) => rt.contains(a[0].dict.get("data"), a[1]))],
+            ["__repr__", builtin("__repr__", 1, (a) => repr(a[0].dict.get("data")))],
+            ["copy", builtin("copy", 1, (a) => rt.construct(typeOf(a[0]), [rt.dictCopy(a[0].dict.get("data"))], null))],
+            ["update", (() => {
+                const f = builtin("update", -1, (a) => {
+                    const kw = a[a.length - 1] instanceof Map ? a.pop() : null;
+                    const self = a[0];
+                    if (a[1] !== undefined) {
+                        const src = a[1];
+                        if (src !== null && typeof src === "object" && typeMethod(src, "keys") !== undefined) {
+                            for (const k of drain(call(rt.getattr(src, "keys"), [], null))) rt.setitem(self, k, getitem(src, k));
+                        } else {
+                            for (const p of drain(src)) { const kv = drain(p); rt.setitem(self, kv[0], kv[1]); }
+                        }
+                    }
+                    if (kw) for (const [k, v] of kw) rt.setitem(self, k, v);
+                    return null;
+                });
+                f.kwnames = true;
+                return f;
+            })()],
+            ["pop", builtin("pop", 3, (a) => call(rt.getattr(a[0].dict.get("data"), "pop"), a.slice(1), null), 2)],
+            ["clear", builtin("clear", 1, (a) => { call(rt.getattr(a[0].dict.get("data"), "clear"), [], null); return null; })],
+            ["setdefault", builtin("setdefault", 3, (a) => { const self = a[0]; if (!rt.contains(self, a[1])) rt.setitem(self, a[1], a[2] === undefined ? null : a[2]); return getitem(self, a[1]); }, 2)],
+            ["__class_getitem__", cgCol],
+        ]), "collections");
+        const UserList = rt.newType("UserList", [MutableSequence], new Map([
+            ["__init__", builtin("__init__", 2, (a) => { a[0].dict.set("data", a[1] === undefined || a[1] === null ? list([]) : list(drain(a[1]))); return null; }, 1)],
+            ["__len__", builtin("__len__", 1, (a) => len(a[0].dict.get("data")))],
+            ["__getitem__", builtin("__getitem__", 2, (a) => getitem(a[0].dict.get("data"), a[1]))],
+            ["__setitem__", builtin("__setitem__", 3, (a) => { rt.setitem(a[0].dict.get("data"), a[1], a[2]); return null; })],
+            ["__delitem__", builtin("__delitem__", 2, (a) => { rt.delitem(a[0].dict.get("data"), a[1]); return null; })],
+            ["__iter__", builtin("__iter__", 1, (a) => iter(a[0].dict.get("data")))],
+            ["__repr__", builtin("__repr__", 1, (a) => repr(a[0].dict.get("data")))],
+            ["append", builtin("append", 2, (a) => { a[0].dict.get("data").items.push(a[1]); return null; })],
+            ["extend", builtin("extend", 2, (a) => { for (const x of drain(a[1])) a[0].dict.get("data").items.push(x); return null; })],
+            ["insert", builtin("insert", 3, (a) => call(rt.getattr(a[0].dict.get("data"), "insert"), [a[1], a[2]], null))],
+            ["pop", builtin("pop", 2, (a) => call(rt.getattr(a[0].dict.get("data"), "pop"), a.slice(1), null), 1)],
+            ["clear", builtin("clear", 1, (a) => { a[0].dict.get("data").items.length = 0; return null; })],
+            ["copy", builtin("copy", 1, (a) => rt.construct(typeOf(a[0]), [a[0].dict.get("data")], null))],
+            ["__class_getitem__", cgCol],
+        ]), "collections");
+        const UserString = rt.newType("UserString", [Sequence], new Map([
+            ["__init__", builtin("__init__", 2, (a) => { a[0].dict.set("data", typeof a[1] === "string" ? a[1] : rt.str(a[1])); return null; })],
+            ["__str__", builtin("__str__", 1, (a) => a[0].dict.get("data"))],
+            ["__repr__", builtin("__repr__", 1, (a) => repr(a[0].dict.get("data")))],
+            ["__len__", builtin("__len__", 1, (a) => len(a[0].dict.get("data")))],
+            ["__getitem__", builtin("__getitem__", 2, (a) => getitem(a[0].dict.get("data"), a[1]))],
+            ["__iter__", builtin("__iter__", 1, (a) => iter(a[0].dict.get("data")))],
+            ["__contains__", builtin("__contains__", 2, (a) => rt.contains(a[0].dict.get("data"), a[1]))],
+            ["__eq__", builtin("__eq__", 2, (a) => eq(a[0].dict.get("data"), isInstance(a[1], UserString) ? a[1].dict.get("data") : a[1]))],
+            ["__hash__", builtin("__hash__", 1, (a) => rt.hashInt(a[0].dict.get("data")))],
+        ]), "collections");
+        g.set("UserDict", UserDict);
+        g.set("UserList", UserList);
+        g.set("UserString", UserString);
         rt.modules.set("collections.abc", g.get("abc"));
     });
     mod("heapq", (g) => {
@@ -2753,6 +3201,7 @@
                     if ((m = /^\(\?P=([A-Za-z_][A-Za-z0-9_]*)\)/.exec(rest))) { if (!names.has(m[1])) bad("unknown group name " + repr(m[1])); out += "\\k<" + m[1] + ">"; i += m[0].length; continue; }
                     if (rest.startsWith("(?#")) { const e = p.indexOf(")", i); if (e < 0) bad("missing ), unterminated comment"); i = e + 1; continue; }
                     if ((m = /^\(\?(<=|<!|=|!|:)/.exec(rest))) { out += m[0]; i += m[0].length; stack.push(st); continue; }
+                    if (rest.startsWith("(?>")) { out += "(?:"; i += 3; stack.push(st); continue; }
                     if ((m = /^\(\?([aiLmsux]*)(?:-([imsx]+))?:/.exec(rest))) {
                         // A scoped flag group: `.`/`^`/`$`/\w follow the new
                         // state here; IGNORECASE becomes a JS modifier.
@@ -2772,7 +3221,21 @@
                 if (c === ".") { out += st.s ? "[\\s\\S]" : "[^\\n]"; i++; continue; }
                 if (c === "^") { out += st.m ? "(?<![^\\n])" : "(?<![\\s\\S])"; i++; continue; }
                 if (c === "$") { out += st.m ? "(?=\\n|(?![\\s\\S]))" : "(?=\\n?(?![\\s\\S]))"; i++; continue; }
-                if (c === "{") { const q = quant(); if (q !== null) out += q; else { out += "\\{"; i++; } continue; }
+                if (c === "*" || c === "+" || c === "?") {
+                    out += c; i++;
+                    if (p[i] === "?") { out += "?"; i++; }
+                    else if (p[i] === "+") { i++; }
+                    continue;
+                }
+                if (c === "{") {
+                    const q = quant();
+                    if (q !== null) {
+                        out += q;
+                        if (p[i] === "?") { out += "?"; i++; }
+                        else if (p[i] === "+") { i++; }
+                    } else { out += "\\{"; i++; }
+                    continue;
+                }
                 if (c === "}" || c === "]") { out += "\\" + c; i++; continue; }
                 out += c; i++;
             }
@@ -2780,17 +3243,50 @@
             return { source: out, flags: flags, ignoreCase: baseI, groups: groups, names: names };
         }
         // Code-point offsets over a string's UTF-16 ones (the same when the
-        // string has no astral characters).
-        const cpIndex = (M, off) => M.sur ? rt.strLen(M.s.slice(0, off)) : off;
-        // Whether the last string scanned has astral characters, and its
-        // length in code points: a loop matching one string at successive
-        // positions measures it once, not per call.
-        let infoS = "", infoSur = false, infoLen = 0;
-        function strInfo(s) { if (s !== infoS) { infoSur = rt.hasSurrogate(s); infoLen = infoSur ? rt.strLen(s) : s.length; infoS = s; } }
-        function utf16Index(s, cp) {
-            let u = 0;
-            for (let k = 0; k < cp && u < s.length; k++) u += charWidth(s, u);
-            return u;
+        // string has no surrogate pairs). A sparse sorted array of valid
+        // surrogate-pair UTF-16 start indices converts in both directions via
+        // O(log K) binary search, avoiding O(N^2) prefix scans even when a
+        // single astral character sits at the end of a long string.
+        const ASTRAL_PAIR = /[\ud800-\udbff][\udc00-\udfff]/g;
+        function buildAstralPairs(s) {
+            const pairs = [];
+            ASTRAL_PAIR.lastIndex = 0;
+            let m;
+            while ((m = ASTRAL_PAIR.exec(s)) !== null) pairs.push(m.index);
+            return pairs.length ? pairs : null;
+        }
+        function cpFromUtf16(pairs, u) {
+            let lo = 0, hi = pairs.length;
+            while (lo < hi) {
+                const mid = (lo + hi) >>> 1;
+                if (pairs[mid] < u) lo = mid + 1; else hi = mid;
+            }
+            return u - lo;
+        }
+        function utf16FromCp(pairs, cp) {
+            let lo = 0, hi = pairs.length;
+            while (lo < hi) {
+                const mid = (lo + hi) >>> 1;
+                if (pairs[mid] - mid < cp) lo = mid + 1; else hi = mid;
+            }
+            return cp + lo;
+        }
+        const cpIndex = (M, off) => M.pairs !== null ? cpFromUtf16(M.pairs, off) : off;
+        // Cached surrogate-pair index and code-point length for the last string
+        // scanned: a loop matching one string at successive positions indexes
+        // it once, not per call.
+        let infoS = "", infoPairs = null, infoLen = 0;
+        function strInfo(s) {
+            if (s !== infoS) {
+                if (rt.hasSurrogate(s)) {
+                    infoPairs = buildAstralPairs(s);
+                    infoLen = infoPairs !== null ? s.length - infoPairs.length : s.length;
+                } else {
+                    infoPairs = null;
+                    infoLen = s.length;
+                }
+                infoS = s;
+            }
         }
         function groupIdx(M, gi) {
             if (gi === undefined) return 0;
@@ -2799,7 +3295,34 @@
             if (k < 0 || k > M.p.ngroups) fail(E.IndexError, "no such group");
             return k;
         }
-        const groupText = (M, gi) => { const v = M.m[groupIdx(M, gi)]; return v === undefined ? null : v; };
+        const isBytesLike = (v) => v !== null && typeof v === "object" && (v.cls === T.bytes || isInstance(v, T.bytes));
+        const bytesToLatin1 = (v) => {
+            const items = v.items;
+            let s = "";
+            for (let i = 0; i < items.length; i += 4096) {
+                const end = Math.min(items.length, i + 4096);
+                let chunk = "";
+                for (let j = i; j < end; j++) chunk += String.fromCharCode(items[j] & 255);
+                s += chunk;
+            }
+            return s;
+        };
+        const latin1ToBytes = (s) => {
+            const out = new Array(s.length);
+            for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i) & 255;
+            return rt.bytes(out);
+        };
+        const needSubject = (P, v) => {
+            if (P.isBytes) {
+                if (!isBytesLike(v)) fail(E.TypeError, "cannot use a bytes pattern on a string-like object");
+                return bytesToLatin1(v);
+            }
+            if (isBytesLike(v)) fail(E.TypeError, "cannot use a string pattern on a bytes-like object");
+            return needStr(v);
+        };
+        const wrapVal = (P, s) => s === null || s === undefined ? null : (P.isBytes ? latin1ToBytes(s) : s);
+        const groupText = (M, gi) => { const v = M.m[groupIdx(M, gi)]; return v === undefined ? null : wrapVal(M.p, v); };
+        const groupTextRaw = (M, gi) => { const v = M.m[groupIdx(M, gi)]; return v === undefined ? null : v; };
         // Scans run without the `d` flag (it slows every match); a Match
         // wanting group offsets reruns the pattern anchored where it matched
         // on the same text, which reproduces the same match.
@@ -2833,14 +3356,14 @@
                     k += m[0].length;
                     const ref = /^\d+$/.test(m[1]) ? BigInt(m[1]) : m[1];
                     if (typeof ref === "string" && !M.p.names.has(ref)) fail(E.IndexError, "unknown group name " + repr(ref));
-                    const v = groupText(M, ref); out += v === null ? "" : v; continue;
+                    const v = groupTextRaw(M, ref); out += v === null ? "" : v; continue;
                 }
                 if (d >= "0" && d <= "9") {
                     const m = /^[0-7]{2}/.exec(tpl.slice(k + 1));
                     if (d === "0" || (d <= "7" && m)) { const digits = d === "0" ? /^[0-7]{0,2}/.exec(tpl.slice(k + 1))[0] : m[0]; k += digits.length; out += String.fromCodePoint(parseInt(d + digits, 8)); continue; }
                     let num = d; if (tpl[k + 1] >= "0" && tpl[k + 1] <= "9") num += tpl[++k];
                     if (Number(num) > M.p.ngroups) fail(error, "invalid group reference " + num);
-                    const v = groupText(M, BigInt(num)); out += v === null ? "" : v; continue;
+                    const v = groupTextRaw(M, BigInt(num)); out += v === null ? "" : v; continue;
                 }
                 const e = { n: "\n", t: "\t", r: "\r", f: "\f", v: "\x0b", a: "\x07", b: "\b", "\\": "\\" }[d];
                 if (e !== undefined) { out += e; continue; }
@@ -2850,19 +3373,21 @@
             return out;
         }
         const Match = pyClass("Match", "re", {
-            group: (a) => { const M = a[0]; if (a.length === 1) return M.m[0]; return a.length === 2 ? groupText(M, a[1]) : tuple(a.slice(1).map((k) => groupText(M, k))); },
-            groups: (a) => { const d = a[1] === undefined ? null : a[1]; return tuple(a[0].m.slice(1).map((x) => x === undefined ? d : x)); },
-            groupdict: (a) => { const M = a[0], d = dict(); for (const [k, gi] of M.p.names) { const v = M.m[gi]; dictSet(d, k, v === undefined ? (a[1] === undefined ? null : a[1]) : v); } return d; },
+            group: (a) => { const M = a[0]; if (a.length === 1) return wrapVal(M.p, M.m[0]); return a.length === 2 ? groupText(M, a[1]) : tuple(a.slice(1).map((k) => groupText(M, k))); },
+            groups: (a) => { const d = a[1] === undefined ? null : a[1]; const P = a[0].p; return tuple(a[0].m.slice(1).map((x) => x === undefined ? d : wrapVal(P, x))); },
+            groupdict: (a) => { const M = a[0], d = dict(); for (const [k, gi] of M.p.names) { const v = M.m[gi]; dictSet(d, k, v === undefined ? (a[1] === undefined ? null : a[1]) : wrapVal(M.p, v)); } return d; },
             start: (a) => BigInt(span(a[0], a[1])[0]),
             end: (a) => BigInt(span(a[0], a[1])[1]),
             span: (a) => tuple(span(a[0], a[1]).map(BigInt)),
-            expand: (a) => expand(a[0], needStr(a[1])),
+            expand: (a) => { const M = a[0]; return wrapVal(M.p, expand(M, needSubject(M.p, a[1]))); },
             __getitem__: (a) => groupText(a[0], a[1]),
             __bool__: () => true,
-            __repr__: (a) => { const [s0, e0] = span(a[0], undefined); return "<re.Match object; span=(" + s0 + ", " + e0 + "), match=" + repr(a[0].m[0]) + ">"; },
+            __repr__: (a) => { const [s0, e0] = span(a[0], undefined); return "<re.Match object; span=(" + s0 + ", " + e0 + "), match=" + repr(wrapVal(a[0].p, a[0].m[0])) + ">"; },
         });
+        const cgRe = { cls: T.classmethod, func: builtin("__class_getitem__", 2, (a) => rt.makeGenericAlias(a[0], a[1])) };
+        Match.dict.set("__class_getitem__", cgRe);
         const prop = (cls, name, get) => cls.dict.set(name, { cls: T.property, fget: builtin(name, 1, (a) => get(a[0])), fset: null, fdel: null, doc: null });
-        prop(Match, "string", (M) => M.s);
+        prop(Match, "string", (M) => M.raw);
         prop(Match, "re", (M) => M.p);
         prop(Match, "pos", (M) => BigInt(M.pos));
         prop(Match, "endpos", (M) => BigInt(M.endpos));
@@ -2870,17 +3395,18 @@
         prop(Match, "lastgroup", (M) => { const k = lastIndex(M); for (const [name, gi] of M.p.names) if (gi === k && k) return name; return null; });
         prop(Match, "regs", (M) => tuple(M.m.map((x, k) => tuple(span(M, BigInt(k)).map(BigInt)))));
         // t: the text the pattern ran on (the string cut at endpos).
-        const mk = (m, s, p, pos, endpos, sur, t) => ({ cls: Match, dict: new Map(), m: m, s: s, t: t, p: p, pos: pos, endpos: endpos, sur: sur });
+        const mk = (m, s, p, pos, endpos, pairs, t, raw) => ({ cls: Match, dict: new Map(), m: m, s: s, raw: raw !== undefined ? raw : s, t: t, p: p, pos: pos, endpos: endpos, pairs: pairs });
         // pos/endpos (code points) -> the string to scan (cut at endpos, as
         // if it ended there) and the UTF-16 start.
         function window(s, a, kw) {
             strInfo(s);
-            const n = infoLen, sur = infoSur;
+            const n = infoLen, pairs = infoPairs;
             let pos = a[2] !== undefined ? a[2] : kwget(kw, "pos", 0n), end = a[3] !== undefined ? a[3] : kwget(kw, "endpos", null);
             pos = Number(needInt(pos)); end = end === null ? n : Number(needInt(end));
             if (pos < 0) pos = 0; if (pos > n) pos = n; if (end > n) end = n; if (end < 0) end = 0;
-            const u0 = sur ? utf16Index(s, pos) : pos, u1 = end < n ? (sur ? utf16Index(s, end) : end) : s.length;
-            return { text: u1 < s.length ? s.slice(0, u1) : s, start: u0, pos: pos, end: end, ok: end >= pos, sur: sur };
+            const u0 = pairs !== null ? utf16FromCp(pairs, pos) : pos;
+            const u1 = end < n ? (pairs !== null ? utf16FromCp(pairs, end) : end) : s.length;
+            return { text: u1 < s.length ? s.slice(0, u1) : s, start: u0, pos: pos, end: end, ok: end >= pos, pairs: pairs };
         }
         // The regex objects are shared per pattern; each call sets lastIndex
         // right before its exec, and a scan keeps its own position, so a
@@ -2896,21 +3422,69 @@
                 pos = m[0] === "" ? m.index + (m.index < text.length ? charWidth(text, m.index) : 1) : m.index + m[0].length;
             }
         }
-        const findItem = (m) => m.length === 1 ? m[0] : m.length === 2 ? (m[1] === undefined ? "" : m[1]) : tuple(m.slice(1).map((x) => x === undefined ? "" : x));
+        let RE_FINDALL_NATIVE = null;
+        try { RE_FINDALL_NATIVE = typeof __zipp_py_re_findall === "function" ? __zipp_py_re_findall : null; } catch (e) { RE_FINDALL_NATIVE = null; }
+        const FINDALL_TUPLE_TMPL = tuple([]);
+        const findItem = (P, m) => {
+            if (!P.isBytes) return m.length === 1 ? m[0] : m.length === 2 ? (m[1] === undefined ? "" : m[1]) : tuple(m.slice(1).map((x) => x === undefined ? "" : x));
+            return m.length === 1 ? latin1ToBytes(m[0]) : m.length === 2 ? latin1ToBytes(m[1] === undefined ? "" : m[1]) : tuple(m.slice(1).map((x) => latin1ToBytes(x === undefined ? "" : x)));
+        };
         const Pattern = pyClass("Pattern", "re", {
-            search: (a) => { const kw = kwOf(a, ["pos", "endpos"]); const s = needStr(a[1]); const w = window(s, a, kw); if (!w.ok) return null; const m = execAt(a[0].re, w.text, w.start); return m === null ? null : mk(m, s, a[0], w.pos, w.end, w.sur, w.text); },
-            match: (a) => { const kw = kwOf(a, ["pos", "endpos"]); const s = needStr(a[1]); const w = window(s, a, kw); if (!w.ok) return null; const m = execAt(sticky(a[0]), w.text, w.start); return m === null ? null : mk(m, s, a[0], w.pos, w.end, w.sur, w.text); },
-            fullmatch: (a) => { const kw = kwOf(a, ["pos", "endpos"]); const s = needStr(a[1]); const w = window(s, a, kw); if (!w.ok) return null; const m = execAt(full(a[0]), w.text, w.start); return m === null ? null : mk(m, s, a[0], w.pos, w.end, w.sur, w.text); },
-            findall: (a) => { const kw = kwOf(a, ["pos", "endpos"]); const s = needStr(a[1]); const w = window(s, a, kw); const out = []; if (w.ok) scan(a[0], w.text, w.start, (m) => out.push(findItem(m))); return list(out); },
-            finditer: (a) => { const kw = kwOf(a, ["pos", "endpos"]); const s = needStr(a[1]); const w = window(s, a, kw); const out = []; if (w.ok) scan(a[0], w.text, w.start, (m) => out.push(mk(m, s, a[0], w.pos, w.end, w.sur, w.text))); return iter(list(out)); },
-            sub: (a) => { const kw = kwOf(a, ["count"]); return subImpl(a[0], a[1], needStr(a[2]), Number(needInt(a[3] !== undefined ? a[3] : kwget(kw, "count", 0n))), false); },
-            subn: (a) => { const kw = kwOf(a, ["count"]); return subImpl(a[0], a[1], needStr(a[2]), Number(needInt(a[3] !== undefined ? a[3] : kwget(kw, "count", 0n))), true); },
+            search: (a) => {
+                const P = a[0];
+                if (a.length <= 3 && !(a[a.length - 1] instanceof Map)) {
+                    const s = needSubject(P, a[1]); strInfo(s);
+                    const n = infoLen, pairs = infoPairs;
+                    let pos = a.length === 3 ? Number(needInt(a[2])) : 0;
+                    if (pos < 0) pos = 0; if (pos > n) pos = n;
+                    const u0 = pairs !== null ? utf16FromCp(pairs, pos) : pos;
+                    const m = execAt(P.re, s, u0);
+                    return m === null ? null : mk(m, s, P, pos, n, pairs, s, a[1]);
+                }
+                const kw = kwOf(a, ["pos", "endpos"]); const s = needSubject(P, a[1]); const w = window(s, a, kw); if (!w.ok) return null; const m = execAt(P.re, w.text, w.start); return m === null ? null : mk(m, s, P, w.pos, w.end, w.pairs, w.text, a[1]);
+            },
+            match: (a) => {
+                const P = a[0];
+                if (a.length <= 3 && !(a[a.length - 1] instanceof Map)) {
+                    const s = needSubject(P, a[1]); strInfo(s);
+                    const n = infoLen, pairs = infoPairs;
+                    let pos = a.length === 3 ? Number(needInt(a[2])) : 0;
+                    if (pos < 0) pos = 0; if (pos > n) pos = n;
+                    const u0 = pairs !== null ? utf16FromCp(pairs, pos) : pos;
+                    const m = execAt(sticky(P), s, u0);
+                    return m === null ? null : mk(m, s, P, pos, n, pairs, s, a[1]);
+                }
+                const kw = kwOf(a, ["pos", "endpos"]); const s = needSubject(P, a[1]); const w = window(s, a, kw); if (!w.ok) return null; const m = execAt(sticky(P), w.text, w.start); return m === null ? null : mk(m, s, P, w.pos, w.end, w.pairs, w.text, a[1]);
+            },
+            fullmatch: (a) => { const P = a[0]; const kw = kwOf(a, ["pos", "endpos"]); const s = needSubject(P, a[1]); const w = window(s, a, kw); if (!w.ok) return null; const m = execAt(full(P), w.text, w.start); return m === null ? null : mk(m, s, P, w.pos, w.end, w.pairs, w.text, a[1]); },
+            findall: (a) => {
+                const P = a[0];
+                if (a.length === 2 && !(a[1] instanceof Map)) {
+                    const s = needSubject(P, a[1]);
+                    if (!P.isBytes && RE_FINDALL_NATIVE !== null) {
+                        const fast = RE_FINDALL_NATIVE(P.re, s, 0, FINDALL_TUPLE_TMPL);
+                        if (fast !== undefined) return list(fast);
+                    }
+                    const out = []; scan(P, s, 0, (m) => out.push(findItem(P, m))); return list(out);
+                }
+                const kw = kwOf(a, ["pos", "endpos"]); const s = needSubject(P, a[1]); const w = window(s, a, kw);
+                if (!w.ok) return list([]);
+                if (!P.isBytes && RE_FINDALL_NATIVE !== null) {
+                    const fast = RE_FINDALL_NATIVE(P.re, w.text, w.start, FINDALL_TUPLE_TMPL);
+                    if (fast !== undefined) return list(fast);
+                }
+                const out = []; scan(P, w.text, w.start, (m) => out.push(findItem(P, m))); return list(out);
+            },
+            finditer: (a) => { const P = a[0]; const kw = kwOf(a, ["pos", "endpos"]); const s = needSubject(P, a[1]); const w = window(s, a, kw); const out = []; if (w.ok) scan(P, w.text, w.start, (m) => out.push(mk(m, s, P, w.pos, w.end, w.pairs, w.text, a[1]))); return iter(list(out)); },
+            sub: (a) => { const kw = kwOf(a, ["count"]); return subImpl(a[0], a[1], a[2], Number(needInt(a[3] !== undefined ? a[3] : kwget(kw, "count", 0n))), false); },
+            subn: (a) => { const kw = kwOf(a, ["count"]); return subImpl(a[0], a[1], a[2], Number(needInt(a[3] !== undefined ? a[3] : kwget(kw, "count", 0n))), true); },
             // CPython 3.7+: every match splits, empty ones included, but the
             // search after an empty match must move past its position.
             split: (a) => {
+                const P = a[0];
                 const kw = kwOf(a, ["maxsplit"]);
-                const s = needStr(a[1]); const max = Number(needInt(a[2] !== undefined ? a[2] : kwget(kw, "maxsplit", 0n)));
-                const re = a[0].re, out = []; let last = 0, pos = 0, n = 0, mustAdvance = false;
+                const s = needSubject(P, a[1]); const max = Number(needInt(a[2] !== undefined ? a[2] : kwget(kw, "maxsplit", 0n)));
+                const re = P.re, out = []; let last = 0, pos = 0, n = 0, mustAdvance = false;
                 while (max <= 0 || n < max) {
                     let m = execAt(re, s, pos);
                     if (m !== null && mustAdvance && m[0] === "" && m.index === pos) {
@@ -2918,14 +3492,14 @@
                         m = execAt(re, s, pos + charWidth(s, pos));
                     }
                     if (m === null) break;
-                    out.push(s.slice(last, m.index));
-                    for (let k = 1; k < m.length; k++) out.push(m[k] === undefined ? null : m[k]);
+                    out.push(wrapVal(P, s.slice(last, m.index)));
+                    for (let k = 1; k < m.length; k++) out.push(m[k] === undefined ? null : wrapVal(P, m[k]));
                     n++;
                     const end = m.index + m[0].length;
                     mustAdvance = end === m.index;
                     last = pos = end;
                 }
-                out.push(s.slice(last));
+                out.push(wrapVal(P, s.slice(last)));
                 return list(out);
             },
             __repr__: (a) => {
@@ -2934,33 +3508,43 @@
                 return "re.compile(" + repr(a[0].src) + (names.length ? ", " + names.join("|") : "") + ")";
             },
         });
+        Pattern.dict.set("__class_getitem__", cgRe);
         for (const name of ["search", "match", "fullmatch", "findall", "finditer", "sub", "subn", "split"]) Pattern.dict.get(name).kwnames = true;
         prop(Pattern, "pattern", (P) => P.src);
         prop(Pattern, "flags", (P) => P.flagsOut);
         prop(Pattern, "groups", (P) => BigInt(P.ngroups));
         prop(Pattern, "groupindex", (P) => { const d = dict(); for (const [k, gi] of P.names) dictSet(d, k, BigInt(gi)); return d; });
-        function subImpl(P, repl, s, count, withCount) {
+        function subImpl(P, repl, rawSubject, count, withCount) {
+            const s = needSubject(P, rawSubject);
             const re = P.re;
             let n = 0, out = "", last = 0, pos = 0, m;
-            // A string template without backslashes is used as is.
-            const literal = typeof repl === "string" && !repl.includes("\\");
-            let sur = false, n0 = 0;
-            if (!literal) { strInfo(s); sur = infoSur; n0 = infoLen; }
+            let replStr = null;
+            if (P.isBytes) {
+                if (isBytesLike(repl)) replStr = bytesToLatin1(repl);
+                else if (typeof repl === "string") fail(E.TypeError, "cannot use a string replacement with a bytes pattern");
+            } else {
+                if (typeof repl === "string") replStr = repl;
+                else if (isBytesLike(repl)) fail(E.TypeError, "cannot use a bytes replacement with a string pattern");
+            }
+            const literal = replStr !== null && !replStr.includes("\\");
+            let pairs = null, n0 = 0;
+            if (!literal) { strInfo(s); pairs = infoPairs; n0 = infoLen; }
             while (pos <= s.length) {
                 if ((m = execAt(re, s, pos)) === null) break;
                 pos = re.lastIndex;
                 if (count > 0 && n >= count) break;
                 out += s.slice(last, m.index);
-                if (literal) out += repl;
+                if (literal) out += replStr;
                 else {
-                    const M = mk(m, s, P, 0, n0, sur, s);
-                    out += typeof repl === "string" ? expand(M, repl) : needStr(call(repl, [M], null));
+                    const M = mk(m, s, P, 0, n0, pairs, s, rawSubject);
+                    out += replStr !== null ? expand(M, replStr) : needSubject(P, call(repl, [M], null));
                 }
                 last = m.index + m[0].length; n++;
                 if (m[0] === "") { if (m.index >= s.length) break; const w = charWidth(s, m.index); out += s.slice(m.index, m.index + w); last = pos = m.index + w; }
             }
             out += s.slice(last);
-            return withCount ? tuple([rt.checkedText(out), BigInt(n)]) : rt.checkedText(out);
+            const finalOut = P.isBytes ? latin1ToBytes(out) : rt.checkedText(out);
+            return withCount ? tuple([finalOut, BigInt(n)]) : finalOut;
         }
         // UTF-16 units of the code point at i: an empty match steps over a
         // whole astral character, never into the middle of its pair.
@@ -2971,27 +3555,41 @@
                 if (flags !== 0n) fail(E.ValueError, "cannot process flags argument with a compiled pattern");
                 return pattern;
             }
-            const src = needStr(pattern, "first argument");
-            const key = src + " " + flags;
+            const isB = isBytesLike(pattern);
+            let srcText, srcVal, effFlags;
+            if (isB) {
+                if (flags & 32n) fail(E.ValueError, "cannot use UNICODE flag with a bytes pattern");
+                srcText = bytesToLatin1(pattern);
+                srcVal = rt.bytes(pattern.items.slice());
+                effFlags = flags | 256n;
+            } else {
+                srcText = needStr(pattern, "first argument");
+                srcVal = srcText;
+                effFlags = flags;
+            }
+            const key = (isB ? "B:" : "S:") + srcText + " " + flags;
             const hit = cache.get(key);
             if (hit !== undefined) return hit;
-            const t = translate(src, flags);
+            const t = translate(srcText, effFlags);
             let re;
             try { re = new RegExp(t.source, (t.ignoreCase ? "i" : "") + "gu"); } catch (e) { fail(error, "bad pattern: " + (e && e.message)); }
-            const flagsOut = t.flags & 256n ? t.flags : t.flags | 32n;
-            const p = { cls: Pattern, dict: new Map(), re: re, src: src, flagsOut: flagsOut, ngroups: t.groups, names: t.names, sticky: null, dsticky: null, full: null };
+            const flagsOut = isB ? (flags & ~32n) : (t.flags & 256n ? t.flags : t.flags | 32n);
+            const p = { cls: Pattern, dict: new Map(), re: re, src: srcVal, isBytes: isB, flagsOut: flagsOut, ngroups: t.groups, names: t.names, sticky: null, dsticky: null, full: null };
             if (cache.size > 512) cache.clear();
             cache.set(key, p); return p;
         }
         const flagsOf = (a, k, kw) => { const f = a[k] !== undefined ? a[k] : kwget(kw, "flags", 0n); return isInt(f) ? asInt(f) : fail(E.TypeError, "flags must be an int"); };
         fnkw(g, "compile", (a) => { const kw = kwOf(a, ["flags"]); return compile(a[0], flagsOf(a, 1, kw)); });
         for (const name of ["search", "match", "fullmatch", "findall", "finditer"]) fnkw(g, name, (a) => { const kw = kwOf(a, ["flags"]); return call(Pattern.dict.get(name), [compile(a[0], flagsOf(a, 2, kw)), a[1]], null); });
-        fnkw(g, "sub", (a) => { const kw = kwOf(a, ["count", "flags"]); return subImpl(compile(a[0], flagsOf(a, 4, kw)), a[1], needStr(a[2]), Number(needInt(a[3] !== undefined ? a[3] : kwget(kw, "count", 0n))), false); });
-        fnkw(g, "subn", (a) => { const kw = kwOf(a, ["count", "flags"]); return subImpl(compile(a[0], flagsOf(a, 4, kw)), a[1], needStr(a[2]), Number(needInt(a[3] !== undefined ? a[3] : kwget(kw, "count", 0n))), true); });
+        fnkw(g, "sub", (a) => { const kw = kwOf(a, ["count", "flags"]); return subImpl(compile(a[0], flagsOf(a, 4, kw)), a[1], a[2], Number(needInt(a[3] !== undefined ? a[3] : kwget(kw, "count", 0n))), false); });
+        fnkw(g, "subn", (a) => { const kw = kwOf(a, ["count", "flags"]); return subImpl(compile(a[0], flagsOf(a, 4, kw)), a[1], a[2], Number(needInt(a[3] !== undefined ? a[3] : kwget(kw, "count", 0n))), true); });
         // re.split(pattern, string, maxsplit=0, flags=0)
         fnkw(g, "split", (a) => { const kw = kwOf(a, ["maxsplit", "flags"]); return call(Pattern.dict.get("split"), [compile(a[0], flagsOf(a, 3, kw)), a[1], a[2] !== undefined ? a[2] : kwget(kw, "maxsplit", 0n)], null); });
         // Only the characters special in a pattern are escaped (3.7+).
-        fn(g, "escape", 1, (a) => needStr(a[0]).replace(/[()[\]{}?*+\-|^$\\.&~# \t\n\r\x0b\x0c]/g, (c) => "\\" + c));
+        fn(g, "escape", 1, (a) => {
+            if (isBytesLike(a[0])) return latin1ToBytes(bytesToLatin1(a[0]).replace(/[()[\]{}?*+\-|^$\\.&~# \t\n\r\x0b\x0c]/g, (c) => "\\" + c));
+            return needStr(a[0]).replace(/[()[\]{}?*+\-|^$\\.&~# \t\n\r\x0b\x0c]/g, (c) => "\\" + c);
+        });
         fn(g, "purge", 0, () => { cache.clear(); return null; });
         g.set("error", error); g.set("Pattern", Pattern); g.set("Match", Match);
     });
@@ -3637,5 +4235,217 @@
         Finalize.dict.get("__init__").kwnames = true;
         Finalize.dict.set("alive", { cls: T.property, fget: builtin("alive", 1, (a) => a[0]._alive && a[0]._ref._wr.deref() !== undefined), fset: null, fdel: null, doc: null });
         g.set("finalize", Finalize);
+    });
+
+    // ---- zlib ------------------------------------------------------------------------------------------------------------------------
+    mod("zlib", (g) => {
+        const ZlibError = pyClass("error", "zlib", {}, [E.Exception]);
+        g.set("error", ZlibError);
+        g.set("DEFLATED", 8n);
+        g.set("MAX_WBITS", 15n);
+        g.set("DEF_MEM_LEVEL", 8n);
+        g.set("DEF_BUF_SIZE", 16384n);
+        g.set("Z_DEFAULT_COMPRESSION", -1n);
+        g.set("Z_NO_COMPRESSION", 0n);
+        g.set("Z_BEST_SPEED", 1n);
+        g.set("Z_BEST_COMPRESSION", 9n);
+        g.set("Z_DEFAULT_STRATEGY", 0n);
+        g.set("Z_FILTERED", 1n);
+        g.set("Z_HUFFMAN_ONLY", 2n);
+        g.set("Z_RLE", 3n);
+        g.set("Z_FIXED", 4n);
+        g.set("Z_NO_FLUSH", 0n);
+        g.set("Z_PARTIAL_FLUSH", 1n);
+        g.set("Z_SYNC_FLUSH", 2n);
+        g.set("Z_FULL_FLUSH", 3n);
+        g.set("Z_FINISH", 4n);
+        let ZLIB_NATIVE = null;
+        try { ZLIB_NATIVE = typeof __zipp_py_zlib === "function" ? __zipp_py_zlib : null; } catch (e) { ZLIB_NATIVE = null; }
+        function needBytesItems(v) {
+            if (v !== null && typeof v === "object" && (v.cls === T.bytes || v.cls === T.bytearray || v.cls === T.memoryview)) {
+                return v.cls === T.memoryview ? v.items : v.items;
+            }
+            fail(E.TypeError, "a bytes-like object is required, not '" + typeOf(v).name + "'");
+        }
+        function callNative(op, items, a, b) {
+            if (ZLIB_NATIVE === null) fail(ZlibError, "native zlib backend unavailable");
+            try { return ZLIB_NATIVE(op, items, a, b); }
+            catch (e) { fail(ZlibError, e && e.message ? String(e.message).replace(/^Error:\s*/, "") : String(e)); }
+        }
+        fnkw(g, "compress", (a) => {
+            const kw = kwOf(a, ["level", "wbits"]);
+            const items = needBytesItems(a[0]);
+            const lvlV = a[1] !== undefined ? a[1] : kwget(kw, "level", -1n);
+            const wbV = a[2] !== undefined ? a[2] : kwget(kw, "wbits", 15n);
+            return rt.bytes(callNative(0, items, Number(needInt(lvlV)), Number(needInt(wbV))));
+        });
+        fnkw(g, "decompress", (a) => {
+            const kw = kwOf(a, ["wbits", "bufsize"]);
+            const items = needBytesItems(a[0]);
+            const wbV = a[1] !== undefined ? a[1] : kwget(kw, "wbits", 15n);
+            return rt.bytes(callNative(1, items, Number(needInt(wbV)), 0));
+        });
+        fn(g, "crc32", 2, (a) => {
+            const items = needBytesItems(a[0]);
+            const start = a[1] === undefined ? 0 : Number(needInt(a[1])) >>> 0;
+            return BigInt(ZLIB_NATIVE !== null ? (ZLIB_NATIVE(2, items, start) >>> 0) : rt.crc32(items, start));
+        }, 1);
+        fn(g, "adler32", 2, (a) => {
+            const items = needBytesItems(a[0]);
+            const start = a[1] === undefined ? 1 : Number(needInt(a[1])) >>> 0;
+            return BigInt(callNative(3, items, start) >>> 0);
+        }, 1);
+        const Compress = pyClass("Compress", "zlib", {
+            compress: (a) => {
+                const self = a[0];
+                if (self._flushed) fail(ZlibError, "Compressor already flushed");
+                const items = needBytesItems(a[1]);
+                for (let i = 0; i < items.length; i++) self._buf.push(items[i]);
+                return rt.bytes([]);
+            },
+            flush: (a) => {
+                const self = a[0];
+                if (self._flushed) return rt.bytes([]);
+                const mode = a[1] === undefined ? 4 : Number(needInt(a[1]));
+                if (mode === 4) {
+                    self._flushed = true;
+                    return rt.bytes(callNative(0, self._buf, self._level, self._wbits));
+                }
+                return rt.bytes([]);
+            },
+            copy: (a) => ({ cls: Compress, dict: new Map(), _buf: a[0]._buf.slice(), _level: a[0]._level, _wbits: a[0]._wbits, _flushed: a[0]._flushed }),
+        });
+        fnkw(g, "compressobj", (a) => {
+            const kw = kwOf(a, ["level", "method", "wbits", "memLevel", "strategy", "zdict"]);
+            const lvl = Number(needInt(a[0] !== undefined ? a[0] : kwget(kw, "level", -1n)));
+            const wb = Number(needInt(a[2] !== undefined ? a[2] : kwget(kw, "wbits", 15n)));
+            if ((lvl !== -1 && (lvl < 0 || lvl > 9))) fail(E.ValueError, "Invalid initialization option");
+            return { cls: Compress, dict: new Map(), _buf: [], _level: lvl, _wbits: wb, _flushed: false };
+        });
+        const Decompress = pyClass("Decompress", "zlib", {
+            decompress: (a) => {
+                const self = a[0];
+                const items = needBytesItems(a[1]);
+                const maxLen = a[2] === undefined ? 0 : Number(needInt(a[2]));
+                for (let i = 0; i < items.length; i++) self._buf.push(items[i]);
+                const out = callNative(1, self._buf, self._wbits, maxLen);
+                self._buf = [];
+                self._eof = true;
+                return rt.bytes(out);
+            },
+            flush: (a) => {
+                const self = a[0];
+                if (self._buf.length === 0) return rt.bytes([]);
+                const out = callNative(1, self._buf, self._wbits, 0);
+                self._buf = [];
+                self._eof = true;
+                return rt.bytes(out);
+            },
+        });
+        Decompress.dict.set("eof", { cls: T.property, fget: builtin("eof", 1, (a) => a[0]._eof), fset: null, fdel: null, doc: null });
+        Decompress.dict.set("unused_data", { cls: T.property, fget: builtin("unused_data", 1, () => rt.bytes([])), fset: null, fdel: null, doc: null });
+        Decompress.dict.set("unconsumed_tail", { cls: T.property, fget: builtin("unconsumed_tail", 1, () => rt.bytes([])), fset: null, fdel: null, doc: null });
+        fnkw(g, "decompressobj", (a) => {
+            const kw = kwOf(a, ["wbits", "zdict"]);
+            const wb = Number(needInt(a[0] !== undefined ? a[0] : kwget(kw, "wbits", 15n)));
+            return { cls: Decompress, dict: new Map(), _buf: [], _wbits: wb, _eof: false };
+        });
+    });
+
+    // ---- shutil ----------------------------------------------------------------------------------------------------------------------
+    mod("shutil", (g) => {
+        const ShutilError = pyClass("Error", "shutil", {}, [E.Exception]);
+        const SameFileError = pyClass("SameFileError", "shutil", {}, [ShutilError]);
+        g.set("Error", ShutilError);
+        g.set("SameFileError", SameFileError);
+        const fspath = (p) => {
+            if (p !== null && typeof p === "object" && p.cls !== T.bytes && rt.typeMethod(p, "__fspath__") !== undefined) p = rt.callMethod(p, "__fspath__", []);
+            return needStr(p);
+        };
+        const copyFileImpl = (src, dst) => {
+            const sNorm = rt.vfs.norm(src), dNorm = rt.vfs.norm(dst);
+            if (sNorm === dNorm) fail(SameFileError, repr(src) + " and " + repr(dst) + " are the same file");
+            const data = rt.vfs.get(sNorm);
+            if (data === undefined) fail(E.FileNotFoundError, "[Errno 2] No such file or directory: '" + src + "'");
+            if (rt.vfs.isDir(dNorm) && !rt.vfs.has(dNorm)) fail(E.IsADirectoryError, "[Errno 21] Is a directory: '" + dst + "'");
+            rt.vfs.set(dNorm, new Uint8Array(data));
+            return dst;
+        };
+        fnkw(g, "copyfile", (a) => { kwOf(a, ["follow_symlinks"]); return copyFileImpl(fspath(a[0]), fspath(a[1])); });
+        const copyImpl = (a) => {
+            kwOf(a, ["follow_symlinks"]);
+            const src = fspath(a[0]);
+            let dst = fspath(a[1]);
+            const dNorm = rt.vfs.norm(dst);
+            if (rt.vfs.isDir(dNorm) && !rt.vfs.has(dNorm)) {
+                const base = src.replace(/\/+$/, "").split("/").pop();
+                dst = dst.endsWith("/") ? dst + base : dst + "/" + base;
+            }
+            return copyFileImpl(src, dst);
+        };
+        fnkw(g, "copy", copyImpl);
+        fnkw(g, "copy2", copyImpl);
+        fn(g, "copyfileobj", 3, (a) => {
+            const fsrc = a[0], fdst = a[1], len = a[2] === undefined ? 65536n : needInt(a[2]);
+            while (true) {
+                const buf = rt.callMethod(fsrc, "read", [len]);
+                if (!truth(buf)) break;
+                rt.callMethod(fdst, "write", [buf]);
+            }
+            return null;
+        }, 2);
+        fnkw(g, "rmtree", (a) => {
+            const kw = kwOf(a, ["ignore_errors", "onerror"]);
+            const ignore = truth(a[1] !== undefined ? a[1] : kwget(kw, "ignore_errors", false));
+            const root = fspath(a[0]), norm = rt.vfs.norm(root);
+            if (!rt.vfs.isDir(norm) && !rt.vfs.has(norm)) {
+                if (ignore) return null;
+                fail(E.FileNotFoundError, "[Errno 2] No such file or directory: '" + root + "'");
+            }
+            const walk = (dir) => {
+                for (const name of rt.vfs.listDir(dir)) {
+                    const child = dir === "" || dir === "." ? name : dir + "/" + name;
+                    if (rt.vfs.isDir(child) && !rt.vfs.has(child)) walk(child);
+                    else rt.vfs.remove(child);
+                }
+                rt.vfs.rmdir(dir);
+            };
+            walk(norm);
+            return null;
+        });
+        fnkw(g, "copytree", (a) => {
+            const kw = kwOf(a, ["dirs_exist_ok"]);
+            const dirsOk = truth(kwget(kw, "dirs_exist_ok", false));
+            const src = fspath(a[0]), dst = fspath(a[1]);
+            const sNorm = rt.vfs.norm(src), dNorm = rt.vfs.norm(dst);
+            if (!rt.vfs.isDir(sNorm)) fail(E.FileNotFoundError, "[Errno 2] No such file or directory: '" + src + "'");
+            if (rt.vfs.isDir(dNorm) && !dirsOk) fail(E.FileExistsError, "[Errno 17] File exists: '" + dst + "'");
+            const walk = (sDir, dDir) => {
+                rt.vfs.mkdir(dDir, true);
+                for (const name of rt.vfs.listDir(sDir)) {
+                    const sc = sDir === "" || sDir === "." ? name : sDir + "/" + name;
+                    const dc = dDir === "" || dDir === "." ? name : dDir + "/" + name;
+                    if (rt.vfs.isDir(sc) && !rt.vfs.has(sc)) walk(sc, dc);
+                    else { const bytes = rt.vfs.get(sc); if (bytes !== undefined) rt.vfs.set(dc, new Uint8Array(bytes)); }
+                }
+            };
+            walk(sNorm, dNorm);
+            return dst;
+        });
+        fn(g, "move", 2, (a) => {
+            const src = fspath(a[0]);
+            let dst = fspath(a[1]);
+            const sNorm = rt.vfs.norm(src), dNorm = rt.vfs.norm(dst);
+            if (rt.vfs.isDir(dNorm) && !rt.vfs.has(dNorm)) {
+                const base = src.replace(/\/+$/, "").split("/").pop();
+                dst = dst.endsWith("/") ? dst + base : dst + "/" + base;
+            }
+            const finalDst = rt.vfs.norm(dst);
+            const data = rt.vfs.get(sNorm);
+            if (data === undefined) fail(E.FileNotFoundError, "[Errno 2] No such file or directory: '" + src + "'");
+            rt.vfs.set(finalDst, data);
+            rt.vfs.remove(sNorm);
+            return dst;
+        });
     });
 })(__zipp_py);

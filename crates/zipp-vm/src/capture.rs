@@ -785,55 +785,77 @@ pub fn arrow_entry_lexicals(stmts: &[Stmt]) -> (HashSet<String>, HashSet<String>
     let mut lex = HashSet::default();
     let mut early_cell = HashSet::default();
     #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
-    let mut simple_lex = Names::default();
-    let mut last_simple: usize = 0;
+    let mut lex_filter = Names::default();
+    let mut last_lex: usize = 0;
     for (i, s) in stmts.iter().enumerate() {
-        if let Stmt::VarDecl(d) = s {
-            if d.kind.is_lexical()
-                && d.decls.len() == 1
-                && matches!(&d.decls[0].id, Pattern::Ident(_))
-                && i > 0
-            {
-                #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
-                pattern_names(&d.decls[0].id, &mut simple_lex);
-                last_simple = i;
+        match s {
+            Stmt::VarDecl(d) if d.kind.is_lexical() => {
+                for decl in &d.decls {
+                    let mut names = Names::default();
+                    pattern_names(&decl.id, &mut names);
+                    for n in names {
+                        lex.insert(n.to_string());
+                        #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                        lex_filter.insert(n);
+                    }
+                }
+                last_lex = i;
             }
+            Stmt::ClassDecl(c) => {
+                if let Some(id) = &c.name {
+                    let name = id.to_string();
+                    lex.insert(name.clone());
+                    early_cell.insert(name);
+                }
+            }
+            _ => {}
         }
+    }
+    if lex.is_empty() {
+        return (lex, early_cell);
+    }
+    let needs_walk = stmts.iter().enumerate().any(|(i, s)| match s {
+        Stmt::VarDecl(d) if d.kind.is_lexical() => {
+            i > 0
+                || d.decls.len() > 1
+                || d.decls.iter().any(|x| !matches!(x.id, Pattern::Ident(_)))
+        }
+        _ => false,
+    });
+    if !needs_walk {
+        return (lex, early_cell);
     }
     let mut prior_refs = Names::default();
     let run = || {
-        for (i, s) in stmts.iter().enumerate() {
+        for (i, s) in stmts[..=last_lex].iter().enumerate() {
             match s {
                 Stmt::VarDecl(d) if d.kind.is_lexical() => {
-                    let mut declared_here = Names::default();
                     for decl in &d.decls {
-                        pattern_names(&decl.id, &mut declared_here);
-                    }
-                    let simple_single =
-                        d.decls.len() == 1 && matches!(&d.decls[0].id, Pattern::Ident(_));
-                    for name in declared_here {
-                        lex.insert(name.to_string());
-                        if !simple_single || prior_refs.contains(name) {
-                            early_cell.insert(name.to_string());
+                        let mut names = Names::default();
+                        pattern_names(&decl.id, &mut names);
+                        let mut own = Names::default();
+                        if let Some(init) = &decl.init {
+                            expr_refs(init, &mut own);
                         }
+                        pattern_init_refs(&decl.id, &mut own);
+                        for n in names {
+                            if prior_refs.contains(n) || own.contains(n) {
+                                early_cell.insert(n.to_string());
+                            }
+                        }
+                        prior_refs.extend(own);
                     }
                 }
-                Stmt::ClassDecl(c) => {
-                    if let Some(id) = &c.name {
-                        let name = id.to_string();
-                        lex.insert(name.clone());
-                        early_cell.insert(name);
+                _ => {
+                    if i < last_lex {
+                        stmt_refs(s, &mut prior_refs, false);
                     }
                 }
-                _ => {}
-            }
-            if i < last_simple {
-                stmt_refs(s, &mut prior_refs, false);
             }
         }
     };
     #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
-    memo::with_lazy_filter(&simple_lex, run);
+    memo::with_lazy_filter(&lex_filter, run);
     #[cfg(any(feature = "meter-only", feature = "safe-sandbox"))]
     (|f: &mut dyn FnMut()| f())(&mut { run });
     (lex, early_cell)

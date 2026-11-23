@@ -102,6 +102,8 @@ impl<'p> Vm<'p> {
             native::WASM_LAZY_GET => self.wasm_lazy_get(state),
             #[cfg(feature = "webassembly")]
             native::WASM_LAZY_SET => self.wasm_lazy_set(state, _this, a0),
+            #[cfg(not(feature = "wasm-no-fs-loader"))]
+            native::IMPORT_META_RESOLVE => self.import_meta_resolve(state, args),
             native::DEC_ADD_INITIALIZER => {
                 let class = state[0];
                 let which = state[1].as_f64() as u8;
@@ -395,6 +397,9 @@ impl<'p> Vm<'p> {
                 &mut c.setters
             }),
             _ => {}
+        }
+        if !is_static {
+            self.class_proto_epoch = self.class_proto_epoch.wrapping_add(1);
         }
     }
 

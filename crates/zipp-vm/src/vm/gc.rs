@@ -1217,6 +1217,9 @@ impl Vm<'_> {
         self.realm_globals.retain_marked(&marks);
 
         let free_after = self.heap.free_indices().len();
+        if swept > 0 {
+            self.invalidate_class_member_cache();
+        }
         gcstats::record(
             stats,
             false,
@@ -1368,6 +1371,9 @@ impl Vm<'_> {
         self.heap.remset_reset();
         self.heap.vremset_reset();
         let free_after = self.heap.free_indices().len();
+        if swept > 0 {
+            self.invalidate_class_member_cache();
+        }
         gcstats::record(
             stats,
             true,

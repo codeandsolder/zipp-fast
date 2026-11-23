@@ -1368,9 +1368,9 @@ impl<'p> Vm<'p> {
                     break;
                 };
                 // Dynamic/foreign program ids can share an integer fid with a
-                // root function. Keep this first lane root-realm only.
+                // root function. Keep this lane to root-realm main/module funcs.
                 if self.get_function_realm(callee_value) != 0
-                    || self.main_func(fid as usize).is_none()
+                    || !(self.is_main_func(fid) || self.loader_module_func(fid))
                 {
                     failed = true;
                     break;
@@ -1438,7 +1438,7 @@ impl<'p> Vm<'p> {
                     )
                 });
                 let direct_global_route_epoch = if body_has_direct_global {
-                    let route_is_exact = self.global_route_epoch == 0
+                    let route_is_exact = self.global_route_epoch < u32::MAX
                         && self.current_realm_id().is_none()
                         && self.jit_func_eligible(fid)
                         && !self
@@ -1465,7 +1465,7 @@ impl<'p> Vm<'p> {
                         failed = true;
                         break;
                     }
-                    Some(0)
+                    Some(self.global_route_epoch)
                 } else {
                     None
                 };
@@ -3244,7 +3244,7 @@ impl<'p> Vm<'p> {
             };
             if same_proto
                 && (self.get_function_realm(Value::from_bits(callee_bits)) != 0
-                    || self.main_func(fid as usize).is_none())
+                    || !(self.is_main_func(fid) || self.loader_module_func(fid)))
             {
                 // A sloppy ordinary call substitutes the CALLEE realm's global
                 // object for undefined `this`. The splice bakes main-realm
@@ -3710,7 +3710,7 @@ impl<'p> Vm<'p> {
                         })
                 });
                 let route_is_exact = callee_value.is_heap()
-                    && self.global_route_epoch == 0
+                    && self.global_route_epoch < u32::MAX
                     && self.current_realm_id().is_none()
                     && self.get_function_realm(callee_value) == 0
                     && self.jit_func_eligible(fid)
@@ -3738,7 +3738,7 @@ impl<'p> Vm<'p> {
                     }
                     continue;
                 }
-                Some(0)
+                Some(self.global_route_epoch)
             } else {
                 None
             };

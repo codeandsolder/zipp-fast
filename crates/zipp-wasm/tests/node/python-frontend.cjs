@@ -199,6 +199,16 @@ if (languages.includes("python")) {
     const testOut = tests.takeFailedConsole().map((e) => e.text).join("\n");
     ok("the test report survives the failed initialization through takeFailedConsole", /test_math PASSED/.test(testOut) && /1 failed, 1 passed/.test(testOut), testOut);
     eq("takeFailedConsole drains", tests.takeFailedConsole(), []);
+
+    const hyphen = new Engine();
+    const hyphenErr = thrown(() => hyphen.initPythonProject(
+      { "fixtures/with-hyphen/verify.py": "print(42)\n" },
+      "fixtures/with-hyphen/verify.py",
+      []
+    ));
+    ok("initPythonProject runs entry script beneath a non-identifier directory", hyphenErr === null, hyphenErr);
+    eq("non-identifier entry script output", hyphen.takeOutput(), ["42"]);
+    hyphen.dispose();
   }
 
   {

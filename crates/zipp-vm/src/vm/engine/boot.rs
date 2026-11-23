@@ -370,6 +370,10 @@ impl<'p> Vm<'p> {
             class_values: vec![ClassSlot::default(); program.classes.len()],
             mi_class_epoch: 0,
             class_proto_epoch: 0,
+            class_member_gc_epoch: 1,
+            class_member_cache: (0..crate::vm::props::CLASS_MEMBER_CACHE_SLOTS)
+                .map(|_| std::cell::Cell::new(crate::vm::props::ClassMemberSlot::EMPTY))
+                .collect(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             mi_recv: rustc_hash::FxHashMap::default(),
             idx_key_scratch: String::new(),
@@ -553,7 +557,7 @@ impl<'p> Vm<'p> {
             deleted_globals: std::collections::HashSet::new(),
             global_route_epoch: 0,
             jit_route_dirty: 0,
-            jit_global_route_ok: rustc_hash::FxHashMap::default(),
+            jit_global_route_ok: Vec::new(),
             strict_unresolvable_globals: Vec::new(),
             array_length_nonwritable: crate::slot_table::SlotSet::default(),
             array_js_len: crate::slot_table::SlotTable::default(),
@@ -757,6 +761,7 @@ impl<'p> Vm<'p> {
             promise_resolve_memo: (0, 0),
             array_then_memo: (0, 0),
             matchall_fast_slots: None,
+            regexp_proto_fast_slots: std::cell::Cell::new(None),
             realms: vec![std::collections::HashMap::new()], // realm 0 = main
             obj_realm: crate::vm::JitGuardedMap::new(),
             realm_ctor_main: Default::default(),
